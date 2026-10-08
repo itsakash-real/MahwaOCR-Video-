@@ -1,0 +1,24 @@
+# Optional convenience wrapper. See the note at the top of the Dockerfile for
+# when Docker is and isn't worth using here.
+#
+#   docker compose build
+#   docker compose run --rm ocr session new "Series Name"
+#   docker compose run --rm ocr session list
+#   docker compose run --rm ocr run --all-pending
+#
+# ./data on the host holds every session, so containers stay disposable.
+
+services:
+  ocr:
+    build: .
+    volumes:
+      - ./data:/data
+    environment:
+      MANHWA_SESSIONS_ROOT: /data/sessions
+      # Pass through whichever key matches your provider.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    # Uncomment to reach an Ollama instance running on the host:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"

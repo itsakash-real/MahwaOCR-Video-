@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manhwa-ocr"
+version = "0.1.0"
+description = "Vision-model transcription for webtoons/manhwa with persistent cross-chapter series memory."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "requests>=2.31",
+    "pillow>=10.0",
+    "PyYAML>=6.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Recap video rendering. Brings its own FFmpeg binary; nothing else to install.
+video = ["imageio-ffmpeg>=0.5"]
+# Exact sync of panels to the narration (word timestamps, CPU only, no PyTorch).
+sync = ["faster-whisper>=1.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+manhwa-ocr = "manhwa_ocr.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["manhwa_ocr*"]
+
+[tool.setuptools.package-data]
+"manhwa_ocr.ui" = ["*.html"]

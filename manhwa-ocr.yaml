@@ -1,0 +1,64 @@
+# Settings for manhwa-ocr. Used from any folder you run commands in.
+
+# Where everything you make goes: one folder per series, holding transcripts,
+# page images, recap scripts, your narration audio and the videos.
+# Relative paths are relative to this file, so "../ManhwaRecaps" is a folder
+# next to the program folder. Keep the program and your output apart.
+output_folder: "../ManhwaRecaps"
+
+provider:
+  # anthropic | gemini | openai | ollama
+  #   "openai" works for ANY OpenAI-compatible endpoint:
+  #   OpenRouter, Groq, Together, LM Studio, vLLM, llama.cpp server.
+  kind: anthropic
+  vision_model: claude-haiku-4-5-20251001
+  # Cheaper text-only model for chapter assembly. null = reuse vision_model.
+  text_model: null
+  base_url: null
+  api_key_env: ANTHROPIC_API_KEY
+  temperature: 0.0        # keep at 0 for reproducible runs
+  max_tokens: 4096        # per tile
+  text_max_tokens: 16000  # chapter assembly and recaps
+  timeout: 180
+  max_retries: 4
+
+slicing:
+  # The most important section. Webtoon strips are ~900x16000; sent whole, a
+  # vision model receives them at roughly 110px wide and text becomes a guess.
+  enabled: true
+  target_height: 1400     # tile height in px
+  overlap: 180            # overlap so bubbles spanning a cut survive
+  snap_to_gutter: true    # cut at flat rows between panels, not through art
+  gutter_search: 220      # how far to hunt for a clean cut
+  min_height_to_slice: 1800
+  max_width: 1100
+
+download:
+  timeout: 60
+  max_retries: 3
+  delay: 0.25             # politeness pause between pages
+  headers:
+    User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36
+
+video:
+  format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
+  fps: 30
+  crf: 20                 # quality: lower = better and bigger files
+  preset: veryfast
+  lead: 0.15              # panel appears this long before its sentence
+  min_shot: 1.0           # recap pacing: ~2.7s average shot, 1-5s range
+  max_shot: 5.0
+  target_shot: 2.7        # average seconds per shot (recap channels: about 2.7)
+  pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
+  workers: 0              # parallel renders; 0 = half your CPU cores (fastest on 4 cores)
+  effects: {shake: true, punch: false, flash: false, end_fade: true}   # calm by default
+  music: null             # e.g. "music/bed.mp3" (relative to the series folder); ducks under narration
+  music_volume: 0.22
+  whisper_model: small.en # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
+  whisper_language: null  # e.g. "hi"
+
+pipeline:
+  concurrency: 4          # parallel vision calls
+  cache: true             # cache per image+prompt; re-runs are nearly free
+  dedupe_threshold: 0.86  # similarity above which overlapping text is merged
+  cleanup: true           # delete pages/tiles once a chapter's transcript exists

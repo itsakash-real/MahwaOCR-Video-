@@ -1,0 +1,851 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manhwa OCR</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --panel-2: #f0f0ed; --line: #e3e3de;
+  --text: #1c1c1a; --muted: #6b6b66; --faint: #9a9a94;
+  --accent: #3d5afe; --accent-soft: #e8ecff;
+  --ok: #1e7a4c; --ok-soft: #e4f4ec;
+  --warn: #9a5b00; --warn-soft: #fbf0dc;
+  --idle: #6b6b66; --idle-soft: #eeeeea;
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+  --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121212; --panel: #1b1b1a; --panel-2: #232321; --line: #2f2f2c;
+    --text: #ececea; --muted: #a2a29c; --faint: #6f6f6a;
+    --accent: #8c9eff; --accent-soft: #252b4a;
+    --ok: #5fd39a; --ok-soft: #173326;
+    --warn: #f0b45a; --warn-soft: #3a2c14;
+    --idle: #a2a29c; --idle-soft: #2a2a28;
+    --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+a { color: var(--accent); }
+
+.app { display: grid; grid-template-columns: 260px 1fr; height: 100vh; }
+
+/* ---------- sidebar ---------- */
+.side {
+  border-right: 1px solid var(--line); background: var(--panel);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.side-head { padding: 16px 16px 10px; display: flex; align-items: center; justify-content: space-between; }
+.brand { font-weight: 650; letter-spacing: -.01em; }
+.side-list { overflow-y: auto; flex: 1; padding: 4px 8px 12px; }
+.sess {
+  display: block; width: 100%; text-align: left; border: 0; background: none;
+  padding: 10px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 2px;
+}
+.sess:hover { background: var(--panel-2); }
+.sess.sel { background: var(--accent-soft); }
+.sess-name { font-weight: 550; display: flex; align-items: center; gap: 6px; }
+.sess-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
+.bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.side-foot { padding: 10px 16px 14px; border-top: 1px solid var(--line); color: var(--faint); font-size: 12px; word-break: break-all; }
+
+/* ---------- main ---------- */
+.main { overflow-y: auto; min-width: 0; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 24px 28px 64px; }
+.empty { color: var(--muted); padding: 60px 0; text-align: center; }
+
+.head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+h1 { font-size: 22px; margin: 0; letter-spacing: -.015em; }
+.path { color: var(--faint); font: 12px var(--mono); margin-top: 4px; word-break: break-all; }
+.head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.btn {
+  border: 1px solid var(--line); background: var(--panel); border-radius: 8px;
+  padding: 6px 12px; cursor: pointer; white-space: nowrap;
+}
+.btn:hover { background: var(--panel-2); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn.sm { padding: 3px 9px; font-size: 12px; }
+.btn:disabled { opacity: .45; cursor: default; }
+.icon-btn { border: 0; background: none; cursor: pointer; color: var(--muted); padding: 4px 6px; border-radius: 6px; font-size: 18px; line-height: 1; }
+.icon-btn:hover { background: var(--panel-2); color: var(--text); }
+
+.next {
+  margin-top: 18px; background: var(--panel); border: 1px solid var(--line);
+  border-left: 3px solid var(--accent); border-radius: var(--radius); padding: 12px 14px;
+  box-shadow: var(--shadow);
+}
+.next-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+.next pre { margin: 6px 0 0; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; }
+.next-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+.problems { margin-top: 10px; padding: 8px 10px; border-radius: 8px; background: var(--warn-soft); color: var(--warn); font-size: 13px; }
+.problems ul { margin-top: 4px; }
+
+.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 16px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; box-shadow: var(--shadow); }
+.tile b { display: block; font-size: 22px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.tile span { color: var(--muted); font-size: 12px; }
+
+.tabs { display: flex; gap: 4px; margin-top: 24px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.tab { border: 0; background: none; padding: 8px 12px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap; }
+.tab.sel { color: var(--text); border-bottom-color: var(--accent); font-weight: 550; }
+.tab .n { color: var(--faint); font-size: 12px; margin-left: 4px; }
+.panel { padding-top: 16px; }
+
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.toolbar .grow { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: var(--panel); padding: 5px 10px; cursor: pointer; font-size: 13px; color: var(--muted); }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.sel { background: var(--panel-2); color: var(--text); font-weight: 550; }
+.selbar {
+  display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: var(--accent-soft); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px;
+}
+.selbar.on { display: flex; }
+.selbar label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.selbar select { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 3px 6px; }
+
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
+th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th { font-size: 12px; font-weight: 600; color: var(--muted); background: var(--panel-2); }
+tr:last-child td { border-bottom: 0; }
+td.num { font-variant-numeric: tabular-nums; color: var(--muted); }
+td.ch { font-weight: 600; font-variant-numeric: tabular-nums; width: 56px; }
+td.cb, th.cb { width: 36px; padding-right: 0; }
+.url { color: var(--muted); font: 12px var(--mono); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; text-decoration: none; }
+.url:hover { color: var(--accent); }
+.row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+.pill { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.idle { background: var(--idle-soft); color: var(--idle); }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; box-shadow: var(--shadow); }
+.card h3 { margin: 0; font-size: 15px; }
+.card .role { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.card .look { margin-top: 8px; font-size: 13px; }
+.card .meta { margin-top: 8px; color: var(--faint); font-size: 12px; }
+.section-title { font-size: 13px; font-weight: 600; color: var(--muted); margin: 22px 0 8px; text-transform: uppercase; letter-spacing: .05em; }
+ul.plain { margin: 0; padding-left: 18px; }
+ul.plain li { margin: 3px 0; }
+
+.list { display: flex; flex-direction: column; gap: 8px; }
+.item { display: flex; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px; box-shadow: var(--shadow); }
+.item .t { font-weight: 550; }
+.item .s { color: var(--muted); font-size: 12px; }
+.item .grow { flex: 1; min-width: 0; }
+
+textarea.links { width: 100%; min-height: 160px; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 10px; font: 12.5px/1.5 var(--mono); resize: vertical; }
+input.text { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 7px 10px; width: 100%; }
+.hint { color: var(--muted); font-size: 13px; }
+
+/* ---------- viewer drawer ---------- */
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.28); opacity: 0; pointer-events: none; transition: opacity .15s; z-index: 10; }
+.scrim.on { opacity: 1; pointer-events: auto; }
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100%);
+  background: var(--panel); border-left: 1px solid var(--line); z-index: 11;
+  transform: translateX(100%); transition: transform .18s ease; display: flex; flex-direction: column;
+}
+.drawer.on { transform: none; }
+.drawer-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.drawer-head .t { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drawer-body { overflow-y: auto; padding: 18px 26px 60px; flex: 1; }
+.raw { font: 12.5px/1.6 var(--mono); white-space: pre-wrap; word-break: break-word; margin: 0; }
+
+.md h1 { font-size: 20px; margin: 4px 0 12px; }
+.md h2 { font-size: 17px; margin: 26px 0 8px; padding-top: 6px; border-top: 1px solid var(--line); }
+.md h3 { font-size: 15px; margin: 18px 0 6px; }
+.md p { margin: 8px 0; }
+.md blockquote { margin: 8px 0; padding: 4px 12px; border-left: 3px solid var(--line); color: var(--muted); }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
+.md code { font: 12.5px var(--mono); background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
+.md pre { background: var(--panel-2); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
+.md pre code { background: none; padding: 0; }
+.md table { box-shadow: none; margin: 10px 0; }
+.md .cue { font: 12px var(--mono); color: var(--accent); background: var(--accent-soft); display: inline-block; padding: 2px 8px; border-radius: 6px; margin: 4px 0; }
+.md ul, .md ol { padding-left: 22px; }
+
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: all .18s; z-index: 20; pointer-events: none; max-width: 90vw; }
+.toast.on { opacity: 1; transform: translateX(-50%); }
+
+.live { display: inline-flex; align-items: center; gap: 6px; color: var(--faint); font-size: 12px; }
+.live i { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+.live.off i { background: var(--faint); }
+
+.menu-btn { display: none; }
+@media (max-width: 820px) {
+  .app { grid-template-columns: 1fr; }
+  .side { position: fixed; inset: 0 auto 0 0; width: 280px; z-index: 12; transform: translateX(-100%); transition: transform .18s; }
+  .side.on { transform: none; }
+  .menu-btn { display: inline-block; }
+  .wrap { padding: 16px 16px 60px; }
+  .tiles { grid-template-columns: repeat(2, 1fr); }
+  .hide-sm { display: none; }
+  .drawer-body { padding: 16px 16px 60px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side" id="side">
+    <div class="side-head">
+      <span class="brand">Manhwa OCR</span>
+      <button class="icon-btn" id="newBtn" title="New series" aria-label="New series">+</button>
+    </div>
+    <div class="side-list" id="sessions"></div>
+    <div class="side-foot" id="root"></div>
+  </aside>
+
+  <main class="main">
+    <div class="wrap" id="view"><div class="empty">Loading…</div></div>
+  </main>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<section class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <span class="t" id="dTitle"></span>
+    <div class="seg"><button id="dRendered" class="sel">Read</button><button id="dRaw">Raw</button></div>
+    <button class="btn sm" id="dCopy">Copy</button>
+    <button class="btn sm" id="dDownload">Download</button>
+    <button class="icon-btn" id="dClose" aria-label="Close">×</button>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+</section>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+// ------------------------------------------------------------ state
+const S = {
+  sessions: [], root: "", selected: null, detail: null,
+  tab: "chapters", filter: "all", picked: new Set(), minutes: 6,
+  live: true, doc: null, docMode: "rendered", creating: false,
+};
+try {
+  const saved = JSON.parse(localStorage.getItem("mocr-ui") || "{}");
+  if (saved.selected) S.selected = saved.selected;
+  if (saved.tab) S.tab = saved.tab;
+  if (saved.minutes) S.minutes = saved.minutes;
+} catch (_) {}
+function persist() {
+  try { localStorage.setItem("mocr-ui", JSON.stringify({ selected: S.selected, tab: S.tab, minutes: S.minutes })); } catch (_) {}
+}
+
+// ------------------------------------------------------------ helpers
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const mins = (w) => (w / 150).toFixed(1);
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("on");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("on"), 1800);
+}
+async function copy(text, label) {
+  try { await navigator.clipboard.writeText(text); toast(label || "Copied"); }
+  catch (_) {
+    const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand("copy"); ta.remove(); toast(label || "Copied");
+  }
+}
+async function api(path, opts = {}) {
+  const init = { headers: {} };
+  if (opts.body !== undefined) {
+    init.method = "POST";
+    init.headers["Content-Type"] = "application/json";
+    init.headers["X-Manhwa-OCR"] = "1";
+    init.body = JSON.stringify(opts.body);
+  }
+  const r = await fetch(path, init);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+// Chapter list -> compact spec: ["1","2","3","4","11"] -> "1-4,11"
+function spec(chs) {
+  const nums = [...new Set(chs.filter((c) => /^\d+$/.test(c)).map(Number))].sort((a, b) => a - b);
+  const other = chs.filter((c) => !/^\d+$/.test(c));
+  const out = [];
+  for (let i = 0; i < nums.length; ) {
+    let j = i; while (j + 1 < nums.length && nums[j + 1] === nums[j] + 1) j++;
+    out.push(i === j ? String(nums[i]) : `${nums[i]}-${nums[j]}`); i = j + 1;
+  }
+  return out.concat(other).join(",");
+}
+const sessArg = () => `--session "${S.detail.slug}"`;
+const cmd = (s) => `python -m manhwa_ocr ${s}`;
+
+// ------------------------------------------------------------ markdown (escape first, then format)
+function inline(s) {
+  return s
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+}
+function md(src) {
+  const lines = String(src).replace(/<!--[\s\S]*?-->/g, "").replace(/\r/g, "").split("\n");
+  const out = []; let i = 0;
+  while (i < lines.length) {
+    const raw = lines[i]; const line = raw.trim();
+    if (!line) { i++; continue; }
+    if (line.startsWith("```")) {
+      const buf = []; i++;
+      while (i < lines.length && !lines[i].trim().startsWith("```")) buf.push(esc(lines[i++]));
+      i++; out.push(`<pre><code>${buf.join("\n")}</code></pre>`); continue;
+    }
+    let m;
+    if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { const n = Math.min(m[1].length, 3); out.push(`<h${n}>${inline(esc(m[2]))}</h${n}>`); i++; continue; }
+    if (/^(-{3,}|\*{3,})$/.test(line)) { out.push("<hr>"); i++; continue; }
+    if (/^\[[^\]]+\]$/.test(line)) { out.push(`<div><span class="cue">${esc(line)}</span></div>`); i++; continue; }
+    if (line.startsWith(">")) {
+      const buf = [];
+      while (i < lines.length && lines[i].trim().startsWith(">")) buf.push(inline(esc(lines[i++].trim().replace(/^>\s?/, ""))));
+      out.push(`<blockquote>${buf.join("<br>")}</blockquote>`); continue;
+    }
+    if (line.startsWith("|") && i + 1 < lines.length && /^\|?\s*:?-{2,}/.test(lines[i + 1].trim())) {
+      const row = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(esc(c.trim())));
+      const head = row(line); i += 2; const body = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) body.push(row(lines[i++]));
+      out.push(`<table><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${body.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+      continue;
+    }
+    if (/^[-*]\s+/.test(line) || /^\d+\.\s+/.test(line)) {
+      const ordered = /^\d+\./.test(line); const buf = [];
+      while (i < lines.length && (/^\s*[-*]\s+/.test(lines[i]) || /^\s*\d+\.\s+/.test(lines[i])))
+        buf.push(`<li>${inline(esc(lines[i++].trim().replace(/^([-*]|\d+\.)\s+/, "")))}</li>`);
+      out.push(ordered ? `<ol>${buf.join("")}</ol>` : `<ul>${buf.join("")}</ul>`); continue;
+    }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|>|```|\||[-*]\s|\d+\.\s|-{3,}$|\[[^\]]+\]$)/.test(lines[i].trim()))
+      buf.push(inline(esc(lines[i++].trim())));
+    if (buf.length) out.push(`<p>${buf.join("<br>")}</p>`); else i++;
+  }
+  return out.join("\n");
+}
+
+// ------------------------------------------------------------ data
+async function loadSessions() {
+  const data = await api("/api/sessions");
+  S.sessions = data.sessions; S.root = data.root;
+  if (!S.selected || !S.sessions.some((s) => s.slug === S.selected))
+    S.selected = data.active || (S.sessions[0] && S.sessions[0].slug) || null;
+  renderSide();
+}
+async function loadDetail() {
+  if (!S.selected) { S.detail = null; return renderMain(); }
+  try { S.detail = await api(`/api/session/${encodeURIComponent(S.selected)}`); }
+  catch (e) { S.detail = null; toast(e.message); }
+  // Drop selections for chapters that no longer exist.
+  if (S.detail) {
+    const have = new Set(S.detail.chapters.map((c) => c.chapter));
+    for (const c of [...S.picked]) if (!have.has(c)) S.picked.delete(c);
+  }
+  renderMain();
+}
+async function refresh() {
+  try { await loadSessions(); await loadDetail(); } catch (e) { toast(e.message); }
+}
+
+// ------------------------------------------------------------ render: sidebar
+function renderSide() {
+  $("root").textContent = S.root;
+  const el = $("sessions");
+  if (!S.sessions.length) {
+    el.innerHTML = `<div class="hint" style="padding:12px">No series yet. Press + to start one.</div>`;
+    return;
+  }
+  el.innerHTML = S.sessions.map((s) => {
+    const pct = s.links ? Math.round((s.transcribed / s.links) * 100) : (s.transcribed ? 100 : 0);
+    return `<button class="sess ${s.slug === S.selected ? "sel" : ""}" data-slug="${esc(s.slug)}">
+      <div class="sess-name">${s.active ? '<span class="dot" title="Active in terminal"></span>' : ""}${esc(s.name)}</div>
+      <div class="sess-meta">${s.transcribed}/${s.links || s.transcribed} transcribed · ${s.recapped} recaps</div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+    </button>`;
+  }).join("");
+}
+
+// ------------------------------------------------------------ render: main
+function renderMain() {
+  const v = $("view");
+  if (S.creating) return renderCreate(v);
+  const d = S.detail;
+  if (!d) {
+    v.innerHTML = `<div class="empty">${S.sessions.length ? "Pick a series on the left." : "No series yet."}
+      <div style="margin-top:14px"><button class="btn primary" data-act="new">Start a new series</button></div></div>`;
+    return;
+  }
+  const chs = d.chapters;
+  const counts = {
+    all: chs.length,
+    ocr: chs.filter((c) => !c.transcribed).length,
+    recap: chs.filter((c) => c.transcribed && !c.recapped).length,
+    done: chs.filter((c) => c.recapped).length,
+  };
+  const recapWords = chs.reduce((n, c) => n + (c.recap_words || 0), 0);
+
+  v.innerHTML = `
+    <div class="head">
+      <div>
+        <button class="btn sm menu-btn" data-act="menu">☰ Series</button>
+        <h1>${esc(d.name)}</h1>
+        <div class="path">${esc(d.path)}</div>
+      </div>
+      <div class="head-actions">
+        <span class="live ${S.live ? "" : "off"}" title="Auto-refresh every 5 seconds"><i></i>${S.live ? "Live" : "Paused"}</span>
+        <button class="btn sm" data-act="live">${S.live ? "Pause" : "Resume"}</button>
+        ${d.active ? "" : '<button class="btn sm" data-act="activate">Make active in terminal</button>'}
+        <button class="btn sm" data-act="copy-path">Copy folder path</button>
+      </div>
+    </div>
+
+    <div class="next">
+      <div class="next-label">Next step</div>
+      <pre>${esc(d.next.join("\n"))}</pre>
+      ${d.problems && d.problems.length ? `<div class="problems"><b>Needs attention</b><ul class="plain">${d.problems.map((p) => `<li>${esc(p)}</li>`).join("")}</ul></div>` : ""}
+      <div class="next-actions">
+        <button class="btn sm primary" data-act="agent-ocr">Copy agent prompt: transcribe</button>
+        <button class="btn sm" data-act="agent-recap">Copy agent prompt: recaps</button>
+        <button class="btn sm" data-act="agent-video">Copy agent prompt: build videos</button>
+      </div>
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><b>${d.links}</b><span>chapter links</span></div>
+      <div class="tile"><b>${d.transcribed}</b><span>transcribed</span></div>
+      <div class="tile"><b>${d.recapped}</b><span>recaps · ~${Math.round(recapWords / 150)} min</span></div>
+      <div class="tile"><b>${d.characters}</b><span>characters tracked</span></div>
+    </div>
+
+    <div class="tabs">
+      ${tabBtn("chapters", "Chapters", chs.length)}
+      ${tabBtn("scripts", "Recap scripts", d.compilations.length)}
+      ${tabBtn("video", "Video", (d.video || []).filter((v) => v.video).length)}
+      ${tabBtn("characters", "Characters", d.characters)}
+      ${tabBtn("links", "Add links", null)}
+    </div>
+    <div class="panel" id="panel"></div>`;
+
+  const p = $("panel");
+  if (S.tab === "chapters") renderChapters(p, d, counts);
+  else if (S.tab === "scripts") renderScripts(p, d);
+  else if (S.tab === "video") renderVideo(p, d);
+  else if (S.tab === "characters") renderCharacters(p, d);
+  else renderLinks(p, d);
+}
+function tabBtn(id, label, n) {
+  return `<button class="tab ${S.tab === id ? "sel" : ""}" data-tab="${id}">${label}${n !== null ? `<span class="n">${n}</span>` : ""}</button>`;
+}
+
+function statusPill(c) {
+  if (c.transcribed) return `<span class="pill ok">Transcribed</span>`;
+  if (c.stage === "prepare") return `<span class="pill idle">Not started</span>`;
+  return `<span class="pill warn">${esc(c.stage_label)}</span>`;
+}
+function recapPill(c) {
+  if (c.recapped) return `<span class="pill ok">${c.recap_words} words · ${mins(c.recap_words)}m</span>`;
+  if (c.transcribed) return `<span class="pill idle">None yet</span>`;
+  return `<span class="pill idle">—</span>`;
+}
+
+function visibleChapters(d) {
+  const f = S.filter;
+  return d.chapters.filter((c) =>
+    f === "all" ? true : f === "ocr" ? !c.transcribed : f === "recap" ? c.transcribed && !c.recapped : c.recapped);
+}
+
+function renderChapters(p, d, counts) {
+  if (!d.chapters.length) {
+    p.innerHTML = `<div class="empty">No chapters yet. Use <b>Add links</b> to paste chapter URLs.</div>`;
+    return;
+  }
+  const rows = visibleChapters(d);
+  const picked = [...S.picked];
+  const pickedT = picked.filter((c) => d.chapters.find((x) => x.chapter === c && x.transcribed));
+  const pickedR = picked.filter((c) => d.chapters.find((x) => x.chapter === c && x.recapped));
+  const allOn = rows.length && rows.every((c) => S.picked.has(c.chapter));
+
+  p.innerHTML = `
+    <div class="toolbar">
+      <div class="seg">
+        ${["all", "ocr", "recap", "done"].map((f) => `<button data-filter="${f}" class="${S.filter === f ? "sel" : ""}">${
+          { all: "All", ocr: "Needs OCR", recap: "Needs recap", done: "Recapped" }[f]} <span class="n">${counts[f]}</span></button>`).join("")}
+      </div>
+      <span class="grow"></span>
+      <span class="hint">Tick chapters to build commands</span>
+    </div>
+
+    <div class="selbar ${picked.length ? "on" : ""}">
+      <b>${picked.length} selected</b> <span class="hint">(${esc(spec(picked))})</span>
+      <span style="flex:1"></span>
+      <label>Length <select id="minSel">${[5, 6, 7, 8].map((m) => `<option ${S.minutes == m ? "selected" : ""}>${m}</option>`).join("")}</select> min</label>
+      <button class="btn sm primary" data-act="cmd-recap" ${pickedT.length ? "" : "disabled"} title="Recap the selected transcribed chapters">Copy recap command</button>
+      <button class="btn sm" data-act="cmd-compile" ${pickedR.length ? "" : "disabled"} title="Combine the selected recaps">Copy compile command</button>
+      <button class="btn sm" data-act="clear">Clear</button>
+    </div>
+
+    <table>
+      <thead><tr>
+        <th class="cb"><input type="checkbox" id="pickAll" ${allOn ? "checked" : ""} aria-label="Select all"></th>
+        <th>Ch</th><th class="hide-sm">Link</th><th>OCR</th><th>Recap</th><th></th>
+      </tr></thead>
+      <tbody>${rows.map((c) => `
+        <tr>
+          <td class="cb"><input type="checkbox" data-pick="${esc(c.chapter)}" ${S.picked.has(c.chapter) ? "checked" : ""} aria-label="Select chapter ${esc(c.chapter)}"></td>
+          <td class="ch">${esc(c.chapter)}</td>
+          <td class="hide-sm">${c.url ? `<a class="url" href="${esc(c.url)}" target="_blank" rel="noopener noreferrer" title="${esc(c.url)}">${esc(c.url.replace(/^https?:\/\//, ""))}</a>` : '<span class="hint">imported</span>'}</td>
+          <td>${statusPill(c)}</td>
+          <td>${recapPill(c)}</td>
+          <td><div class="row-actions">
+            <button class="btn sm" data-doc="transcript" data-id="${esc(c.chapter)}" ${c.transcribed ? "" : "disabled"}>Transcript</button>
+            <button class="btn sm" data-doc="recap" data-id="${esc(c.chapter)}" ${c.recapped ? "" : "disabled"}>Recap</button>
+          </div></td>
+        </tr>`).join("")}
+      </tbody>
+    </table>
+    ${rows.length ? "" : '<div class="empty">Nothing matches this filter.</div>'}
+    ${d.scratch_mb >= 1 ? `<p class="hint" style="margin-top:12px">${d.scratch_mb} MB of scratch files on disk (in-progress chapters). Clear with <code>${esc(cmd(`clean ${sessArg()} --yes`))}</code></p>` : ""}`;
+}
+
+function renderScripts(p, d) {
+  const recaps = d.chapters.filter((c) => c.recapped);
+  const comp = d.compilations;
+  p.innerHTML = `
+    <div class="section-title" style="margin-top:0">Compiled video scripts</div>
+    ${comp.length ? `<div class="list">${comp.map((c) => `
+      <div class="item">
+        <div class="grow"><div class="t">${esc(c.name.replace(/^compiled_/, "Chapters ").replace(/_/g, ", "))}</div>
+        <div class="s">${c.words.toLocaleString()} words · ~${Math.round(c.words / 150)} min · ${new Date(c.modified * 1000).toLocaleString()}</div></div>
+        <button class="btn sm" data-doc="compiled" data-id="${esc(c.name)}">Open</button>
+      </div>`).join("")}</div>`
+      : `<p class="hint">None yet. On the Chapters tab, tick recapped chapters and copy the compile command, or run:<br><code>${esc(cmd(`compile ${sessArg()} --chapters all`))}</code></p>`}
+
+    <div class="section-title">Per-chapter recaps</div>
+    ${recaps.length ? `<div class="list">${recaps.map((c) => `
+      <div class="item">
+        <div class="grow"><div class="t">Chapter ${esc(c.chapter)}</div>
+        <div class="s">${c.recap_words} words · ~${mins(c.recap_words)} min${c.recap_hook ? " · “" + esc(c.recap_hook.slice(0, 110)) + (c.recap_hook.length > 110 ? "…" : "") + "”" : ""}</div></div>
+        <button class="btn sm" data-doc="recap" data-id="${esc(c.chapter)}">Open</button>
+      </div>`).join("")}</div>`
+      : '<p class="hint">No recaps written yet.</p>'}`;
+}
+
+function mediaUrl(kind, chapter, n) {
+  return `/api/session/${encodeURIComponent(S.selected)}/media?kind=${kind}&chapter=${encodeURIComponent(chapter)}&n=${n || 1}`;
+}
+function fmtDur(s) { if (!s) return ""; const m = Math.floor(s / 60); return `${m}:${String(Math.round(s % 60)).padStart(2, "0")}`; }
+
+function renderVideo(p, d) {
+  const rows = d.video || [];
+  if (!rows.length) {
+    p.innerHTML = `<div class="empty">No transcribed chapters yet. Videos come after transcripts and recaps.</div>`;
+    return;
+  }
+  const planCell = (v) => {
+    if (!v.plan) return '<span class="pill idle">—</span>';
+    if (v.plan.broken) return '<span class="pill warn">Plan broken</span>';
+    if (v.plan.outdated) return '<span class="pill warn" title="Made for the old editing style: build again">Old style</span>';
+    const label = v.plan.sync === "synced" ? `Synced${v.plan.matched != null ? " " + Math.round(v.plan.matched * 100) + "%" : ""}`
+      : v.plan.sync === "estimated" ? "Estimated timing" : "Even timing";
+    const extra = v.plan.reviewed ? " · reviewed" : v.plan.edited ? " · edited" : "";
+    return `<span class="pill ${v.plan.sync === "synced" ? "ok" : "warn"}">${esc(label + extra)}</span>`;
+  };
+  p.innerHTML = `
+    <div class="toolbar">
+      <span class="hint"><b>1.</b> Press <b>Script</b> and record it (or paste it into your TTS tool).
+        <b>2.</b> <b>Upload</b> the recording (or save it as <code>audio/chapter_N.mp3</code> in the series folder).
+        <b>3.</b> Copy the agent prompt and paste it into Antigravity.</span>
+      <span class="grow"></span>
+      <button class="btn sm primary" data-act="agent-video">Copy agent prompt: build videos</button>
+    </div>
+    <table>
+      <thead><tr><th>Ch</th><th>Recap tags</th><th>Narration</th><th class="hide-sm">Panels</th><th>Plan</th><th></th></tr></thead>
+      <tbody>${rows.map((v) => `
+        <tr>
+          <td class="ch">${esc(v.chapter)}</td>
+          <td>${!v.recap ? '<span class="pill idle">No recap</span>'
+              : v.tagged == null ? '<span class="pill warn" title="Rewrite the recap to enable sync">Untagged</span>'
+              : `<span class="pill ${v.tagged >= 0.7 ? "ok" : "warn"}">${Math.round(v.tagged * 100)}%</span>`}</td>
+          <td>${v.tts ? `<button class="btn sm" data-doc="tts" data-id="${esc(v.chapter)}" title="The narration to record: plain text, no tags">Script</button>` : ""}
+              ${v.audio ? `<button class="btn sm" data-media="audio" data-ch="${esc(v.chapter)}" title="${esc(v.audio)}">▶ ${esc(fmtDur(v.duration) || "Play")}</button>` : ""}
+              <button class="btn sm" data-act="upload" data-ch="${esc(v.chapter)}">${v.audio ? "Replace" : "Upload"}</button></td>
+          <td class="num hide-sm">${v.panels || "—"}</td>
+          <td>${planCell(v)}</td>
+          <td><div class="row-actions">
+            <button class="btn sm" data-media="storyboard" data-ch="${esc(v.chapter)}" ${v.storyboards.length ? "" : "disabled"}>Storyboard</button>
+            <button class="btn sm" data-media="preview" data-ch="${esc(v.chapter)}" ${v.preview ? "" : "disabled"}>Preview</button>
+            <button class="btn sm ${v.video && v.video_up_to_date ? "primary" : ""}" data-media="video" data-ch="${esc(v.chapter)}" ${v.video ? "" : "disabled"}
+              title="${v.video && !v.video_up_to_date ? "The plan or the narration changed since this render: build again" : ""}">${v.video && !v.video_up_to_date ? "Video (old)" : "Video"}</button>
+          </div></td>
+        </tr>`).join("")}</tbody>
+    </table>
+    <input type="file" id="audioPick" accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac,.aac,.opus" hidden>
+    <p class="hint" style="margin-top:12px">Storyboards show each shot with the sentence spoken over it. Fix a wrong panel by editing <code>video/chapter_N.plan.json</code>, then render again; only changed shots re-render.</p>`;
+}
+
+function openMedia(kind, chapter, n) {
+  const url = mediaUrl(kind, chapter, n);
+  const titles = { video: `Chapter ${chapter} — video`, preview: `Chapter ${chapter} — preview`, audio: `Chapter ${chapter} — narration`, storyboard: `Chapter ${chapter} — storyboard` };
+  S.doc = { media: kind, url, title: titles[kind] || kind, filename: `chapter_${chapter}.${kind === "audio" ? "audio" : kind === "storyboard" ? "png" : "mp4"}`, chapter, n: n || 1 };
+  drawDoc();
+  $("drawer").classList.add("on"); $("scrim").classList.add("on"); $("drawer").setAttribute("aria-hidden", "false");
+}
+
+function renderCharacters(p, d) {
+  const m = d.memory;
+  const open = (m.plot_threads || []).filter((t) => t.status === "open");
+  const closed = (m.plot_threads || []).filter((t) => t.status !== "open");
+  p.innerHTML = `
+    ${m.characters.length ? `<div class="cards">${m.characters.map((c) => `
+      <div class="card">
+        <h3>${esc(c.name)}</h3>
+        ${c.role ? `<div class="role">${esc(c.role)}</div>` : ""}
+        ${c.aliases && c.aliases.length ? `<div class="role">aka ${esc(c.aliases.join(", "))}</div>` : ""}
+        ${c.appearance ? `<div class="look">${esc(c.appearance)}</div>` : ""}
+        <div class="meta">First seen ${esc(c.first_seen || "?")} · last ${esc(c.last_seen || "?")}</div>
+      </div>`).join("")}</div>`
+      : '<p class="hint">No characters yet. They appear here as chapters are transcribed.</p>'}
+    ${open.length ? `<div class="section-title">Open plot threads</div><ul class="plain">${open.map((t) => `<li>${esc(t.thread)} <span class="hint">since ${esc(t.opened || "?")}</span></li>`).join("")}</ul>` : ""}
+    ${m.world_facts.length ? `<div class="section-title">World facts</div><ul class="plain">${m.world_facts.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}
+    ${Object.keys(m.glossary || {}).length ? `<div class="section-title">Terms</div><ul class="plain">${Object.entries(m.glossary).map(([k, v]) => `<li><b>${esc(k)}</b> — ${esc(v)}</li>`).join("")}</ul>` : ""}
+    ${closed.length ? `<div class="section-title">Resolved threads</div><ul class="plain">${closed.map((t) => `<li>${esc(t.thread)}</li>`).join("")}</ul>` : ""}
+    <p class="hint" style="margin-top:20px">Wrong name or description? Edit <code>series_memory.json</code> in the series folder — every later chapter picks up the fix.</p>`;
+}
+
+function renderLinks(p, d) {
+  p.innerHTML = `
+    <p class="hint" style="margin-top:0">Paste chapter links in reading order — one per line, or all at once. Duplicates are skipped and each new link gets the next chapter number, so finished chapters never get renumbered.</p>
+    <textarea class="links" id="linkBox" placeholder="https://…/chapter/8&#10;https://…/chapter/9"></textarea>
+    <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn primary" data-act="add-links">Add links</button>
+      <button class="btn" data-doc="links" data-id="x">View chapters.txt</button>
+      <span class="hint" id="linkMsg"></span>
+    </div>
+    <p class="hint" style="margin-top:18px">Then in your terminal agent: <b>Copy agent prompt: transcribe</b> above.</p>`;
+}
+
+function renderCreate(v) {
+  v.innerHTML = `
+    <div class="head"><div><button class="btn sm menu-btn" data-act="menu">☰ Series</button><h1>Start a new series</h1>
+    <div class="path">Each series gets its own folder, memory and recaps. Nothing is shared.</div></div></div>
+    <div style="margin-top:20px;max-width:640px">
+      <label class="hint" for="newName">Series name</label>
+      <input class="text" id="newName" placeholder="e.g. The Hero Cannot Rest" maxlength="120" style="margin:4px 0 14px">
+      <label class="hint" for="newLinks">Chapter links (optional — you can add them later)</label>
+      <textarea class="links" id="newLinks" placeholder="https://…/chapter/1&#10;https://…/chapter/2" style="margin-top:4px"></textarea>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn primary" data-act="create">Create series</button>
+        <button class="btn" data-act="cancel-new">Cancel</button>
+      </div>
+    </div>`;
+  setTimeout(() => $("newName") && $("newName").focus(), 0);
+}
+
+// ------------------------------------------------------------ viewer
+async function openDoc(type, id) {
+  try {
+    const doc = await api(`/api/session/${encodeURIComponent(S.selected)}/doc?type=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}`);
+    S.doc = doc; S.docMode = "rendered"; drawDoc();
+    $("drawer").classList.add("on"); $("scrim").classList.add("on"); $("drawer").setAttribute("aria-hidden", "false");
+  } catch (e) { toast(e.message); }
+}
+function drawDoc() {
+  $("dTitle").textContent = S.doc.title;
+  const isMedia = !!S.doc.media;
+  $("dRendered").parentElement.style.display = isMedia ? "none" : "";
+  $("dCopy").style.display = isMedia ? "none" : "";
+  if (isMedia) {
+    const u = esc(S.doc.url);
+    let body;
+    if (S.doc.media === "audio") body = `<audio controls autoplay src="${u}" style="width:100%"></audio>`;
+    else if (S.doc.media === "storyboard") body =
+      `<div class="toolbar"><button class="btn sm" data-sb="-1">‹ Prev</button><span class="hint">Sheet ${S.doc.n}</span><button class="btn sm" data-sb="1">Next ›</button></div>
+       <img src="${u}" alt="Storyboard" style="width:100%;border-radius:8px" onerror="this.replaceWith(Object.assign(document.createElement('p'),{className:'hint',textContent:'No more storyboard sheets.'}))">`;
+    else body = `<video controls autoplay src="${u}" style="width:100%;border-radius:8px;background:#000"></video>`;
+    $("dBody").innerHTML = body;
+    return;
+  }
+  $("dRendered").classList.toggle("sel", S.docMode === "rendered");
+  $("dRaw").classList.toggle("sel", S.docMode === "raw");
+  $("dBody").innerHTML = S.docMode === "raw"
+    ? `<pre class="raw">${esc(S.doc.text)}</pre>`
+    : `<div class="md">${md(S.doc.text)}</div>`;
+  $("dBody").scrollTop = 0;
+}
+function closeDoc() {
+  const v = $("dBody").querySelector("video,audio");
+  if (v) v.pause();  // don't keep playing behind a closed drawer
+  $("drawer").classList.remove("on"); $("scrim").classList.remove("on"); $("drawer").setAttribute("aria-hidden", "true");
+}
+function download(name, text) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: "text/markdown;charset=utf-8" }));
+  a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// ------------------------------------------------------------ actions
+function agentOcrPrompt() {
+  return `Read AGENTS.md. Work only on the series "${S.detail.name}". ` +
+    `Keep running \`${cmd(`next ${sessArg()}`)}\` and doing exactly what it says ` +
+    `(every command it prints already includes ${sessArg()}), until it reports every chapter is transcribed. ` +
+    `Do not stop after one chapter. If you get interrupted, run the same next command again to pick up where you left off.`;
+}
+function agentRecapPrompt(chs) {
+  const sp = chs && chs.length ? spec(chs) : "";
+  const chArg = sp ? ` --chapters ${sp}` : "";
+  return `Read AGENTS.md. Run \`${cmd(`recap ${sessArg()}${chArg} --prepare --minutes ${S.minutes}`)}\`, ` +
+    `then read the TASK.md it prints and write the narration it asks for into the parts.json it names. ` +
+    `Write original narration in your own words and quote the source only briefly. ` +
+    `Finish with \`${cmd(`recap ${sessArg()} --finalize`)}\`.`;
+}
+
+document.addEventListener("click", async (ev) => {
+  const t = ev.target.closest("[data-slug],[data-tab],[data-filter],[data-act],[data-doc],[data-media]");
+  if (!t || t.disabled) return;
+  if (t.dataset.media) return openMedia(t.dataset.media, t.dataset.ch, 1);
+
+  if (t.dataset.slug) {
+    S.selected = t.dataset.slug; S.creating = false; S.picked.clear(); persist();
+    $("side").classList.remove("on"); renderSide(); return loadDetail();
+  }
+  if (t.dataset.tab) { S.tab = t.dataset.tab; persist(); return renderMain(); }
+  if (t.dataset.filter) { S.filter = t.dataset.filter; return renderMain(); }
+  if (t.dataset.doc) return openDoc(t.dataset.doc, t.dataset.id);
+
+  const d = S.detail;
+  switch (t.dataset.act) {
+    case "menu": $("side").classList.toggle("on"); break;
+    case "new": S.creating = true; renderMain(); break;
+    case "cancel-new": S.creating = false; renderMain(); break;
+    case "live": S.live = !S.live; renderMain(); break;
+    case "copy-path": copy(d.path, "Folder path copied"); break;
+    case "agent-ocr": copy(agentOcrPrompt(), "Agent prompt copied — paste into Antigravity"); break;
+    case "agent-recap": {
+      const need = d.chapters.filter((c) => c.transcribed && !c.recapped).map((c) => c.chapter);
+      copy(agentRecapPrompt(need), need.length ? `Prompt copied for ${need.length} chapter(s)` : "Prompt copied");
+      break;
+    }
+    case "cmd-recap": {
+      const chs = [...S.picked].filter((c) => d.chapters.find((x) => x.chapter === c && x.transcribed));
+      copy(agentRecapPrompt(chs), `Recap prompt copied for chapters ${spec(chs)}`);
+      break;
+    }
+    case "cmd-compile": {
+      const chs = [...S.picked].filter((c) => d.chapters.find((x) => x.chapter === c && x.recapped));
+      copy(cmd(`compile ${sessArg()} --chapters ${spec(chs)}`), `Compile command copied for ${spec(chs)}`);
+      break;
+    }
+    case "clear": S.picked.clear(); renderMain(); break;
+    case "agent-video": {
+      const ready = (d.video || []).filter((v) => v.audio && v.recap).map((v) => v.chapter);
+      const chArg = ready.length ? ` --chapters ${spec(ready)}` : "";
+      copy(`Read AGENTS.md (section "Making videos"). First run \`${cmd(`video pair${chArg} ${sessArg()}`)}\`, look at every pairing sheet it lists and fix pairs.json so every sentence has the panel that shows it, then run the same command with --apply. ` +
+        `Then run \`${cmd(`video build${chArg} ${sessArg()}`)}\`. ` +
+        `For each chapter it builds, open the storyboard images listed in .work/video/chN/REVIEW.md and check that every shot's panel matches the sentence spoken over it. ` +
+        `Fix wrong shots in video/chapter_N.plan.json exactly as REVIEW.md describes, set "reviewed": true, then run \`${cmd(`video render --chapter N ${sessArg()}`)}\` for each chapter you changed.`,
+        ready.length ? `Prompt copied for chapters ${spec(ready)}` : "Prompt copied (no chapter has audio yet)");
+      break;
+    }
+    case "upload": {
+      const pick = $("audioPick");
+      pick.dataset.ch = t.dataset.ch;
+      pick.value = "";
+      pick.click();
+      break;
+    }
+    case "activate":
+      try { await api(`/api/session/${encodeURIComponent(d.slug)}/activate`, { body: {} }); toast("Now active in the terminal"); refresh(); }
+      catch (e) { toast(e.message); }
+      break;
+    case "add-links": {
+      const box = $("linkBox"); const msg = $("linkMsg");
+      try {
+        const r = await api(`/api/session/${encodeURIComponent(d.slug)}/links`, { body: { urls: box.value } });
+        box.value = "";
+        msg.textContent = `Added ${r.added}${r.duplicates ? `, skipped ${r.duplicates} duplicate(s)` : ""}. ${r.total} total.`;
+        refresh();
+      } catch (e) { msg.textContent = e.message; }
+      break;
+    }
+    case "create": {
+      const name = $("newName").value.trim(); const urls = $("newLinks").value;
+      if (!name) { toast("Give it a name"); return; }
+      try {
+        const r = await api("/api/sessions", { body: { name, urls } });
+        S.creating = false; S.selected = r.slug; S.tab = r.added ? "chapters" : "links"; persist();
+        toast(r.added ? `Created with ${r.added} link(s)` : "Created — add links next");
+        refresh();
+      } catch (e) { toast(e.message); }
+      break;
+    }
+  }
+});
+
+document.addEventListener("change", (ev) => {
+  const t = ev.target;
+  if (t.dataset && t.dataset.pick) {
+    t.checked ? S.picked.add(t.dataset.pick) : S.picked.delete(t.dataset.pick);
+    renderMain();
+  } else if (t.id === "pickAll") {
+    for (const c of visibleChapters(S.detail)) t.checked ? S.picked.add(c.chapter) : S.picked.delete(c.chapter);
+    renderMain();
+  } else if (t.id === "minSel") {
+    S.minutes = Number(t.value); persist();
+  } else if (t.id === "audioPick" && t.files && t.files[0]) {
+    const file = t.files[0], ch = t.dataset.ch;
+    const ext = (file.name.split(".").pop() || "").toLowerCase();
+    toast(`Uploading ${file.name}…`);
+    fetch(`/api/session/${encodeURIComponent(S.selected)}/audio?chapter=${encodeURIComponent(ch)}&ext=${encodeURIComponent(ext)}`, {
+      method: "POST", headers: { "X-Manhwa-OCR": "1", "Content-Type": file.type || "application/octet-stream" }, body: file,
+    }).then((r) => r.json().then((j) => { if (!r.ok) throw new Error(j.error || r.statusText); return j; }))
+      .then((j) => { toast(`Saved ${j.saved}`); refresh(); })
+      .catch((e) => toast(e.message));
+  }
+});
+
+$("newBtn").onclick = () => { S.creating = true; $("side").classList.remove("on"); renderMain(); };
+$("dClose").onclick = closeDoc;
+$("scrim").onclick = closeDoc;
+$("dRendered").onclick = () => { S.docMode = "rendered"; drawDoc(); };
+$("dRaw").onclick = () => { S.docMode = "raw"; drawDoc(); };
+$("dCopy").onclick = () => S.doc && copy(S.doc.text, "Copied to clipboard");
+$("dDownload").onclick = () => {
+  if (!S.doc) return;
+  if (S.doc.media) {
+    const a = document.createElement("a"); a.href = S.doc.url; a.download = S.doc.filename; a.click();
+  } else download(S.doc.filename, S.doc.text);
+};
+$("dBody").addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-sb]");
+  if (b && S.doc && S.doc.media === "storyboard") openMedia("storyboard", S.doc.chapter, Math.max(1, S.doc.n + Number(b.dataset.sb)));
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDoc(); });
+
+// Live refresh, skipped while typing so a re-render never eats input.
+setInterval(() => {
+  if (!S.live || S.creating || document.hidden) return;
+  const a = document.activeElement;
+  if (a && (a.tagName === "TEXTAREA" || a.tagName === "SELECT" || (a.tagName === "INPUT" && a.type !== "checkbox"))) return;
+  refresh();
+}, 5000);
+
+refresh();
+</script>
+</body>
+</html>

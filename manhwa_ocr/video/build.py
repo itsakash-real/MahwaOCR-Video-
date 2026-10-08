@@ -1,0 +1,398 @@
+"""Per-chapter video orchestration: status, planning, rendering, clips, compilations.
+
+Timing quality, best first:
+  synced     recap has panel tags + faster-whisper available: each shot starts
+             when its sentence is actually spoken
+  estimated  recap has panel tags, no whisper: right panels, sentence times
+             estimated from text length
+  even       no tags: the audio's length spread across panels
+
+A plan someone edited by hand (or marked reviewed) is never silently replaced.
+If its inputs change, the user is told and decides.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Callable, Dict, List
+
+from PIL import Image
+
+from ..memory import SeriesMemory
+from ..util import UserError, atomic_save_image, require_chapter, sort_chapters
+from . import cues as cues_mod
+from . import sync as sync_mod
+from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, run, video_info
+from .frames import background, format_from
+from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
+from .panels import _font, build_panels, load_panels, panel_image
+from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, validate
+from .render import output_path, render
+from .storyboard import storyboard_paths, write_review_task, write_storyboard
+
+
+END_TAIL = 1.5   # seconds the video runs on after the last word
+
+
+def _mmss(seconds: float) -> str:
+    return f"{int(seconds // 60)}:{seconds % 60:04.1f}"
+
+
+def _shots_hash(plan: Dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(plan.get("shots"), sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: str,
+            vcfg: Dict[str, Any], duration: float) -> Dict[str, Any]:
+    cp = cues_mod.cues_path(root, chapter)
+    st = audio.stat() if audio else None
+    knobs = {k: vcfg.get(k) for k in ("min_shot", "max_shot", "target_shot", "lead", "pair_ratio", "fps",
+                                      "music", "music_volume", "effects")}
+    return {
+        "panels": panels_fp,
+        "audio": [audio.name, st.st_size, int(st.st_mtime)] if st else None,
+        "duration": round(duration, 2),
+        "cues": hashlib.sha256(cp.read_bytes()).hexdigest()[:16] if cp.exists() else None,
+        "format": fmt,
+        "settings": hashlib.sha256(json.dumps(knobs, sort_keys=True, default=str).encode()).hexdigest()[:12],
+    }
+
+
+# ------------------------------------------------------------------ status
+
+
+def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str, Any]:
+    """What exists for one chapter's video. probe=True also reads audio length (slower)."""
+    chapter = require_chapter(chapter)
+    audio = audio_path(root, chapter)
+    cues = cues_mod.load_cues(root, chapter)
+    panels = load_panels(root, chapter)
+    plan_file = plan_path(root, chapter)
+    plan = None
+    if plan_file.exists():
+        try:
+            plan = json.loads(plan_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            plan = {"broken": True}
+        if not isinstance(plan, dict):
+            plan = {"broken": True}
+        elif plan.get("version") != PLAN_VERSION and not plan.get("broken"):
+            plan = {**plan, "outdated": True}
+    video = output_path(root, chapter)
+    preview = output_path(root, chapter, preview=True)
+    # Outdated if the plan was edited or the narration was replaced after the render.
+    up_to_date = bool(video.exists() and plan_file.exists() and not (plan or {}).get("outdated")
+                      and video.stat().st_mtime >= plan_file.stat().st_mtime
+                      and (audio is None or video.stat().st_mtime >= audio.stat().st_mtime))
+    duration = None
+    if audio and probe:
+        try:
+            duration = media_duration(audio)
+        except UserError:
+            duration = None
+    elif plan and isinstance(plan, dict) and not plan.get("broken"):
+        duration = plan.get("duration")
+    return {
+        "chapter": chapter,
+        "transcribed": (root / f"chapter_{chapter}.md").exists(),
+        "recap": (root / "recaps" / f"chapter_{chapter}.md").exists(),
+        "tagged": cues.get("tagged_ratio") if cues else None,
+        "tts": cues_mod.tts_path(root, chapter).exists(),
+        "audio": audio.name if audio else None,
+        "duration": duration,
+        "pages": len(list_pages(root, chapter)),
+        "panels": len(panels["panels"]) if panels else 0,
+        "plan": None if plan is None else {
+            "broken": bool(plan.get("broken")),
+            "outdated": bool(plan.get("outdated")),
+            "sync": plan.get("sync"),
+            "matched": (plan.get("sync_report") or {}).get("matched"),
+            "reviewed": bool(plan.get("reviewed")),
+            "edited": (not plan.get("broken")) and plan.get("generated_hash") not in (None, _shots_hash(plan)),
+            "shots": len(plan.get("shots") or []),
+        },
+        "video": video.name if video.exists() else None,
+        "video_up_to_date": up_to_date,
+        "preview": preview.name if preview.exists() else None,
+        "storyboards": [p.name for p in storyboard_paths(root, chapter)],
+    }
+
+
+# ------------------------------------------------------------------ plan
+
+
+def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto", fmt: str | None = None,
+              duration: float | None = None, pages_from: Path | None = None, log: Callable = print) -> Dict[str, Any]:
+    root, chapter = sess.path, require_chapter(chapter)
+    vcfg = dict(cfg.video)
+    fmt = fmt or vcfg.get("format", "16:9")
+    ensure_gitignore(root)
+
+    if pages_from:
+        from ..images import import_pages, list_images
+        from .media import pages_dir
+
+        found = list_images(Path(pages_from))
+        if not found:
+            raise UserError(f"No images found in {pages_from}")
+        import_pages(found, pages_dir(root, chapter), log=log)
+        log(f"  chapter {chapter}: imported {len(found)} page images")
+    ensure_pages(sess, chapter, cfg.download, log=log)
+    panels = build_panels(root, chapter, vcfg.get("panels"), log=log)
+
+    audio = audio_path(root, chapter)
+    if duration is None:
+        if audio is None:
+            raise UserError(
+                f"No narration audio for chapter {chapter}. Save it as audio/chapter_{chapter}.mp3 "
+                f"(or .wav/.m4a) in {root}, or upload it from the dashboard."
+            )
+        timing = audio_timing(audio)
+        duration = timing["duration"]
+        if timing["speech_end"] + END_TAIL < duration - 0.5:
+            # TTS exports often pad silence on the end; the video ends with the voice.
+            log(f"  chapter {chapter}: narration ends at {_mmss(timing['speech_end'])}; skipping "
+                f"{duration - timing['speech_end']:.0f}s of silence at the end of {audio.name}")
+            duration = timing["speech_end"] + END_TAIL
+    if duration < 1.0:
+        raise UserError(f"The narration for chapter {chapter} is only {duration:.2f}s long. Check {audio}.")
+    rel_audio = audio.relative_to(root).as_posix() if audio else None
+    inputs = _inputs(root, chapter, panels.get("fingerprint", ""), audio, fmt, vcfg, duration)
+
+    existing_file = plan_path(root, chapter)
+    if existing_file.exists() and not force:
+        try:
+            existing = json.loads(existing_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = None
+        if isinstance(existing, dict) and existing.get("version") != PLAN_VERSION:
+            if existing.get("reviewed") or existing.get("generated_hash") != _shots_hash(existing):
+                raise UserError(
+                    f"Chapter {chapter}'s plan was made for the old editing style and can't be rendered. "
+                    f"Rebuild it with:  video plan --chapter {chapter} --force  (its hand edits will be lost).")
+            log(f"  chapter {chapter}: plan was made for the old editing style, rebuilding")
+            existing = None
+        if isinstance(existing, dict):
+            if existing.get("inputs") == inputs:
+                log(f"  chapter {chapter}: plan is up to date")
+                return existing
+            edited = existing.get("generated_hash") != _shots_hash(existing)
+            if edited or existing.get("reviewed"):
+                log(f"  ! chapter {chapter}: the audio, recap or panels changed, but the plan was edited/reviewed "
+                    "by hand, so it was left alone. Rebuild it with --force (hand edits will be lost).")
+                return existing
+
+    sentences, report, mode_note = None, None, "even timing (recap has no panel tags)"
+    cue_data = cues_mod.load_cues(root, chapter)
+    if cue_data:
+        base = cue_data["sentences"]
+        words: List[Dict[str, Any]] = []
+        if audio and sync != "off" and sync_mod.available():
+            try:
+                memory = SeriesMemory.load(root / "series_memory.json", sess.name)
+                words = sync_mod.transcribe(
+                    audio, model=vcfg.get("whisper_model", "small.en"), language=vcfg.get("whisper_language"),
+                    initial_prompt=sync_mod.character_prompt(memory), cache=sync_mod.timeline_path(root, chapter),
+                    log=log)
+            except UserError as exc:
+                log(f"  ! {exc} Falling back to estimated timing.")
+        elif audio and sync != "off":
+            log(f"  note: install faster-whisper for exact sync:  {sync_mod.SYNC_HINT}")
+        aligned = sync_mod.align(base, words, duration)
+        sentences = aligned["sentences"]
+        report = {"matched": aligned["matched"] if words else None,
+                  "unmatched": aligned["unmatched"][:8] if words else [],
+                  "tagged": cue_data.get("tagged_ratio")}
+        mode_note = (f"synced to the audio ({aligned['matched']:.0%} of sentences matched)" if words
+                     else "panels from the recap tags, timing estimated from text length")
+
+    norm_w = panels["norm_width"]
+    plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
+                      vcfg={**vcfg, "format": fmt}, sentences=sentences, sync_report=report,
+                      image_for=lambda p: panel_image(root, chapter, p, norm_w))
+    if sentences and not report.get("matched"):
+        plan["sync"] = "estimated"
+    plan["inputs"] = inputs
+    plan["generated_hash"] = _shots_hash(plan)
+    errs = validate(plan, {p["id"] for p in panels["panels"]})
+    if errs:
+        raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
+    save_plan(root, chapter, plan)
+    log(f"  chapter {chapter}: {len(plan['shots'])} shots, {mode_note}")
+    if report and report.get("unmatched"):
+        log("    sentences placed by estimate (check these by ear):")
+        for s in report["unmatched"][:5]:
+            log(f"      - {s[:90]}")
+    write_storyboard(root, chapter, plan, log=log)
+    write_review_task(root, chapter, plan, sess.slug)
+    return plan
+
+
+def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: int = 0,
+                   log: Callable = print) -> Path:
+    root, chapter = sess.path, require_chapter(chapter)
+    panels = load_panels(root, chapter)
+    if not panels:
+        raise UserError(f"No panels for chapter {chapter} yet. Run:  video plan --chapter {chapter}")
+    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    if plan.get("panels_fingerprint") and plan["panels_fingerprint"] != panels.get("fingerprint"):
+        log("  ! panels were re-detected since this plan was made; shots still reference valid ids, rendering anyway")
+    return render(root, chapter, plan, cfg.video, preview=preview, workers=workers, log=log)
+
+
+def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "auto", fmt: str | None = None,
+          preview: bool = False, workers: int = 0, log: Callable = print) -> Dict[str, str]:
+    """Plan + storyboard + render for each chapter, skipping what's already current."""
+    results: Dict[str, str] = {}
+    for chapter in sort_chapters(chapters):
+        log(f"=== Chapter {chapter} ===")
+        if audio_path(sess.path, chapter) is None:
+            results[chapter] = "skipped: no audio"
+            log(f"  no audio yet (save it as audio/chapter_{chapter}.mp3)")
+            continue
+        try:
+            make_plan(sess, chapter, cfg, force=force, sync=sync, fmt=fmt, log=log)
+            out = output_path(sess.path, chapter, preview)
+            pf = plan_path(sess.path, chapter)
+            if out.exists() and out.stat().st_mtime >= pf.stat().st_mtime and not force:
+                results[chapter] = f"up to date: {out.name}"
+                log(f"  {out.name} is up to date")
+                continue
+            path = render_chapter(sess, chapter, cfg, preview=preview, workers=workers, log=log)
+            results[chapter] = f"rendered: {path.name}"
+        except UserError as exc:
+            results[chapter] = f"failed: {exc}"
+            log(f"  FAILED: {exc}")
+    return results
+
+
+# ------------------------------------------------------------------ clips (Shorts)
+
+
+def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | None = None,
+              preview: bool = False, workers: int = 0, log: Callable = print) -> Path:
+    """Cut a highlight from a chapter's plan, optionally re-framed as 9:16."""
+    root, chapter = sess.path, require_chapter(chapter)
+    panels = load_panels(root, chapter)
+    if not panels:
+        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
+    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    duration = float(plan["duration"])
+    if not 0 <= start < end <= duration + 0.01:
+        raise UserError(f"Clip range {start}-{end}s must be inside the chapter (0-{duration:.1f}s).")
+    fmt = fmt or plan.get("format", "16:9")
+    if fmt in {"9:16", "shorts"} and end - start > 180:
+        log("  ! YouTube Shorts are limited to 3 minutes; this clip is longer.")
+    shots = []
+    for s in plan["shots"]:
+        a, b = max(float(s["start"]), start), min(float(s["end"]), end)
+        if b - a < 0.2:
+            continue
+        cut_in = a - float(s["start"])  # how much of this shot's opening the clip skips
+        cards = []
+        for c in s.get("cards") or []:
+            at = float(c.get("at") or 0) - cut_in
+            # A card that already arrived before the clip starts is simply there:
+            # replaying its entrance would look like a glitch.
+            cards.append({**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"})
+        extra: Dict[str, Any] = {}
+        if len(cards) >= 2:
+            # Where the pair's slide really happens, relative to the clipped shot
+            # (negative = already happened, so the first card starts in place).
+            extra["pair_move_at"] = round(float(s["cards"][1].get("at") or 0) - cut_in, 3)
+        if cards and len(cards) >= 2 and float(cards[1]["at"]) > b - a - 0.25:
+            cards, extra = cards[:1], {}
+        layout = s.get("layout") if len(cards) >= 2 or s.get("layout") != "pair" else "single"
+        shots.append({**s, **extra, "layout": layout, "cards": cards,
+                      "start": round(a - start, 3), "end": round(b - start, 3),
+                      "effects": [{**e, "t": round(float(e["t"]) - start, 3)} for e in s.get("effects") or []
+                                  if a <= float(e["t"]) <= b]})
+    if not shots:
+        raise UserError("No shots fall inside that range.")
+    shots[0]["start"] = 0.0
+    shots[-1]["end"] = round(end - start, 3)
+    for prev, cur in zip(shots, shots[1:]):
+        cur["start"] = prev["end"]
+    clip = {**plan, "format": fmt, "shots": shots, "duration": round(end - start, 3), "audio_offset": start}
+    tag = f"clip_{start:g}-{end:g}".replace(".", "_") + ("_9x16" if fmt in {"9:16", "shorts"} else "")
+    return render(root, chapter, clip, cfg.video, preview=preview, workers=workers, log=log, name=tag)
+
+
+# ------------------------------------------------------------------ compilations
+
+
+def _title_card(root: Path, chapter: str, fmt_name: str, out: Path, seconds: float = 2.5) -> None:
+    fmt = format_from(fmt_name, 30)
+    panels = load_panels(root, chapter)
+    if panels:
+        img = panel_image(root, chapter, panels["panels"][0], panels["norm_width"])
+    else:
+        img = Image.new("RGB", (900, 900), (30, 30, 40))
+    frame = Image.fromarray(background("blur", img, fmt))
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(frame)
+    font = _font(int(110 * fmt.unit))
+    text = f"Chapter {chapter}"
+    box = draw.textbbox((0, 0), text, font=font)
+    w, h = box[2] - box[0], box[3] - box[1]
+    draw.text(((fmt.width - w) / 2, (fmt.height - h) / 2), text, fill=(255, 255, 255), font=font,
+              stroke_width=int(4 * fmt.unit), stroke_fill=(0, 0, 0))
+    silent = out.with_name(out.stem + ".v.mp4")
+    enc = open_encoder(silent, fmt.width, fmt.height, fmt.fps, crf=20, preset="veryfast")
+    raw = frame.tobytes()
+    for _ in range(round(seconds * fmt.fps)):
+        enc.stdin.write(raw)
+    close_encoder(enc)
+    run(["-i", str(silent), "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v", "-map", "1:a",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest", str(out)])
+    silent.unlink(missing_ok=True)
+
+
+def compile_videos(sess, chapters: List[str], *, titles: bool = True, name: str | None = None,
+                   log: Callable = print) -> Path:
+    """Join finished chapter videos, with a title card before each chapter."""
+    from ..script import _spec_name
+    from ..workspace import work_root
+
+    root = sess.path
+    chapters = sort_chapters(require_chapter(c) for c in chapters)
+    missing = [c for c in chapters if not output_path(root, c).exists()]
+    if missing:
+        raise UserError(f"No rendered video for chapter(s) {', '.join(missing)}. Run:  video build --chapters "
+                        + ",".join(missing))
+    infos = {c: video_info(output_path(root, c)) for c in chapters}
+    sizes = {(i["width"], i["height"]) for i in infos.values()}
+    if len(sizes) > 1:
+        raise UserError("These chapters were rendered in different formats (16:9 vs 9:16); compile one format at a time.")
+    fmt_name = "9:16" if next(iter(sizes))[1] > next(iter(sizes))[0] else "16:9"
+
+    work = work_root(root) / "video" / "compile"
+    work.mkdir(parents=True, exist_ok=True)
+    parts: List[Path] = []
+    for c in chapters:
+        if titles:
+            card = work / f"title_{c}_{fmt_name.replace(':', 'x')}.mp4"
+            if not card.exists():
+                _title_card(root, c, fmt_name, card)
+            parts.append(card)
+        parts.append(output_path(root, c))
+    listing = work / "concat.txt"
+    # Relative to the list file, so the series folder's name (which may be
+    # Korean, Hindi, ...) never appears in it; quotes escaped the concat way.
+    lines = []
+    for p in parts:
+        rel = os.path.relpath(p, work).replace("\\", "/").replace("'", "'\\''")
+        lines.append(f"file '{rel}'\n")
+    listing.write_text("".join(lines), encoding="utf-8")
+    out = video_dir(root) / f"compiled_{name or _spec_name(chapters)}.mp4"
+    tmp = out.with_name(out.stem + ".part.mp4")
+    run(["-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", "-movflags", "+faststart", str(tmp)],
+        timeout=1800)
+    os.replace(tmp, out)
+    log(f"  wrote video/{out.name}")
+    return out

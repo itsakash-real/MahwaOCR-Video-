@@ -1,0 +1,446 @@
+"""Drawing video frames in the recap-channel style.
+
+Style (see manhwa_recap_style_spec.md, measured from a real recap channel):
+  * Hard cuts between shots. Motion starts on the cut and *eases out*: a
+    Ken Burns move over ~2.6s, then the shot holds still until the next cut.
+  * Panels are shown as cards: a focal crop of the panel, thin white border,
+    rounded corners and a strong black drop shadow.
+  * Layouts: single (centred card), pair (first card centred, then slides
+    left as the second slides in from the right), inset (small card over a
+    blurred close-up), wide (near full-width panel).
+  * Backgrounds: blurred + darkened + vignetted copy of the panel, or plain
+    black, or plain white.
+  * CapCut-style entrances (fade_in, slide_*, pull_down, zoom_in,
+    fit_in_frame, blur_in, swing_right), all 0.6-0.8s with ease-out curves:
+    deliberately unhurried.
+
+Every function here is a pure function of (shot, time), so frames can be drawn
+in any order and the storyboard shows exactly what the video will.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFilter
+
+LAYOUTS = ("single", "pair", "inset", "wide")
+BACKGROUNDS = ("blur", "black", "white")
+MOTIONS = ("push_in", "pull_out", "pan_left", "pan_right", "pan_up", "pan_down", "hold")
+ENTRANCES = ("cut", "fade_in", "slide_left", "slide_right", "slide_up", "slide_down", "pull_down",
+             "zoom_in", "fit_in_frame", "blur_in", "swing_right")
+EXITS = ("cut", "fade_out")
+EFFECTS = ("shake", "punch", "flash")
+
+ENTER_DUR = {"cut": 0.0, "fade_in": 0.6, "slide_left": 0.7, "slide_right": 0.7, "slide_up": 0.7,
+             "slide_down": 0.7, "pull_down": 0.75, "zoom_in": 0.7, "fit_in_frame": 0.75, "blur_in": 0.8,
+             "swing_right": 0.8}
+KB_MAX = 2.6          # Ken Burns eases out over at most this long, then holds
+PAIR_MOVE = 0.7       # first card's slide to the left when the second arrives
+EXIT_FADE = 0.6
+SHAKE_LEN, PUNCH_LEN, FLASH_LEN = 0.5, 0.85, 0.6
+SRC_HEADROOM = 1.12   # source pre-scaled this much beyond the card for zoom room
+
+
+@dataclass(frozen=True)
+class Format:
+    width: int
+    height: int
+    fps: int
+
+    @property
+    def portrait(self) -> bool:
+        return self.height > self.width
+
+    @property
+    def unit(self) -> float:
+        return min(self.width, self.height) / 1080.0
+
+
+def format_from(name: str, fps: int, preview: bool = False) -> Format:
+    portrait = str(name).replace(" ", "") in {"9:16", "shorts", "portrait", "vertical"}
+    w, h = (1080, 1920) if portrait else (1920, 1080)
+    if preview:
+        w, h = (480, 854) if portrait else (854, 480)
+    return Format(w, h, int(fps))
+
+
+# ------------------------------------------------------------------ easing
+
+
+def ease_out(p: float) -> float:
+    p = min(max(p, 0.0), 1.0)
+    return 1 - (1 - p) ** 3
+
+
+def ease_out_back(p: float, s: float = 1.2) -> float:
+    p = min(max(p, 0.0), 1.0) - 1
+    return 1 + (s + 1) * p ** 3 + s * p ** 2
+
+
+def ease_in_out(p: float) -> float:
+    p = min(max(p, 0.0), 1.0)
+    return 0.5 - 0.5 * math.cos(math.pi * p)
+
+
+# ------------------------------------------------------------------ layout geometry
+
+
+def card_box(layout: str, fmt: Format) -> Tuple[float, float]:
+    """Largest card size (w, h) for a layout; the crop's aspect decides the actual fit."""
+    W, H = fmt.width, fmt.height
+    if fmt.portrait:
+        return {"single": (0.92 * W, 0.70 * H), "pair": (0.90 * W, 0.42 * H),
+                "inset": (0.55 * W, 0.28 * H), "wide": (0.96 * W, 0.55 * H)}.get(layout, (0.92 * W, 0.7 * H))
+    return {"single": (0.62 * W, 0.90 * H), "pair": (0.42 * W, 0.80 * H),
+            "inset": (0.34 * W, 0.60 * H), "wide": (0.94 * W, 0.86 * H)}.get(layout, (0.62 * W, 0.90 * H))
+
+
+# Crop shape ranges (w/h) per layout. Tall panels are cut to a focal region of
+# this shape rather than shrunk into a thin strip: a single card should take
+# roughly 40-60% of the frame width, a pair card is portrait like the reference.
+_CROP_RANGE = {
+    False: {"single": (0.82, 1.2), "pair": (0.62, 0.95), "inset": (0.85, 1.25)},
+    True: {"single": (0.75, 1.3), "pair": (0.9, 1.6), "inset": (0.9, 1.5)},
+}
+
+
+def crop_aspect(layout: str, fmt: Format, panel_aspect: float) -> float:
+    """The crop shape (w/h) a panel should be cut to for this layout."""
+    bw, bh = card_box(layout, fmt)
+    box = bw / bh
+    if layout == "wide":
+        return min(panel_aspect, box)
+    lo, hi = _CROP_RANGE[fmt.portrait].get(layout, (0.8, 1.2))
+    return min(max(panel_aspect, lo), min(hi, box))
+
+
+def fit(aspect: float, box: Tuple[float, float]) -> Tuple[int, int]:
+    bw, bh = box
+    cw = min(bw, bh * aspect)
+    return max(8, int(cw)), max(8, int(cw / aspect))
+
+
+def slot_centres(layout: str, fmt: Format, size: Tuple[int, int], index: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """(start centre, resting centre) for card `index` in this layout."""
+    W, H = fmt.width, fmt.height
+    cw, ch = size
+    if layout == "pair":
+        if fmt.portrait:
+            rest = (W / 2, 0.27 * H) if index == 0 else (W / 2, 0.73 * H)
+        else:
+            rest = (0.27 * W, H / 2) if index == 0 else (0.73 * W, H / 2)
+        start = (W / 2, H / 2) if index == 0 else rest
+        return start, rest
+    if layout == "inset":
+        if fmt.portrait:
+            c = (W / 2, 0.93 * H - ch / 2)
+        else:
+            c = (0.05 * W + cw / 2, 0.93 * H - ch / 2)
+        return c, c
+    c = (W / 2, H / 2)
+    return c, c
+
+
+# ------------------------------------------------------------------ backgrounds
+
+
+def _vignette(fmt: Format) -> np.ndarray:
+    ys, xs = np.ogrid[0:fmt.height, 0:fmt.width]
+    nx = (xs - fmt.width / 2) / (fmt.width / 2)
+    ny = (ys - fmt.height / 2) / (fmt.height / 2)
+    d = np.sqrt(nx ** 2 + ny ** 2) / math.sqrt(2)
+    return (1.0 - 0.45 * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
+
+
+def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
+    if kind == "black" or (kind == "blur" and panel is None):
+        return np.zeros((fmt.height, fmt.width, 3), np.uint8)
+    if kind == "white":
+        return np.full((fmt.height, fmt.width, 3), 255, np.uint8)
+    # Blur: the panel scaled to cover the frame, blurred, darkened, vignetted.
+    sw, sh = max(4, fmt.width // 8), max(4, fmt.height // 8)
+    k = max(sw / panel.width, sh / panel.height)
+    small = panel.convert("RGB").resize((max(4, int(panel.width * k) + 1), max(4, int(panel.height * k) + 1)),
+                                        Image.BILINEAR)
+    left, top = (small.width - sw) // 2, (small.height - sh) // 2
+    small = small.crop((left, top, left + sw, top + sh)).filter(ImageFilter.GaussianBlur(4.5))
+    big = np.asarray(small.resize((fmt.width, fmt.height), Image.BICUBIC), dtype=np.float32)
+    return np.clip(big * 0.72 * _vignette(fmt), 0, 255).astype(np.uint8)
+
+
+# ------------------------------------------------------------------ cards
+
+
+class Card:
+    """One panel card: focal crop, border, rounded corners, black shadow, motion."""
+
+    def __init__(self, panel: Image.Image, spec: Dict[str, Any], layout: str, index: int,
+                 shot_start: float, shot_end: float, fmt: Format, pair_move_at: float | None):
+        self.fmt = fmt
+        self.layout, self.index = layout, index
+        u = fmt.unit
+        crop = spec.get("crop") or [0, 0, 1, 1]
+        x0, y0, x1, y1 = (max(0.0, min(1.0, float(v))) for v in crop)
+        if x1 - x0 < 0.02 or y1 - y0 < 0.02:
+            x0, y0, x1, y1 = 0.0, 0.0, 1.0, 1.0
+        pw, ph = panel.size
+        region = panel.crop((int(x0 * pw), int(y0 * ph), max(int(x0 * pw) + 2, int(x1 * pw)),
+                             max(int(y0 * ph) + 2, int(y1 * ph))))
+        aspect = region.width / region.height
+        self.cw, self.ch = fit(aspect, card_box(layout, fmt))
+        self.border = max(1, round(3 * u))
+        self.radius = max(2, round(12 * u))
+        self.margin = max(6, round(46 * u))
+        iw, ih = self.cw - 2 * self.border, self.ch - 2 * self.border
+        self.iw, self.ih = iw, ih
+        self.src = region.convert("RGB").resize((max(2, round(iw * SRC_HEADROOM)), max(2, round(ih * SRC_HEADROOM))),
+                                                Image.LANCZOS)
+
+        # Static parts of the sprite, built once: shadow + white rounded border.
+        m = self.margin
+        sw, sh = self.cw + 2 * m, self.ch + 2 * m
+        shadow = Image.new("L", (sw, sh), 0)
+        off = round(10 * u)
+        ImageDraw.Draw(shadow).rounded_rectangle((m - round(4 * u), m + off - round(2 * u), m + self.cw + round(4 * u),
+                                                  m + self.ch + off + round(6 * u)), self.radius + 4, fill=235)
+        shadow = shadow.filter(ImageFilter.GaussianBlur(20 * u))
+        base = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+        base.putalpha(shadow)
+        card_mask = Image.new("L", (sw, sh), 0)
+        ImageDraw.Draw(card_mask).rounded_rectangle((m, m, m + self.cw - 1, m + self.ch - 1), self.radius, fill=255)
+        base.paste(Image.new("RGBA", (sw, sh), (255, 255, 255, 255)), (0, 0), card_mask)
+        self.base = base
+        self.inner_mask = Image.new("L", (iw, ih), 0)
+        ImageDraw.Draw(self.inner_mask).rounded_rectangle((0, 0, iw - 1, ih - 1), max(1, self.radius - self.border),
+                                                          fill=255)
+
+        self.appear = shot_start + max(0.0, float(spec.get("at") or 0.0))
+        self.enter = spec.get("enter") if spec.get("enter") in ENTRANCES else "cut"
+        self.enter_dur = ENTER_DUR[self.enter]
+        self.motion = spec.get("motion") if spec.get("motion") in MOTIONS else "push_in"
+        self.kb_dur = max(0.01, min(shot_end - self.appear, KB_MAX))
+        self.start_c, self.rest_c = slot_centres(layout, fmt, (self.cw, self.ch), index)
+        self.pair_move_at = pair_move_at if (layout == "pair" and index == 0) else None
+
+    # -------------------------------------------------- time-varying parts
+
+    def visible(self, t: float) -> bool:
+        return t >= self.appear - 1e-9
+
+    def settled_at(self) -> float:
+        end = max(self.appear + self.enter_dur, self.appear + self.kb_dur)
+        if self.pair_move_at is not None:
+            end = max(end, self.pair_move_at + PAIR_MOVE)
+        return end
+
+    def _viewport(self, t: float, extra_zoom: float) -> Tuple[float, float, float, float]:
+        sw, sh = self.src.size
+        p = ease_out((t - self.appear) / self.kb_dur)
+        m = self.motion
+        zoom = {"push_in": 1.0 + 0.07 * p, "pull_out": 1.10 - 0.10 * p, "hold": 1.01 + 0.02 * p}.get(m, 1.08)
+        zoom *= 1 + extra_zoom
+        # The source is the whole crop (at extra resolution, so zoomed views stay
+        # sharp); zoom 1 shows all of it, zoom 1.1 shows the middle 1/1.1.
+        vw, vh = sw / zoom, sh / zoom
+        cx, cy = sw / 2, sh / 2
+        sx, sy = (sw - vw) / 2 * 0.85, (sh - vh) / 2 * 0.85
+        q = 2 * p - 1  # -1 -> +1 across the move
+        if m == "pan_left":
+            cx += sx * -q
+        elif m == "pan_right":
+            cx += sx * q
+        elif m == "pan_up":
+            cy += sy * -q
+        elif m == "pan_down":
+            cy += sy * q
+        return cx - vw / 2, cy - vh / 2, vw, vh
+
+    def centre(self, t: float) -> Tuple[float, float]:
+        if self.pair_move_at is None:
+            return self.rest_c
+        p = ease_out((t - self.pair_move_at) / PAIR_MOVE)
+        (ax, ay), (bx, by) = self.start_c, self.rest_c
+        return ax + (bx - ax) * p, ay + (by - ay) * p
+
+    def entrance(self, t: float) -> Dict[str, float]:
+        """Offsets/scale/rotation/blur/alpha for the entrance animation at time t."""
+        out = {"dx": 0.0, "dy": 0.0, "scale": 1.0, "rot": 0.0, "blur": 0.0, "alpha": 1.0}
+        if self.enter == "cut" or t >= self.appear + self.enter_dur:
+            return out
+        u = t - self.appear
+        d = self.enter_dur
+        p = ease_out(u / d)
+        W, H, e = self.fmt.width, self.fmt.height, self.enter
+        fade = min(1.0, u / (0.55 * d))
+        if e == "fade_in":
+            out["alpha"] = ease_in_out(u / d)
+        elif e == "slide_left":       # comes in from the right
+            out["dx"], out["alpha"] = (1 - p) * 0.38 * W, fade
+        elif e == "slide_right":      # comes in from the left
+            out["dx"], out["alpha"] = -(1 - p) * 0.38 * W, fade
+        elif e == "slide_up":         # rises from below
+            out["dy"], out["alpha"] = (1 - p) * 0.35 * H, fade
+        elif e == "slide_down":       # drops from above
+            out["dy"], out["alpha"] = -(1 - p) * 0.35 * H, fade
+        elif e == "pull_down":        # drops in and settles with a slight overshoot
+            out["dy"], out["alpha"] = -(1 - ease_out_back(u / d)) * 0.4 * H, fade
+        elif e == "zoom_in":
+            out["scale"], out["alpha"] = 0.80 + 0.20 * p, ease_in_out(u / d)
+        elif e == "fit_in_frame":     # starts oversized, shrinks into place
+            out["scale"], out["alpha"] = 1.28 - 0.28 * p, fade
+        elif e == "blur_in":
+            out["blur"], out["alpha"] = (1 - p) * 22 * self.fmt.unit, fade
+        elif e == "swing_right":
+            out["rot"], out["dx"], out["alpha"] = -11 * (1 - p), -(1 - p) * 0.06 * W, ease_in_out(u / d)
+        return out
+
+    def sprite(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+        x0, y0, vw, vh = self._viewport(t, extra_zoom)
+        content = self.src.transform((self.iw, self.ih), Image.AFFINE,
+                                     (vw / self.iw, 0.0, x0, 0.0, vh / self.ih, y0), resample=Image.BILINEAR)
+        spr = self.base.copy()
+        off = self.margin + self.border
+        spr.paste(content, (off, off), self.inner_mask)
+        return spr
+
+
+# ------------------------------------------------------------------ effects
+
+
+def shake_offset(t: float, times: List[float], unit: float) -> Tuple[float, float]:
+    """A damped wobble, not random jitter: reads as weight, not glitch."""
+    for te in times:
+        dt = t - te
+        if 0 <= dt < SHAKE_LEN:
+            amp = 10 * unit * math.exp(-5.5 * dt)
+            return amp * math.sin(2 * math.pi * 7 * dt), 0.5 * amp * math.cos(2 * math.pi * 5 * dt)
+    return 0.0, 0.0
+
+
+def punch_amount(t: float, times: List[float]) -> float:
+    best = 0.0
+    for te in times:
+        dt = t - te
+        if 0 <= dt < 0.25:
+            best = max(best, ease_out(dt / 0.25))
+        elif 0.25 <= dt < PUNCH_LEN:
+            best = max(best, 1 - ease_in_out((dt - 0.25) / (PUNCH_LEN - 0.25)))
+    return 0.04 * best
+
+
+def flash_alpha(t: float, times: List[float]) -> float:
+    best = 0.0
+    for te in times:
+        dt = t - te
+        if 0 <= dt < 0.12:
+            best = max(best, 0.55 * dt / 0.12)
+        elif 0.12 <= dt < FLASH_LEN:
+            best = max(best, 0.55 * (1 - (dt - 0.12) / (FLASH_LEN - 0.12)))
+    return best
+
+
+# ------------------------------------------------------------------ shot
+
+
+def _mix(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
+    """(1-k)*a + k*b in integer math; far faster than float on 1080p frames."""
+    w = int(round(max(0.0, min(1.0, k)) * 256))
+    return ((a.astype(np.uint16) * (256 - w) + b.astype(np.uint16) * w) >> 8).astype(np.uint8)
+
+
+class ShotRenderer:
+    """Draws one shot at any time t (seconds on the video timeline)."""
+
+    def __init__(self, shot: Dict[str, Any], images: Dict[str, Image.Image], fmt: Format,
+                 effects_on: Dict[str, bool] | None = None, video_end: float | None = None,
+                 end_fade: bool = False):
+        self.fmt = fmt
+        self.shot = shot
+        self.start, self.end = float(shot["start"]), float(shot["end"])
+        layout = shot.get("layout") if shot.get("layout") in LAYOUTS else "single"
+        cards = [c for c in shot.get("cards") or [] if c.get("panel") in images]
+        if layout == "pair" and len(cards) < 2:
+            layout = "single"
+        cards = cards[:2] if layout == "pair" else cards[:1]
+        self.layout = layout
+        pair_move_at = None
+        if layout == "pair":
+            # A clip that starts after the second card arrived carries the real
+            # (negative) arrival time here, so the first card is already in place.
+            move = shot.get("pair_move_at", cards[1].get("at"))
+            pair_move_at = self.start + float(move or 0.0)
+        self.cards = [Card(images[c["panel"]], c, layout, i, self.start, self.end, fmt, pair_move_at)
+                      for i, c in enumerate(cards)]
+
+        bg_kind = shot.get("background") if shot.get("background") in BACKGROUNDS else "blur"
+        bg_panel = shot.get("bg_panel") if shot.get("bg_panel") in images else (cards[0]["panel"] if cards else None)
+        self.bg = background(bg_kind, images.get(bg_panel) if bg_panel else None, fmt)
+
+        on = {"shake": True, "punch": False, "flash": False}
+        on.update({k: bool(v) for k, v in (effects_on or {}).items()})
+        fx = [e for e in shot.get("effects") or [] if isinstance(e, dict) and on.get(e.get("type"))]
+        self.shakes = [float(e["t"]) for e in fx if e["type"] == "shake"]
+        self.punches = [float(e["t"]) for e in fx if e["type"] == "punch"]
+        self.flashes = [float(e["t"]) for e in fx if e["type"] == "flash"]
+
+        self.exit = shot.get("exit") if shot.get("exit") in EXITS else "cut"
+        self.fade_from = self.end - EXIT_FADE if self.exit == "fade_out" else None
+        if end_fade and video_end is not None and abs(video_end - self.end) < 0.05:
+            self.fade_from = min(self.fade_from or 1e9, self.end - 1.0)
+        if self.fade_from is not None:
+            self.fade_from = max(self.start, self.fade_from)  # a short last shot must not start dark
+
+        # From this moment until any exit fade, every frame is identical.
+        settle = max([c.settled_at() for c in self.cards] + [self.start])
+        for times, length in ((self.shakes, SHAKE_LEN), (self.punches, PUNCH_LEN), (self.flashes, FLASH_LEN)):
+            for te in times:
+                settle = max(settle, te + length)
+        self.static_from = settle
+        self._static: np.ndarray | None = None
+
+    def is_static(self, t: float) -> bool:
+        return t >= self.static_from and (self.fade_from is None or t < self.fade_from)
+
+    def frame_array(self, t: float) -> np.ndarray:
+        if self.is_static(t) and self._static is not None:
+            return self._static
+        img = Image.fromarray(self.bg)
+        dx_s, dy_s = shake_offset(t, self.shakes, self.fmt.unit)
+        extra = punch_amount(t, self.punches)
+        for card in self.cards:
+            if not card.visible(t):
+                continue
+            spr = card.sprite(t, extra)
+            ent = card.entrance(t)
+            if ent["blur"] > 0.3:
+                spr = spr.filter(ImageFilter.GaussianBlur(ent["blur"]))
+            if abs(ent["scale"] - 1) > 1e-3:
+                spr = spr.resize((max(2, int(spr.width * ent["scale"])), max(2, int(spr.height * ent["scale"]))),
+                                 Image.BILINEAR)
+            if abs(ent["rot"]) > 0.05:
+                spr = spr.rotate(ent["rot"], resample=Image.BILINEAR, expand=True)
+            alpha = spr.getchannel("A")
+            if ent["alpha"] < 0.999:
+                a = ent["alpha"]
+                alpha = alpha.point(lambda v, a=a: int(v * a))
+            cx, cy = card.centre(t)
+            x = int(round(cx + ent["dx"] + dx_s - spr.width / 2))
+            y = int(round(cy + ent["dy"] + dy_s - spr.height / 2))
+            img.paste(spr.convert("RGB"), (x, y), alpha)
+        out = np.asarray(img, dtype=np.uint8)
+        fa = flash_alpha(t, self.flashes)
+        if fa > 0.001:
+            out = _mix(out, np.full_like(out, 255), fa)
+        if self.fade_from is not None and t > self.fade_from:
+            span = max(1e-3, self.end - self.fade_from)
+            out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
+        if self.is_static(t):
+            self._static = out
+        return out
+
+    def frame(self, t: float) -> Image.Image:
+        return Image.fromarray(self.frame_array(t))

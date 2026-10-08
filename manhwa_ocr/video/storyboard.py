@@ -1,0 +1,155 @@
+"""Storyboard and review task, so an agent (or you) can check a plan before rendering.
+
+The storyboard draws each shot's middle frame with the same renderer the video
+uses, labelled with its time, panel id and the sentence being spoken. A vision
+agent can look at it and spot "the narration says the sword breaks but the
+panel shows a forest", then fix that one shot in the plan.
+"""
+
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
+from typing import Any, Dict, List
+
+from PIL import Image, ImageDraw
+
+from ..util import atomic_save_image, atomic_write_text, require_chapter
+from ..workspace import work_root
+from .frames import ShotRenderer, format_from
+from .media import video_dir
+from .panels import _font, load_panels, panel_image
+
+PER_SHEET = 24
+COLS = 4
+
+
+def storyboard_paths(root: Path, chapter: str) -> List[Path]:
+    return sorted(video_dir(root).glob(f"chapter_{require_chapter(chapter)}.storyboard_*.png"))
+
+
+def _clock(t: float) -> str:
+    m, s = divmod(max(0.0, t), 60)
+    return f"{int(m)}:{s:04.1f}"
+
+
+def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) -> List[Path]:
+    chapter = require_chapter(chapter)
+    for old in storyboard_paths(root, chapter):
+        old.unlink()
+    panels_data = load_panels(root, chapter) or {"panels": [], "norm_width": None}
+    panels = {p["id"]: p for p in panels_data["panels"]}
+    fmt = format_from(plan.get("format", "16:9"), 30, preview=True)
+    thumb_w = 400 if not fmt.portrait else 230
+    thumb_h = round(thumb_w * fmt.height / fmt.width)
+    text_h, pad = 92, 10
+    font, small = _font(18), _font(15)
+    shots = plan["shots"]
+    cache: Dict[str, Image.Image] = {}
+    out = []
+    for n, start in enumerate(range(0, len(shots), PER_SHEET), start=1):
+        chunk = shots[start:start + PER_SHEET]
+        rows = (len(chunk) + COLS - 1) // COLS
+        cell_w, cell_h = thumb_w + 2 * pad, thumb_h + text_h + 2 * pad
+        sheet = Image.new("RGB", (COLS * cell_w, rows * cell_h), (24, 24, 24))
+        draw = ImageDraw.Draw(sheet)
+        for i, shot in enumerate(chunk):
+            x, y = (i % COLS) * cell_w + pad, (i // COLS) * cell_h + pad
+            ids = [c.get("panel") for c in shot.get("cards") or []]
+            if shot.get("bg_panel"):
+                ids.append(shot["bg_panel"])
+            missing = [p for p in ids if p not in panels]
+            if not missing and ids:
+                images = {}
+                for pid in dict.fromkeys(ids):
+                    if pid not in cache:
+                        if len(cache) > 16:
+                            cache.clear()
+                        cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"])
+                    images[pid] = cache[pid]
+                # 85% through: entrances done and a pair's second card has arrived.
+                when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))
+                frame = ShotRenderer(shot, images, fmt, {"punch": False, "shake": False, "flash": False}).frame(when)
+                sheet.paste(frame.resize((thumb_w, thumb_h)), (x, y))
+                wordy = [pid for pid in dict.fromkeys(ids) if panels[pid].get("text_only")]
+                if wordy:
+                    # Hand-picked bubble/lettering/credits panels: flag them for the reviewer.
+                    draw.rectangle((x, y, x + thumb_w - 1, y + thumb_h - 1), outline=(230, 60, 60), width=4)
+                    draw.text((x + 8, y + 6), f"TEXT PANEL {', '.join(wordy)}: pick a drawn one",
+                              fill=(255, 90, 90), font=font, stroke_width=2, stroke_fill=(0, 0, 0))
+            else:
+                draw.rectangle((x, y, x + thumb_w, y + thumb_h), outline=(200, 60, 60), width=3)
+                draw.text((x + 8, y + 8), f"MISSING PANEL {', '.join(map(str, missing))}", fill=(230, 80, 80), font=font)
+            fx = ",".join(e["type"] for e in shot.get("effects") or [])
+            head = f"{shot.get('id')}  {_clock(float(shot['start']))}-{_clock(float(shot['end']))}  {' + '.join(map(str, ids[:2]))}"
+            draw.text((x, y + thumb_h + 4), head, fill=(255, 214, 90), font=font)
+            enters = "/".join(c.get("enter", "cut") for c in shot.get("cards") or [])
+            style = f"{shot.get('layout')} · {shot.get('background')} · {enters}{('  +' + fx) if fx else ''}"
+            draw.text((x, y + thumb_h + 26), style, fill=(150, 190, 255), font=small)
+            said = textwrap.shorten(shot.get("sentence") or "(no sentence: even timing)", 120, placeholder="…")
+            for k, line in enumerate(textwrap.wrap(said, 48)[:2]):
+                draw.text((x, y + thumb_h + 46 + 18 * k), line, fill=(220, 220, 220), font=small)
+        path = video_dir(root) / f"chapter_{chapter}.storyboard_{n:02d}.png"
+        atomic_save_image(sheet, path)
+        out.append(path)
+    log(f"  storyboard: {len(out)} image(s), {len(shots)} shots")
+    return out
+
+
+def write_review_task(root: Path, chapter: str, plan: Dict[str, Any], session: str | None) -> Path:
+    pin = f' --session "{session}"' if session else ""
+    boards = "\n".join(f"- `{p.relative_to(root).as_posix()}`" for p in storyboard_paths(root, chapter))
+    sheets = "\n".join(f"- `{p.relative_to(root).as_posix()}`"
+                       for p in sorted((root / "media" / f"ch{chapter}").glob("panels_sheet_*.png")))
+    sync_note = ("Shots follow the narration sentence by sentence."
+                 if plan.get("sync") == "synced" else
+                 "This plan uses even timing (no sentence sync), so only check for broken or unreadable shots.")
+    doc = f"""# Video review — chapter {chapter}
+
+{sync_note}
+
+## Look at
+
+Storyboard (each shot's middle frame, its time, panel id, and the words being spoken):
+{boards}
+
+Panel contact sheets (every available panel with its id):
+{sheets}
+
+## Check each shot
+
+- Does the panel match what the sentence describes? If not, find the right panel id on the contact sheets.
+- Never show speech bubbles, captions, sound-effect lettering, blank pages, or credits/"Read at" pages.
+  Those are marked "TEXT - don't use" on the contact sheets, and a red "TEXT PANEL" box on the storyboard.
+  The narration already tells that part; show the drawn panel next to it instead.
+- Is anything unreadable or badly cropped (a face cut in half, a card that is mostly a caption)?
+
+## How to fix
+
+Edit `video/chapter_{chapter}.plan.json`. Useful fields per shot:
+
+- `cards[k].panel`: a panel id from the contact sheets
+- `cards[k].crop`: `[x0, y0, x1, y1]` as fractions of the panel. Use it to frame a face or the action, and
+  to keep speech bubbles out. Example: `[0, 0.15, 1, 0.6]` is the upper-middle part.
+- `cards[k].enter`: cut, fade_in, slide_left, slide_right, slide_up, slide_down, pull_down, zoom_in,
+  fit_in_frame, blur_in, swing_right
+- `cards[k].motion`: push_in, pull_out, pan_left, pan_right, pan_up, pan_down, hold
+- `layout`: single, pair (2 cards; the 2nd slides in at `cards[1].at` seconds), inset (small card over
+  `bg_panel` blurred), wide
+- `background`: blur, black, white
+- `effects`: list of {{"type": "shake"|"punch"|"flash", "t": seconds}}, with t inside the shot.
+  Use them sparingly.
+
+Don't change `start`/`end` unless you keep shots back to back. Never edit the MP4 or anything in `.work/`.
+
+When the plan is right, set `"reviewed": true` in it and render:
+
+```bash
+python -m manhwa_ocr video render --chapter {chapter}{pin}
+```
+
+Only edited shots (and the one after each) are re-rendered.
+"""
+    path = work_root(root) / "video" / f"ch{chapter}" / "REVIEW.md"
+    atomic_write_text(path, doc)
+    return path
