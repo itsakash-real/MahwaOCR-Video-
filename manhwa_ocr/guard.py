@@ -9,9 +9,9 @@ file was changed, added or deleted, nothing runs: the error names the files and
 says how to get the locked version back. An agent that edited the code can't
 quietly carry on with the edited version.
 
-What's covered: the program package, tests, and the rule files agents read
-(AGENTS.md, GEMINI.md, .agent/). Not covered: manhwa-ocr.yaml (your settings)
-and everything in your output folder.
+What's covered: everything in the program folder, so even a new scratch
+script there stops every command. Not covered: manhwa-ocr.yaml (your settings),
+caches, git's own folder, and everything in your output folder.
 
 This is a guard, not a wall: any program running as you could undo it. It
 turns a silent change into a loud stop, and git (if set up) brings the code back.
@@ -30,19 +30,17 @@ from .util import UserError, atomic_write_text
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_FILE = ROOT / ".code-lock.json"
-COVERED = ("manhwa_ocr", "tests", ".agent")
-COVERED_FILES = ("AGENTS.md", "GEMINI.md", "pyproject.toml")
-SKIP_PARTS = {"__pycache__", ".pytest_cache"}
+SKIP_PARTS = {"__pycache__", ".pytest_cache", ".git", "manhwa_ocr.egg-info"}
+SKIP_FILES = {"manhwa-ocr.yaml", ".code-lock.json"}   # your settings; the lock itself
 
 
 def _files() -> List[Path]:
-    out: List[Path] = []
-    for name in COVERED:
-        base = ROOT / name
-        if base.is_dir():
-            out += [p for p in base.rglob("*") if p.is_file() and not SKIP_PARTS & set(p.parts)
-                    and p.suffix not in {".pyc", ".pyo"}]
-    out += [ROOT / n for n in COVERED_FILES if (ROOT / n).is_file()]
+    out = []
+    for p in ROOT.rglob("*"):
+        rel = p.relative_to(ROOT)
+        if (p.is_file() and not SKIP_PARTS & set(rel.parts) and rel.as_posix() not in SKIP_FILES
+                and p.suffix not in {".pyc", ".pyo"}):
+            out.append(p)
     return sorted(out)
 
 
