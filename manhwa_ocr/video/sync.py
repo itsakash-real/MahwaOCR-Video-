@@ -1,10 +1,16 @@
 """Find when each script sentence is spoken in the recorded narration.
 
-faster-whisper gives word-level timestamps for the audio. We already know the
-exact script, so whisper only has to get the *timing* right, not every word:
-both word sequences are lined up with difflib, and each sentence's start is
-taken from its first matched word. Misheard names, ad-libs and skipped words
-just leave gaps, which are filled by interpolating between neighbours.
+whisper.cpp (via pywhispercpp) gives word-level timestamps for the audio. We
+already know the exact script, so whisper only has to get the *timing* right,
+not every word: both word sequences are lined up with difflib, and each
+sentence's start is taken from its first matched word. Misheard names, ad-libs
+and skipped words just leave gaps, which are filled by interpolating between
+neighbours.
+
+whisper.cpp (ggml) rather than faster-whisper (ctranslate2/Intel MKL) is used
+deliberately: MKL's allocator can fail with "mkl_malloc: failed to allocate
+memory" under the memory pressure of a normal multi-app desktop, even though
+the model itself only needs ~150-300MB. ggml doesn't have that failure mode.
 
 Transcription is the slow part, so it is cached in
 video/chapter_N.timeline.json keyed by the audio file's hash and the model.
@@ -16,11 +22,13 @@ import difflib
 import hashlib
 import json
 import re
+import subprocess
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List
 
 from ..util import UserError, atomic_write_text, require_chapter
+from .ffmpeg import ffmpeg_exe
 from .media import video_dir
 
 SYNC_HINT = 'pip install -e ".[sync]"'
@@ -35,7 +43,7 @@ def timeline_path(root: Path, chapter: str) -> Path:
 
 def available() -> bool:
     try:
-        import faster_whisper  # noqa: F401
+        import pywhispercpp.model  # noqa: F401
         return True
     except ImportError:
         return False
@@ -73,6 +81,20 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()[:24]
 
 
+def _mono16k(path: Path) -> "Any":
+    """Decode to mono 16kHz float32 PCM ourselves, so whisper.cpp never needs
+    ffmpeg on PATH (we already carry one via imageio-ffmpeg)."""
+    import numpy as np
+
+    cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
+          "-f", "f32le", "-ac", "1", "-ar", "16000", "-"]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or not proc.stdout:
+        raise UserError(f"Couldn't decode {path.name} for whisper:\n"
+                        f"{(proc.stderr or b'').decode('utf-8', 'replace')[-800:]}")
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
 def transcribe(audio: Path, *, model: str = "small.en", language: str | None = None,
                initial_prompt: str | None = None, cache: Path | None = None,
                log=print) -> List[Dict[str, Any]]:
@@ -86,17 +108,23 @@ def transcribe(audio: Path, *, model: str = "small.en", language: str | None = N
         except (OSError, ValueError):
             pass
     if not available():
-        raise UserError(f"Syncing to the audio needs faster-whisper. Install it with:  {SYNC_HINT}")
-    from faster_whisper import WhisperModel
+        raise UserError(f"Syncing to the audio needs pywhispercpp. Install it with:  {SYNC_HINT}")
+    from pywhispercpp.model import Model
 
     log(f"  transcribing {audio.name} with whisper '{model}' (first run downloads the model)...")
     try:
-        wm = WhisperModel(model, device="cpu", compute_type="int8")
-        segments, _info = wm.transcribe(str(audio), word_timestamps=True, vad_filter=True,
-                                        language=language, initial_prompt=initial_prompt,
-                                        condition_on_previous_text=False)
-        words = [{"w": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)}
-                 for seg in segments for w in (seg.words or []) if w.word.strip()]
+        pcm = _mono16k(audio)
+        wm = Model(model, print_progress=False, print_realtime=False, redirect_whispercpp_logs_to=None)
+        # English-only (".en") models can't produce other languages; skip the
+        # detection pass instead of leaving it to guess (it can pick nonsense
+        # like Chinese at near-zero confidence and is simply wasted work).
+        lang = language or ("en" if model.endswith(".en") else "")
+        segments = wm.transcribe(pcm, token_timestamps=True, split_on_word=True, max_len=1,
+                                 language=lang, initial_prompt=initial_prompt or "")
+        words = [{"w": seg.text.strip(), "start": round(seg.t0 / 100, 3), "end": round(seg.t1 / 100, 3)}
+                 for seg in segments if seg.text.strip()]
+    except UserError:
+        raise
     except Exception as exc:  # noqa: BLE001 - model download/decoding errors
         raise UserError(f"Whisper couldn't transcribe {audio.name}: {exc}") from None
     if not words:

@@ -20,7 +20,10 @@ dependencies = [
 # Recap video rendering. Brings its own FFmpeg binary; nothing else to install.
 video = ["imageio-ffmpeg>=0.5"]
 # Exact sync of panels to the narration (word timestamps, CPU only, no PyTorch).
-sync = ["faster-whisper>=1.0"]
+# whisper.cpp (ggml), not faster-whisper (ctranslate2/MKL): MKL's allocator can
+# fail with "mkl_malloc: failed to allocate memory" under ordinary desktop
+# memory pressure; ggml doesn't have that failure mode.
+sync = ["pywhispercpp>=1.5"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]

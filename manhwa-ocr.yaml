@@ -9,13 +9,13 @@ output_folder: "../ManhwaRecaps"
 provider:
   # anthropic | gemini | openai | ollama
   #   "openai" works for ANY OpenAI-compatible endpoint:
-  #   OpenRouter, Groq, Together, LM Studio, vLLM, llama.cpp server.
-  kind: anthropic
-  vision_model: claude-haiku-4-5-20251001
+  #   OpenRouter, Groq, Together, LM Studio, vLLM, DeepSeek, etc.
+  kind: openai
+  vision_model: deepseek-flash
   # Cheaper text-only model for chapter assembly. null = reuse vision_model.
-  text_model: null
-  base_url: null
-  api_key_env: ANTHROPIC_API_KEY
+  text_model: deepseek-chat
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
   temperature: 0.0        # keep at 0 for reproducible runs
   max_tokens: 4096        # per tile
   text_max_tokens: 16000  # chapter assembly and recaps
@@ -26,11 +26,11 @@ slicing:
   # The most important section. Webtoon strips are ~900x16000; sent whole, a
   # vision model receives them at roughly 110px wide and text becomes a guess.
   enabled: true
-  target_height: 1400     # tile height in px
-  overlap: 180            # overlap so bubbles spanning a cut survive
+  target_height: 2200     # tile height in px (optimized for modern vision models)
+  overlap: 280            # overlap so bubbles spanning a cut survive intact
   snap_to_gutter: true    # cut at flat rows between panels, not through art
-  gutter_search: 220      # how far to hunt for a clean cut
-  min_height_to_slice: 1800
+  gutter_search: 350      # how far to hunt for a clean cut (wider search avoids speech bubbles)
+  min_height_to_slice: 2600
   max_width: 1100
 
 download:
@@ -54,7 +54,7 @@ video:
   effects: {shake: true, punch: false, flash: false, end_fade: true}   # calm by default
   music: null             # e.g. "music/bed.mp3" (relative to the series folder); ducks under narration
   music_volume: 0.22
-  whisper_model: small.en # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
+  whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
   whisper_language: null  # e.g. "hi"
 
 pipeline:

@@ -74,7 +74,7 @@ These came from the tool research. Don't revisit them without a reason.
 | Rendering | **FFmpeg filtergraphs, run from Python with subprocess** | Fastest on CPU, gives the same output for the same input, easy to script. |
 | FFmpeg binary | `ffmpeg` on PATH if present, else **`imageio-ffmpeg`**'s bundled binary | Nothing to install by hand on Windows. |
 | Panel detection | **Our own gutter scanner** (numpy) | Webtoon panels are separated by blank horizontal bands. Every ML panel detector found is AGPL (ultralytics/YOLO) or non-commercial (Magi). |
-| Word timestamps | **faster-whisper**, `device="cpu"`, `compute_type="int8"` | MIT, Windows wheels, no PyTorch, no CUDA errors. |
+| Word timestamps | ~~faster-whisper~~ **pywhispercpp (whisper.cpp)** — switched later | MIT, Windows wheels, no PyTorch, no CUDA errors. faster-whisper's ctranslate2/MKL backend turned out to crash (`mkl_malloc: failed to allocate memory`) under ordinary desktop memory pressure; ggml doesn't have that failure mode. |
 | Alignment | **Fuzzy-match** whisper's words against our own script | We know the exact text, so timing is all we need from whisper. |
 | Video format | **16:9 1920×1080 at 30fps first**; 9:16 in Phase 8 | The plan file keeps format separate, so adding 9:16 later is cheap. |
 | Encoding | libx264, `-crf 20 -preset veryfast -pix_fmt yuv420p`, AAC 192k | Plays everywhere, YouTube-friendly. |
@@ -123,6 +123,7 @@ All commands take `--session` and follow the existing CLI conventions.
 
 ```bash
 python -m manhwa_ocr video panels     --chapter N     # split pages into panels
+python -m manhwa_ocr video align      --chapter N     # added later: decide which panel per sentence, see below
 python -m manhwa_ocr video plan       --chapter N     # write/refresh the shot list
 python -m manhwa_ocr video sync       --chapter N     # word timings from the audio
 python -m manhwa_ocr video render     --chapter N     # render the MP4
@@ -132,6 +133,14 @@ python -m manhwa_ocr video build      --chapters 1-7  # all of the above, skips 
 python -m manhwa_ocr video status                     # per chapter: audio? plan? video?
 ```
 
+`video align` (and `chapter_N.alignment.json`) didn't exist in the original
+design below — `video plan` used to decide panel selection itself, reading
+`cues.json`'s tags directly (see Phase 4). That turned out to let a wrong tag
+(or a sentence with nothing to show, like an internal thought) through
+silently. `video align` is now the only place a panel is chosen; `video plan`
+only translates its decisions into shots. See `AGENTS.md`'s "Making videos"
+section for the current pipeline and rules.
+
 `next` gains video steps. Once a chapter has a transcript, a recap and an audio
 file but no video, it prints the exact `video build` command.
 
@@ -140,7 +149,7 @@ Dependencies go in optional extras so OCR-only users aren't affected:
 ```toml
 [project.optional-dependencies]
 video = ["imageio-ffmpeg>=0.5", "numpy>=1.24"]
-sync  = ["faster-whisper>=1.0"]
+sync  = ["pywhispercpp>=1.5"]   # was faster-whisper; see the decisions table above
 ```
 
 When an extra is missing, commands raise `UserError` with the exact install
@@ -303,9 +312,11 @@ still compiles and renders.
 **Goal:** panels switch on the sentence that describes them, within about 0.3s.
 
 - New `manhwa_ocr/video/sync.py`:
-  - `transcribe(audio)`: faster-whisper with `word_timestamps=True`,
-    `vad_filter=True`, model from config (default `small.en`; `base` for speed;
-    multilingual models for Hindi narration). Cache the result in
+  - `transcribe(audio)`: pywhispercpp (whisper.cpp) with word-level timestamps
+    (`token_timestamps=True, split_on_word=True, max_len=1`), model from config
+    (default `base.en`; `tiny.en` for speed/low RAM; multilingual models for
+    Hindi narration). Audio is decoded to mono 16kHz PCM with our own bundled
+    ffmpeg first, so whisper.cpp never needs ffmpeg on PATH. Cache the result in
     `video/chapter_N.timeline.json`, keyed by the audio file's hash, so it runs
     once per recording.
   - `align(script_sentences, words)`: normalise both sides (lowercase, strip
@@ -320,7 +331,7 @@ still compiles and renders.
   unless they change panel.
 - Lead time: a panel appears 0.15s **before** its sentence starts, so the cut
   doesn't feel late. This is configurable.
-- If faster-whisper isn't installed, `video plan` uses even timing and says how
+- If pywhispercpp isn't installed, `video plan` uses even timing and says how
   to enable sync.
 
 **Accept:** a synthetic test using a hand-made word list with known timestamps

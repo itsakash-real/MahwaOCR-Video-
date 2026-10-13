@@ -77,9 +77,10 @@ cd C:\Users\akash\Documents\manhwaOCR
 pip install -e ".[video,sync]"
 ```
 
-`video` brings FFmpeg (rendering). `sync` brings faster-whisper, which hears
-your narration so the pictures change exactly when you talk about them. The
-first sync downloads a speech model (a few hundred MB, once).
+`video` brings FFmpeg (rendering). `sync` brings pywhispercpp (whisper.cpp),
+which hears your narration so the pictures change exactly when you talk about
+them. The first sync downloads a speech model (tens to a couple hundred MB,
+once).
 
 Check it works:
 
@@ -245,11 +246,18 @@ chapter that has audio):
 > `python -m manhwa_ocr video pair --chapters 1-7 --session "the-hero-cannot-rest"`,
 > look at every pairing sheet and fix pairs.json so each sentence has the panel
 > that shows it, then apply it with `--apply`. Then run
-> `python -m manhwa_ocr video build --chapters 1-7 --session "the-hero-cannot-rest"`.
-> For each chapter it builds, open the storyboard images listed in
+> `python -m manhwa_ocr video build --chapters 1-7 --session "the-hero-cannot-rest"`,
+> which runs the alignment step (deciding which panel shows for every sentence,
+> written to chapter_N.alignment.json) before planning and rendering each
+> chapter. For each chapter it builds, open the storyboard images listed in
 > .work/video/chN/REVIEW.md and check that every shot's picture matches the
-> sentence spoken over it. Fix wrong shots in video/chapter_N.plan.json exactly
-> as REVIEW.md describes, set "reviewed": true, then run
+> sentence spoken over it. If a shot's *picture* is wrong, fix it in pairs.json
+> (see above) and re-run `video align` + `video plan --chapter N --force` for
+> that chapter — never edit a shot's `panel` field directly in
+> video/chapter_N.plan.json, it gets overwritten the next time the plan is
+> rebuilt. For a pure presentation fix (crop, entrance, background), edit that
+> shot in video/chapter_N.plan.json as REVIEW.md describes, set
+> "reviewed": true, then run
 > `python -m manhwa_ocr video render --chapter N --session "the-hero-cannot-rest"`
 > for each chapter you changed.
 
@@ -262,9 +270,16 @@ python -m manhwa_ocr video build --chapters 1-7
 What `video build` does, per chapter:
 
 1. **Panels:** splits the pages into individual panels.
-2. **Sync:** listens to your audio and finds when each sentence starts.
-3. **Plan:** decides which picture shows when, how it's cropped, and how it
-   moves.
+2. **Align:** listens to your audio to find when each sentence starts, then
+   deterministically decides which panel shows for every sentence (or, for a
+   sentence that's just a thought or a sound with no visible actor, holds
+   whatever panel is already on screen rather than guessing one). Writes
+   `chapter_N.alignment.json` and validates its own output; this is the only
+   step that decides *which picture*, and the only step whose result you may
+   need to glance over (it prints a short review queue when something's
+   genuinely ambiguous).
+3. **Plan:** turns the alignment's decisions into shots — crop, layout,
+   entrance, background. It never re-decides which panel to show.
 4. **Storyboard:** one frame per shot, so you can check it at a glance.
 5. **Render:** the final 1080p MP4.
 
@@ -304,12 +319,42 @@ The editing follows the usual recap channel style:
 
 ## Step 6 — Review and fix
 
+**`video render` refused with "... never reviewed"?** That's `video align`
+telling you it couldn't resolve some sentences with full confidence — the
+error names them (`sentence numbers: 2, 6, 7, ...`). You don't have to drive
+the review by hand: paste this into Antigravity (or any agent), filling in
+the chapter number and pasting the exact sentence list from the error:
+
+> Chapter {N}, series "{series name}". `video render` refused because these
+> sentences are in the alignment review queue and were never confirmed:
+> {paste the sentence numbers from the error}. For each one: work out which
+> pairing sheet covers it (`.work\video\chN\pairing_NN.png`, 6 sentences per
+> sheet — sentence S is on sheet `ceil(S/6)`), open it, and judge: does the
+> green (currently tagged) panel actually show what that sentence says? If a
+> grey "next" panel fits better, note the change. Only update
+> `.work\video\chN\pairs.json` for sentences you're actually changing — leave
+> the rest alone. Then run, in order: `video pair --chapter N --apply`,
+> `video align --chapter N`, `video plan --chapter N --force`. Some sentences
+> will likely still show in the new review queue even after you've confirmed
+> them — that's expected, the tool has no way to mark "a human already looked"
+> separately from "resolve this with full confidence on your own evidence."
+> List every sentence you kept vs. changed and why, then run
+> `video render --chapter N --force` (force is correct here because you've now
+> actually reviewed the queue, not because you're skipping the check).
+
+This is also exactly what to do for chapters 3 onward the first time you build
+them — `video align` flags whatever it isn't sure about, the same way it did
+here.
+
 **Pictures don't match the words?** That's the pairing. Run
 `python -m manhwa_ocr video pair --chapter N` and open the sheets it lists
 (in `.work\video\chN\`): every sentence is shown with its panel (green) and
 the next panels in the story (grey), so a panel that's one off is easy to see.
-Fix the numbers in `pairs.json`, then `video pair --chapter N --apply`,
-`video plan --chapter N --force` and `video render --chapter N`.
+Fix the numbers in `pairs.json`, then run, in order:
+`video pair --chapter N --apply`, `video align --chapter N` (this is what
+actually decides which picture shows — it must pass its own validation before
+the next step will run), `video plan --chapter N --force`, and
+`video render --chapter N`.
 
 The video always follows these rules: each panel is shown once, panels keep
 their full width (only top and bottom are trimmed), text-only panels are never
@@ -320,16 +365,17 @@ On the dashboard's **Video** tab, each chapter has:
 - **Storyboard:** every shot with its time and the sentence spoken over it.
 - **Preview** / **Video:** play it in the browser. You can seek.
 
-If a shot shows the wrong picture, the agent (or you) edits
-`video\chapter_N.plan.json` and renders again. **Only the changed shots are
-redrawn, so a fix takes seconds.**
+If a shot has the wrong *picture*, that's a pairing/alignment fix (see above),
+not a plan edit — `video\chapter_N.plan.json` is only presentation now.
+Everything else, the agent (or you) edits directly in the plan and renders
+again. **Only the changed shots are redrawn, so a fix takes seconds.**
 
-| To fix… | Change, in that shot | Then |
+| To fix… | Change | Then |
 |---|---|---|
-| wrong picture | `cards[0].panel` (ids are on `media\chN\panels_sheet_*.png`) | `video render --chapter N` |
-| wrong part of the picture | `cards[0].crop`: `[left, top, right, bottom]` as fractions, e.g. `[0, 0.2, 1, 0.7]` | same |
-| animation | `cards[0].enter` (`cut`, `fade_in`, `slide_up`, `blur_in`, `zoom_in`, …) | same |
-| background | `background`: `blur`, `black` or `white` | same |
+| wrong picture | `pairs.json` for that sentence (ids are on `media\chN\panels_sheet_*.png`) | `video align --chapter N`, `video plan --chapter N --force`, `video render --chapter N` |
+| wrong part of the picture | that shot's `cards[0].crop` in the plan: `[left, top, right, bottom]` as fractions, e.g. `[0, 0.2, 1, 0.7]` | `video render --chapter N` |
+| animation | that shot's `cards[0].enter` in the plan (`cut`, `fade_in`, `slide_up`, `blur_in`, `zoom_in`, …) | same |
+| background | that shot's `background` in the plan: `blur`, `black` or `white` | same |
 
 A plan you've edited is never overwritten automatically. `video plan --chapter N
 --force` throws your edits away and starts fresh.
@@ -471,12 +517,16 @@ All in `manhwa-ocr.yaml` in the program folder; changes are picked up next run.
 | Memory file got damaged | Copy `series_memory.prev.json` (the previous good version) back over it |
 | `No narration audio for chapter N` | Step 4: upload it, or save `audio\chapter_N.mp3` |
 | Recap shows **Untagged** on the Video tab | Written before tagging existed. Re-run step 3 for it with `--force`, then record again. |
-| Plan says **Estimated timing** | `pip install -e ".[sync]"`, then `video plan --chapter N --force` |
-| Plan says **Old style** | Made by an older version. `video build --chapters N` rebuilds it; if you had edited it, use `video plan --chapter N --force`. |
-| Video is longer than your narration, or ends on a blank/credits page | Fixed in the current version: rebuild with `video plan --chapter N --force`, then `video render --chapter N` |
-| Speech bubbles or text-only panels in the video | Same: `video plan --chapter N --force` (the panel check improved). Contact sheets mark them "TEXT - don't use". |
-| Pictures drift out of sync with your voice | Make sure you recorded the *current* `tts.txt`. Then `video plan --chapter N --force` and `video render --chapter N`. |
-| `the plan was edited ... left alone` | You changed the audio or recap after editing the plan. `video plan --chapter N --force` rebuilds it (your edits are lost). |
+| Plan says **Estimated timing** | `pip install -e ".[sync]"`, then `video align --chapter N` and `video plan --chapter N --force` |
+| Plan says **Old style** | Made by an older version. `video build --chapters N` rebuilds it; if you had edited it, use `video align --chapter N` then `video plan --chapter N --force`. |
+| `has no alignment yet` | Tagged chapters need `video align --chapter N` run before `video plan` — this is expected, not an error in your setup; `video build` does it for you automatically. |
+| `alignment failed validation` | `video align --chapter N` found a structural problem (a missing panel, a timing gap, an unexplained jump). It prints exactly which sentence and why; fix that in `pairs.json` and re-run `video align`. |
+| `... never reviewed` when rendering | `video align` flagged some sentences it wasn't fully sure about — rendering refuses until you've actually looked. See the agent prompt at the top of Step 6, or `PROMPTS.md`'s checkpointed review. Fix `pairs.json` if needed, re-run `video align` + `video plan --chapter N --force`, then render. (`--force` on render skips this check — only use it once you've actually looked, or deliberately accept the risk.) |
+| Video is longer than your narration, or ends on a blank/credits page | Fixed in the current version: rebuild with `video align --chapter N` and `video plan --chapter N --force`, then `video render --chapter N` |
+| Speech bubbles or text-only panels in the video | Same: `video align --chapter N` then `video plan --chapter N --force` (the panel check improved). Contact sheets mark them "TEXT - don't use". |
+| Pictures drift out of sync with your voice | Make sure you recorded the *current* `tts.txt`. Then `video align --chapter N`, `video plan --chapter N --force` and `video render --chapter N`. |
+| Right picture, wrong moment it appears | That's timing, not selection — check `video status` for "estimated" (see above). If it says "synced", it's a pairing issue: see "Pictures don't match the words" in Step 6. |
+| `the plan was edited ... left alone` | You changed the audio or recap after editing the plan. Re-run `video align --chapter N` (so the alignment reflects the new audio/tags), then `video plan --chapter N --force` rebuilds the plan (your plan edits are lost). |
 | Panels split strangely | Check `media\chN\panels_sheet_*.png`. Tune `video.panels` in `manhwa-ocr.yaml`, then `video panels --chapter N --force` |
 | Want to start a series over | `session archive "<name>" --yes`, then `start` |
 | Something else crashed | Re-run with `MANHWA_DEBUG=1` set to see the full error |

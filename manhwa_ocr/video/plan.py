@@ -37,6 +37,8 @@ from .media import video_dir
 
 PLAN_VERSION = 2
 MIN_SYNC_SHOT = 1.0      # shorter shots merge into the previous one (avoids flicker)
+MAX_SYNC_SHOT = 5.5      # max duration when merging sentences sharing the same panel
+MAX_PAIR_SHOT = 6.5      # max total duration allowed for a 2-panel pair shot
 PUNCH_GAP = 4.0
 EFFECT_GRACE = 0.35
 
@@ -195,6 +197,43 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
         nxt["sentence_starts"] = first["sentence_starts"] + nxt["sentence_starts"]
     units[0]["start"] = 0.0
     units[-1]["end"] = duration
+    return units
+
+
+def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Translate chapter_N.alignment.json's segments into the same unit shape
+    synced_units()/even_units() produce, so everything downstream (pairing,
+    layouts, crops, entrances) is unchanged.
+
+    This is a pure translation, nothing else: the panel for each unit is
+    whatever the alignment already decided (`selected_panel` on SHOW,
+    whatever panel is already current on HOLD_PREVIOUS). No panel is chosen,
+    scored or guessed at here - that already happened in align_engine.py.
+    Consecutive segments that resolve to the same panel are merged into one
+    shot, exactly as synced_units() already does for repeated tags.
+    """
+    units: List[Dict[str, Any]] = []
+
+    def add(unit: Dict[str, Any]) -> None:
+        if units and (unit["end"] - unit["start"] < MIN_SYNC_SHOT or unit["panels"] == units[-1]["panels"]):
+            u = units[-1]
+            u["end"] = unit["end"]
+            if unit["sentence"] and unit["sentence"] != u["sentence"]:
+                u["sentence"] = " ".join(x for x in (u["sentence"], unit["sentence"]) if x)
+            u["sentence_starts"] += unit["sentence_starts"]
+            return
+        units.append(unit)
+
+    current: str | None = None
+    for seg in segments:
+        if seg.get("display_action") == "SHOW" and seg.get("selected_panel"):
+            current = seg["selected_panel"]
+        if current is None:
+            continue  # nothing has ever been shown yet; nothing to hold either
+        add({"start": float(seg["start"]), "end": float(seg["end"]), "panels": [current],
+            "cues": [], "emphasis": [], "sentence": seg.get("text"), "sentence_starts": [float(seg["start"])]})
+    if units:
+        units[0]["start"] = 0.0
     return units
 
 
@@ -365,11 +404,12 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
             # Pair cards are narrow and panels are never cut at the sides, so
             # only portrait-shaped panels pair up.
             wide = lambda p: float(p.get("width") or 1) / max(1.0, float(p.get("height") or 1)) > 1.0  # noqa: E731
-            # Synced: each card must be on screen long enough for its words.
-            long_enough = (not timed or (u["end"] - u["start"] >= 1.2 and v["end"] - v["start"] >= 1.5))
+            # Synced: each card must be on screen long enough for its words, but not too long.
+            long_enough = (not timed or (1.2 <= u["end"] - u["start"] <= 4.0 and 1.5 <= v["end"] - v["start"] <= 4.0))
             if (long_enough and len(u["panels"]) == 1 and len(v["panels"]) == 1
                     and u["panels"][0] != v["panels"][0] and not wide(a) and not wide(b)
-                    and (v["end"] - u["start"]) >= 2.8 and _rng(chapter, 10_000 + i).random() < ratio):
+                    and (2.8 <= (v["end"] - u["start"]) <= MAX_PAIR_SHOT)
+                    and _rng(chapter, 10_000 + i).random() < ratio):
                 # The second card slides in exactly when its own part starts.
                 out.append({**u, "end": v["end"], "panels": [u["panels"][0], v["panels"][0]],
                             "second_at": v["start"] - u["start"],
@@ -386,11 +426,27 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
                vcfg: Dict[str, Any], image_for: Callable[[Dict[str, Any]], Image.Image],
                sentences: List[Dict[str, Any]] | None = None,
-               sync_report: Dict[str, Any] | None = None) -> Dict[str, Any]:
+               sync_report: Dict[str, Any] | None = None,
+               alignment_units: List[Dict[str, Any]] | None = None,
+               alignment_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Turn already-decided panel timing into shots. When `alignment_units` is
+    given (the normal path: chapter_N.alignment.json via units_from_alignment()),
+    this function makes no panel decisions of its own - it only lays out,
+    crops and animates whatever panel each unit already names. `sentences`
+    (cues.json-driven) and the no-tags `even` fallback remain only for direct
+    callers/tests exercising the shot-design logic in isolation; the live
+    `video plan` pipeline (build.py) always passes `alignment_units`.
+    """
     panels = panels_data["panels"]
     fmt = format_from(vcfg.get("format", "16:9"), int(vcfg.get("fps", 30)))
     by_id = {p["id"]: p for p in panels}
-    if sentences:
+    if alignment_units is not None:
+        units = _pair_up(alignment_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
+        # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
+        # not a generic "aligned" label - video render's refusal of an
+        # "estimated" plan must keep working exactly as it did before this.
+        mode = (alignment_meta or {}).get("sync_mode") or "aligned"
+    elif sentences:
         units = _pair_up(synced_units(panels, sentences, duration, vcfg), chapter,
                          float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         mode = "synced"
@@ -408,6 +464,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "duration": round(duration, 3),
         "sync": mode,
         "sync_report": sync_report,
+        "alignment_review_queue": (alignment_meta or {}).get("review_queue"),
         "music": vcfg.get("music"),
         "music_volume": float(vcfg.get("music_volume", 0.22)),
         "effects_enabled": dict(vcfg.get("effects") or {}),

@@ -1,8 +1,8 @@
 """Per-chapter video orchestration: status, planning, rendering, clips, compilations.
 
 Timing quality, best first:
-  synced     recap has panel tags + faster-whisper available: each shot starts
-             when its sentence is actually spoken
+  synced     recap has panel tags + whisper (pywhispercpp) available: each
+             shot starts when its sentence is actually spoken
   estimated  recap has panel tags, no whisper: right panels, sentence times
              estimated from text length
   even       no tags: the audio's length spread across panels
@@ -22,15 +22,14 @@ from typing import Any, Callable, Dict, List
 
 from PIL import Image
 
-from ..memory import SeriesMemory
 from ..util import UserError, atomic_save_image, require_chapter, sort_chapters
+from . import align_engine
 from . import cues as cues_mod
-from . import sync as sync_mod
 from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, run, video_info
 from .frames import background, format_from
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
-from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, validate
+from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, units_from_alignment, validate
 from .render import output_path, render
 from .storyboard import storyboard_paths, write_review_task, write_storyboard
 
@@ -48,7 +47,11 @@ def _shots_hash(plan: Dict[str, Any]) -> str:
 
 def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: str,
             vcfg: Dict[str, Any], duration: float) -> Dict[str, Any]:
-    cp = cues_mod.cues_path(root, chapter)
+    # alignment.json is plan.py's one source of panel-selection truth, so its
+    # own hash (not cues.json's) is what tells us the plan needs rebuilding -
+    # a pairs.json fix doesn't invalidate the cached plan until `video align`
+    # has actually turned it into a new alignment.json.
+    ap = align_engine.alignment_path(root, chapter)
     st = audio.stat() if audio else None
     knobs = {k: vcfg.get(k) for k in ("min_shot", "max_shot", "target_shot", "lead", "pair_ratio", "fps",
                                       "music", "music_volume", "effects")}
@@ -56,7 +59,7 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
         "panels": panels_fp,
         "audio": [audio.name, st.st_size, int(st.st_mtime)] if st else None,
         "duration": round(duration, 2),
-        "cues": hashlib.sha256(cp.read_bytes()).hexdigest()[:16] if cp.exists() else None,
+        "alignment": hashlib.sha256(ap.read_bytes()).hexdigest()[:16] if ap.exists() else None,
         "format": fmt,
         "settings": hashlib.sha256(json.dumps(knobs, sort_keys=True, default=str).encode()).hexdigest()[:12],
     }
@@ -65,12 +68,33 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
 # ------------------------------------------------------------------ status
 
 
+def _alignment_status(root: Path, chapter: str) -> Dict[str, Any] | None:
+    """Read-only peek at chapter_N.alignment.json for `video status` - never
+    regenerates it (that's `video align`'s job), just reports what's there."""
+    path = align_engine.alignment_path(root, chapter)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"broken": True}
+    if not isinstance(data, dict):
+        return {"broken": True}
+    return {
+        "broken": False,
+        "sync_mode": data.get("sync_mode"),
+        "validation_status": (data.get("validation") or {}).get("status"),
+        "review_queue": len(data.get("review_queue") or []),
+    }
+
+
 def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str, Any]:
     """What exists for one chapter's video. probe=True also reads audio length (slower)."""
     chapter = require_chapter(chapter)
     audio = audio_path(root, chapter)
     cues = cues_mod.load_cues(root, chapter)
     panels = load_panels(root, chapter)
+    alignment = _alignment_status(root, chapter)
     plan_file = plan_path(root, chapter)
     plan = None
     if plan_file.exists():
@@ -106,6 +130,7 @@ def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str
         "duration": duration,
         "pages": len(list_pages(root, chapter)),
         "panels": len(panels["panels"]) if panels else 0,
+        "alignment": alignment,
         "plan": None if plan is None else {
             "broken": bool(plan.get("broken")),
             "outdated": bool(plan.get("outdated")),
@@ -186,36 +211,46 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
                     "by hand, so it was left alone. Rebuild it with --force (hand edits will be lost).")
                 return existing
 
-    sentences, report, mode_note = None, None, "even timing (recap has no panel tags)"
-    cue_data = cues_mod.load_cues(root, chapter)
-    if cue_data:
-        base = cue_data["sentences"]
-        words: List[Dict[str, Any]] = []
-        if audio and sync != "off" and sync_mod.available():
-            try:
-                memory = SeriesMemory.load(root / "series_memory.json", sess.name)
-                words = sync_mod.transcribe(
-                    audio, model=vcfg.get("whisper_model", "small.en"), language=vcfg.get("whisper_language"),
-                    initial_prompt=sync_mod.character_prompt(memory), cache=sync_mod.timeline_path(root, chapter),
-                    log=log)
-            except UserError as exc:
-                log(f"  ! {exc} Falling back to estimated timing.")
-        elif audio and sync != "off":
-            log(f"  note: install faster-whisper for exact sync:  {sync_mod.SYNC_HINT}")
-        aligned = sync_mod.align(base, words, duration)
-        sentences = aligned["sentences"]
-        report = {"matched": aligned["matched"] if words else None,
-                  "unmatched": aligned["unmatched"][:8] if words else [],
-                  "tagged": cue_data.get("tagged_ratio")}
-        mode_note = (f"synced to the audio ({aligned['matched']:.0%} of sentences matched)" if words
-                     else "panels from the recap tags, timing estimated from text length")
-
+    # No recap/tags at all is a different, pre-existing case from "has tags but
+    # the alignment is missing/broken": there is nothing to align, so panels
+    # are just spread evenly - this isn't tag-based panel *selection*, nothing
+    # is being selected. Once a chapter has tags, chapter_N.alignment.json
+    # becomes the ONLY source of panel selection: it must already exist (made
+    # with `video align`) and pass validation, with no fallback to reinterpreting
+    # the tags here - a missing or broken alignment stops planning loudly.
     norm_w = panels["norm_width"]
+    if not cues_mod.load_cues(root, chapter):
+        units, mode_note, meta = None, "even timing (recap has no panel tags)", None
+    else:
+        align_path = align_engine.alignment_path(root, chapter)
+        if not align_path.exists():
+            raise UserError(
+                f"Chapter {chapter} has no alignment yet. Run:  video align --chapter {chapter}\n"
+                f"(it decides which panel shows for each sentence; `plan` only turns that into shots.)")
+        try:
+            alignment = json.loads(align_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise UserError(f"Chapter {chapter}'s alignment.json is unreadable ({exc}). "
+                            f"Rebuild it with:  video align --chapter {chapter}") from None
+        if not isinstance(alignment, dict) or not alignment.get("segments"):
+            raise UserError(f"Chapter {chapter}'s alignment.json is invalid (no segments). "
+                            f"Rebuild it with:  video align --chapter {chapter}")
+        av = alignment.get("validation") or {}
+        if av.get("status") != "PASS":
+            problems = "; ".join(f"sentence {p.get('sentence')} [{p.get('check')}]: {p.get('detail')}"
+                                 for p in (av.get("problems") or [])[:5])
+            raise UserError(
+                f"Chapter {chapter}'s alignment failed validation, so planning stopped (no silent fallback):\n"
+                f"  {problems}\nFix it and rebuild with:  video align --chapter {chapter}")
+        units = units_from_alignment(alignment["segments"])
+        queue = alignment.get("review_queue") or []
+        meta = {"sync_mode": alignment.get("sync_mode"), "review_queue": queue}
+        mode_note = (f"{len(alignment['segments'])} sentences from the alignment engine "
+                    f"({alignment.get('sync_mode', '?')} timing, {len(queue)} flagged for review)")
+
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
-                      vcfg={**vcfg, "format": fmt}, sentences=sentences, sync_report=report,
+                      vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
                       image_for=lambda p: panel_image(root, chapter, p, norm_w))
-    if sentences and not report.get("matched"):
-        plan["sync"] = "estimated"
     plan["inputs"] = inputs
     plan["generated_hash"] = _shots_hash(plan)
     errs = validate(plan, {p["id"] for p in panels["panels"]})
@@ -223,22 +258,40 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
     save_plan(root, chapter, plan)
     log(f"  chapter {chapter}: {len(plan['shots'])} shots, {mode_note}")
-    if report and report.get("unmatched"):
-        log("    sentences placed by estimate (check these by ear):")
-        for s in report["unmatched"][:5]:
-            log(f"      - {s[:90]}")
+    if meta and meta.get("review_queue"):
+        log(f"    {len(meta['review_queue'])} sentence(s) flagged for review "
+            f"(see video align's output, or PROMPTS.md)")
     write_storyboard(root, chapter, plan, log=log)
     write_review_task(root, chapter, plan, sess.slug)
     return plan
 
 
 def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: int = 0,
+                   allow_estimated: bool = False, allow_unreviewed: bool = False,
                    log: Callable = print) -> Path:
     root, chapter = sess.path, require_chapter(chapter)
     panels = load_panels(root, chapter)
     if not panels:
         raise UserError(f"No panels for chapter {chapter} yet. Run:  video plan --chapter {chapter}")
     plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    if plan.get("sync") == "estimated" and not allow_estimated:
+        raise UserError(
+            f"Chapter {chapter}'s timing was only estimated from text length, not synced to the real "
+            f"narration (whisper couldn't transcribe it) — the pictures will drift out of sync with the voice.\n"
+            f"Fix the sync first: lower `whisper_model` in manhwa-ocr.yaml (e.g. to base.en or tiny.en if your "
+            f"machine is low on RAM), then rebuild the plan:  video plan --chapter {chapter} --force\n"
+            f"To render with the estimated timing anyway, pass --force to render.")
+    queue = plan.get("alignment_review_queue") or []
+    if queue and not allow_unreviewed:
+        shown = ", ".join(str(n) for n in queue[:15]) + ("..." if len(queue) > 15 else "")
+        raise UserError(
+            f"Chapter {chapter} has {len(queue)} sentence(s) `video align` couldn't resolve with full "
+            f"confidence, never reviewed (sentence numbers: {shown}) — one of these may be the wrong "
+            f"picture for its sentence.\n"
+            f"Look at them first: open .work/video/ch{chapter}/pairing_NN.png for those sentence numbers, "
+            f"or use the checkpointed review template in PROMPTS.md. Fix pairs.json if anything's wrong, "
+            f"then `video align --chapter {chapter}` and `video plan --chapter {chapter} --force` again.\n"
+            f"To render anyway, pass --force to render.")
     if plan.get("panels_fingerprint") and plan["panels_fingerprint"] != panels.get("fingerprint"):
         log("  ! panels were re-detected since this plan was made; shots still reference valid ids, rendering anyway")
     return render(root, chapter, plan, cfg.video, preview=preview, workers=workers, log=log)
@@ -255,6 +308,8 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
             log(f"  no audio yet (save it as audio/chapter_{chapter}.mp3)")
             continue
         try:
+            if cues_mod.load_cues(sess.path, chapter):
+                align_engine.build_alignment(sess.path, chapter, cfg, sync=sync, log=log)
             make_plan(sess, chapter, cfg, force=force, sync=sync, fmt=fmt, log=log)
             out = output_path(sess.path, chapter, preview)
             pf = plan_path(sess.path, chapter)
@@ -262,7 +317,8 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
                 results[chapter] = f"up to date: {out.name}"
                 log(f"  {out.name} is up to date")
                 continue
-            path = render_chapter(sess, chapter, cfg, preview=preview, workers=workers, log=log)
+            path = render_chapter(sess, chapter, cfg, preview=preview, workers=workers,
+                                  allow_estimated=force, allow_unreviewed=force, log=log)
             results[chapter] = f"rendered: {path.name}"
         except UserError as exc:
             results[chapter] = f"failed: {exc}"

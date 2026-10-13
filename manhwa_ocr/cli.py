@@ -640,16 +640,23 @@ def cmd_video(args) -> int:
         if not rows:
             _log("No transcribed chapters yet.")
             return 0
-        _log(f"{'ch':<6}{'recap':<8}{'tags':<7}{'audio':<10}{'panels':<8}{'plan':<26}video")
+        _log(f"{'ch':<6}{'recap':<8}{'tags':<7}{'audio':<10}{'panels':<8}{'align':<12}{'plan':<26}video")
         for r in rows:
             plan = r["plan"]
+            align = r["alignment"]
+            align_s = ("-" if not align else "BROKEN" if align["broken"]
+                      else "FAIL" if align["validation_status"] != "PASS"
+                      else f"{align['review_queue']} review" if align["review_queue"] else "ok")
             plan_s = "-" if not plan else ("BROKEN" if plan["broken"] else "old style: rebuild" if plan["outdated"] else
                                            f"{plan['sync']}{' reviewed' if plan['reviewed'] else ''}{' edited' if plan['edited'] else ''}")
             audio_s = f"{r['duration']:.0f}s" if r["duration"] else ("yes" if r["audio"] else "-")
             video_s = "-" if not r["video"] else ("ok" if r["video_up_to_date"] else "outdated")
             tags = f"{r['tagged']:.0%}" if r["tagged"] is not None else "-"
             _log(f"{r['chapter']:<6}{'yes' if r['recap'] else '-':<8}{tags:<7}{audio_s:<10}{r['panels'] or '-':<8}"
-                 f"{plan_s:<25} {video_s}")
+                 f"{align_s:<12}{plan_s:<25} {video_s}")
+        _log("\n'align' is video align's own check: a sentence it couldn't resolve with full "
+            "confidence (never confirmed by you) shows as \"N review\" - open its pairing sheet "
+            "or PROMPTS.md before trusting the video for that stretch.")
         _log(f"\nAudio goes in: {sess.path / 'audio'}  (chapter_N.mp3 / .wav / .m4a)")
         return 0
 
@@ -693,6 +700,48 @@ def cmd_video(args) -> int:
             _log(f"  check the pictures: {task.relative_to(sess.path).as_posix()}")
         return 0
 
+    if action == "align":
+        from .video import align_engine
+
+        for c in chapters(default_all=False):
+            result = align_engine.build_alignment(sess.path, c, cfg,
+                                                  sync="off" if args.no_sync else "auto", log=_log)
+            segs = result["segments"]
+            counts = {}
+            for s in segs:
+                counts[s["narration_type"]] = counts.get(s["narration_type"], 0) + 1
+            resolved = sum(1 for s in segs if not s["needs_review"])
+            queue = result["review_queue"]
+            _log(f"\n=== Chapter {c} alignment ({result['sync_mode']}) ===")
+            _log(f"  segments: {len(segs)}")
+            for t in ("VISUAL_ACTION", "INTERNAL", "PURE_AUDIO", "SAME"):
+                _log(f"    {t}: {counts.get(t, 0)}")
+            _log(f"  resolved automatically: {resolved}")
+            _log(f"  sent to review: {len(queue)}")
+            if queue:
+                _log("\n  review queue:")
+                by_n = {s["sentence"]: s for s in segs}
+                for n in queue:
+                    s = by_n[n]
+                    _log(f"    #{n}  {s['start']:.1f}s  tagged={s['tagged_panels']}  "
+                        f"window={s['candidate_window']}  reason={s['confidence']}")
+                    _log(f"        {s['text'][:90]}")
+            v = result["validation"]
+            _log(f"\n  validation: {v['status']}")
+            for name, status in v["checks"].items():
+                if status != "PASS":
+                    _log(f"    FAIL: {name}")
+            for p in v["problems"][:15]:
+                _log(f"      sentence {p['sentence']} [{p['check']}]: {p['detail']}")
+            held = [s for s in segs if s["narration_type"] in {"INTERNAL", "PURE_AUDIO", "SAME"} and s["tagged_panels"]]
+            if held:
+                _log("\n  previously force-matched, now held instead (no panel search attempted):")
+                for s in held[:10]:
+                    _log(f"    #{s['sentence']}  was tagged {s['tagged_panels']} -> now HOLD_PREVIOUS "
+                        f"({s['narration_type']}: {s['type_reason']})")
+            _log(f"\n  wrote {align_engine.alignment_path(sess.path, c).relative_to(sess.path).as_posix()}")
+        return 0
+
     if action == "storyboard":
         from .video.panels import load_panels
         from .video.plan import load_plan
@@ -709,7 +758,8 @@ def cmd_video(args) -> int:
     if action == "render":
         for c in chapters(default_all=False):
             _log(f"=== Chapter {c} ===")
-            vb.render_chapter(sess, c, cfg, preview=args.preview, workers=args.workers, log=_log)
+            vb.render_chapter(sess, c, cfg, preview=args.preview, workers=args.workers,
+                              allow_estimated=args.force, allow_unreviewed=args.force, log=_log)
         return 0
 
     if action == "build":
@@ -848,7 +898,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "pair", "plan", "sync", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "storyboard", "render",
                                       "build", "clip", "compile"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")

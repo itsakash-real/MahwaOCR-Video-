@@ -40,11 +40,12 @@ The effect: a character introduced in chapter 1 as "silver hair, red eyes, black
 ```bash
 cd manhwaOCR
 pip install -e .              # transcripts + recaps
-pip install -e ".[video,sync]"   # + recap videos (FFmpeg, faster-whisper)
+pip install -e ".[video,sync]"   # + recap videos (FFmpeg, pywhispercpp)
 ```
 
 Dependencies: `requests`, `pillow`, `pyyaml`, `numpy`. Video adds `imageio-ffmpeg`
-and `faster-whisper`.
+and `pywhispercpp` (whisper.cpp, not faster-whisper — avoids its ctranslate2/MKL
+memory-allocator crashes on ordinary desktops).
 
 If the `manhwa-ocr` command isn't on your PATH after install (common on Windows), use the module form everywhere instead — it behaves identically:
 
@@ -208,9 +209,19 @@ Turns each chapter into a 1080p recap video synced to your recorded narration.
 
 1. **Panels.** Pages are split into panels at their gutters, with panels that
    cross page boundaries handled.
-2. **Panel tags.** The recap writer tags each sentence with its panel, and
-   faster-whisper finds when each sentence is spoken.
-3. **Frames.** Recap-channel editing:
+2. **Panel tags.** The recap writer tags each sentence with the panel it
+   describes.
+3. **Align** (`video align`, deterministic, no AI judgment at render time).
+   Whisper (pywhispercpp) finds when each sentence is spoken; for each
+   sentence, a rule-based classifier decides whether it's even something a
+   panel can show (a thought or a sound with no visible actor holds whatever's
+   already on screen, no search attempted), and otherwise picks a panel from
+   the story's own forward sequence, trusting the tag unless the panel's own
+   OCR'd text gives stronger evidence against it. Writes
+   `chapter_N.alignment.json`, the single source of truth for panel selection,
+   and validates its own output (panels exist, no backward/unexplained jumps,
+   no timing gaps, …) before anything downstream may use it.
+4. **Frames.** Recap-channel editing:
    - hard cuts about every 2.7s;
    - focal crops shown as bordered cards with drop shadows;
    - single, side-by-side (slide-in) and inset layouts;
@@ -219,8 +230,9 @@ Turns each chapter into a 1080p recap video synced to your recorded narration.
      swing, pull down);
    - eased camera moves that settle and hold, all drawn with sub-pixel
      precision.
-4. **Plan.** The result is an editable `plan.json`, reviewed through a
-   storyboard image.
+5. **Plan.** `video plan` only translates the alignment's decisions into an
+   editable `plan.json` (crop, layout, entrance) — it never re-decides which
+   panel to show. Reviewed through a storyboard image.
 
 Editing one shot re-renders only that shot. Also: 9:16 Shorts clips,
 multi-chapter compilations, ducked background music. Design and trade-offs are

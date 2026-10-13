@@ -1,3 +1,7 @@
+---
+trigger: model_decision
+---
+
 # Rules for AI agents (read first, these override everything else)
 
 This folder is the **program**. You may **run** it. You may **never change** it.

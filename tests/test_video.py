@@ -23,7 +23,7 @@ from manhwa_ocr.cli import main as cli  # noqa: E402
 from manhwa_ocr.config import load_config  # noqa: E402
 from manhwa_ocr.sessions import SessionStore  # noqa: E402
 from manhwa_ocr.util import UserError  # noqa: E402
-from manhwa_ocr.video import cues, sync  # noqa: E402
+from manhwa_ocr.video import align_engine, cues, sync  # noqa: E402
 from manhwa_ocr.video.frames import ENTER_DUR, Format, ShotRenderer  # noqa: E402
 from manhwa_ocr.video.media import audio_path, keep_pages, pages_dir  # noqa: E402
 from manhwa_ocr.video.panels import build_panels, detect, load_panels, panel_image  # noqa: E402
@@ -588,6 +588,143 @@ def test_hand_edited_plan_is_not_overwritten(tmp_path):
     vb.make_plan(sess, "1", cfg, sync="off", log=logs.append)
     assert json.loads(pf.read_text())["shots"][0]["cards"][0]["motion"] == "hold"
     assert any("left alone" in line for line in logs)
+
+
+@needs_ffmpeg
+def test_render_refuses_estimated_timing_unless_forced(tmp_path):
+    from manhwa_ocr.video import build as vb
+
+    _, sess, cfg = _session_with_video(tmp_path)
+    cues.write_outputs(sess.path, "1", "{P001-01} The hero wakes up somewhere unfamiliar.", None)
+    build_panels(sess.path, "1", log=lambda *_: None)
+    align_engine.build_alignment(sess.path, "1", cfg, sync="off", log=lambda *_: None)
+    vb.make_plan(sess, "1", cfg, sync="off", log=lambda *_: None)
+    with pytest.raises(UserError, match="only estimated"):
+        vb.render_chapter(sess, "1", cfg, preview=True, log=lambda *_: None)
+    out = vb.render_chapter(sess, "1", cfg, preview=True, allow_estimated=True, log=lambda *_: None)
+    assert out.exists()
+
+
+@needs_ffmpeg
+def test_plan_fails_without_alignment_when_tags_exist(tmp_path):
+    """plan.py must never fall back to reinterpreting cues.json tags itself:
+    a chapter with tags but no chapter_N.alignment.json must fail planning,
+    not quietly build a plan from the raw tags."""
+    from manhwa_ocr.video import build as vb
+
+    _, sess, cfg = _session_with_video(tmp_path)
+    cues.write_outputs(sess.path, "1", "{P001-01} The hero wakes up somewhere unfamiliar.", None)
+    build_panels(sess.path, "1", log=lambda *_: None)
+    with pytest.raises(UserError, match="has no alignment yet"):
+        vb.make_plan(sess, "1", cfg, sync="off", log=lambda *_: None)
+
+
+@needs_ffmpeg
+def test_plan_fails_on_invalid_alignment_json(tmp_path):
+    """A broken alignment.json must fail planning, not fall back to cues.json."""
+    from manhwa_ocr.video import build as vb
+
+    _, sess, cfg = _session_with_video(tmp_path)
+    cues.write_outputs(sess.path, "1", "{P001-01} The hero wakes up somewhere unfamiliar.", None)
+    build_panels(sess.path, "1", log=lambda *_: None)
+    path = align_engine.alignment_path(sess.path, "1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("not valid json {{{", encoding="utf-8")
+    with pytest.raises(UserError, match="unreadable"):
+        vb.make_plan(sess, "1", cfg, sync="off", log=lambda *_: None)
+
+
+@needs_ffmpeg
+def test_plan_fails_when_alignment_validation_failed(tmp_path):
+    """An alignment that failed its own validation must stop planning outright,
+    not silently proceed (or fall back to cues.json) anyway."""
+    from manhwa_ocr.video import build as vb
+
+    _, sess, cfg = _session_with_video(tmp_path)
+    cues.write_outputs(sess.path, "1", "{P001-01} The hero wakes up somewhere unfamiliar.", None)
+    build_panels(sess.path, "1", log=lambda *_: None)
+    align_engine.build_alignment(sess.path, "1", cfg, sync="off", log=lambda *_: None)
+    path = align_engine.alignment_path(sess.path, "1")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["validation"]["status"] = "FAIL"
+    data["validation"]["problems"] = [{"sentence": 1, "check": "panels_exist", "detail": "synthetic failure"}]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(UserError, match="failed validation"):
+        vb.make_plan(sess, "1", cfg, sync="off", log=lambda *_: None)
+
+
+@needs_ffmpeg
+def test_plan_uses_alignment_decision_not_raw_cue_tag(tmp_path):
+    """Even with cues.json present, the plan's shots must reflect the alignment
+    engine's decision, not a direct re-read of the cue tag - proving plan.py
+    truly treats alignment.json as the only source, not a second opinion."""
+    from manhwa_ocr.video import build as vb
+    from manhwa_ocr.video.plan import load_plan
+
+    _, sess, cfg = _session_with_video(tmp_path)
+    cues.write_outputs(sess.path, "1",
+                       "{P001-01} The hero wakes up somewhere unfamiliar. {P001-01} He looks around in shock.",
+                       None)
+    build_panels(sess.path, "1", log=lambda *_: None)
+    align_engine.build_alignment(sess.path, "1", cfg, sync="off", log=lambda *_: None)
+    # Hand-edit the alignment to force sentence 2 onto a different panel than its cue tag.
+    path = align_engine.alignment_path(sess.path, "1")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["segments"][1]["selected_panel"] = "P001-02"
+    data["segments"][1]["display_action"] = "SHOW"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    vb.make_plan(sess, "1", cfg, sync="off", log=lambda *_: None)
+    plan = load_plan(sess.path, "1", {"P001-01", "P001-02", "P001-03", "P002-01"})
+    panels_shown = [c["panel"] for s in plan["shots"] for c in s["cards"]]
+    assert "P001-02" in panels_shown
+
+
+def test_status_surfaces_alignment_review_queue(tmp_path):
+    """A terminal-only user has no agent reading video align's own output for
+    them - `video status` must show a non-empty review queue on its own."""
+    from manhwa_ocr.video import build as vb
+
+    _, sess, cfg = _session_with_video(tmp_path)
+    assert vb.chapter_status(sess.path, "1")["alignment"] is None  # nothing built yet
+
+    cues.write_outputs(sess.path, "1", "{P001-01} The hero wakes up somewhere unfamiliar.", None)
+    build_panels(sess.path, "1", log=lambda *_: None)
+    align_engine.build_alignment(sess.path, "1", cfg, sync="off", log=lambda *_: None)
+    clean = vb.chapter_status(sess.path, "1")["alignment"]
+    assert clean == {"broken": False, "sync_mode": "estimated", "validation_status": "PASS", "review_queue": 0}
+
+    path = align_engine.alignment_path(sess.path, "1")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["review_queue"] = [1]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    flagged = vb.chapter_status(sess.path, "1")["alignment"]
+    assert flagged["review_queue"] == 1
+
+
+@needs_ffmpeg
+def test_render_refuses_unreviewed_alignment_queue_unless_forced(tmp_path):
+    """A non-empty alignment review queue means at least one sentence's panel
+    was never confirmed by a human - rendering must refuse by default, the
+    same way it already refuses "estimated" timing."""
+    from manhwa_ocr.video import build as vb
+
+    _, sess, cfg = _session_with_video(tmp_path)
+    cues.write_outputs(sess.path, "1", "{P001-01} The hero wakes up somewhere unfamiliar.", None)
+    build_panels(sess.path, "1", log=lambda *_: None)
+    align_engine.build_alignment(sess.path, "1", cfg, sync="off", log=lambda *_: None)
+    vb.make_plan(sess, "1", cfg, sync="off", log=lambda *_: None)
+
+    path = vb.plan_path(sess.path, "1")
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    plan["alignment_review_queue"] = [1]
+    path.write_text(json.dumps(plan), encoding="utf-8")
+
+    with pytest.raises(UserError, match="never reviewed"):
+        vb.render_chapter(sess, "1", cfg, preview=True, allow_estimated=True, log=lambda *_: None)
+    out = vb.render_chapter(sess, "1", cfg, preview=True, allow_estimated=True, allow_unreviewed=True,
+                            log=lambda *_: None)
+    assert out.exists()
 
 
 @needs_ffmpeg

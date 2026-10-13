@@ -3,6 +3,17 @@
 Instructions for AI coding agents (Antigravity, OpenCode, Cursor, Claude Code, Aider)
 working in this repo.
 
+**If you are driving the tool for the user (not editing its code):** use only
+`python -m manhwa_ocr <command>`. Never run `python -c` snippets that `import
+manhwa_ocr...`, never call `inspect.getsource(...)` on its modules, never load
+its internal functions directly to "check" or "debug" something — not even to
+read a file faster. If a command's output is confusing or an error doesn't say
+what to do, **stop and show the user the exact command and error**; don't probe
+the source to figure it out yourself. The "Verifying changes" section near the
+bottom of this file, and anything under "Architecture"/"Extending", is for
+whoever edits this package's code — it is not a hint to call those internals
+from your own one-off scripts.
+
 ## What this project is
 
 `manhwa-ocr` turns webtoon/manhwa chapters into recap videos:
@@ -71,11 +82,21 @@ bible out of another's.
 ```bash
 python -m manhwa_ocr session list                  # * marks the active one
 python -m manhwa_ocr start "Series Name" <urls...> # new series, creates AND activates
-python -m manhwa_ocr session info                  # chapters + memory state
+python -m manhwa_ocr session info                  # chapters + memory state (active series only)
 ```
 
-Without `--session`, commands use the active series, and refuse to run if there
-is none. They never fall back to writing in the current folder.
+`session info`/`session use`/`session list` act on the **active** series and do
+**not** take `--session` — that flag only exists on the per-task commands
+(`video`, `recap`, `next`, `status`, `links`, ...). Don't guess at flags; if a
+command errors with something like "unrecognized arguments" or "No active
+series", that's telling you which form it wants — re-read this section rather
+than trying variations. The reliable pattern that needs no active-series state
+at all: always pass `--session "<name>"` directly to the task command you're
+running (`video status --session "<name>"`, `video pair --chapter 2 --session
+"<name>"`, ...); you never need to `session use` first.
+
+Without `--session`, task commands use the active series, and refuse to run if
+there is none. They never fall back to writing in the current folder.
 
 Never use `--workdir` to work around a session issue; it bypasses isolation.
 Never archive a session unless the user explicitly asks.
@@ -232,12 +253,62 @@ the dashboard. `next` tells you which chapters are ready. Then:
 python -m manhwa_ocr video build --chapters 1-7 --session "<name>"
 ```
 
-That splits panels, transcribes the audio with whisper, builds the plan, writes
-a storyboard, and renders. Steps that are already current are skipped.
+That splits panels, then — for every chapter that has panel tags — **explicitly
+runs the alignment step** described below as its own pipeline stage before
+planning and rendering. Steps that are already current are skipped.
 
-**Pairing check first (most important).** The video shows, for each sentence,
-the panel(s) the recap tagged it with. A tag one panel off shows the wrong
-picture for the whole sentence. Before building, run:
+**The production pipeline is `video align → video plan → video render`.**
+For a chapter with panel tags, `chapter_N.alignment.json` is the **single
+source of truth for which panel shows for every sentence**. Nothing downstream
+re-decides this:
+
+- **`video align --chapter N`** reads the recap's tags, the narration audio and
+  the panels, and deterministically decides, per sentence: is this even
+  something a panel can show? `INTERNAL`/`PURE_AUDIO` sentences (a thought, a
+  sound with no visible actor) hold whatever panel is already on screen
+  (`"display_action": "HOLD_PREVIOUS"`, `"selected_panel": null`) — no panel
+  search is attempted for them at all. Everything else gets
+  `"display_action": "SHOW"` with a concrete `"selected_panel"`. It writes
+  `video/chapter_N.alignment.json` and runs its own validator — 8 structural
+  checks (timestamps monotonic, every panel id exists, no backward jumps, no
+  unexplained jumps, panels never shown outside their own interval, no
+  gaps/overlaps, non-visual segments never change panel, segment durations are
+  sane). **This validation must pass before planning or rendering will
+  proceed.** It also prints a review queue: sentences its own evidence (the
+  recap's tag, sequence order, lexical overlap with each panel's own OCR'd
+  text) couldn't resolve with real confidence — this is now the *only* place a
+  panel-content judgment call happens, and it's a short, bounded list instead
+  of the whole chapter.
+- **`video plan --chapter N --force`** *only translates*
+  `chapter_N.alignment.json` into the renderer's shot format — crops, layouts,
+  entrances, pairing two shots side by side for presentation. **It makes no
+  panel-selection decisions of its own: not from `cues.json`'s tags, not from
+  OCR, not from CLIP/embeddings, not from the narration text, not from any
+  heuristic or LLM judgment.** `cues.json` is read for exactly one thing here —
+  whether the chapter has tags at all, which decides whether the no-tags
+  "even" spread applies or an alignment is required. Once a chapter has tags,
+  `video plan` **requires** a `chapter_N.alignment.json` that exists, parses,
+  and whose own `"validation"."status"` is `"PASS"`. If it's **missing,
+  malformed, or failed validation, planning fails explicitly** and tells you to
+  run `video align --chapter N` — it never falls back to reinterpreting the
+  recap's tags itself.
+- **The renderer follows the alignment's decision exactly and never infers a
+  replacement:** `"display_action": "SHOW"` with a `"selected_panel"` shows
+  exactly that panel; `"display_action": "HOLD_PREVIOUS"` with
+  `"selected_panel": null` keeps whatever panel is already on screen.
+
+If `video align`'s review queue isn't empty, use the checkpointed review
+template in `PROMPTS.md` (in the output folder) to resolve it before treating
+the chapter as done — small batches, a real preview clip per batch, the user
+confirms each one. **"Validation passed" is not "nothing to check."**
+Validation only catches structural problems (missing panels, bad timing,
+backward jumps); it can't tell whether a panel's *content* matches the
+sentence — that's exactly what the review queue and `PROMPTS.md`'s checkpoint
+loop are for.
+
+**Pairing check before aligning.** The alignment engine places already-correct
+tags into shots deterministically — it is not a substitute for tagging the
+right panel in the first place. Before running `video align`, run:
 
 ```bash
 python -m manhwa_ocr video pair --chapter N --session "<name>"
@@ -249,10 +320,11 @@ For each row: does the green panel show what the sentence says? If a grey one
 fits better, use it. Edit `.work/video/chN/pairs.json` (sentence number -> list
 of panel ids, in story order; two ids = shown one after the other). Rules:
 never a TEXT/credits panel, never the same panel for two sentences far apart,
-keep story order. Then:
+keep story order. Then run the full pipeline, in order:
 
 ```bash
 python -m manhwa_ocr video pair --chapter N --apply --session "<name>"
+python -m manhwa_ocr video align --chapter N --session "<name>"
 python -m manhwa_ocr video plan --chapter N --force --session "<name>"
 python -m manhwa_ocr video render --chapter N --session "<name>"
 ```
@@ -265,29 +337,51 @@ out where they sit at a panel's top or bottom.
 1. Open the storyboard images listed in `.work/video/chN/REVIEW.md`. Each shot
    shows its cards, its time, its layout, background and entrances, and the
    sentence spoken over it.
-2. If a card doesn't match its sentence, edit that shot in
-   `video/chapter_N.plan.json`. You can change:
-   - `cards[k].panel` (ids are on the contact sheets)
-   - `cards[k].crop` (`[x0, y0, x1, y1]` fractions of the panel; frame the face or action)
-   - `cards[k].enter`, `cards[k].motion`
-   - `layout`, `background`, `effects`
-
-   Keep shots back to back; don't touch `start`/`end` unless you must. Keep
-   entrances varied but calm: most shots should be `cut` + a slow move.
-   **Never put a panel marked "TEXT - don't use" or "CREDITS" on a card.** Those
-   are bubbles, captions, lettering or scanlator pages. The storyboard boxes them
-   in red if they're used. Use `crop` to keep caption boxes out of art panels.
+2. If a card's *panel* doesn't match its sentence, the fix belongs in the
+   pairing tags, not the plan: edit `.work/video/chN/pairs.json` (see "Pairing
+   check" above, or `PROMPTS.md` for an alignment issue the pairing review
+   missed), then re-run `video align` and `video plan --force` for that
+   chapter. You may still hand-edit `video/chapter_N.plan.json` directly for
+   pure presentation — `crop`, `enter`, `motion`, `layout`, `background`,
+   `effects` — but **never `cards[k].panel`**: that field is the alignment's
+   decision, copied in by `video plan`; changing it in the plan doesn't change
+   the alignment, so the next `video align`/`video plan --force` silently
+   overwrites your edit.
 3. Set `"reviewed": true` and run `video render --chapter N --session "<name>"`.
    Only edited shots re-render.
 
 Rules:
-- **Edit the plan, never the MP4, the segments or anything in `.work/`.**
+- **Fix a wrong picture in pairs.json/the recap tags, never in the plan.** The
+  plan only carries presentation fields now; which panel shows for which
+  sentence lives in `chapter_N.alignment.json`, produced by `video align`.
 - A plan with hand edits or `reviewed: true` is never overwritten automatically.
   `--force` rebuilds it and discards edits; don't use it unless asked.
 - Sync needs panel tags in the recap. If `video status` shows "Untagged", the
   recap predates tagging. **Ask the user before fixing it**, because the fix is
   `recap --chapters N --prepare --force` (rewrite with tags), and then they
-  must re-record. Without tags the video still builds, just with even timing.
+  must re-record. Without tags the video still builds, just with even timing —
+  and no alignment step applies, since there is nothing to align.
+- **"estimated" vs "synced" in `video status`'s plan column is not cosmetic.**
+  "synced" means `video align`'s whisper step actually time-aligned the
+  narration audio; "estimated" means whisper failed (often low RAM —
+  `mkl_malloc`-style errors) and shot timing was guessed from sentence length,
+  so the picture visibly drifts from the voice as the chapter goes on.
+  `video render` refuses an "estimated" plan by default for exactly this
+  reason. If you hit that refusal: don't pass `--force` to push through it —
+  tell the user whisper is failing, suggest lowering `whisper_model` in
+  `manhwa-ocr.yaml` (e.g. `small.en` → `base.en` or `tiny.en` if the machine is
+  RAM-constrained), then re-run `video align --chapter N` and
+  `video plan --chapter N --force`, and check `video status` again for
+  "synced" before rendering.
+- **`video render` also refuses by default when `video align`'s review queue
+  for that chapter isn't empty** — it means at least one sentence's panel was
+  never confirmed by a human, and rendering anyway risks shipping the next
+  vampire-panel-style mistake unseen. The error names the flagged sentence
+  numbers. Don't pass `--force` to push through it — open the pairing sheets
+  for those sentences (`.work/video/chN/pairing_NN.png`) or use `PROMPTS.md`'s
+  checkpointed review template, fix `pairs.json` if anything's wrong, then
+  `video align --chapter N` and `video plan --chapter N --force` again before
+  rendering.
 - Plans made for the old editing style are rebuilt automatically by
   `video build`. If such a plan had hand edits, it stops and asks for
   `video plan --chapter N --force`; ask the user before running that.
