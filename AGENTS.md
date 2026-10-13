@@ -226,167 +226,54 @@ someone else's script. Do not paste transcript dialogue in bulk.
 
 ## Making videos
 
-Each chapter becomes a 1080p recap video cut to the user's recorded narration,
-in the style of `manhwa_recap_style_spec.md`:
-
-- **Hard cuts**, about one shot per sentence (about 2.7s on average, 1–5s).
-- **Cards, not full panels.** Each shot shows a focal crop of a panel (faces,
-  action) as a card with a white border, rounded corners and a black drop shadow.
-- **Layouts:** `single` (one card centred), `pair` (the first card starts
-  centred, then slides left while a second slides in from the right), `inset`
-  (a card over a blurred close-up of another panel) and `wide` (full width).
-- **Backgrounds:** `blur` (a blurred, darkened copy of the panel), `black` or
-  `white`.
-- **Calm motion.** CapCut-style entrances (`fade_in`, `slide_up`, `blur_in`,
-  `zoom_in`, `fit_in_frame`, `swing_right`, `pull_down`, …) take 0.6–0.8s.
-  The camera move eases out over at most 2.6s, then holds still.
-- **Effects** are tied to cues and off by default, except for a small shake on
-  `{impact}`.
-
-The design is in `docs/VIDEO_BUILD_PLAN.md`.
-
-Only build a video for a chapter once the user has put its narration in place:
-`audio/chapter_N.mp3` (or `.wav`, `.m4a`) in the series folder, or uploaded from
-the dashboard. `next` tells you which chapters are ready. Then:
+Once the user has recorded `audio/chapter_N.mp3` (or `.wav`, `.m4a`), build the
+video with one terminal command. No agent review is needed:
 
 ```bash
 python -m manhwa_ocr video build --chapters 1-7 --session "<name>"
 ```
 
-That splits panels, then — for every chapter that has panel tags — **explicitly
-runs the alignment step** described below as its own pipeline stage before
-planning and rendering. Steps that are already current are skipped.
+What the tool does, in order, all deterministic:
 
-**The production pipeline is `video align → video plan → video render`.**
-For a chapter with panel tags, `chapter_N.alignment.json` is the **single
-source of truth for which panel shows for every sentence**. Nothing downstream
-re-decides this:
+1. **Align** (`video align`): decides which panel shows for each sentence, from
+   the recap's tags and the narration's timing. Writes
+   `video/chapter_N.alignment.json`.
+2. **Coverage**: every drawn panel must appear. A panel no sentence picked is
+   placed in story order, into a nearby sentence, and listed under
+   `placed_by_order` in the QA file. Text-only panels (captions, blank or white
+   pages, credits) are the only ones left out, and they are listed too.
+3. **Plan** (`video plan`): turns the alignment into shots. Every card has one of
+   the allowed shapes (landscape: 3:4, 1:1, 4:3, 16:9; portrait: 9:16, 3:4, 1:1).
+   Cards of one layout share the same area. Every shot holds at least 3 seconds
+   (`min_hold` in `manhwa-ocr.yaml`); a short sentence shares its shot with the
+   next one, as a pair of cards. Crops are slid to avoid speech bubbles and
+   captions, and never cut a detected head.
+4. **QA** (`video/chapter_N.qa.json`): objective checks. The build stops only on
+   hard failures: a drawn panel that would never appear, a card that isn't an
+   allowed shape, or a shot under the minimum. Otherwise it renders.
+5. **Render** (`video render`): 1080p MP4.
 
-- **`video align --chapter N`** reads the recap's tags, the narration audio and
-  the panels, and deterministically decides, per sentence: is this even
-  something a panel can show? `INTERNAL`/`PURE_AUDIO` sentences (a thought, a
-  sound with no visible actor) hold whatever panel is already on screen
-  (`"display_action": "HOLD_PREVIOUS"`, `"selected_panel": null`) — no panel
-  search is attempted for them at all. Everything else gets
-  `"display_action": "SHOW"` with a concrete `"selected_panel"`. It writes
-  `video/chapter_N.alignment.json` and runs its own validator — 8 structural
-  checks (timestamps monotonic, every panel id exists, no backward jumps, no
-  unexplained jumps, panels never shown outside their own interval, no
-  gaps/overlaps, non-visual segments never change panel, segment durations are
-  sane). **This validation must pass before planning or rendering will
-  proceed.** It also prints a review queue: sentences its own evidence (the
-  recap's tag, sequence order, lexical overlap with each panel's own OCR'd
-  text) couldn't resolve with real confidence — this is now the *only* place a
-  panel-content judgment call happens, and it's a short, bounded list instead
-  of the whole chapter.
-- **`video plan --chapter N --force`** *only translates*
-  `chapter_N.alignment.json` into the renderer's shot format — crops, layouts,
-  entrances, pairing two shots side by side for presentation. **It makes no
-  panel-selection decisions of its own: not from `cues.json`'s tags, not from
-  OCR, not from CLIP/embeddings, not from the narration text, not from any
-  heuristic or LLM judgment.** `cues.json` is read for exactly one thing here —
-  whether the chapter has tags at all, which decides whether the no-tags
-  "even" spread applies or an alignment is required. Once a chapter has tags,
-  `video plan` **requires** a `chapter_N.alignment.json` that exists, parses,
-  and whose own `"validation"."status"` is `"PASS"`. If it's **missing,
-  malformed, or failed validation, planning fails explicitly** and tells you to
-  run `video align --chapter N` — it never falls back to reinterpreting the
-  recap's tags itself.
-- **The renderer follows the alignment's decision exactly and never infers a
-  replacement:** `"display_action": "SHOW"` with a `"selected_panel"` shows
-  exactly that panel; `"display_action": "HOLD_PREVIOUS"` with
-  `"selected_panel": null` keeps whatever panel is already on screen.
+Gates:
+- Timing that is only estimated (whisper unavailable) stops the render, unless
+  `--force` is given. Fix it by lowering `whisper_model` in `manhwa-ocr.yaml`.
+- Sentences flagged for review in the alignment are warnings, listed in the QA
+  file. `video render --strict` makes them stop the render instead.
 
-If `video align`'s review queue isn't empty, use the checkpointed review
-template in `PROMPTS.md` (in the output folder) to resolve it before treating
-the chapter as done — small batches, a real preview clip per batch, the user
-confirms each one. **"Validation passed" is not "nothing to check."**
-Validation only catches structural problems (missing panels, bad timing,
-backward jumps); it can't tell whether a panel's *content* matches the
-sentence — that's exactly what the review queue and `PROMPTS.md`'s checkpoint
-loop are for.
+Check a chapter's state with `video status --session "<name>"`. Run
+`video build --chapter N --force` only to rebuild a plan from scratch; it
+discards hand edits, so ask the user first.
 
-**Pairing check before aligning.** The alignment engine places already-correct
-tags into shots deterministically — it is not a substitute for tagging the
-right panel in the first place. Before running `video align`, run:
+**Fix a wrong picture in the recap tags, not in the plan.** The plan carries
+presentation only. To change which panel a sentence shows, edit the recap's
+panel tags (`recaps/chapter_N.cues.json`), then rebuild. Never edit
+`cards[k].panel` in the plan by hand: the next build overwrites it.
 
-```bash
-python -m manhwa_ocr video pair --chapter N --session "<name>"
-```
+**Never rewrite a recap whose chapter already has audio** (`audio/chapter_N.*`)
+unless the user asks. Their recording would no longer match the script.
 
-Open every `pairing_NN.png` listed in `.work/video/chN/PAIRING.md`. Each row is
-one sentence: green = its tagged panel(s), grey = the next panels in the story.
-For each row: does the green panel show what the sentence says? If a grey one
-fits better, use it. Edit `.work/video/chN/pairs.json` (sentence number -> list
-of panel ids, in story order; two ids = shown one after the other). Rules:
-never a TEXT/credits panel, never the same panel for two sentences far apart,
-keep story order. Then run the full pipeline, in order:
-
-```bash
-python -m manhwa_ocr video pair --chapter N --apply --session "<name>"
-python -m manhwa_ocr video align --chapter N --session "<name>"
-python -m manhwa_ocr video plan --chapter N --force --session "<name>"
-python -m manhwa_ocr video render --chapter N --session "<name>"
-```
-
-The video itself enforces: each panel shown once (no repeats), panels never cut
-at the sides (only top/bottom), no text-only panels, captions/bubbles cropped
-out where they sit at a panel's top or bottom.
-
-**Review loop:**
-1. Open the storyboard images listed in `.work/video/chN/REVIEW.md`. Each shot
-   shows its cards, its time, its layout, background and entrances, and the
-   sentence spoken over it.
-2. If a card's *panel* doesn't match its sentence, the fix belongs in the
-   pairing tags, not the plan: edit `.work/video/chN/pairs.json` (see "Pairing
-   check" above, or `PROMPTS.md` for an alignment issue the pairing review
-   missed), then re-run `video align` and `video plan --force` for that
-   chapter. You may still hand-edit `video/chapter_N.plan.json` directly for
-   pure presentation — `crop`, `enter`, `motion`, `layout`, `background`,
-   `effects` — but **never `cards[k].panel`**: that field is the alignment's
-   decision, copied in by `video plan`; changing it in the plan doesn't change
-   the alignment, so the next `video align`/`video plan --force` silently
-   overwrites your edit.
-3. Set `"reviewed": true` and run `video render --chapter N --session "<name>"`.
-   Only edited shots re-render.
-
-Rules:
-- **Fix a wrong picture in pairs.json/the recap tags, never in the plan.** The
-  plan only carries presentation fields now; which panel shows for which
-  sentence lives in `chapter_N.alignment.json`, produced by `video align`.
-- A plan with hand edits or `reviewed: true` is never overwritten automatically.
-  `--force` rebuilds it and discards edits; don't use it unless asked.
-- Sync needs panel tags in the recap. If `video status` shows "Untagged", the
-  recap predates tagging. **Ask the user before fixing it**, because the fix is
-  `recap --chapters N --prepare --force` (rewrite with tags), and then they
-  must re-record. Without tags the video still builds, just with even timing —
-  and no alignment step applies, since there is nothing to align.
-- **"estimated" vs "synced" in `video status`'s plan column is not cosmetic.**
-  "synced" means `video align`'s whisper step actually time-aligned the
-  narration audio; "estimated" means whisper failed (often low RAM —
-  `mkl_malloc`-style errors) and shot timing was guessed from sentence length,
-  so the picture visibly drifts from the voice as the chapter goes on.
-  `video render` refuses an "estimated" plan by default for exactly this
-  reason. If you hit that refusal: don't pass `--force` to push through it —
-  tell the user whisper is failing, suggest lowering `whisper_model` in
-  `manhwa-ocr.yaml` (e.g. `small.en` → `base.en` or `tiny.en` if the machine is
-  RAM-constrained), then re-run `video align --chapter N` and
-  `video plan --chapter N --force`, and check `video status` again for
-  "synced" before rendering.
-- **`video render` also refuses by default when `video align`'s review queue
-  for that chapter isn't empty** — it means at least one sentence's panel was
-  never confirmed by a human, and rendering anyway risks shipping the next
-  vampire-panel-style mistake unseen. The error names the flagged sentence
-  numbers. Don't pass `--force` to push through it — open the pairing sheets
-  for those sentences (`.work/video/chN/pairing_NN.png`) or use `PROMPTS.md`'s
-  checkpointed review template, fix `pairs.json` if anything's wrong, then
-  `video align --chapter N` and `video plan --chapter N --force` again before
-  rendering.
-- Plans made for the old editing style are rebuilt automatically by
-  `video build`. If such a plan had hand edits, it stops and asks for
-  `video plan --chapter N --force`; ask the user before running that.
-- `--preview` renders a fast 480p check; `video clip --from A --to B --format 9:16`
-  makes a Short; `video compile --chapters 1-7` joins chapters with title cards.
+**Tag every sentence with its panel.** Recap tags tell the video which panel
+a sentence is about. Recap writing is the one AI step left in the video
+pipeline; everything after the tags is deterministic.
 
 ## Running it (provider mode)
 

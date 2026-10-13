@@ -8,6 +8,7 @@ generated tones, and are skipped if FFmpeg isn't available.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
 import urllib.error
@@ -27,7 +28,7 @@ from manhwa_ocr.video import align_engine, cues, sync  # noqa: E402
 from manhwa_ocr.video.frames import ENTER_DUR, Format, ShotRenderer  # noqa: E402
 from manhwa_ocr.video.media import audio_path, keep_pages, pages_dir  # noqa: E402
 from manhwa_ocr.video.panels import build_panels, detect, load_panels, panel_image  # noqa: E402
-from manhwa_ocr.video.plan import build_plan, even_units, validate  # noqa: E402
+from manhwa_ocr.video.plan import build_plan, even_units, hold_groups, validate  # noqa: E402
 
 
 def _ffmpeg_ok() -> bool:
@@ -292,13 +293,14 @@ def test_even_plan_covers_audio_exactly():
 
 
 def test_even_plan_keeps_a_calm_pace():
-    # 40 panels in 30s: show a selection at ~2.7s each, never half-second flicker.
+    # 40 panels in 120s: every panel shown, each shot held at least min_hold.
     many = [{"id": f"P0{i // 10 + 1:02d}-{i % 10 + 1:02d}", "width": 300, "height": 400, "text": ""}
             for i in range(40)]
-    units = even_units(many, 30.0, VCFG)
-    durs = [u["end"] - u["start"] for u in units]
-    assert min(durs) >= VCFG["min_shot"] - 0.01
-    assert sum(durs) / len(durs) == pytest.approx(2.7, abs=0.4)
+    shots, stats = hold_groups(even_units(many, 120.0, VCFG), 3.0)
+    durs = [s["end"] - s["start"] for s in shots]
+    assert min(durs) >= 3.0 - 0.01
+    shown = {p for s in shots for p in s["panels"]}
+    assert shown == {p["id"] for p in many}
 
 
 def test_even_plan_skips_text_only_panels():
@@ -307,9 +309,10 @@ def test_even_plan_skips_text_only_panels():
     assert "P001-02" not in used
 
 
-def test_even_plan_cycles_panels_for_long_audio():
+def test_even_plan_never_repeats_or_drops_a_panel_for_long_audio():
     units = even_units(PANELS[:2], 60.0, VCFG)
-    assert len(units) > 2 and max(u["end"] - u["start"] for u in units) <= VCFG["max_shot"] + 0.01
+    assert [u["panels"][0] for u in units] == ["P001-01", "P001-02"]
+    assert units[-1]["end"] == pytest.approx(60.0)
 
 
 def test_synced_plan_follows_sentences_and_places_effects():
@@ -360,11 +363,17 @@ def test_no_panel_is_shown_twice_in_a_row():
     assert sorted(seq) == sorted(set(seq)) == ["P001-01", "P001-03", "P001-05"]   # each panel once
 
 
-def test_crops_never_cut_the_sides_and_pans_are_vertical():
+def test_crops_are_vertical_pans_and_always_an_allowed_shape():
+    from manhwa_ocr.video.frames import format_from, shapes_for
+
+    fmt = format_from("16:9", 30)
     for s in _plan(40.0)["shots"]:
         for c in s["cards"]:
-            assert c["crop"][0] == 0.0 and c["crop"][2] == 1.0
             assert c["motion"] not in ("pan_left", "pan_right")
+            p = next(x for x in PANELS if x["id"] == c["panel"])
+            x0, y0, x1, y1 = c["crop"]
+            aspect = (x1 - x0) * p["width"] / ((y1 - y0) * p["height"])
+            assert min(abs(math.log(aspect / a)) for a in shapes_for(s["layout"], fmt)) < 0.02
 
 
 def test_text_only_tags_show_the_nearest_drawn_panel():
@@ -535,6 +544,7 @@ def _session_with_video(tmp_path, seconds=4):
          str(sess.path / "audio" / "chapter_1.mp3")])
     cfg = load_config(series__workdir=str(sess.path), series__name="Vid")
     cfg.video["workers"] = 1
+    cfg.video["min_hold"] = 1.0   # short test clips; the 3 s floor has its own tests
     return store, sess, cfg
 
 
@@ -721,10 +731,14 @@ def test_render_refuses_unreviewed_alignment_queue_unless_forced(tmp_path):
     path.write_text(json.dumps(plan), encoding="utf-8")
 
     with pytest.raises(UserError, match="never reviewed"):
-        vb.render_chapter(sess, "1", cfg, preview=True, allow_estimated=True, log=lambda *_: None)
+        vb.render_chapter(sess, "1", cfg, preview=True, allow_estimated=True, strict=True, log=lambda *_: None)
     out = vb.render_chapter(sess, "1", cfg, preview=True, allow_estimated=True, allow_unreviewed=True,
-                            log=lambda *_: None)
+                            strict=True, log=lambda *_: None)
     assert out.exists()
+    # Without --strict a flagged sentence is only a warning: the video still renders.
+    logs = []
+    assert vb.render_chapter(sess, "1", cfg, preview=True, allow_estimated=True, log=logs.append).exists()
+    assert any("flagged for review" in line for line in logs)
 
 
 @needs_ffmpeg
@@ -745,7 +759,7 @@ def test_clip_and_compile(tmp_path):
 @needs_ffmpeg
 def test_cli_video_build_and_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("MANHWA_SESSIONS_ROOT", str(tmp_path))
-    store, sess, _ = _session_with_video(tmp_path)
+    store, sess, _ = _session_with_video(tmp_path, seconds=12)   # the real config's 3 s minimum needs room
     store.activate(sess.slug)
     assert cli(["video", "build", "--chapters", "1", "--preview", "--no-sync", "--workers", "1"]) == 0
     assert cli(["video", "status"]) == 0

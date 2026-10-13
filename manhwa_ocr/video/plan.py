@@ -26,13 +26,13 @@ import math
 import random
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Tuple
 
 from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
-from .crops import clean_crop, tone
-from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, crop_aspect, format_from
+from .crops import _panel_maps, choose_shape, tone
+from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
 from .media import video_dir
 
 PLAN_VERSION = 2
@@ -41,6 +41,7 @@ MAX_SYNC_SHOT = 5.5      # max duration when merging sentences sharing the same 
 MAX_PAIR_SHOT = 6.5      # max total duration allowed for a 2-panel pair shot
 PUNCH_GAP = 4.0
 EFFECT_GRACE = 0.35
+MIN_HOLD = 3.0           # seconds: no picture is held on screen for less than this
 
 ENTRANCE_WEIGHTS = [("cut", 50), ("fade_in", 10), ("fit_in_frame", 9), ("zoom_in", 8), ("blur_in", 7),
                     ("slide_up", 5), ("pull_down", 4), ("swing_right", 4), ("slide_down", 3)]
@@ -70,45 +71,18 @@ def _pick(rng: random.Random, weights, avoid: str | None = None) -> str:
 
 
 def even_units(panels: List[Dict[str, Any]], duration: float, vcfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Spread the audio over the panels: ~2.7s each, longer for text-heavy ones."""
+    """No tags: every drawn panel, in story order, shares the narration's length.
+    Longer and text-heavier panels get a little more time. Nothing is dropped:
+    text-only panels (captions, blank pages, credits) are the only exclusion,
+    and hold_groups() makes sure no shot is shorter than min_hold."""
     if not panels:
         raise UserError("No panels to put in the video.")
-    lo = float(vcfg.get("min_shot", 1.0))
-    hi = max(lo + 0.5, float(vcfg.get("max_shot", 5.0)))
-    target = min(hi, max(lo, float(vcfg.get("target_shot", 2.7))))
-    fits = max(1, int(duration / target))
-    # Recap videos show art, not speech bubbles: the narration carries the
-    # dialogue. Use text-only panels only if there's too little art to fill time.
-    art = [p for p in panels if not p.get("text_only")]
-    if len(art) >= min(len(panels), fits) or len(art) >= 0.5 * len(panels):
-        panels = art or panels
-    if len(panels) > fits:
-        # More panels than the narration has time for. Squeezing them all in
-        # gives frantic half-second shots, so show an evenly spaced selection:
-        # story order and coverage are kept, and the pacing stays calm.
-        step = len(panels) / fits
-        panels = [panels[min(len(panels) - 1, int(i * step + step / 2))] for i in range(fits)]
-    rounds = max(1, math.ceil(duration / (len(panels) * hi)))
-    seq = [p for _ in range(rounds) for p in panels]
-    weights = [1.0 + min(len(p.get("text") or ""), 300) / 150 + (0.4 if p.get("tall") else 0) for p in seq]
-    n = len(seq)
-    if n * lo >= duration:
-        durs = [duration / n] * n
-    else:
-        fixed: Dict[int, float] = {}
-        for _ in range(n + 1):
-            free = [i for i in range(n) if i not in fixed]
-            remaining = duration - sum(fixed.values())
-            wsum = sum(weights[i] for i in free) or 1.0
-            trial = {i: remaining * weights[i] / wsum for i in free}
-            clamped = {i: (lo if d < lo else hi) for i, d in trial.items() if d < lo or d > hi}
-            if not clamped:
-                fixed.update(trial)
-                break
-            fixed.update(clamped)
-        durs = [fixed[i] for i in range(n)]
+    art = [p for p in panels if not p.get("text_only")] or list(panels)
+    weights = [1.0 + min(len(p.get("text") or ""), 300) / 150 + (0.4 if p.get("tall") else 0) for p in art]
+    total = sum(weights) or 1.0
     units, t = [], 0.0
-    for p, d in zip(seq, durs):
+    for p, w in zip(art, weights):
+        d = duration * w / total
         units.append({"start": t, "end": t + d, "panels": [p["id"]], "cues": [], "emphasis": [],
                       "sentence": None, "sentence_starts": [t]})
         t += d
@@ -215,7 +189,10 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     units: List[Dict[str, Any]] = []
 
     def add(unit: Dict[str, Any]) -> None:
-        if units and (unit["end"] - unit["start"] < MIN_SYNC_SHOT or unit["panels"] == units[-1]["panels"]):
+        # Only the same panel in a row is merged. A short unit of a different
+        # panel stays its own unit: hold_groups() gives it time, so no panel is
+        # ever dropped here.
+        if units and unit["panels"] == units[-1]["panels"]:
             u = units[-1]
             u["end"] = unit["end"]
             if unit["sentence"] and unit["sentence"] != u["sentence"]:
@@ -227,14 +204,99 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     current: str | None = None
     for seg in segments:
         if seg.get("display_action") == "SHOW" and seg.get("selected_panel"):
-            current = seg["selected_panel"]
-        if current is None:
+            # "sequence" = every panel this sentence shows, in story order
+            # (the selected one plus any the coverage pass placed in it).
+            # A hand-edited selected_panel replaces the panel the alignment chose;
+            # the coverage extras placed in this sentence are kept, so no panel is
+            # dropped by an edit.
+            sel = seg["selected_panel"]
+            old = seg.get("selected_by_align")
+            extras = [p for p in (seg.get("sequence") or []) if p not in (sel, old)]
+            seq = [sel, *extras] if sel != old and extras else (seg.get("sequence") or [sel])
+            if sel not in seq:
+                seq = [sel, *seq]
+            current = seq[-1]     # the panel left on screen after this sentence
+        else:
+            seq = [current] if current is not None else []
+        if not seq:
             continue  # nothing has ever been shown yet; nothing to hold either
-        add({"start": float(seg["start"]), "end": float(seg["end"]), "panels": [current],
-            "cues": [], "emphasis": [], "sentence": seg.get("text"), "sentence_starts": [float(seg["start"])]})
+        start, end = float(seg["start"]), float(seg["end"])
+        step = (end - start) / len(seq)
+        for k, pid in enumerate(seq):
+            a = start + k * step
+            b = end if k == len(seq) - 1 else a + step
+            add({"start": a, "end": b, "panels": [pid], "cues": [], "emphasis": [],
+                 "sentence": seg.get("text") if k == 0 else None,
+                 "sentence_starts": [start] if k == 0 else [a]})
     if units:
         units[0]["start"] = 0.0
     return units
+
+
+def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Pack timed single-panel units into shots that each hold >= min_hold.
+
+    A unit shorter than min_hold is paired with its neighbour: the two panels
+    share one shot (one after the other, the second sliding in). A pair that is
+    still too short takes time from a neighbouring shot by moving only the
+    boundary between them, so the total length and every panel stay as they are.
+    Returns (shots, stats). Raises UserError if the narration can't hold them.
+    """
+    if not units:
+        return [], {"min_hold": min_hold, "shots": 0, "pairs": 0, "retimed": 0, "moved_seconds": 0.0}
+    groups: List[List[Dict[str, Any]]] = []
+    i = 0
+    while i < len(units):
+        g = [units[i]]
+        i += 1
+        while sum(u["end"] - u["start"] for u in g) < min_hold and len(g) < 2 and i < len(units):
+            g.append(units[i])
+            i += 1
+        groups.append(g)
+
+    n = len(groups)
+    b = [g[0]["start"] for g in groups] + [groups[-1][-1]["end"]]  # group k spans b[k]..b[k+1]
+    retimed: set = set()
+    moved = 0.0
+    for _ in range(4 * n + 4):
+        short = next((k for k in range(n) if b[k + 1] - b[k] < min_hold - 1e-6), None)
+        if short is None:
+            break
+        need = min_hold - (b[short + 1] - b[short])
+        donor = next((j for j in sorted(range(n), key=lambda j: abs(j - short))
+                      if j != short and b[j + 1] - b[j] - need >= min_hold - 1e-6), None)
+        if donor is None:
+            raise UserError(
+                f"The narration is too short to hold {len(units)} panels for {min_hold:g}s each. "
+                f"Record a longer narration, or lower min_hold in manhwa-ocr.yaml.")
+        if donor > short:
+            for m in range(short + 1, donor + 1):
+                b[m] += need
+        else:
+            for m in range(donor + 1, short + 1):
+                b[m] -= need
+        retimed.update({short, donor})
+        moved += need
+
+    shots: List[Dict[str, Any]] = []
+    pairs = 0
+    for k, g in enumerate(groups):
+        start, end = b[k], b[k + 1]
+        if len(g) == 1:
+            shots.append({**g[0], "start": start, "end": end})
+            continue
+        pairs += 1
+        a, c = g
+        shots.append({"start": start, "end": end, "panels": [a["panels"][0], c["panels"][0]],
+                      "cues": a["cues"] + c["cues"], "emphasis": a["emphasis"] + c["emphasis"],
+                      "sentence": " ".join(x for x in (a.get("sentence"), c.get("sentence")) if x) or None,
+                      "sentence_starts": a["sentence_starts"] + c["sentence_starts"],
+                      "second_at": c["start"] - a["start"]})
+    shots[0]["start"] = 0.0
+    shots[-1]["end"] = units[-1]["end"]
+    stats = {"min_hold": min_hold, "shots": len(shots), "pairs": pairs,
+             "retimed": len(retimed), "moved_seconds": round(moved, 3)}
+    return shots, stats
 
 
 # ------------------------------------------------------------------ shot design
@@ -249,7 +311,9 @@ class _Designer:
         self.by_id = {p["id"]: p for p in panels}
         self.image_for = image_for
         self._img: Dict[str, Image.Image] = {}
-        self._crops: Dict[tuple, List[List[float]]] = {}
+        self._crops: Dict[tuple, List[float]] = {}
+        self._maps: Dict[str, Any] = {}
+        self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": []}
         self._tone: Dict[str, str] = {}
         self.uses: Dict[str, int] = {}
         self.prev_enter: str | None = None
@@ -268,15 +332,17 @@ class _Designer:
         return float(p.get("width") or 1) / max(1.0, float(p.get("height") or 1))
 
     def crop(self, pid: str, layout: str) -> List[float]:
-        aspect = crop_aspect(layout, self.fmt, self.panel_aspect(pid))
-        key = (pid, round(aspect, 3))
+        """The card's crop: one exact shape from the layout's list (crops.py)."""
+        key = (pid, layout)
         if key not in self._crops:
-            # Tall panels may be cut a little shorter than the card's tallest
-            # shape, if that keeps a bubble or caption out of the picture.
-            widest = crop_aspect(layout, self.fmt, 100.0)
-            shapes = sorted({round(aspect, 3), round((aspect + widest) / 2, 3), round(widest, 3)})
-            shapes = [a for a in shapes if a >= aspect] if aspect < widest else [aspect]
-            self._crops[key] = list(clean_crop(self.img(pid), shapes))
+            if pid not in self._maps:
+                self._maps[pid] = _panel_maps(self.img(pid))
+            shape, box, head_ok = choose_shape(self.img(pid), shapes_for(layout, self.fmt), self._maps[pid])
+            if not head_ok and pid not in self.crop_stats["head_risk"]:
+                self.crop_stats["head_risk"].append(pid)
+            if shape < self.panel_aspect(pid) and pid not in self.crop_stats["side_cut"]:
+                self.crop_stats["side_cut"].append(pid)
+            self._crops[key] = list(box)
         return self._crops[key]
 
     def tone(self, pid: str) -> str:
@@ -327,8 +393,11 @@ class _Designer:
         ids = [p for p in dict.fromkeys(unit["panels"]) if p in self.by_id]
         first = ids[0]
 
-        if len(ids) >= 2 and dur >= 2.4:
-            layout = "inset" if (rng.random() < 0.2 and dur >= 2.8) else "pair"
+        if len(ids) >= 2:
+            # Both panels are cards, whatever the shot's length (hold_groups() has
+            # already given it at least min_hold). The inset layout would turn one
+            # panel into a blurred background only, so it is never used here.
+            layout = "pair"
         elif self.panel_aspect(first) >= 1.45:
             layout = "wide"
         else:
@@ -440,8 +509,10 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     panels = panels_data["panels"]
     fmt = format_from(vcfg.get("format", "16:9"), int(vcfg.get("fps", 30)))
     by_id = {p["id"]: p for p in panels}
+    timing = None
     if alignment_units is not None:
-        units = _pair_up(alignment_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
+        shots_units, timing = hold_groups(alignment_units, float(vcfg.get("min_hold", MIN_HOLD)))
+        units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
         # not a generic "aligned" label - video render's refusal of an
         # "estimated" plan must keep working exactly as it did before this.
@@ -451,7 +522,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                          float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         mode = "synced"
     else:
-        units = _pair_up(even_units(panels, duration, vcfg), chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
+        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), float(vcfg.get("min_hold", MIN_HOLD)))
+        units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
     designer = _Designer(chapter, panels, fmt, vcfg, image_for)
     shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
@@ -469,6 +541,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "music_volume": float(vcfg.get("music_volume", 0.22)),
         "effects_enabled": dict(vcfg.get("effects") or {}),
         "panels_fingerprint": panels_data.get("fingerprint"),
+        "timing": timing,
+        "crop_stats": designer.crop_stats,
         "reviewed": False,
         "shots": shots,
     }

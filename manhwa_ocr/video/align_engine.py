@@ -181,6 +181,45 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
     return segments
 
 
+def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]], duration: float,
+                   min_hold: float) -> Dict[str, Any]:
+    """Every drawn panel must appear in the video. A panel no sentence picked is
+    placed, in story order, into one of the sentences nearest to it (the one
+    with the fewest extra panels so far). Its time is shared with that
+    sentence's picks; plan.py does the timing. Text-only panels (captions,
+    blank pages, credits) are never placed.
+
+    Returns {"placed_by_order": [...], "uncovered": [...]}; `uncovered` is only
+    non-empty when the narration is too short to give every panel min_hold.
+    """
+    order = {p["id"]: i for i, p in enumerate(panels)}
+    shows = [k for k, s in enumerate(segments) if s.get("selected_panel")]
+    for s in segments:
+        s["extra_panels"] = []
+    shown = {segments[k]["selected_panel"] for k in shows}
+    missing = [p["id"] for p in panels if not p.get("text_only") and p["id"] not in shown]
+    # Each shot holds at most two panels, and each needs min_hold of time.
+    room = 2 * int(duration // min_hold) - len(shown)
+    placed, uncovered = [], []
+    for pid in sorted(missing, key=lambda x: order[x]):
+        if len(placed) >= max(0, room) or not shows:
+            uncovered.append(pid)
+            continue
+        i = order[pid]
+        near = sorted(shows, key=lambda k: (abs(order[segments[k]["selected_panel"]] - i), k))[:3]
+        k = min(near, key=lambda k: (len(segments[k]["extra_panels"]), abs(order[segments[k]["selected_panel"]] - i)))
+        segments[k]["extra_panels"].append(pid)
+        placed.append(pid)
+    for seg in segments:
+        if seg.get("selected_panel"):
+            seg["selected_by_align"] = seg["selected_panel"]
+            seq = sorted({seg["selected_panel"], *seg["extra_panels"]}, key=lambda p: order[p])
+            seg["sequence"] = seq
+        if not seg["extra_panels"]:
+            del seg["extra_panels"]
+    return {"placed_by_order": placed, "uncovered": uncovered}
+
+
 def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], vcfg: Dict[str, Any],
                      sync: str, log) -> tuple[List[Dict[str, Any]], str, float]:
     """Adds "start"/"end" to each sentence using whisper (cached if available),
@@ -245,12 +284,18 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
     for seg, t in zip(segments, timed):
         seg["start"], seg["end"] = round(float(t["start"]), 3), round(float(t["end"]), 3)
 
+    min_hold = float(vcfg.get("min_hold", 3.0))
+    coverage = place_coverage(segments, plist, duration, min_hold)
+    coverage["art_panels"] = sum(1 for p in plist if not p.get("text_only"))
+    coverage["text_only_excluded"] = [p["id"] for p in plist if p.get("text_only")]
+    coverage["placed_by_order_count"] = len(coverage["placed_by_order"])
     validation = validate_mod.validate(segments, order, duration)
     queue = validate_mod.review_queue(segments, validation)
 
     result = {
-        "version": 1, "chapter": chapter, "audio": {"duration": round(duration, 3)},
+        "version": 2, "chapter": chapter, "audio": {"duration": round(duration, 3)},
         "sync_mode": sync_mode, "segments": segments, "validation": validation, "review_queue": queue,
+        "coverage": coverage,
     }
     atomic_write_text(alignment_path(root, chapter), json.dumps(result, indent=1, ensure_ascii=False))
     return result

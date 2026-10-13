@@ -759,7 +759,8 @@ def cmd_video(args) -> int:
         for c in chapters(default_all=False):
             _log(f"=== Chapter {c} ===")
             vb.render_chapter(sess, c, cfg, preview=args.preview, workers=args.workers,
-                              allow_estimated=args.force, allow_unreviewed=args.force, log=_log)
+                              allow_estimated=args.force, allow_unreviewed=args.force,
+                              strict=args.strict, log=_log)
         return 0
 
     if action == "build":
@@ -904,6 +905,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
     p.add_argument("--force", action="store_true", help="rebuild even if up to date (discards plan edits)")
     p.add_argument("--preview", action="store_true", help="fast 480p render for checking")
+    p.add_argument("--strict", action="store_true",
+                   help="render: stop if any sentence is flagged for review (default: warn only)")
     p.add_argument("--format", choices=["16:9", "9:16"], help="video shape (default from config: 16:9)")
     p.add_argument("--no-sync", dest="no_sync", action="store_true", help="don't transcribe the audio")
     p.add_argument("--duration", type=float, help="plan without audio, for this many seconds")

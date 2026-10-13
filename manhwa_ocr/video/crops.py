@@ -307,3 +307,101 @@ def tone(img: Image.Image) -> str:
     if m < 40:
         return "dark"
     return "mid"
+
+
+# ------------------------------------------------------------------ shape-locked crops
+#
+# Every card is cut to one exact shape (w/h in pixels), chosen from a short
+# list per layout. The window is slid over the panel and scored: it avoids
+# lettering and flat white, keeps the head inside (a face's top edge is never
+# cut), and prefers real art. A window of the target shape always exists, so
+# nothing is dropped for lack of a crop.
+
+HEAD_MARGIN = 0.04       # fraction of the panel's height kept above a detected head
+FIGURE_MIN = 0.004       # skin share above this means a character is drawn here
+
+
+def _panel_maps(img: Image.Image) -> Dict[str, np.ndarray]:
+    """Analysis maps for one panel, computed once and sliced per candidate."""
+    rgb = _small(img, 120)
+    soft, hard, flat_white = _art_maps(rgb)
+    return {"soft": soft, "texty": np.clip(hard + flat_white, 0, 1), "skin": _skin(rgb),
+            "blank": flat_white}
+
+
+def face_top(maps: Dict[str, np.ndarray]) -> float | None:
+    """Fraction of the panel's height where the topmost character's skin starts,
+    searched in the upper 55% (where heads are). None if no figure is found.
+
+    Heuristic: a run of three rows that are at least 3% skin. Pale or heavily
+    stylised art can miss; the QA report counts those panels as head_risk."""
+    rows = maps["skin"].mean(axis=1)
+    h = len(rows)
+    run = 0
+    for y in range(int(0.55 * h)):
+        run = run + 1 if rows[y] >= 0.03 else 0
+        if run >= 3:
+            return max(0.0, (y - 2) / h)
+    return None
+
+
+def figure_share(img: Image.Image) -> float:
+    """Share of the panel that is skin-coloured: a rough test for a character."""
+    return round(float(_panel_maps(img)["skin"].mean()), 4)
+
+
+def shape_crop(img: Image.Image, aspect: float, maps: Dict[str, np.ndarray] | None = None) -> Tuple[Box, float, bool]:
+    """Best window of exactly `aspect` (w/h in pixels) inside the panel.
+
+    Returns (box, score, head_ok). Lower score is better. A window that is
+    narrower than the panel cuts the sides; a wider-than-target panel is cut
+    only at the top and bottom, so panels keep their full width when they can.
+    """
+    m = maps or _panel_maps(img)
+    gh, gw = m["soft"].shape
+    panel_aspect = gw / gh
+    r = aspect / panel_aspect                       # box width / box height, as fractions
+    fe = face_top(m)
+    best: Tuple[float, Box, bool] | None = None
+    if r <= 1.0:
+        # narrower than the panel: smaller windows of the same shape (sides may be cut)
+        sizes = [(r * s, s, s) for s in (1.0, 0.85, 0.7, 0.55)]
+    else:
+        # wider than the target: full width only, so only top and bottom are cut
+        sizes = [(1.0, 1.0 / r, 1.0)]
+    for bw, bh, s in sizes:
+        xs = [0.0] if bw >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bw, 7))
+        ys = [0.0] if bh >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bh, 11))
+        for x0 in xs:
+            for y0 in ys:
+                x1, y1 = x0 + bw, y0 + bh
+                r0, r1 = int(y0 * gh), max(int(y0 * gh) + 1, int(y1 * gh))
+                c0, c1 = int(x0 * gw), max(int(x0 * gw) + 1, int(x1 * gw))
+                texty = float(m["texty"][r0:r1, c0:c1].mean())
+                soft = float(m["soft"][r0:r1, c0:c1].mean())
+                skin = float(m["skin"][r0:r1, c0:c1].mean())
+                blank = float(m["blank"][r0:r1, c0:c1].mean())
+                head_ok = fe is None or y0 <= fe - HEAD_MARGIN
+                score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + 0.1 * (1.0 - s)
+                         + (1.0 if soft < 0.02 else 0.0) + (5.0 if not head_ok else 0.0))
+                if best is None or score < best[0]:
+                    box = (round(float(x0), 4), round(float(y0), 4), round(float(x1), 4), round(float(y1), 4))
+                    best = (score, box, head_ok)
+    score, box, head_ok = best
+    return box, score, head_ok
+
+
+def choose_shape(img: Image.Image, shapes: List[float], maps: Dict[str, np.ndarray] | None = None) -> Tuple[float, Box, bool]:
+    """Pick the allowed shape that shows this panel best: the lowest crop score,
+    with a penalty for cutting the sides and a small pull toward the panel's own
+    shape. Returns (shape, box, head_ok)."""
+    m = maps or _panel_maps(img)
+    gw, gh = m["soft"].shape[1], m["soft"].shape[0]
+    panel_aspect = gw / gh
+    best = None
+    for a in shapes:
+        box, score, head_ok = shape_crop(img, a, m)
+        cost = (score + 0.4 * max(0.0, np.log(panel_aspect / a)) + 0.02 * abs(np.log(a / panel_aspect)))
+        if best is None or cost < best[0]:
+            best = (cost, a, box, head_ok)
+    return best[1], best[2], best[3]

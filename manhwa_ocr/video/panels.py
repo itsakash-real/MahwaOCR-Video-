@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw, ImageFont
 from ..util import UserError, atomic_save_image, atomic_write_text, require_chapter
 from .media import list_pages, media_dir
 
-PANELS_VERSION = 3
+PANELS_VERSION = 4
 ANALYSIS_WIDTH = 240     # rows are summarised at this width; plenty for gutter finding
 MAX_PANEL_RATIO = 3.2    # height/width beyond which a gutterless stretch gets split
 TALL_RATIO = 1.6         # height/width at which a panel scrolls instead of zooming
@@ -385,7 +385,7 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
         off += nh
     _attach_notes(panels, root, chapter, offsets, norm_w)
 
-    from .crops import art_score, crop_art, is_text_only, looks_like_credits
+    from .crops import FIGURE_MIN, art_score, crop_art, figure_share, is_text_only, looks_like_credits
 
     rows = []
     edge_pages = _edge_pages(panels)
@@ -394,11 +394,16 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
         try:
             img = panel_image(root, chapter, row, norm_w)
             row["art"], row["crop_art"] = art_score(img), crop_art(img)
+            row["figure"] = figure_share(img)
         except OSError:
-            row["art"], row["crop_art"] = 1.0, 1.0
+            row["art"], row["crop_art"], row["figure"] = 1.0, 1.0, 1.0
         # Credits/promo pages (scanlator names, "Read at ...") are never shown.
         row["credits"] = bool(edge_pages & _pages_of(row)) and looks_like_credits(row.get("text") or "")
-        row["text_only"] = row["credits"] or is_text_only(row["art"], row["crop_art"])
+        # A panel with a character in it is art even when it has little
+        # texture (a pale portrait, a plain background): only lettering, caption
+        # boxes and blank pages are text-only.
+        row["text_only"] = row["credits"] or (is_text_only(row["art"], row["crop_art"])
+                                              and row["figure"] < FIGURE_MIN)
         rows.append(row)
 
     data = {

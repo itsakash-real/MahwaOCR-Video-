@@ -22,11 +22,11 @@ from typing import Any, Callable, Dict, List
 
 from PIL import Image
 
-from ..util import UserError, atomic_save_image, require_chapter, sort_chapters
+from ..util import UserError, atomic_save_image, atomic_write_text, require_chapter, sort_chapters
 from . import align_engine
 from . import cues as cues_mod
 from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, run, video_info
-from .frames import background, format_from
+from .frames import background, format_from, shapes_for
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
 from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, units_from_alignment, validate
@@ -35,6 +35,53 @@ from .storyboard import storyboard_paths, write_review_task, write_storyboard
 
 
 END_TAIL = 1.5   # seconds the video runs on after the last word
+
+
+def qa_path(root: Path, chapter: str) -> Path:
+    return video_dir(root) / f"chapter_{require_chapter(chapter)}.qa.json"
+
+
+def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict[str, Any] | None,
+                   min_hold: float) -> Dict[str, Any]:
+    """Objective checks on a finished plan. `failures` stop the build; the rest
+    are warnings for the QA file and the log. Nothing here judges art quality."""
+    import math
+
+    fmt = format_from(plan.get("format", "16:9"), int(plan.get("fps", 30)))
+    dims = {p["id"]: (float(p.get("width") or 1), float(p.get("height") or 1)) for p in panels["panels"]}
+    art = [p["id"] for p in panels["panels"] if not p.get("text_only")]
+    shots = plan.get("shots") or []
+    shown = {c["panel"] for s in shots for c in s.get("cards") or []}
+    missing = [p for p in art if p not in shown]
+    shape_bad = []
+    for s in shots:
+        allowed = shapes_for(s.get("layout", "single"), fmt)
+        for c in s.get("cards") or []:
+            pw, ph = dims.get(c["panel"], (1.0, 1.0))
+            x0, y0, x1, y1 = (float(v) for v in c["crop"])
+            aspect = ((x1 - x0) * pw) / max(1e-9, (y1 - y0) * ph)
+            if min(abs(math.log(aspect / a)) for a in allowed) > 0.02:
+                shape_bad.append(f"{s.get('id')} {c['panel']} ({aspect:.2f})")
+    shortest = min((float(s["end"]) - float(s["start"]) for s in shots), default=0.0)
+    failures = []
+    if missing:
+        failures.append(f"{len(missing)} drawn panel(s) would never appear: {', '.join(missing[:12])}")
+    if shape_bad:
+        failures.append(f"{len(shape_bad)} card(s) are not one of the allowed shapes: {', '.join(shape_bad[:6])}")
+    if shots and shortest < min_hold - 0.01:
+        failures.append(f"a shot lasts {shortest:.2f}s, under the {min_hold:g}s minimum")
+    cs = plan.get("crop_stats") or {}
+    return {
+        "chapter": plan.get("chapter"),
+        "failures": failures,
+        "art_panels": len(art), "shown_panels": len(set(art) & shown), "missing": missing,
+        "placed_by_order": (align_cov or {}).get("placed_by_order", []),
+        "text_only_excluded": [p["id"] for p in panels["panels"] if p.get("text_only")],
+        "shots": len(shots), "shortest_shot": round(shortest, 2), "timing": plan.get("timing"),
+        "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
+        "review_queue": plan.get("alignment_review_queue") or [],
+        "sync": plan.get("sync"),
+    }
 
 
 def _mmss(seconds: float) -> str:
@@ -219,6 +266,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     # with `video align`) and pass validation, with no fallback to reinterpreting
     # the tags here - a missing or broken alignment stops planning loudly.
     norm_w = panels["norm_width"]
+    align_cov = None
     if not cues_mod.load_cues(root, chapter):
         units, mode_note, meta = None, "even timing (recap has no panel tags)", None
     else:
@@ -243,6 +291,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
                 f"Chapter {chapter}'s alignment failed validation, so planning stopped (no silent fallback):\n"
                 f"  {problems}\nFix it and rebuild with:  video align --chapter {chapter}")
         units = units_from_alignment(alignment["segments"])
+        align_cov = alignment.get("coverage")
         queue = alignment.get("review_queue") or []
         meta = {"sync_mode": alignment.get("sync_mode"), "review_queue": queue}
         mode_note = (f"{len(alignment['segments'])} sentences from the alignment engine "
@@ -256,18 +305,27 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
+    qa = quality_report(plan, panels, align_cov, float(vcfg.get("min_hold", 3.0)))
+    atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
+    if qa["failures"]:
+        raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])
+                        + f"\nDetails: video/chapter_{chapter}.qa.json")
     save_plan(root, chapter, plan)
     log(f"  chapter {chapter}: {len(plan['shots'])} shots, {mode_note}")
-    if meta and meta.get("review_queue"):
-        log(f"    {len(meta['review_queue'])} sentence(s) flagged for review "
-            f"(see video align's output, or PROMPTS.md)")
+    log(f"    all {qa['shown_panels']}/{qa['art_panels']} drawn panels shown; shortest shot "
+        f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order")
+    if qa["head_risk"]:
+        log(f"    ! {len(qa['head_risk'])} panel(s) where a head may be cut: {', '.join(qa['head_risk'][:8])}")
+    if qa["review_queue"]:
+        log(f"    ! {len(qa['review_queue'])} sentence(s) flagged for review (non-blocking; "
+            f"see video/chapter_{chapter}.qa.json)")
     write_storyboard(root, chapter, plan, log=log)
     write_review_task(root, chapter, plan, sess.slug)
     return plan
 
 
 def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: int = 0,
-                   allow_estimated: bool = False, allow_unreviewed: bool = False,
+                   allow_estimated: bool = False, allow_unreviewed: bool = False, strict: bool = False,
                    log: Callable = print) -> Path:
     root, chapter = sess.path, require_chapter(chapter)
     panels = load_panels(root, chapter)
@@ -282,7 +340,10 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
             f"machine is low on RAM), then rebuild the plan:  video plan --chapter {chapter} --force\n"
             f"To render with the estimated timing anyway, pass --force to render.")
     queue = plan.get("alignment_review_queue") or []
-    if queue and not allow_unreviewed:
+    if queue and not strict:
+        log(f"  ! {len(queue)} sentence(s) flagged for review; rendering anyway "
+            f"(see video/chapter_{chapter}.qa.json). Use --strict to stop on them.")
+    if queue and strict and not allow_unreviewed:
         shown = ", ".join(str(n) for n in queue[:15]) + ("..." if len(queue) > 15 else "")
         raise UserError(
             f"Chapter {chapter} has {len(queue)} sentence(s) `video align` couldn't resolve with full "

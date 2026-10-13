@@ -118,8 +118,37 @@ def crop_aspect(layout: str, fmt: Format, panel_aspect: float) -> float:
     return min(max(panel_aspect, lo), min(hi, box))
 
 
-def fit(aspect: float, box: Tuple[float, float]) -> Tuple[int, int]:
+# The only card shapes a video uses (w/h). Landscape video: 3:4, 1:1, 4:3, 16:9.
+# Portrait (9:16) video: 9:16, 3:4, 1:1. Each layout gets its own short list.
+LAYOUT_SHAPES = {
+    False: {"single": [0.75, 1.0, 1.333, 1.777], "pair": [0.75, 1.0], "inset": [0.75, 1.0],
+            "wide": [1.333, 1.777]},
+    True: {"single": [0.5625, 0.75, 1.0], "pair": [0.5625, 0.75], "inset": [0.5625, 0.75],
+           "wide": [0.75, 1.0]},
+}
+
+
+def shapes_for(layout: str, fmt: Format) -> List[float]:
+    return LAYOUT_SHAPES[fmt.portrait].get(layout, [1.0])
+
+
+def layout_area(layout: str, fmt: Format) -> float:
+    """One card area (in pixels) for every shape of a layout, so cards of
+    different shapes in the same layout carry the same visual weight. Chosen as
+    the largest area at which every shape still fits its layout box."""
+    bw, bh = card_box(layout, fmt)
+    return 0.98 * min(min(bw * bw / a, a * bh * bh) for a in shapes_for(layout, fmt))
+
+
+def fit(aspect: float, box: Tuple[float, float], area: float | None = None) -> Tuple[int, int]:
+    """Card size (w, h) for an aspect. With `area`, every shape gets that same
+    area (only shrunk if it still doesn't fit the box)."""
     bw, bh = box
+    if area:
+        cw, ch = (area * aspect) ** 0.5, (area / aspect) ** 0.5
+        k = min(1.0, bw / cw, bh / ch)
+        cw, ch = cw * k, ch * k
+        return max(8, int(cw)), max(8, int(ch))
     cw = min(bw, bh * aspect)
     return max(8, int(cw)), max(8, int(cw / aspect))
 
@@ -191,7 +220,7 @@ class Card:
         region = panel.crop((int(x0 * pw), int(y0 * ph), max(int(x0 * pw) + 2, int(x1 * pw)),
                              max(int(y0 * ph) + 2, int(y1 * ph))))
         aspect = region.width / region.height
-        self.cw, self.ch = fit(aspect, card_box(layout, fmt))
+        self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
         self.border = max(1, round(3 * u))
         self.radius = max(2, round(12 * u))
         self.margin = max(6, round(46 * u))
