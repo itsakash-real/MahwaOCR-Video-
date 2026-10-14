@@ -1,326 +1,249 @@
-# manhwa-ocr
+<div align="center">
 
-Transcribe webtoon/manhwa chapters with a vision model, keeping **character and plot context across chapters**.
+# 📖➜🎬 manhwa-ocr
 
-Works with Claude, Gemini, any OpenAI-compatible endpoint (OpenRouter, Groq, LM Studio, vLLM), or local models via Ollama. No vendor SDKs — plain HTTP.
+**Turn any webtoon chapter into a recap video, synced to your own voice.**
 
-**New here? Read [USER_GUIDE.md](USER_GUIDE.md).** It walks the whole job step
-by step, with copy-paste prompts for Antigravity:
+Read the pages with a vision model. Remember every character. Write the recap. Record it.
+Get a 1080p video, cut to your narration, from one terminal command.
 
-1. Paste chapter links.
-2. The agent transcribes them.
-3. The agent writes recap scripts.
-4. You record the narration.
-5. The agent builds the videos.
+![python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
+![license](https://img.shields.io/badge/license-MIT-green)
+![tests](https://img.shields.io/badge/tests-293%20passing-brightgreen)
+![platform](https://img.shields.io/badge/tested%20on-Windows-lightgrey)
+![deps](https://img.shields.io/badge/runtime%20deps-4-blue)
+![no sdks](https://img.shields.io/badge/vendor%20SDKs-none-orange)
 
-Agents read [AGENTS.md](AGENTS.md).
+[Quick start](#-quick-start) ·
+[How it works](#-how-it-works) ·
+[Make a video](#-make-a-video) ·
+[Commands](#-commands) ·
+[Providers](#-providers) ·
+[FAQ](#-faq) ·
+[Limits](#-honest-limits)
 
----
-
-## Why not just use Tesseract?
-
-Traditional OCR fails on comics. The fonts are stylized, text sits on top of artwork, and speech bubbles have no consistent layout. Tesseract and EasyOCR produce garbage on manhwa pages.
-
-This tool uses a **vision model** that reads the page the way a person does — it sees the art, understands who's talking, and distinguishes dialogue from narration from sound effects.
-
-## The two things that make it work
-
-**1. Tall-strip slicing.** Webtoon pages are delivered as single images around `900 × 16000` pixels. Hand one to a vision model whole and it gets downscaled to roughly **110 pixels wide** before the model ever sees it. Text becomes unreadable and the model starts inventing lines from context.
-
-This tool slices each page into overlapping full-resolution tiles, and snaps each cut to a flat "gutter" row between panels so speech bubbles don't get bisected. This is the single largest quality difference versus naive approaches.
-
-**2. Persistent series memory.** After each chapter the model writes a structured update to `series_memory.json` — characters (with **appearance descriptions**), world rules, terminology, open plot threads. That file is injected into the prompt for every subsequent chapter.
-
-The effect: a character introduced in chapter 1 as "silver hair, red eyes, black gloves" gets correctly identified by name when they reappear unnamed in chapter 6. Without this, every chapter starts blind.
+</div>
 
 ---
 
-## Install
+## ✨ What you get
+
+| You give it | You get |
+|---|---|
+| Chapter links, or a folder of page images | A clean **transcript** of every chapter (dialogue, narration, sound effects) |
+| Nothing extra | A **story bible** that remembers characters, looks, names and plot threads across chapters |
+| The transcripts | A **recap script** per chapter, tagged with the panel each sentence describes |
+| Your recorded narration (`.mp3`) | A **1080p recap video**: hard cuts, blurred backgrounds, bordered cards, synced to your voice |
+
+No vendor SDKs. No GPU needed. Plain HTTP to Claude, Gemini, OpenAI-compatible endpoints (OpenRouter, Groq, DeepSeek, LM Studio, vLLM) or local Ollama.
+
+---
+
+## 🚀 Quick start
 
 ```bash
-cd manhwaOCR
-pip install -e .              # transcripts + recaps
-pip install -e ".[video,sync]"   # + recap videos (FFmpeg, pywhispercpp)
-```
-
-Dependencies: `requests`, `pillow`, `pyyaml`, `numpy`. Video adds `imageio-ffmpeg`
-and `pywhispercpp` (whisper.cpp, not faster-whisper — avoids its ctranslate2/MKL
-memory-allocator crashes on ordinary desktops).
-
-If the `manhwa-ocr` command isn't on your PATH after install (common on Windows), use the module form everywhere instead — it behaves identically:
-
-```bash
-python -m manhwa_ocr run <url> --chapter 1
-```
-
-## Sessions
-
-Each series lives in its own isolated session, so character bibles never bleed
-across series. Switching is instant and nothing is lost.
-
-```bash
-manhwa-ocr session new "The Hero Cannot Rest"   # creates and activates
-manhwa-ocr session new "Some Other Series"
-
-manhwa-ocr session list      # * marks the active one
-manhwa-ocr session use "The Hero Cannot Rest"   # switch back; all data intact
-manhwa-ocr session info      # chapters + memory state
-```
-
-Every other command uses the active session automatically. Per-command override:
-`--session "Some Other Series"`.
-
-Series folders live in the folder set by `output_folder:` in `manhwa-ocr.yaml`.
-That is `../ManhwaRecaps` by default: a folder next to the program folder, so
-code and output stay apart. If there is no config, they go in
-`~/.manhwa-ocr/sessions/`. `$MANHWA_SESSIONS_ROOT` or `--sessions-root`
-override it for one shell or one command.
-
-`session archive` never deletes. It moves the directory under `_archived/` and
-prints the path.
-
-## Chapter links
-
-Paste your chapter URLs into the session's `chapters.txt`, one per line in
-reading order. Chapter numbers come from line order, so the URLs don't need to
-follow any pattern.
-
-```bash
-manhwa-ocr links path        # prints the file to paste into
-manhwa-ocr links add "https://..." "https://..."
-manhwa-ocr links list        # per-chapter done/pending
-manhwa-ocr status            # summary + what's next
-```
-
-Override numbering with `47 = https://...` on a line.
-
-## Quick start
-
-```bash
-# 1. Set your key
-export ANTHROPIC_API_KEY=sk-ant-...        # bash
-$env:ANTHROPIC_API_KEY = "sk-ant-..."      # PowerShell
-
-# 2. Create a session and add links
-manhwa-ocr session new "My Series"
-manhwa-ocr links add "https://site.com/ch/1" "https://site.com/ch/2"
-
-# 3. Run everything pending
-manhwa-ocr run --all-pending
-```
-
-Output lands in the session directory:
-
-```
-<session>/
-├── chapter_1.md          ← the transcript
-├── chapter_2.md
-├── chapters.txt          ← your link list
-├── series_memory.json    ← the story bible, grows each chapter
-├── .cache/               ← per-image results; re-runs are nearly free
-└── ch1/
-    ├── pages/            ← downloaded originals
-    ├── tiles/            ← sliced tiles
-    └── raw_blocks.txt    ← stage-1 extraction, for debugging
-```
-
-## Agent mode — no API key needed
-
-If your models come bundled with an agentic IDE (Antigravity, Cursor, Claude
-Code) rather than as raw API access, the driving agent can do the vision work
-itself:
-
-```bash
-manhwa-ocr prepare --next          # downloads + slices, writes TASK.md
-#   agent reads tiles -> tile_results.json
-manhwa-ocr assemble --chapter 1    # writes ASSEMBLE.md
-#   agent answers -> assembled.json
-manhwa-ocr finalize --chapter 1    # writes chapter + updates memory
-```
-
-Each step is a plain file handoff. See `AGENTS.md`, which agents read
-automatically, and `USER_GUIDE.md` for the full walkthrough.
-
-## Local images
-
-If a site is JavaScript-rendered or blocks scripts, don't fight it. Save the images with your browser and point the tool at the folder:
-
-```bash
-manhwa-ocr prepare --folder ./my-saved-pages --chapter 3
-```
-
-## Other backends
-
-```bash
-# Gemini (handy if you're driving this from Antigravity)
-manhwa-ocr run --next \
-  --provider gemini --model gemini-2.0-flash \
-  --api-key-env GEMINI_API_KEY
-
-# Local, free, offline
-manhwa-ocr run --next --provider ollama --model llama3.2-vision
-
-# OpenRouter / Groq / Together / anything OpenAI-shaped
-manhwa-ocr run --next \
-  --provider openai \
-  --base-url https://openrouter.ai/api/v1 \
-  --model qwen/qwen-2.5-vl-72b-instruct \
-  --api-key-env OPENROUTER_API_KEY
-
-# LM Studio on localhost
-manhwa-ocr run --next \
-  --provider openai --base-url http://localhost:1234/v1 --model local-model
-```
-
-Local vision models are noticeably weaker at stylized comic lettering than hosted ones. Expect more `[unclear: ...]` markers. The slicing helps a lot here — small models benefit most from seeing full-resolution tiles.
-
-## Dashboard
-
-```bash
-manhwa-ocr ui        # http://127.0.0.1:8765
-```
-
-A local, single-page dashboard for everything the pipeline has produced: every
-series, per-chapter OCR and recap status, compiled scripts, character memory, and
-a reader with copy/download. Tick chapters to generate ready-made agent prompts
-for exactly those chapters. It binds to localhost only, uses no third-party
-libraries, and doesn't run the pipeline itself.
-
-## Recaps
-
-```bash
-manhwa-ocr recap   --session "My Series" --chapters 1-4,11 --prepare   # agent mode
-manhwa-ocr recap   --session "My Series" --finalize
-manhwa-ocr compile --session "My Series" --chapters 1-4,11
-```
-
-One narration file per chapter under `recaps/`, then compile any selection into a
-single video script with a runtime table. Existing recaps are skipped unless
-`--force`. Without `--prepare`, `recap` calls the configured provider directly.
-
-## Recap videos
-
-```bash
+git clone https://github.com/itsakash-real/MahwaOCR-Video-.git
+cd MahwaOCR-Video-
 pip install -e ".[video,sync]"
-manhwa-ocr video build --chapters 1-7     # needs audio/chapter_N.mp3 per chapter
 ```
 
-Turns each chapter into a 1080p recap video synced to your recorded narration.
-
-1. **Panels.** Pages are split into panels at their gutters, with panels that
-   cross page boundaries handled.
-2. **Panel tags.** The recap writer tags each sentence with the panel it
-   describes.
-3. **Align** (`video align`, deterministic, no AI judgment at render time).
-   Whisper (pywhispercpp) finds when each sentence is spoken; for each
-   sentence, a rule-based classifier decides whether it's even something a
-   panel can show (a thought or a sound with no visible actor holds whatever's
-   already on screen, no search attempted), and otherwise picks a panel from
-   the story's own forward sequence, trusting the tag unless the panel's own
-   OCR'd text gives stronger evidence against it. Writes
-   `chapter_N.alignment.json`, the single source of truth for panel selection,
-   and validates its own output (panels exist, no backward/unexplained jumps,
-   no timing gaps, …) before anything downstream may use it.
-4. **Frames.** Recap-channel editing:
-   - hard cuts about every 2.7s;
-   - focal crops shown as bordered cards with drop shadows;
-   - single, side-by-side (slide-in) and inset layouts;
-   - blurred, black or white backgrounds;
-   - calm CapCut-style entrances (fade, slide, blur, zoom, fit in frame,
-     swing, pull down);
-   - eased camera moves that settle and hold, all drawn with sub-pixel
-     precision.
-5. **Plan.** `video plan` only translates the alignment's decisions into an
-   editable `plan.json` (crop, layout, entrance) — it never re-decides which
-   panel to show. Reviewed through a storyboard image.
-
-Editing one shot re-renders only that shot. Also: 9:16 Shorts clips,
-multi-chapter compilations, ducked background music. Design and trade-offs are
-in `docs/VIDEO_BUILD_PLAN.md`.
-
-## Inspect the memory
+Then, for a series you have already transcribed and recorded narration for:
 
 ```bash
-manhwa-ocr memory show     # rendered briefing, exactly as the model sees it
-manhwa-ocr memory path     # where the JSON lives
-manhwa-ocr memory reset --yes
+python -m manhwa_ocr video build --chapters 8 --session "my-series" --force
 ```
 
-`series_memory.json` is plain JSON and **meant to be hand-edited**. If the model gets a character's name wrong early, fix it there and every later chapter inherits the correction. Commit it to git alongside your transcripts.
+That one command aligns the narration, plans every shot, checks every card, and renders the video.
+Measured on a 4-core laptop: **a 5-minute chapter builds in about 11 minutes.**
+
+> 🧭 **Never used it?** Double-click `Open_Video_Guide.bat` (Windows) or open
+> [`docs/video_guide.html`](docs/video_guide.html). It is a click-through decision tree: find your situation, copy the command.
 
 ---
 
-## How it works
+## 🧠 How it works
 
-```
-chapter URL
-    │
-    ├─ scrape page image URLs           scrapers.py
-    ├─ download, normalize to PNG       images.py
-    ├─ slice tall strips into tiles     images.py  ← quality-critical
-    │
-    ├─ STAGE 1 (vision, parallel)       pipeline.py
-    │    one call per tile → {scene, blocks[]}
-    │    series memory injected into every prompt
-    │    cached by image hash + prompt version
-    │
-    ├─ dedupe overlapping tile text     pipeline.py
-    │
-    ├─ STAGE 2 (text, one call)         pipeline.py
-    │    merge tiles → markdown transcript
-    │    propose memory updates
-    │
-    └─ merge into series_memory.json    memory.py
+```mermaid
+flowchart LR
+    A[Chapter links<br/>or image folder] --> B[Slice into<br/>full-res tiles]
+    B --> C[Vision model<br/>reads each tile]
+    C --> D[(Story bible<br/>series_memory.json)]
+    C --> E[Transcript<br/>chapter_N.md]
+    D --> F[Recap script<br/>panel-tagged]
+    E --> F
+    F --> G[You record<br/>narration]
+    G --> H[Align<br/>whisper timing]
+    H --> I[Plan shots<br/>exact card shapes]
+    I --> J[Verify cards<br/>no AI]
+    J --> K[Render<br/>1080p MP4]
 ```
 
-Stage 1 is expensive and cached per image. Stage 2 is cheap. That split means you can iterate on the assembly prompt without paying for the vision pass again.
+### The three ideas that make it good
 
-## Reproducibility
+**1. Tall-strip slicing.** Webtoon pages are around `900 × 16000` px. Give one to a vision model whole and it is shrunk to ~110 px wide before it sees a letter. This tool cuts each page into overlapping full-resolution tiles and snaps each cut to a flat gutter between panels, so speech bubbles are never bisected.
 
-Runs are deterministic as far as the models allow:
+**2. Persistent story memory.** After every chapter the model updates `series_memory.json`: characters (with *appearance*), world rules, terms, open threads. That file is fed into every later chapter. A character introduced as "silver hair, red eyes, black gloves" in chapter 1 is correctly named when they reappear unnamed in chapter 6. The file is plain JSON, meant to be hand-edited, and safe to commit.
 
-- `temperature: 0.0` by default
-- the model id is pinned in config
-- `PROMPT_VERSION` in `prompts.py` is part of the cache key — bump it when you edit a prompt, or stale cached results will be reused
+**3. A video stage with no AI judgement at render time.** Which panel shows for which sentence is decided once, deterministically, and written to `chapter_N.alignment.json`. The planner only lays out what that file says. Every card is then checked on its own pixels before rendering.
 
-Same inputs plus same `series_memory.json` gives you the same output. Note that memory is **order-dependent**: running chapters 1→7 produces different context than 7→1. Process in order.
+---
 
-## Testing
+## 🎬 Make a video
+
+```bash
+python -m manhwa_ocr video build --chapters 8 --session "my-series" --force   # build + render
+python -m manhwa_ocr video clip  --chapter 8 --from 60 --to 80 --session "my-series"   # 20-second preview
+python -m manhwa_ocr video status --session "my-series"                         # what is done
+```
+
+Put your narration at `<series folder>/audio/chapter_N.mp3`. The text to read is in `recaps/chapter_N.tts.txt`.
+
+### What the video looks like
+
+- **Hard cuts**, one shot per sentence, never shorter than 3 seconds
+- **Cards in exact shapes:** 9:16, 3:4, 1:1, 4:3, 16:9, all with one fixed area per layout so nothing looks uneven
+- **Single, side-by-side and wide layouts**, over a darkened blurred copy of the same picture
+- **White border, rounded corners, drop shadow** on every card
+- Mostly still pictures with slight eased movement, like the recap channels this is modelled on
+- **Speech bubbles are painted out**; sound-effect lettering is kept
+- **Every drawn panel appears**; only lettering-only pages, blank pages and credits are left out, and each is listed
+
+### Checks that run on every build
+
+| Check | What it catches |
+|---|---|
+| Alignment validation | panels that do not exist, backward jumps, timing gaps |
+| Card shape | any card that is not one of the five allowed shapes |
+| Coverage | any drawn panel that would never appear |
+| Minimum hold | any shot under 3 seconds |
+| Verify (`video verify`) | lettering, painted patches, blank pages, heads that may be cut; re-crops where a clean window exists |
+
+Everything above runs without an AI model, and writes its findings to `video/chapter_N.qa.json` and `video/chapter_N.verify.json`.
+
+### Optional: a second pair of eyes
+
+Some faults (a face cut in half, a wrong picture for a sentence) are easiest to judge by looking. Two optional ways:
+
+- **An IDE agent** reads the storyboard and your narration, and writes fixes to `video/chapter_N.fixes.json`.
+- **From the terminal, with a vision model:** `video review` does the same loop: look, fix, rebuild, look again, approve.
+
+Fixes are validated as a whole: a bad entry rejects the file and nothing is applied. Set `video.require_review: true` to make a render wait for approval. Details and the copy-paste agent prompt are in [`USER_GUIDE.md`](USER_GUIDE.md).
+
+---
+
+## 🧰 Commands
+
+| Command | What it does |
+|---|---|
+| `next` | Prints exactly what to do next. Safe to run any time. |
+| `start "Series" <urls…>` | Begin a series: its own folder, memory and recaps |
+| `run --next` / `--all-pending` | Transcribe chapters with an API key (provider mode) |
+| `prepare` · `assemble` · `finalize` | The same job done by an agent, as file handoffs (no key) |
+| `recap --chapters 1-4 --prepare` | Write recap narration, one file per chapter |
+| `compile --chapters 1-4,11` | Stitch recaps into one video script, with a runtime table |
+| `video build` | Align, plan, check and render, in one go |
+| `video verify` · `review` · `approve` | Check cards, run the reviewer, approve a plan |
+| `video clip --from A --to B` | Cut a short preview or a Shorts clip |
+| `video compile --chapters 1-7` | Join chapter videos with title cards |
+| `status` · `video status` | Progress per chapter |
+| `ui` | Local dashboard at `http://127.0.0.1:8765` |
+| `memory show` | The story bible, exactly as the model sees it |
+
+Use the module form everywhere if `manhwa-ocr` is not on your PATH: `python -m manhwa_ocr <command>`.
+
+---
+
+## 🔌 Providers
+
+Transcription and recap writing work with any of these. The video stage needs none.
+
+| Provider | Setting | Key |
+|---|---|---|
+| Anthropic (Claude) | `kind: anthropic` | `ANTHROPIC_API_KEY` |
+| Google Gemini | `kind: gemini` | `GEMINI_API_KEY` |
+| OpenAI-compatible (OpenRouter, Groq, Together, DeepSeek, LM Studio, vLLM) | `kind: openai` + `base_url` | your key's env var |
+| Ollama (local, free) | `kind: ollama` | none |
+| **No key at all** | *agent mode*: your IDE agent does the reading | none |
+
+```yaml
+# manhwa-ocr.yaml
+provider:
+  kind: openai
+  base_url: https://api.deepseek.com
+  vision_model: deepseek-flash
+  text_model: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+```
+
+---
+
+## 🗂 Where things live
+
+```
+manhwaOCR/                       the program
+├── manhwa_ocr/                  source code
+│   └── video/                   panels · align · plan · verify · fixes · review · frames · render
+├── docs/video_guide.html        click-through guide
+├── Open_Video_Guide.bat         double-click to open it
+└── manhwa-ocr.yaml              your settings
+
+ManhwaRecaps/<series>/           your output (kept outside the program folder)
+├── chapter_N.md                 transcripts
+├── series_memory.json           the story bible (hand-editable)
+├── recaps/                      scripts, TTS text, panel tags
+├── audio/chapter_N.mp3          your narration
+└── video/                       alignment, plan, QA, verify, fixes, MP4s
+```
+
+---
+
+## ❓ FAQ
+
+**Do I need an API key?** No. Agent mode lets an IDE agent do the reading. The video stage needs no model at all.
+
+**Does it work on Windows?** Yes, that is where it is developed and tested. macOS and Linux are untested here; the code is plain Python and FFmpeg via imageio, so they should work.
+
+**Why not Tesseract?** Comic lettering is stylised and sits on art. A vision model reads the page the way a person does and can tell dialogue from narration from sound effects.
+
+**A build failed with red text.** Open `docs/video_guide.html`, section "Something failed". The common ones: missing audio file, or narration too short for the number of panels.
+
+**How do I stop a panel from showing?** Add it to `drop` in `video/chapter_N.fixes.json` and build again.
+
+---
+
+## ⚠️ Honest limits
+
+- **Faces:** finding a head without an AI model uses skin colour and outline heuristics. It misses pale or white-haired characters, so some heads can still be cut. The verify report lists the risky panels, and the reviewer step exists for exactly this.
+- **Long holds:** when several sentences in a row describe one panel, that panel can stay on screen for 10+ seconds. A maximum hold per panel is planned.
+- **Terminal reviewer:** `video review` is built and tested with a fake provider, but has not yet been run against a real chapter with a live model.
+- **Build time:** about 11 minutes per 5-minute chapter on 4 cores. Rendering is the slow part; changed shots only are re-rendered on a second run.
+- **Copyright:** this tool transcribes images you point it at. Use it on material you have the right to process.
+
+---
+
+## 🛠 Develop
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -q
+python -m pytest tests/ -q        # 293 tests
 ```
 
-225 tests covering config, slicing, providers, memory merge semantics, sessions, link numbering and resume, the agent flow, recaps and compile, scrapers, video (panels, sync, plans, rendering, clips) and the dashboard (including path-traversal, range and upload guards). `tests/test_audit.py` holds a regression test for each bug found in the full audit.
+- **New site:** subclass `Scraper` in `scrapers.py`.
+- **New model backend:** subclass `Provider` in `providers.py`, register it in `PROVIDERS`.
+- **Different prompt:** edit `prompts.py` and bump `PROMPT_VERSION` (it is part of the cache key).
 
-## Extending
-
-**New site:** subclass `Scraper` in `scrapers.py`, implement `matches()` and `page_urls()`, add it to the `SCRAPERS` list. The generic scraper already handles most static reader pages.
-
-**New backend:** subclass `Provider` in `providers.py`, implement `vision()` and `text()`, register it in `PROVIDERS`.
-
-**Different output format:** edit `CHAPTER_PROMPT` in `prompts.py` and bump `PROMPT_VERSION`. Want a recap-video script instead of a transcript? That's a prompt change, not a code change.
-
-## Tuning
-
-| Symptom | Fix |
-|---|---|
-| Garbled or invented text | Lower `slicing.target_height` to 1000–1200 |
-| Text cut mid-sentence between tiles | Raise `slicing.overlap` to 250 |
-| Same line appears twice | Lower `pipeline.dedupe_threshold` to ~0.80 |
-| Distinct lines wrongly merged | Raise `dedupe_threshold` to ~0.92 |
-| Rate limit errors | Lower `pipeline.concurrency` to 1–2 |
-| Cuts landing through artwork | Raise `slicing.gutter_search` to 300 |
-
-## Cost
-
-Roughly, for a 30-page chapter at ~90 tiles with a small hosted vision model: a few cents. Caching means re-runs after prompt edits cost almost nothing on stage 1. Local models via Ollama are free.
+Contributors and AI agents: read [`AGENTS.md`](AGENTS.md) first. Design notes for the video stage are in [`docs/VIDEO_BUILD_PLAN.md`](docs/VIDEO_BUILD_PLAN.md).
 
 ---
 
-## Note on use
+## 📜 License and use
 
-This tool transcribes images you point it at. Comics are copyrighted, and most reader sites prohibit automated access in their terms of service. Use it on material you have the right to process — your own scans, licensed copies, public-domain work, or content you have permission to use. Check the site's terms and `robots.txt` before scraping, keep `download.delay` set, and don't republish transcripts of licensed work.
+MIT, as declared in `pyproject.toml`.
 
-MIT licensed.
+Comics are copyrighted and most reader sites forbid automated access. Use this on your own scans, licensed copies, public-domain work, or content you have permission to use. Check each site's terms and `robots.txt`, keep `download.delay` set, and do not republish transcripts of licensed work.
+
+<div align="center">
+
+**If this saved you hours, a ⭐ helps other people find it.**
+
+</div>
