@@ -259,6 +259,19 @@ Gates:
 - Sentences flagged for review in the alignment are warnings, listed in the QA
   file. `video render --strict` makes them stop the render instead.
 
+Review before rendering (see USER_GUIDE.md, "Review the video before rendering"):
+- `video verify --chapter N` rebuilds the plan and runs the non-AI check on every
+  drawn panel (lettering, painted patches, blank pages, head cuts). It writes
+  `video/chapter_N.verify.json` and drops panels that have no character and no clean crop.
+- Reviewer fixes go in `video/chapter_N.fixes.json` only: `drop`, `face`, `crop`.
+  They are validated as a whole; a bad entry refuses the file and nothing is applied.
+  Never hand-edit `cards[k].panel` in the plan.
+- `video review --chapter N` runs the vision reviewer (DeepSeek flash by default) in a
+  loop: review, fix, rebuild, review again. It approves only when the reviewer approves.
+- `video approve --chapter N` approves the current plan by hand. With
+  `video.require_review: true`, `video render` refuses unless the current plan is approved.
+  `--force` never bypasses the review gate.
+
 Check a chapter's state with `video status --session "<name>"`. Run
 `video build --chapter N --force` only to rebuild a plan from scratch; it
 discards hand edits, so ask the user first.

@@ -278,8 +278,10 @@ def _stitch(panel: Panel, files: Dict[str, Path], max_side: int | None = None) -
     return out
 
 
-def panel_image(root: Path, chapter: str, panel: Dict[str, Any] | Panel, norm_w: int | None = None) -> Image.Image:
-    """Crop one panel from the kept pages, side margins trimmed."""
+def panel_image(root: Path, chapter: str, panel: Dict[str, Any] | Panel, norm_w: int | None = None,
+                clean: bool = False) -> Image.Image:
+    """Crop one panel from the kept pages, side margins trimmed. clean=True also
+    paints out its speech bubbles: that is the picture the video shows."""
     if isinstance(panel, dict):
         panel = Panel(**{k: panel[k] for k in ("id", "index", "y0", "y1", "x0", "x1", "segments")})
     files = {p.name: p for p in list_pages(root, chapter)}
@@ -289,6 +291,10 @@ def panel_image(root: Path, chapter: str, panel: Dict[str, Any] | Panel, norm_w:
     x0, x1 = int(panel.x0 * scale), int(round(panel.x1 * scale))
     if x1 - x0 >= 8:
         strip = strip.crop((x0, 0, min(strip.width, x1), strip.height))
+    if clean:
+        from .crops import clean_bubbles
+
+        strip = clean_bubbles(strip)
     return strip
 
 

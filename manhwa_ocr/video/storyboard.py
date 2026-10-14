@@ -65,7 +65,7 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
                     if pid not in cache:
                         if len(cache) > 16:
                             cache.clear()
-                        cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"])
+                        cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"], clean=True)
                     images[pid] = cache[pid]
                 # 85% through: entrances done and a pair's second card has arrived.
                 when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))
@@ -104,6 +104,8 @@ def write_review_task(root: Path, chapter: str, plan: Dict[str, Any], session: s
     sync_note = ("Shots follow the narration sentence by sentence."
                  if plan.get("sync") == "synced" else
                  "This plan uses even timing (no sentence sync), so only check for broken or unreadable shots.")
+    from .review import CHECKLIST  # imported here: review.py imports this module
+
     doc = f"""# Video review — chapter {chapter}
 
 {sync_note}
@@ -141,6 +143,31 @@ Edit `video/chapter_{chapter}.plan.json`. Useful fields per shot:
   Use them sparingly.
 
 Don't change `start`/`end` unless you keep shots back to back. Never edit the MP4 or anything in `.work/`.
+
+## Fixes that survive a rebuild (preferred)
+
+Write them in `video/chapter_{chapter}.fixes.json` instead of the plan:
+
+- `drop`: a panel that is only lettering, a logo, or a blank screen (no character, no story).
+- `face`: a head's top and bottom as fractions of the panel's height, so the crop keeps the whole head.
+- `crop`: an exact box for a panel, with `shape` one of 9:16, 3:4, 1:1, 4:3, 16:9.
+
+Then rebuild the plan and look at the new storyboard:
+
+```bash
+python -m manhwa_ocr video verify --chapter {chapter}{pin}
+python -m manhwa_ocr video storyboard --chapter {chapter}{pin}
+```
+
+When every shot is right, approve it so it can be rendered:
+
+```bash
+python -m manhwa_ocr video approve --chapter {chapter}{pin}
+```
+
+## Full checklist
+
+{CHECKLIST}
 
 When the plan is right, set `"reviewed": true` in it and render:
 

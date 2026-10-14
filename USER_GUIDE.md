@@ -382,6 +382,175 @@ A plan you've edited is never overwritten automatically. `video plan --chapter N
 
 ---
 
+## Step 5b — Review the video before rendering (storyboard check)
+
+Building a video does not mean it is right. Each chapter's storyboard shows every
+shot: the picture, the time, the panel id, and the narration sentence spoken over
+it. Before rendering, someone has to read that storyboard against the narration.
+There are two ways to do that. Use one, not both.
+
+Both ways write the same file, `video/chapter_N.fixes.json`, and both finish with
+`video approve`. Nothing else in the plan or the code is edited by hand.
+
+### Before either way: the automatic check (no AI)
+
+```powershell
+python -m manhwa_ocr video verify --chapter 8 --session "manhwa-2"
+```
+
+This rebuilds the plan and checks every drawn panel on its pixels: lettering, painted
+bubble patches, blank pages, and a head that would be cut. Each panel that fails gets a
+clean crop if one exists. A panel with no character and no clean crop is dropped and
+listed by panel id, with its reason. The full report is `video/chapter_8.verify.json`.
+
+### Way A: an IDE agent (Antigravity, Claude Code, Cursor)
+
+Build the storyboard, then paste this prompt into the agent. The same prompt is written
+to `.work/video/ch8/REVIEW.md` next to the storyboard sheets:
+
+```text
+You are reviewing the storyboard of a manhwa recap video for chapter 8 of the
+series "manhwa-2". Do not edit any program code. Do not delete any file. Do not
+edit video/chapter_8.plan.json. You may only write video/chapter_8.fixes.json,
+and you run only "python -m manhwa_ocr ..." commands.
+
+1. Open every storyboard sheet: video/chapter_8.storyboard_01.png, _02, _03
+   (and any more the folder has). Open .work/video/ch8/NARRATION.md, which lists
+   each shot's time, panel ids, and the sentence spoken over it. Read it all first.
+
+2. For EVERY shot, compare the picture with the sentence spoken over it. If the
+   picture does not show what the sentence describes, note the shot id.
+
+3. Look for these problems, in every shot:
+   a. Any TEXT on screen: speech-bubble dialogue, captions, sound-effect lettering,
+      a logo, a watermark (for example ASURASCANS.COM), a "Read at" credit, or a
+      title card. These must not be shown. Propose a "drop" for a panel that is
+      only text or a logo.
+   b. A WHITE or BLANK screen, or an empty wall, door, leaf, or floor with no
+      character and no story value. Propose a "drop" for it.
+   c. A FACE or HEAD cut: half a face, a chin or forehead missing, a character cut
+      at the eyes or nose. Propose a "face" entry with the head's top and bottom as
+      fractions of the panel's height (0 is the top edge, 1 is the bottom edge), or a
+      "crop" entry whose box keeps the whole head.
+   d. A PAINTED PATCH: a flat grey or coloured blob where a bubble was removed.
+      Propose a "crop" that avoids it, if one exists.
+   e. An IMPORTANT panel that is missing: a character or story beat the narration
+      describes but no shot shows. Name the panel ids you can see are missing.
+   f. A duplicate in a row, or a clearly wrong order.
+
+4. Rules for fixes:
+   - Drop only a panel that shows no character and no story detail. Never drop a
+     panel with a character in it, even a small one.
+   - A "crop" must keep one of these shapes: 9:16, 3:4, 1:1, 4:3, 16:9. The box is
+     [x0, y0, x1, y1] as fractions of the panel (0 to 1), and must keep that shape.
+   - Use the panel id exactly as the storyboard shows it, for example P016-06.
+
+5. Write your fixes to video/chapter_8.fixes.json in this exact form (keep the file
+   valid JSON; leave a list empty if you have nothing for it):
+
+   {"version": 1,
+    "drop": [{"panel": "P016-06", "reason": "sound-effect lettering only"}],
+    "face": [{"panel": "P017-02", "top": 0.12, "bottom": 0.46}],
+    "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}]}
+
+6. Rebuild and look again:
+     python -m manhwa_ocr video verify --chapter 8 --session "manhwa-2"
+     python -m manhwa_ocr video storyboard --chapter 8 --session "manhwa-2"
+   Then repeat from step 1 with the NEW storyboard images. Stop when every shot is
+   right and no fixes are needed.
+
+7. When the chapter is clean, run:
+     python -m manhwa_ocr video approve --chapter 8 --session "manhwa-2"
+   Then reply exactly: "yes, you can render the video".
+   If you cannot make a shot right, do not approve. Say which shot and why.
+
+8. Final message: list each shot id you changed, what was wrong, and what you did.
+   List every dropped panel by its page and panel id, with its reason.
+```
+
+### Way B: the terminal (DeepSeek flash, no IDE agent)
+
+The same review runs from the terminal. The reviewer is the vision model in
+`manhwa-ocr.yaml` (`provider:`), which is DeepSeek flash by default.
+
+**One-time setup**
+
+1. Get an API key at platform.deepseek.com and copy it (it starts with `sk-`).
+2. Set it for your Windows user (open a new terminal after this):
+
+   ```powershell
+   setx DEEPSEEK_API_KEY "sk-paste-your-key-here"
+   ```
+
+   To try it for one terminal session only, use instead:
+
+   ```powershell
+   $env:DEEPSEEK_API_KEY = "sk-paste-your-key-here"
+   ```
+
+3. Check `manhwa-ocr.yaml`. These lines are the defaults:
+
+   ```yaml
+   provider:
+     kind: openai
+     vision_model: deepseek-flash      # reads the storyboard images
+     text_model: deepseek-chat         # text-only tasks
+     base_url: https://api.deepseek.com
+     api_key_env: DEEPSEEK_API_KEY
+
+   video:
+     require_review: false             # true: a video must be approved before rendering
+     review:
+       max_rounds: 3                   # review-and-fix rounds before giving up
+       model: null                     # null = vision_model above; or set another vision model
+   ```
+
+**Run it**
+
+```powershell
+# Show what the reviewer would say, apply nothing:
+python -m manhwa_ocr video review --chapter 8 --session "manhwa-2" --dry-run
+
+# Review, apply its fixes, rebuild, review again; approve when it is clean:
+python -m manhwa_ocr video review --chapter 8 --session "manhwa-2"
+
+# Allow more rounds:
+python -m manhwa_ocr video review --chapter 8 --session "manhwa-2" --max-rounds 5
+```
+
+Each round: the reviewer reads the storyboard sheets and the narration, and replies
+with JSON (`approved`, plus `drop`, `face`, `crop` entries, and notes). Those fixes are
+checked against the chapter's real panels and allowed shapes. A reply with a bad entry
+is refused as a whole and nothing is applied. The plan is then rebuilt. The loop stops
+when the reviewer approves, or after `max_rounds`. If the reviewer never approves,
+nothing is approved, and the notes say which shots and panels remain.
+
+Then render:
+
+```powershell
+python -m manhwa_ocr video render --chapter 8 --session "manhwa-2"
+```
+
+**Notes**
+
+- A reviewer cost is one call per round, with each storyboard sheet as an image.
+- The check is only as good as the model. Look at the approved storyboard yourself
+  before publishing.
+- If the model does not accept images, the run stops with a message. Pick a vision
+  model in `provider:` or set `video.review.model`.
+- `--force` does not skip the review gate. With `require_review: true`, a render
+  needs an approval for the current plan.
+
+**Summary of the commands**
+
+| Command | What it does |
+|---|---|
+| `video verify --chapter N` | rebuild the plan and run the automatic check (no AI) |
+| `video storyboard --chapter N` | rebuild the storyboard sheets and NARRATION.md |
+| `video review --chapter N` | DeepSeek (or your vision model) reviews, fixes, and approves |
+| `video approve --chapter N` | approve the current plan by hand |
+| `video render --chapter N` | render the MP4 (needs approval if `require_review` is true) |
+
 ## Step 7 — Finish: one long video, Shorts, the full script
 
 ```bash

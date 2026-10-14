@@ -121,7 +121,7 @@ def crop_aspect(layout: str, fmt: Format, panel_aspect: float) -> float:
 # The only card shapes a video uses (w/h). Landscape video: 3:4, 1:1, 4:3, 16:9.
 # Portrait (9:16) video: 9:16, 3:4, 1:1. Each layout gets its own short list.
 LAYOUT_SHAPES = {
-    False: {"single": [0.75, 1.0, 1.333, 1.777], "pair": [0.75, 1.0], "inset": [0.75, 1.0],
+    False: {"single": [0.5625, 0.75, 1.0, 1.333, 1.777], "pair": [0.5625, 0.75, 1.0], "inset": [0.75, 1.0],
             "wide": [1.333, 1.777]},
     True: {"single": [0.5625, 0.75, 1.0], "pair": [0.5625, 0.75], "inset": [0.5625, 0.75],
            "wide": [0.75, 1.0]},

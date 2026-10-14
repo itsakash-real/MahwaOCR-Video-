@@ -9,6 +9,7 @@ it broke. Set MANHWA_DEBUG=1 to see full tracebacks.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -753,6 +754,45 @@ def cmd_video(args) -> int:
             for p in write_storyboard(sess.path, c, plan, log=_log):
                 _log(f"  {p.relative_to(sess.path).as_posix()}")
             write_review_task(sess.path, c, plan, sess.slug)
+            from .video.review import write_narration
+
+            _log(f"  narration: {write_narration(sess.path, c, plan).relative_to(sess.path).as_posix()}")
+        return 0
+
+    if action == "verify":
+        from .video import verify as vf
+
+        for c in chapters(default_all=False):
+            vb.make_plan(sess, c, cfg, force=True, sync="off" if args.no_sync else "auto",
+                         fmt=args.format, log=_log)
+            from .video.media import video_dir
+
+            rep = json.loads((video_dir(sess.path) / f"chapter_{c}.verify.json").read_text(encoding="utf-8"))
+            _log(f"=== Chapter {c}: checked {len(rep['panels'])} drawn panels ===")
+            for pid, r in rep["panels"].items():
+                if r["action"] != "ok":
+                    _log(f"  {pid}: {r['action']} ({', '.join(r['problems']) or 'no character'})")
+            _log(f"  dropped: {len(rep['dropped'])}   needs eyes: {len(rep['needs_eyes'])}")
+            _log(f"  report: video/chapter_{c}.verify.json")
+        return 0
+
+    if action == "review":
+        from .video import review as rv
+
+        for c in chapters(default_all=False):
+            rv.run_review(sess, c, cfg, dry_run=args.dry_run, max_rounds=args.max_rounds or 3, log=_log)
+        return 0
+
+    if action == "approve":
+        from .video import review as rv
+        from .video.panels import load_panels
+        from .video.plan import load_plan
+
+        for c in chapters(default_all=False):
+            ids = {p["id"] for p in (load_panels(sess.path, c) or {"panels": []})["panels"]}
+            plan = load_plan(sess.path, c, ids)
+            rv.approve(sess.path, c, plan, note="approved by hand")
+            _log(f"  chapter {c}: approved; render with  video render --chapter {c}")
         return 0
 
     if action == "render":
@@ -900,7 +940,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
     p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "storyboard", "render",
-                                      "build", "clip", "compile"])
+                                      "build", "clip", "compile", "verify", "review", "approve"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
     p.add_argument("--force", action="store_true", help="rebuild even if up to date (discards plan edits)")
@@ -917,6 +957,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-titles", dest="no_titles", action="store_true", help="compile without title cards")
     p.add_argument("--name", help="compiled output name")
     p.add_argument("--apply", action="store_true", help="pair: save the fixed tags from pairs.json")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing")
+    p.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
+                   help="review: how many review-and-fix rounds to allow (default 3)")
     ws(p)
     p.set_defaults(func=cmd_video)
 

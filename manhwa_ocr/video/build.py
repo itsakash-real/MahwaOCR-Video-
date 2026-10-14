@@ -27,6 +27,8 @@ from . import align_engine
 from . import cues as cues_mod
 from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, run, video_info
 from .frames import background, format_from, shapes_for
+from . import fixes as fixes_mod
+from .verify import verify_chapter
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
 from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, units_from_alignment, validate
@@ -35,6 +37,29 @@ from .storyboard import storyboard_paths, write_review_task, write_storyboard
 
 
 END_TAIL = 1.5   # seconds the video runs on after the last word
+
+
+def _replace_dropped(units: List[Dict[str, Any]], drop: Dict[str, str]) -> List[Dict[str, Any]]:
+    """A dropped panel's time is kept but shows the nearest panel that stays on
+    screen (the one before it, or after it if it comes first). Timing unchanged."""
+    if not drop or not units:
+        return units
+    kept = [u["panels"][0] not in drop for u in units]
+    after: List[str | None] = [None] * len(units)
+    cur: str | None = None
+    for i in range(len(units) - 1, -1, -1):
+        if kept[i]:
+            cur = units[i]["panels"][0]
+        after[i] = cur
+    out, prev = [], None
+    for i, u in enumerate(units):
+        if kept[i]:
+            prev = u["panels"][0]
+            out.append(u)
+            continue
+        rep = prev or after[i]
+        out.append({**u, "panels": [rep]} if rep else u)
+    return out
 
 
 def qa_path(root: Path, chapter: str) -> Path:
@@ -63,14 +88,17 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
             if min(abs(math.log(aspect / a)) for a in allowed) > 0.02:
                 shape_bad.append(f"{s.get('id')} {c['panel']} ({aspect:.2f})")
     shortest = min((float(s["end"]) - float(s["start"]) for s in shots), default=0.0)
+    cs = plan.get("crop_stats") or {}
     failures = []
     if missing:
         failures.append(f"{len(missing)} drawn panel(s) would never appear: {', '.join(missing[:12])}")
     if shape_bad:
         failures.append(f"{len(shape_bad)} card(s) are not one of the allowed shapes: {', '.join(shape_bad[:6])}")
+    if cs.get("bubble"):
+        failures.append(f"{len(cs['bubble'])} panel(s) would show a speech bubble or caption in their card: "
+                        f"{', '.join(cs['bubble'][:8])}")
     if shots and shortest < min_hold - 0.01:
         failures.append(f"a shot lasts {shortest:.2f}s, under the {min_hold:g}s minimum")
-    cs = plan.get("crop_stats") or {}
     return {
         "chapter": plan.get("chapter"),
         "failures": failures,
@@ -234,6 +262,8 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         raise UserError(f"The narration for chapter {chapter} is only {duration:.2f}s long. Check {audio}.")
     rel_audio = audio.relative_to(root).as_posix() if audio else None
     inputs = _inputs(root, chapter, panels.get("fingerprint", ""), audio, fmt, vcfg, duration)
+    fp = fixes_mod.fixes_path(root, chapter)
+    inputs["fixes"] = hashlib.sha256(fp.read_bytes()).hexdigest()[:16] if fp.exists() else None
 
     existing_file = plan_path(root, chapter)
     if existing_file.exists() and not force:
@@ -266,6 +296,25 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     # with `video align`) and pass validation, with no fallback to reinterpreting
     # the tags here - a missing or broken alignment stops planning loudly.
     norm_w = panels["norm_width"]
+    # Non-AI check of every card (verify.py), plus any reviewer fixes. Dropped
+    # panels become text-only: they never count as missing, and no shot shows them.
+    dims = {p["id"]: (float(p.get("width") or 1), float(p.get("height") or 1)) for p in panels["panels"]}
+    fixes = fixes_mod.load(root, chapter, dims)
+    fmt_obj = format_from(fmt, int(vcfg.get("fps", 30)))
+    shapes = sorted({a for k in ("single", "pair", "wide") for a in shapes_for(k, fmt_obj)})
+    report = verify_chapter(panels["panels"], lambda p: panel_image(root, chapter, p, norm_w, clean=True),
+                            shapes, root, chapter, log=log)
+    drop = {d["panel"]: d["reason"] for d in report["dropped"]}
+    drop.update(fixes["drop"])
+    for p in panels["panels"]:
+        if p["id"] in drop:
+            p["text_only"] = True
+    if drop:
+        log(f"  chapter {chapter}: {len(drop)} panel(s) dropped (no character and no clean crop): "
+            + ", ".join(sorted(drop)))
+    if report["needs_eyes"]:
+        log(f"  ! {len(report['needs_eyes'])} panel(s) with a character whose head may be cut: "
+            + ", ".join(report["needs_eyes"][:12]))
     align_cov = None
     if not cues_mod.load_cues(root, chapter):
         units, mode_note, meta = None, "even timing (recap has no panel tags)", None
@@ -290,7 +339,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
             raise UserError(
                 f"Chapter {chapter}'s alignment failed validation, so planning stopped (no silent fallback):\n"
                 f"  {problems}\nFix it and rebuild with:  video align --chapter {chapter}")
-        units = units_from_alignment(alignment["segments"])
+        units = _replace_dropped(units_from_alignment(alignment["segments"]), drop)
         align_cov = alignment.get("coverage")
         queue = alignment.get("review_queue") or []
         meta = {"sync_mode": alignment.get("sync_mode"), "review_queue": queue}
@@ -299,7 +348,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
 
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
-                      image_for=lambda p: panel_image(root, chapter, p, norm_w))
+                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True), fixes=fixes)
     plan["inputs"] = inputs
     plan["generated_hash"] = _shots_hash(plan)
     errs = validate(plan, {p["id"] for p in panels["panels"]})
@@ -332,6 +381,14 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
     if not panels:
         raise UserError(f"No panels for chapter {chapter} yet. Run:  video plan --chapter {chapter}")
     plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    if (cfg.video or {}).get("require_review"):          # --force is not a bypass for the review
+        from .review import is_approved
+
+        if not is_approved(root, chapter, plan):
+            raise UserError(
+                f"Chapter {chapter} video has not been reviewed yet (require_review is on in manhwa-ocr.yaml).\n"
+                f'Review it first:  video review --chapter {chapter} --session "{sess.slug}"\n'
+                f"or check the storyboard yourself and run:  video approve --chapter {chapter}")
     if plan.get("sync") == "estimated" and not allow_estimated:
         raise UserError(
             f"Chapter {chapter}'s timing was only estimated from text length, not synced to the real "

@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Make a recap video: step by step</title>
+<style>
+  :root { --bg:#0f1220; --card:#181d33; --ink:#e8ecff; --muted:#9aa3c7; --line:#3a4370;
+          --go:#2fbf71; --ask:#f3b43f; --stop:#ff6b6b; --info:#5aa9ff; --code:#0b0e1a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--ink); line-height:1.45; }
+  header { padding:28px 32px 10px; }
+  h1 { margin:0 0 6px; font-size:26px; }
+  header p { margin:0; color:var(--muted); }
+  .wrap { padding:18px 32px 60px; max-width:1100px; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; margin:14px 0 4px; color:var(--muted); font-size:14px; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:13px; font-weight:600; }
+  .p-start{background:#2b3366;color:#cfd7ff} .p-ask{background:var(--ask);color:#241a00}
+  .p-go{background:var(--go);color:#03210f} .p-stop{background:var(--stop);color:#2a0606} .p-info{background:var(--info);color:#031a33}
+
+  /* ---- tree ---- */
+  .tree, .tree ul { list-style:none; margin:0; padding-left:0; }
+  .tree ul { margin-left:26px; padding-left:22px; border-left:2px solid var(--line); }
+  .tree li { position:relative; margin:10px 0; }
+  .tree ul > li::before { content:""; position:absolute; left:-22px; top:22px; width:18px; border-top:2px solid var(--line); }
+  details { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:0; }
+  details[open] { box-shadow:0 6px 18px rgba(0,0,0,.25); }
+  summary { cursor:pointer; padding:12px 16px; font-weight:600; font-size:17px; list-style:none; display:flex; align-items:center; gap:10px; }
+  summary::-webkit-details-marker { display:none; }
+  summary::before { content:"▶"; font-size:12px; color:var(--muted); transition:transform .15s; }
+  details[open] > summary::before { transform:rotate(90deg); }
+  .body { padding:0 18px 14px 18px; color:#d7dcf5; }
+  .leaf { display:flex; gap:12px; align-items:flex-start; background:var(--card); border:1px solid var(--line);
+          border-radius:12px; padding:12px 16px; }
+  .leaf .txt { flex:1; }
+  .note { color:var(--muted); font-size:14px; margin:6px 0 0; }
+  .ok { color:var(--go); } .warn { color:var(--ask); } .bad { color:var(--stop); }
+
+  /* ---- commands ---- */
+  .cmd { position:relative; background:var(--code); border:1px solid #242a4d; border-radius:10px; margin:10px 0; }
+  .cmd code { display:block; padding:12px 90px 12px 14px; font-family: Consolas, "Courier New", monospace; font-size:14px; color:#bfe3ff; white-space:pre-wrap; word-break:break-all; }
+  .cmd button { position:absolute; right:8px; top:8px; background:#2b3366; color:#e8ecff; border:0; border-radius:8px;
+                padding:6px 10px; cursor:pointer; font-size:13px; }
+  .cmd button:hover { background:#3a4480; }
+  .cmd button.done { background:var(--go); color:#03210f; }
+  .steps { margin:8px 0 0 0; padding-left:20px; color:#d7dcf5; }
+  .steps li { margin:4px 0; }
+  table { border-collapse:collapse; width:100%; margin:8px 0; font-size:14px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .fold-all { background:var(--card); color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; margin-right:8px; }
+  .search { background:var(--card); color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:8px 12px; width:260px; margin:10px 0 0; }
+  mark { background:#ffe27a; color:#222; border-radius:3px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Make a recap video</h1>
+  <p>Find your box, follow the arrow. Click a command's <b>Copy</b> button and paste it into the terminal.</p>
+</header>
+<div class="wrap">
+
+  <div class="legend">
+    <span class="pill p-start">START</span>
+    <span class="pill p-ask">QUESTION (choose)</span>
+    <span class="pill p-go">DO THIS</span>
+    <span class="pill p-info">LOOK AT</span>
+    <span class="pill p-stop">PROBLEM</span>
+  </div>
+  <input class="search" id="q" placeholder="Search (e.g. audio, clip, error)" oninput="find(this.value)">
+  <div style="margin:12px 0">
+    <button class="fold-all" onclick="setAll(true)">Open all</button>
+    <button class="fold-all" onclick="setAll(false)">Close all</button>
+  </div>
+
+  <ul class="tree" id="tree">
+
+  <li><span class="pill p-start">START</span>
+    <details open><summary>Where do I run commands?</summary>
+      <div class="body">
+        <ol class="steps">
+          <li>Double-click <b>Open_Video_Guide.bat</b> (you are reading it now).</li>
+          <li>Open a terminal in the program folder: <code>C:\Users\akash\Documents\manhwaOCR</code>. In File Explorer, click the address bar, type <code>cmd</code>, press Enter.</li>
+          <li>Paste a command, press Enter, wait until the terminal shows the prompt again.</li>
+        </ol>
+      </div>
+    </details>
+  </li>
+
+  <li><span class="pill p-ask">QUESTION</span>
+    <details open><summary>1. Is the narration audio saved for this chapter?</summary>
+      <div class="body">
+        <ul class="tree">
+          <li><div class="leaf"><span class="pill p-stop">NO</span><div class="txt">
+              Record the text file <code>ManhwaRecaps\manhwa-2\recaps\chapter_8.tts.txt</code>.<br>
+              Save the recording as <code>ManhwaRecaps\manhwa-2\audio\chapter_8.mp3</code>.<br>
+              <span class="note">Then come back to step 2.</span></div></div></li>
+          <li><div class="leaf"><span class="pill p-go">YES</span><div class="txt">Go to step 2.</div></div></li>
+        </ul>
+      </div>
+    </details>
+  </li>
+
+  <li><span class="pill p-go">DO THIS</span>
+    <details open><summary>2. Build the video (about 11 minutes)</summary>
+      <div class="body">
+        <div class="cmd"><code>python -m manhwa_ocr video build --chapters 8 --session "manhwa-2" --force</code><button onclick="copy(this)">Copy</button></div>
+        <p class="note">Change <b>8</b> to your chapter. Change <b>manhwa-2</b> to your series name. Let it finish. The last line tells you the result.</p>
+        <ul class="tree">
+          <li><div class="leaf"><span class="pill p-go">"wrote video\chapter_8.mp4"</span><div class="txt">Go to step 3.</div></div></li>
+          <li><div class="leaf"><span class="pill p-ask">"can't be built yet"</span><div class="txt">Go to step 5.</div></div></li>
+          <li><div class="leaf"><span class="pill p-stop">red text / "Error:"</span><div class="txt">Go to step 6.</div></div></li>
+        </ul>
+      </div>
+    </details>
+  </li>
+
+  <li><span class="pill p-info">LOOK AT</span>
+    <details open><summary>3. Check a 20-second sample</summary>
+      <div class="body">
+        <div class="cmd"><code>python -m manhwa_ocr video clip --chapter 8 --from 60 --to 80 --session "manhwa-2"</code><button onclick="copy(this)">Copy</button></div>
+        <p>Open <code>ManhwaRecaps\manhwa-2\video\chapter_8.clip_60-80.mp4</code> and watch it. Look for:</p>
+        <table>
+          <tr><th>Check</th><th>Good</th><th>Bad</th></tr>
+          <tr><td>Faces</td><td>whole head visible</td><td>half a face, chin missing</td></tr>
+          <tr><td>Pictures</td><td>match what the narrator says</td><td>wrong panel for the words</td></tr>
+          <tr><td>Stillness</td><td>cuts every few seconds</td><td>one picture for 10 seconds or more</td></tr>
+          <tr><td>Text</td><td>sound effects like "PWAH" are fine</td><td>speech bubbles with dialogue</td></tr>
+        </table>
+        <ul class="tree">
+          <li><div class="leaf"><span class="pill p-go">Looks right</span><div class="txt">Go to step 4.</div></div></li>
+          <li><div class="leaf"><span class="pill p-stop">Something is wrong</span><div class="txt">Go to step 5.</div></div></li>
+        </ul>
+      </div>
+    </details>
+  </li>
+
+  <li><span class="pill p-go">DO THIS</span>
+    <details><summary>4. Chapter finished. Repeat for the next chapter.</summary>
+      <div class="body">
+        <p>The full video is <code>ManhwaRecaps\manhwa-2\video\chapter_8.mp4</code>. Repeat steps 2 and 3 with <b>9</b>, <b>10</b>, and so on.</p>
+        <div class="cmd"><code>python -m manhwa_ocr video status --session "manhwa-2"</code><button onclick="copy(this)">Copy</button></div>
+        <p class="note">Shows every chapter. <b>ok</b> = done. <b>outdated</b> = build that chapter again.</p>
+      </div>
+    </details>
+  </li>
+
+  <li><span class="pill p-ask">QUESTION</span>
+    <details open><summary>5. Something is wrong with the pictures. What do you want to do?</summary>
+      <div class="body">
+        <ul class="tree">
+          <li>
+            <details><summary>A. Build again (no AI, free)</summary>
+              <div class="body">
+                <p>Use this after you change the audio, the recap, or the fix file in option C.</p>
+                <div class="cmd"><code>python -m manhwa_ocr video build --chapters 8 --session "manhwa-2"</code><button onclick="copy(this)">Copy</button></div>
+                <p class="note">Without <code>--force</code> it rebuilds only what changed, so it is much faster.</p>
+              </div>
+            </details>
+          </li>
+          <li>
+            <details><summary>B. AI review (needs a DeepSeek key, see Setup)</summary>
+              <div class="body">
+                <p class="warn">Status: the review loop is built and tested with fake data, but not yet run on a real chapter.</p>
+                <div class="cmd"><code>python -m manhwa_ocr video review --chapter 8 --session "manhwa-2"</code><button onclick="copy(this)">Copy</button></div>
+                <p>When it says <b>approved</b>, render it:</p>
+                <div class="cmd"><code>python -m manhwa_ocr video render --chapter 8 --session "manhwa-2"</code><button onclick="copy(this)">Copy</button></div>
+              </div>
+            </details>
+          </li>
+          <li>
+            <details><summary>C. Fix it by hand</summary>
+              <div class="body">
+                <ol class="steps">
+                  <li>Open <code>ManhwaRecaps\manhwa-2\.work\video\ch8\REVIEW.md</code>, and the storyboard pictures in <code>ManhwaRecaps\manhwa-2\video\</code>.</li>
+                  <li>Write your fixes in <code>ManhwaRecaps\manhwa-2\video\chapter_8.fixes.json</code>. Example:</li>
+                </ol>
+                <div class="cmd"><code>{
+ "version": 1,
+ "drop": [ {"panel": "P016-06", "reason": "blank page, no character"} ],
+ "face": [ {"panel": "P017-02", "top": 0.12, "bottom": 0.46} ],
+ "crop": [ {"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]} ]
+}</code><button onclick="copy(this)">Copy</button></div>
+                <ul class="steps">
+                  <li><b>drop</b>: remove a panel with no character and no story.</li>
+                  <li><b>face</b>: the head's top and bottom, as a fraction of the panel height (0 = top, 1 = bottom).</li>
+                  <li><b>crop</b>: an exact box. <b>shape</b> is 9:16, 3:4, 1:1, 4:3 or 16:9.</li>
+                </ul>
+                <p>If the file has a mistake, the build names the line and applies none of it. Then go back to <b>A</b>.</p>
+              </div>
+            </details>
+          </li>
+        </ul>
+      </div>
+    </details>
+  </li>
+
+  <li><span class="pill p-stop">PROBLEM</span>
+    <details open><summary>6. Something failed (red text). Find your message.</summary>
+      <div class="body">
+        <table>
+          <tr><th>The message says</th><th>What to do</th></tr>
+          <tr><td><code>No narration audio</code></td><td>Go to step 1. The file is missing or has the wrong name.</td></tr>
+          <tr><td><code>too short to hold N panels</code></td><td>The narration is shorter than the pictures need. Record a longer narration.</td></tr>
+          <tr><td><code>whisper</code> or <code>estimated</code></td><td>The voice could not be matched. Check the audio is clear, and see Setup.</td></tr>
+          <tr><td><code>not valid JSON</code> or <code>Error:</code></td><td>Open the file the message names, fix the line it names, then rebuild.</td></tr>
+          <tr><td>Anything else</td><td>Copy the last 20 lines of the terminal and send them to whoever maintains this tool.</td></tr>
+        </table>
+        <p class="note">Never delete files to get past an error.</p>
+      </div>
+    </details>
+  </li>
+
+  <li><span class="pill p-info">LOOK AT</span>
+    <details><summary>Setup (do this once)</summary>
+      <div class="body">
+        <ol class="steps">
+          <li>Check Python: <code>python --version</code> (3.10 or newer).</li>
+          <li>Install the video parts: <code>pip install -e ".[video,sync]"</code></li>
+          <li>Optional, for option B: set your DeepSeek key, then <b>close the terminal and open a new one</b>.
+            <div class="cmd"><code>setx DEEPSEEK_API_KEY "sk-your-key-here"</code><button onclick="copy(this)">Copy</button></div>
+          </li>
+        </ol>
+      </div>
+    </details>
+  </li>
+
+  </ul>
+</div>
+
+<script>
+function copy(btn) {
+  const text = btn.parentElement.querySelector('code').innerText;
+  const done = () => { btn.textContent = 'Copied'; btn.classList.add('done');
+                       setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1500); };
+  if (navigator.clipboard) { navigator.clipboard.writeText(text).then(done, () => fallback(text, done)); }
+  else { fallback(text, done); }
+}
+function fallback(text, done) {
+  const t = document.createElement('textarea'); t.value = text; document.body.appendChild(t);
+  t.select(); document.execCommand('copy'); t.remove(); done();
+}
+function setAll(open) { document.querySelectorAll('#tree details').forEach(d => d.open = open); }
+function find(term) {
+  term = term.trim().toLowerCase();
+  document.querySelectorAll('#tree details').forEach(d => {
+    const hit = term && d.textContent.toLowerCase().includes(term);
+    if (term) { d.open = hit || d.open; d.style.outline = hit ? '2px solid #ffe27a' : ''; }
+    else { d.style.outline = ''; }
+  });
+}
+</script>
+</body>
+</html>

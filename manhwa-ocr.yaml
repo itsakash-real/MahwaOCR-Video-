@@ -50,12 +50,18 @@ video:
   max_shot: 5.0
   target_shot: 2.7        # average seconds per shot (recap channels: about 2.7)
   pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
-  workers: 0              # parallel renders; 0 = half your CPU cores (fastest on 4 cores)
+  workers: 0              # parallel renders; 0 = all your CPU cores
   effects: {shake: true, punch: false, flash: false, end_fade: true}   # calm by default
   music: null             # e.g. "music/bed.mp3" (relative to the series folder); ducks under narration
   music_volume: 0.22
   whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
   whisper_language: null  # e.g. "hi"
+  # true: a chapter's video must be approved (video review, or video approve) before rendering
+  require_review: false
+  # The AI review (video review): the same provider as above, or set model: here.
+  review:
+    max_rounds: 3
+    model: null           # null = the provider's vision_model (deepseek-flash by default)
 
 pipeline:
   concurrency: 4          # parallel vision calls

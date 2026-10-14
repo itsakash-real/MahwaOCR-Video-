@@ -56,7 +56,7 @@ def _panel(root: str, chapter: str, panel: Dict[str, Any], norm_w: int, fingerpr
     if img is None:
         if len(_PANEL_CACHE) > 6:
             _PANEL_CACHE.clear()
-        img = panel_image(Path(root), chapter, panel, norm_w)
+        img = panel_image(Path(root), chapter, panel, norm_w, clean=True)
         _PANEL_CACHE[key] = img
     return img
 
@@ -153,7 +153,7 @@ def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any],
 
     started = time.time()
     if todo:
-        n = workers or int(vcfg.get("workers") or 0) or max(1, (os.cpu_count() or 2) // 2)
+        n = workers or int(vcfg.get("workers") or 0) or max(1, os.cpu_count() or 2)
         n = max(1, min(n, len(todo)))
         if n == 1:
             for k, job in enumerate(todo, start=1):

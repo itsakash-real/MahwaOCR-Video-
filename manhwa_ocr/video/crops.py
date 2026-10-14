@@ -18,7 +18,7 @@ The result is just a default: crops are stored in the plan, where the agent
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 from PIL import Image
@@ -312,28 +312,165 @@ def tone(img: Image.Image) -> str:
 # ------------------------------------------------------------------ shape-locked crops
 #
 # Every card is cut to one exact shape (w/h in pixels), chosen from a short
-# list per layout. The window is slid over the panel and scored: it avoids
-# lettering and flat white, keeps the head inside (a face's top edge is never
-# cut), and prefers real art. A window of the target shape always exists, so
-# nothing is dropped for lack of a crop.
+# list per layout. The window is slid over the panel and scored. Three things
+# are hard constraints:
+#   - no speech bubble or caption box inside the card (bubble_boxes)
+#   - a detected head is kept whole: its top and chin stay inside the card
+#   - the card is the exact shape (checked by plan.quality_report)
+# A window of the target shape always exists, so nothing is dropped for lack of
+# a crop; when even the best window breaks a constraint, that is reported.
 
-HEAD_MARGIN = 0.04       # fraction of the panel's height kept above a detected head
+HEAD_MARGIN = 0.04       # fraction of the panel's height kept above and below a head
 FIGURE_MIN = 0.004       # skin share above this means a character is drawn here
+BUBBLE_OK = 0.02         # share of a card a speech bubble may take before it counts as shown
 
 
-def _panel_maps(img: Image.Image) -> Dict[str, np.ndarray]:
+def _panel_maps(img: Image.Image) -> Dict[str, Any]:
     """Analysis maps for one panel, computed once and sliced per candidate."""
     rgb = _small(img, 120)
     soft, hard, flat_white = _art_maps(rgb)
-    return {"soft": soft, "texty": np.clip(hard + flat_white, 0, 1), "skin": _skin(rgb),
-            "blank": flat_white}
+    gray = rgb.mean(axis=2)
+    m: Dict[str, Any] = {"soft": soft, "texty": np.clip(hard + flat_white, 0, 1), "skin": _skin(rgb),
+                         "blank": flat_white, "gray": gray, "gray_hi": _small(img, 240).mean(axis=2)}
+    m["bubble_regions"] = bubble_regions(m)
+    m["bubbles"] = [r["box"] for r in m["bubble_regions"]]
+    # Where clean_bubbles() painted: flat patches the crop should avoid if it can.
+    m["painted"] = list(getattr(img, "painted_boxes", []))
+    return m
 
 
-def face_top(maps: Dict[str, np.ndarray]) -> float | None:
+def _label(fg: np.ndarray) -> Tuple[np.ndarray, int]:
+    """Label 4-connected regions of a boolean grid: (labels, count), 0 = background."""
+    try:
+        import cv2                      # compiled labelling, if OpenCV happens to be installed
+
+        n, lab = cv2.connectedComponents(fg.astype(np.uint8), connectivity=4)
+        return lab.astype(np.int32), int(n) - 1
+    except ImportError:
+        pass
+    # Pure numpy fallback: every cell takes the smallest label among its neighbours
+    # until nothing changes. Correct everywhere, but slow on large white areas.
+    h, w = fg.shape
+    big = np.iinfo(np.int64).max
+    lab = np.where(fg, np.arange(h * w, dtype=np.int64).reshape(h, w) + 1, big)
+    while True:
+        m = lab.copy()
+        np.minimum(m[1:, :], lab[:-1, :], out=m[1:, :])
+        np.minimum(m[:-1, :], lab[1:, :], out=m[:-1, :])
+        np.minimum(m[:, 1:], lab[:, :-1], out=m[:, 1:])
+        np.minimum(m[:, :-1], lab[:, 1:], out=m[:, :-1])
+        m = np.where(fg, m, big)
+        if np.array_equal(m, lab):
+            break
+        lab = m
+    values = np.unique(lab[fg])
+    remap = np.zeros(h * w + 2, dtype=np.int32)
+    remap[values % (h * w + 2)] = np.arange(1, len(values) + 1, dtype=np.int32)
+    out = np.zeros((h, w), dtype=np.int32)
+    out[fg] = remap[lab[fg] % (h * w + 2)]
+    return out, len(values)
+
+
+def _components(mask: np.ndarray) -> List[Tuple[int, int, int, int, int, np.ndarray]]:
+    """4-connected regions of a boolean grid: (y0, y1, x0, x1, area, pixels), ends
+    exclusive; `pixels` is the region's own mask inside its box."""
+    fg = np.asarray(mask, dtype=bool)
+    if not fg.any():
+        return []
+    lab, count = _label(fg)
+    ys, xs = np.nonzero(lab)
+    ids = lab[ys, xs]
+    y_min = np.full(count + 1, 1 << 30, np.int64); y_max = np.full(count + 1, -1, np.int64)
+    x_min = np.full(count + 1, 1 << 30, np.int64); x_max = np.full(count + 1, -1, np.int64)
+    np.minimum.at(y_min, ids, ys); np.maximum.at(y_max, ids, ys)
+    np.minimum.at(x_min, ids, xs); np.maximum.at(x_max, ids, xs)
+    area = np.bincount(ids, minlength=count + 1)
+    out = []
+    for k in range(1, count + 1):
+        if area[k] == 0:
+            continue
+        y0, y1, x0, x1 = int(y_min[k]), int(y_max[k]) + 1, int(x_min[k]), int(x_max[k]) + 1
+        out.append((y0, y1, x0, x1, int(area[k]), lab[y0:y1, x0:x1] == k))
+    return out
+
+
+def bubble_boxes(m: Dict[str, Any]) -> List[Box]:
+    """Speech bubbles and caption boxes, as panel fractions (see bubble_regions)."""
+    return [r["box"] for r in bubble_regions(m)]
+
+
+def bubble_regions(m: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Speech bubbles and caption boxes: {"box": panel fractions, "fill": how much
+    of its box the white region fills}.
+
+    A bubble is a compact, pure-white region with three marks that pale art
+    (sky, walls, speed lines) lacks:
+      - dark lettering in at least two separate lines of text,
+      - a dark outline around most of its edge,
+      - a bounded size: at least 20% of the panel wide and 5% tall, at most 35% of it,
+      - lettering in its middle, not just at its edges (art with outlines fails this).
+    Measured on a finer grid than the crop search, so thin outlines survive.
+    """
+    gray = m["gray_hi"]
+    h, w = gray.shape
+    white = gray > 235
+    dark = gray < 90
+    out: List[Dict[str, Any]] = []
+    for y0, y1, x0, x1, area, pix in _components(white):
+        bh, bw = y1 - y0, x1 - x0
+        if bw < 0.2 * w or bh < 0.05 * h or area > 0.35 * h * w or area / float(bh * bw) < 0.38:
+            continue
+        block = dark[y0:y1, x0:x1] & ~pix            # lettering: dark pixels inside the region's box
+        if not 0.005 <= float(block.mean()) <= 0.35:
+            continue
+        rows = block.mean(axis=1) > 0.02
+        bands = int(np.sum(rows[1:] & ~rows[:-1]) + (1 if rows[0] else 0))
+        if bands < 2:
+            continue
+        # outline: the ring just outside the region must be mostly dark
+        pad = np.pad(pix, 4)
+        ring = np.zeros_like(pad)
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+                ring |= np.roll(np.roll(pad, dy, axis=0), dx, axis=1)
+        ring &= ~pad
+        gy0, gx0 = max(0, y0 - 4), max(0, x0 - 4)
+        sub = gray[gy0:min(h, y1 + 4), gx0:min(w, x1 + 4)]
+        ry0, rx0 = gy0 - (y0 - 4), gx0 - (x0 - 4)
+        ring = ring[ry0:ry0 + sub.shape[0], rx0:rx0 + sub.shape[1]]
+        outline = float((sub[ring] < 170).mean()) if ring.any() else 0.0
+        # A bubble cut by the panel's edge has no outline there, so a region with
+        # a lot of text (four or more lines) needs less of it.
+        if outline < (0.25 if bands >= 4 else 0.4):
+            continue
+        # Lettering sits in the middle of a bubble. Robe folds, door frames and
+        # speed lines put their dark pixels at the edges instead: reject those.
+        yy, xx = np.mgrid[0:bh, 0:bw]
+        radius = ((yy - (bh - 1) / 2) / (bh / 2)) ** 2 + ((xx - (bw - 1) / 2) / (bw / 2)) ** 2
+        dk = dark[y0:y1, x0:x1]
+        centre = float(dk[radius <= 0.36].mean()) if (radius <= 0.36).any() else 0.0
+        edge_ring = (radius <= 1.0) & (radius > 0.36)
+        edge = float(dk[edge_ring].mean()) if edge_ring.any() else 0.0
+        if centre < 0.035 or centre < 0.6 * edge:
+            continue
+        out.append({"box": (max(0, x0 - 2) / w, max(0, y0 - 2) / h, min(w, x1 + 2) / w, min(h, y1 + 2) / h),
+                    "fill": area / float(bh * bw)})
+    return out
+
+
+def _overlap_share(box: Box, other: Box) -> float:
+    """Share of `box`'s area that lies inside `other`."""
+    ix = max(0.0, min(box[2], other[2]) - max(box[0], other[0]))
+    iy = max(0.0, min(box[3], other[3]) - max(box[1], other[1]))
+    area = (box[2] - box[0]) * (box[3] - box[1])
+    return (ix * iy) / area if area > 0 else 0.0
+
+
+def face_top(maps: Dict[str, Any]) -> float | None:
     """Fraction of the panel's height where the topmost character's skin starts,
     searched in the upper 55% (where heads are). None if no figure is found.
 
-    Heuristic: a run of three rows that are at least 3% skin. Pale or heavily
+    Heuristic: three rows in a row that are at least 3% skin. Pale or heavily
     stylised art can miss; the QA report counts those panels as head_risk."""
     rows = maps["skin"].mean(axis=1)
     h = len(rows)
@@ -345,63 +482,178 @@ def face_top(maps: Dict[str, np.ndarray]) -> float | None:
     return None
 
 
+def face_bottom(maps: Dict[str, Any], top: float) -> float:
+    """Fraction of the panel's height where the skin from `top` ends (the chin),
+    allowing gaps of up to two rows."""
+    rows = maps["skin"].mean(axis=1)
+    h = len(rows)
+    last, gap = int(top * h) + 2, 0
+    for k in range(last, int(0.9 * h)):
+        if rows[k] >= 0.02:
+            last, gap = k, 0
+        else:
+            gap += 1
+            if gap > 2:
+                break
+    return min(1.0, (last + 1) / h)
+
+
 def figure_share(img: Image.Image) -> float:
     """Share of the panel that is skin-coloured: a rough test for a character."""
     return round(float(_panel_maps(img)["skin"].mean()), 4)
 
 
-def shape_crop(img: Image.Image, aspect: float, maps: Dict[str, np.ndarray] | None = None) -> Tuple[Box, float, bool]:
-    """Best window of exactly `aspect` (w/h in pixels) inside the panel.
+def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """Every window of exactly `aspect` (w/h in pixels) worth showing, best first.
 
-    Returns (box, score, head_ok). Lower score is better. A window that is
-    narrower than the panel cuts the sides; a wider-than-target panel is cut
-    only at the top and bottom, so panels keep their full width when they can.
+    Each: {"box", "score", "head_ok", "bubble_ok", "blank", "soft", "painted", "texty"}.
+    Lower score is better. A window narrower than the panel cuts the sides; a
+    panel wider than the shape keeps its full width where it can. A face
+    position from fixes.json (maps["face_override"]) replaces the skin guess.
+    All windows are scored together with summed-area tables, so this is fast.
     """
     m = maps or _panel_maps(img)
     gh, gw = m["soft"].shape
     panel_aspect = gw / gh
     r = aspect / panel_aspect                       # box width / box height, as fractions
-    fe = face_top(m)
-    best: Tuple[float, Box, bool] | None = None
-    if r <= 1.0:
-        # narrower than the panel: smaller windows of the same shape (sides may be cut)
-        sizes = [(r * s, s, s) for s in (1.0, 0.85, 0.7, 0.55)]
+    full = (r, 1.0) if r <= 1.0 else (1.0, 1.0 / r)
+    if m.get("face_override"):
+        fe, fb = m["face_override"]
     else:
-        # wider than the target: full width only, so only top and bottom are cut
-        sizes = [(1.0, 1.0 / r, 1.0)]
-    for bw, bh, s in sizes:
-        xs = [0.0] if bw >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bw, 7))
-        ys = [0.0] if bh >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bh, 11))
+        fe = face_top(m)
+        fb = face_bottom(m, fe) if fe is not None else None
+
+    boxes: List[Tuple[float, float, float, float, float]] = []      # x0, y0, x1, y1, scale
+    for s in (1.0, 0.85, 0.7, 0.55):               # no deeper zoom: the card would go soft
+        bw, bh = full[0] * s, full[1] * s
+        if s < 1.0 and (bw < 0.1 or bh < 0.1):
+            continue                                # too small to show anything useful
+        xs = [0.0] if bw >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bw, 17))
+        ys = [0.0] if bh >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bh, 21))
+        if fe is not None and fb is not None and bh < 1.0 - 1e-9:
+            # exact positions that keep the whole head (top and chin) in the card
+            for y in (fe - HEAD_MARGIN, fb + HEAD_MARGIN - bh):
+                ys.append(min(max(0.0, y), 1.0 - bh))
         for x0 in xs:
             for y0 in ys:
-                x1, y1 = x0 + bw, y0 + bh
-                r0, r1 = int(y0 * gh), max(int(y0 * gh) + 1, int(y1 * gh))
-                c0, c1 = int(x0 * gw), max(int(x0 * gw) + 1, int(x1 * gw))
-                texty = float(m["texty"][r0:r1, c0:c1].mean())
-                soft = float(m["soft"][r0:r1, c0:c1].mean())
-                skin = float(m["skin"][r0:r1, c0:c1].mean())
-                blank = float(m["blank"][r0:r1, c0:c1].mean())
-                head_ok = fe is None or y0 <= fe - HEAD_MARGIN
-                score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + 0.1 * (1.0 - s)
-                         + (1.0 if soft < 0.02 else 0.0) + (5.0 if not head_ok else 0.0))
-                if best is None or score < best[0]:
-                    box = (round(float(x0), 4), round(float(y0), 4), round(float(x1), 4), round(float(y1), 4))
-                    best = (score, box, head_ok)
-    score, box, head_ok = best
-    return box, score, head_ok
+                boxes.append((x0, y0, x0 + bw, y0 + bh, s))
+    if not boxes:
+        return []
+    B = np.array(boxes, dtype=np.float64)
+    x0, y0, x1, y1, scale = B[:, 0], B[:, 1], B[:, 2], B[:, 3], B[:, 4]
+
+    # Pixel rows and columns of each window, the same rule the scoring always used.
+    r0 = (y0 * gh).astype(int)
+    r1 = np.maximum(r0 + 1, (y1 * gh).astype(int))
+    c0 = (x0 * gw).astype(int)
+    c1 = np.maximum(c0 + 1, (x1 * gw).astype(int))
+    area_px = ((r1 - r0) * (c1 - c0)).astype(np.float64)
+
+    def window_mean(key: str) -> np.ndarray:
+        table = np.zeros((gh + 1, gw + 1))
+        table[1:, 1:] = m[key].cumsum(axis=0).cumsum(axis=1)
+        total = table[r1, c1] - table[r0, c1] - table[r1, c0] + table[r0, c0]
+        return total / area_px
+
+    texty = window_mean("texty")
+    soft = window_mean("soft")
+    skin = window_mean("skin")
+    blank = window_mean("blank")
+    head_ok = np.ones(len(B), dtype=bool)
+    if fe is not None:
+        head_ok &= y0 <= fe - HEAD_MARGIN
+        if fb is not None:
+            head_ok &= y1 >= fb + HEAD_MARGIN
+
+    def worst_overlap(regions) -> np.ndarray:
+        worst = np.zeros(len(B))
+        box_area = (x1 - x0) * (y1 - y0)
+        for bx0, by0, bx1, by1 in regions:
+            ix = np.maximum(0.0, np.minimum(x1, bx1) - np.maximum(x0, bx0))
+            iy = np.maximum(0.0, np.minimum(y1, by1) - np.maximum(y0, by0))
+            share = np.where(box_area > 0, ix * iy / np.maximum(box_area, 1e-12), 0.0)
+            worst = np.maximum(worst, share)
+        return worst
+
+    bubble = worst_overlap(m["bubbles"])
+    painted = worst_overlap(m["painted"])
+    score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + 0.1 * (1.0 - scale)
+             + (soft < 0.02).astype(float) + np.where(head_ok, 0.0, 5.0)
+             + (0.3 if (r > 1.0) else 0.0) * (scale < 1.0)     # a narrower window cuts the sides
+             + 3.0 * painted                                    # a painted patch is flat: avoid it
+             + 20.0 * bubble + np.where(bubble > BUBBLE_OK, 30.0, 0.0))  # bubble text outranks a head risk
+    order = np.argsort(score, kind="stable")[:60]
+    out: List[Dict[str, Any]] = []
+    for i in order:
+        box = (round(float(x0[i]), 4), round(float(y0[i]), 4), round(float(x1[i]), 4), round(float(y1[i]), 4))
+        out.append({"box": box, "score": float(score[i]), "head_ok": bool(head_ok[i]),
+                    "bubble_ok": bool(bubble[i] <= BUBBLE_OK), "blank": float(blank[i]), "soft": float(soft[i]),
+                    "painted": float(painted[i]), "texty": float(texty[i])})
+    return out
 
 
-def choose_shape(img: Image.Image, shapes: List[float], maps: Dict[str, np.ndarray] | None = None) -> Tuple[float, Box, bool]:
+def shape_crop(img: Image.Image, aspect: float, maps: Dict[str, Any] | None = None) -> Tuple[Box, float, bool, bool]:
+    """Best window of exactly `aspect`: (box, score, head_ok, bubble_ok)."""
+    best = shape_candidates(img, aspect, maps)[0]
+    return best["box"], best["score"], best["head_ok"], best["bubble_ok"]
+
+
+def choose_shape(img: Image.Image, shapes: List[float],
+                 maps: Dict[str, Any] | None = None) -> Tuple[float, Box, bool, bool]:
     """Pick the allowed shape that shows this panel best: the lowest crop score,
     with a penalty for cutting the sides and a small pull toward the panel's own
-    shape. Returns (shape, box, head_ok)."""
+    shape. Returns (shape, box, head_ok, bubble_ok)."""
     m = maps or _panel_maps(img)
     gw, gh = m["soft"].shape[1], m["soft"].shape[0]
     panel_aspect = gw / gh
     best = None
     for a in shapes:
-        box, score, head_ok = shape_crop(img, a, m)
-        cost = (score + 0.4 * max(0.0, np.log(panel_aspect / a)) + 0.02 * abs(np.log(a / panel_aspect)))
+        box, score, head_ok, bubble_ok = shape_crop(img, a, m)
+        cost = score + 0.4 * max(0.0, np.log(panel_aspect / a)) + 0.02 * abs(np.log(a / panel_aspect))
         if best is None or cost < best[0]:
-            best = (cost, a, box, head_ok)
-    return best[1], best[2], best[3]
+            best = (cost, a, box, head_ok, bubble_ok)
+    return best[1], best[2], best[3], best[4]
+
+
+
+def clean_bubbles(img: Image.Image, maps: Dict[str, Any] | None = None) -> Image.Image:
+    """The panel with its speech bubbles and caption boxes painted out.
+
+    The recap's narration carries the story (manhwa_recap_style_spec.md), so no
+    dialogue is left on screen. Each detected bubble is covered by an ellipse
+    (a rectangle for a caption box) slightly larger than the bubble, filled
+    with the median colour of the art just around it and feathered into the
+    picture. A bubble's own outline, text and most of its tail are inside it.
+    Works only on the area around each bubble, so it stays fast.
+    """
+    from PIL import ImageDraw, ImageFilter
+
+    m = maps or _panel_maps(img)
+    if not m["bubble_regions"]:
+        return img
+    painted = [r["box"] for r in m["bubble_regions"]]
+    out = img.convert("RGB")
+    W, H = out.size
+    for r in m["bubble_regions"]:
+        x0, y0, x1, y1 = r["box"]
+        bx0, by0, bx1, by1 = x0 * W, y0 * H, x1 * W, y1 * H
+        grow = 0.04 * max(bx1 - bx0, by1 - by0)
+        ring_w = 14
+        pad = int(grow + ring_w + 6)
+        cx0, cy0 = max(0, int(bx0) - pad), max(0, int(by0) - pad)
+        cx1, cy1 = min(W, int(bx1) + pad), min(H, int(by1) + pad)
+        local = out.crop((cx0, cy0, cx1, cy1))
+        mask = Image.new("L", local.size, 0)
+        shape = (bx0 - grow - cx0, by0 - grow - cy0, bx1 + grow - cx0, by1 + grow - cy0)
+        d = ImageDraw.Draw(mask)
+        d.rectangle(shape, fill=255) if r["fill"] >= 0.82 else d.ellipse(shape, fill=255)
+        grown = mask.filter(ImageFilter.MaxFilter(ring_w + 1 if ring_w % 2 == 0 else ring_w))
+        ring = np.asarray(grown, dtype=bool) & ~np.asarray(mask, dtype=bool)
+        if not ring.any():
+            continue
+        fill = np.median(np.asarray(local, dtype=np.float32)[ring], axis=0)
+        alpha = mask.filter(ImageFilter.GaussianBlur(3))
+        patched = Image.composite(Image.new("RGB", local.size, tuple(int(v) for v in fill)), local, alpha)
+        out.paste(patched, (cx0, cy0))
+    out.painted_boxes = painted         # read by _panel_maps so crops can steer clear
+    return out

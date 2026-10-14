@@ -31,7 +31,8 @@ from typing import Any, Callable, Dict, List, Tuple
 from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
-from .crops import _panel_maps, choose_shape, tone
+from .crops import _panel_maps, tone
+from .verify import pick_crop
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
 from .media import video_dir
 
@@ -43,9 +44,9 @@ PUNCH_GAP = 4.0
 EFFECT_GRACE = 0.35
 MIN_HOLD = 3.0           # seconds: no picture is held on screen for less than this
 
-ENTRANCE_WEIGHTS = [("cut", 50), ("fade_in", 10), ("fit_in_frame", 9), ("zoom_in", 8), ("blur_in", 7),
-                    ("slide_up", 5), ("pull_down", 4), ("swing_right", 4), ("slide_down", 3)]
-MOTION_WEIGHTS = [("push_in", 45), ("pull_out", 20), ("pan", 25), ("hold", 10)]
+# Reference recap (measured): hard cuts, almost still pictures, only slight drift.
+ENTRANCE_WEIGHTS = [("cut", 90), ("fade_in", 10)]
+MOTION_WEIGHTS = [("hold", 55), ("push_in", 30), ("pan", 15)]
 
 
 def plan_path(root: Path, chapter: str) -> Path:
@@ -306,14 +307,15 @@ class _Designer:
     """Turns timing units into shots: layouts, crops, backgrounds, animation."""
 
     def __init__(self, chapter: str, panels: List[Dict[str, Any]], fmt: Format, vcfg: Dict[str, Any],
-                 image_for: Callable[[Dict[str, Any]], Image.Image]):
+                 image_for: Callable[[Dict[str, Any]], Image.Image], fixes: Dict[str, Any] | None = None):
         self.chapter, self.fmt, self.vcfg = chapter, fmt, vcfg
+        self.fixes = fixes or {"crop": {}, "face": {}}
         self.by_id = {p["id"]: p for p in panels}
         self.image_for = image_for
         self._img: Dict[str, Image.Image] = {}
         self._crops: Dict[tuple, List[float]] = {}
         self._maps: Dict[str, Any] = {}
-        self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": []}
+        self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": [], "bubble": []}
         self._tone: Dict[str, str] = {}
         self.uses: Dict[str, int] = {}
         self.prev_enter: str | None = None
@@ -335,11 +337,22 @@ class _Designer:
         """The card's crop: one exact shape from the layout's list (crops.py)."""
         key = (pid, layout)
         if key not in self._crops:
+            if pid in self.fixes["crop"]:                  # a reviewer's exact crop (fixes.json)
+                shape, box = self.fixes["crop"][pid]
+                self._crops[key] = list(box)
+                if shape < self.panel_aspect(pid) and pid not in self.crop_stats["side_cut"]:
+                    self.crop_stats["side_cut"].append(pid)
+                return self._crops[key]
             if pid not in self._maps:
                 self._maps[pid] = _panel_maps(self.img(pid))
-            shape, box, head_ok = choose_shape(self.img(pid), shapes_for(layout, self.fmt), self._maps[pid])
-            if not head_ok and pid not in self.crop_stats["head_risk"]:
+            maps = self._maps[pid]
+            if pid in self.fixes["face"]:                   # a reviewer's head position replaces the skin guess
+                maps = {**maps, "face_override": self.fixes["face"][pid]}
+            shape, box, probs, _ = pick_crop(self.img(pid), shapes_for(layout, self.fmt), maps)
+            if "head_cut" in probs and pid not in self.crop_stats["head_risk"]:
                 self.crop_stats["head_risk"].append(pid)
+            if "lettering" in probs and pid not in self.crop_stats["bubble"]:
+                self.crop_stats["bubble"].append(pid)
             if shape < self.panel_aspect(pid) and pid not in self.crop_stats["side_cut"]:
                 self.crop_stats["side_cut"].append(pid)
             self._crops[key] = list(box)
@@ -353,14 +366,13 @@ class _Designer:
     def background(self, rng: random.Random, pid: str, layout: str) -> str:
         if layout == "inset":
             return "blur"
-        # A real mix of blurred, black and white, leaning on what suits the
-        # panel: light panels sit well on white, dark ones on black.
+        # Blurred (most shots) or black. Never white: a white screen behind
+        # pale manhwa cards washes the picture out. Dark panels lean on black.
         t = self.tone(pid)
-        black, white = {"white": (0.20, 0.45), "dark": (0.50, 0.15)}.get(t, (0.28, 0.20))
-        r = rng.random()
-        kind = "black" if r < black else ("white" if r < black + white else "blur")
+        black = {"dark": 0.40}.get(t, 0.15)
+        kind = "black" if rng.random() < black else "blur"
         if kind != "blur" and kind == self.prev_bg:
-            kind = "blur"  # never two identical solid backgrounds in a row
+            kind = "blur"  # never two black backgrounds in a row
         self.prev_bg = kind
         return kind
 
@@ -497,6 +509,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                sentences: List[Dict[str, Any]] | None = None,
                sync_report: Dict[str, Any] | None = None,
                alignment_units: List[Dict[str, Any]] | None = None,
+               fixes: Dict[str, Any] | None = None,
                alignment_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
@@ -525,7 +538,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         shots_units, timing = hold_groups(even_units(panels, duration, vcfg), float(vcfg.get("min_hold", MIN_HOLD)))
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
-    designer = _Designer(chapter, panels, fmt, vcfg, image_for)
+    designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes)
     shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
     return {
         "version": PLAN_VERSION,

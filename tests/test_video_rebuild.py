@@ -46,13 +46,13 @@ def _aspect(box, w, h):
 @pytest.mark.parametrize("target", [0.5625, 0.75, 1.0, 1.333, 1.777])
 def test_crop_is_exactly_the_target_shape(target):
     for img in (_art(900, 2400), _art(1600, 1000), _art(900, 900)):
-        box, _, _ = shape_crop(img, target)
+        box, _, _, _ = shape_crop(img, target)
         assert _aspect(box, img.width, img.height) == pytest.approx(target, rel=0.01)
 
 
 def test_crop_avoids_a_white_caption_band_at_the_top():
     img = _blank_top(900, 2000, band=0.3)
-    box, _, _ = shape_crop(img, 0.75)
+    box, _, _, _ = shape_crop(img, 0.75)
     assert box[1] >= 0.29          # the window starts below the white band
 
 
@@ -62,13 +62,13 @@ def test_crop_never_cuts_a_detected_head():
     fe = face_top(maps)
     assert fe is not None and 0.3 < fe < 0.4
     for target in (0.75, 1.0, 1.333):
-        box, _, ok = shape_crop(img, target, maps)
+        box, _, ok, _ = shape_crop(img, target, maps)
         assert ok and box[1] <= fe - 0.04 + 1e-6
 
 
 def test_choose_shape_returns_an_allowed_shape():
     img = _art(900, 2400)
-    shape, box, _ = choose_shape(img, shapes_for("single", format_from("16:9", 30)))
+    shape, box, _, _ = choose_shape(img, shapes_for("single", format_from("16:9", 30)))
     assert shape in LAYOUT_SHAPES[False]["single"]
 
 
@@ -174,3 +174,47 @@ def test_quality_gate_flags_a_shot_under_the_minimum_and_a_wrong_shape():
 def test_figure_share_sees_a_character_and_not_a_blank_page():
     assert figure_share(_face(400, 800, top=0.3)) > FIGURE_MIN
     assert figure_share(Image.new("RGB", (400, 800), (255, 255, 255))) < FIGURE_MIN
+
+
+def _bubble_panel(w=900, h=1600):
+    img = _art(w, h)
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((int(0.52 * w), int(0.10 * h), int(0.92 * w), int(0.30 * h)), radius=60, fill=(255, 255, 255))
+    for y in range(int(0.13 * h), int(0.28 * h), 30):      # dark lettering rows, chunky like real type
+        d.rectangle((int(0.56 * w), y, int(0.88 * w), y + 14), fill=(20, 20, 20))
+    return img
+
+
+def test_bubble_with_lettering_is_found_and_kept_out_of_the_card():
+    from manhwa_ocr.video.crops import _overlap_share, bubble_boxes
+
+    img = _bubble_panel()
+    maps = _panel_maps(img)
+    assert maps["bubbles"], "the speech bubble should be detected"
+    for target in (0.75, 1.0):
+        box, _, _, bubble_ok = shape_crop(img, target, maps)
+        assert bubble_ok
+        assert max(_overlap_share(box, b) for b in maps["bubbles"]) <= 0.02
+
+
+def test_clean_bubbles_paints_out_the_lettering_and_leaves_the_art_alone():
+    import numpy as np
+
+    from manhwa_ocr.video.crops import clean_bubbles
+
+    img = _bubble_panel()
+    cleaned = clean_bubbles(img)
+    a, b = np.asarray(img.convert("RGB"), dtype=int), np.asarray(cleaned, dtype=int)
+    h, w = a.shape[:2]
+    inside = (slice(int(0.12 * h), int(0.28 * h)), slice(int(0.56 * w), int(0.88 * w)))   # where the lettering was
+    assert (a[inside].min(axis=2) < 60).mean() > 0.05          # the original has dark lettering there
+    assert (b[inside].min(axis=2) < 60).mean() < 0.005         # the cleaned picture does not
+    far = (slice(int(0.6 * h), h), slice(0, w))
+    assert np.abs(a[far] - b[far]).max() == 0                  # art away from the bubble is untouched
+
+
+def test_clean_bubbles_returns_a_panel_without_bubbles_unchanged():
+    from manhwa_ocr.video.crops import clean_bubbles
+
+    img = _art(600, 900)
+    assert clean_bubbles(img) is img
