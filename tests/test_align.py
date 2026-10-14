@@ -95,18 +95,36 @@ def test_visual_sound_action_still_gets_matched():
     assert segments[1]["needs_review"] is False
 
 
-def test_ocr_system_notification_match_beats_a_weaker_tag():
-    """A sentence naming a concrete stat gain should prefer the panel whose own
-    OCR'd text contains that exact evidence, even over the original tag."""
+def test_the_recap_tag_wins_over_word_overlap_with_another_panel():
+    """The writer tagged this sentence while looking at the panels. Another panel
+    sharing a few words with the sentence must not replace it: that showed the wrong
+    picture while the narrator spoke (the Chapter 8 mismatch)."""
     panels = [_panel("P010-01"), _panel("P010-02", text="SYSTEM Strength +20"), _panel("P010-03")]
     sentences = [{"text": "He stares at the ceiling, lost in doubt.", "panels": ["P010-01"]},
                 {"text": "The system suddenly announces that his strength has increased by 20.",
-                 "panels": ["P010-03"]}]  # original tag is the weaker, wrong one
-    segments = align_sentences(sentences, panels)
-    seg = segments[1]
-    assert seg["selected_panel"] == "P010-02"
-    assert seg["confidence"] == "ocr_overrides_tag"
-    assert seg["needs_review"] is True  # overriding the original tag is always flagged
+                 "panels": ["P010-03"]}]
+    seg = align_sentences(sentences, panels)[1]
+    assert seg["selected_panel"] == "P010-03"
+    assert seg["confidence"] == "tag_confirmed_in_window"
+    assert seg["needs_review"] is False
+
+
+def test_a_tag_on_a_text_only_panel_falls_back_to_the_next_real_panel():
+    panels = [_panel("P010-01"), _panel("P010-02", text_only=True), _panel("P010-03", text="strength increased")]
+    sentences = [{"text": "He stares at the ceiling, lost in doubt.", "panels": ["P010-01"]},
+                {"text": "His strength has increased.", "panels": ["P010-02"]}]
+    seg = align_sentences(sentences, panels)[1]
+    assert seg["selected_panel"] != "P010-02"
+
+
+def test_every_tag_on_a_multi_panel_sentence_is_shown_in_order():
+    panels = [_panel(f"P001-0{i}") for i in range(1, 6)]
+    sentences = [{"text": "Then the door opens and he walks in slowly.",
+                  "panels": ["P001-01", "P001-02", "P001-03"]},
+                {"text": "He sits down.", "panels": ["P001-04"]}]
+    segs = align_sentences(sentences, panels)
+    assert segs[0]["selected_panel"] == "P001-01"
+    assert segs[0]["tagged_extras"] == ["P001-02", "P001-03"]
 
 
 def test_a_shared_stopword_never_overrides_a_tag():

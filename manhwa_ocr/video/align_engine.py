@@ -145,16 +145,18 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
         best = candidates[0] if candidates else None
         best_ocr = best["ocr_overlap"] if best else 0
 
-        tag = tagged[0] if tagged else None
+        # Tags the writer gave this sentence, in order. A tag on a text-only panel can't be
+        # shown, so it is not usable; the rest are the sentence's own pictures.
+        usable = [p for p in tagged if not by_id[p].get("text_only")]
+        tag = usable[0] if usable else None
         if tag and order[tag] < cursor - JUMP_TOLERANCE:
             # A real backward jump: don't trust it blindly, search the forward window instead.
             selected, confidence, needs_review = (best["panel"] if best else tag), "tag_behind_cursor", True
         elif tag and tag in window:
-            tag_ov = next((c["ocr_overlap"] for c in candidates if c["panel"] == tag), 0)
-            if best["panel"] == tag or best_ocr < MIN_OVERRIDE_EVIDENCE or best_ocr <= tag_ov:
-                selected, confidence, needs_review = tag, "tag_confirmed_in_window", False
-            else:
-                selected, confidence, needs_review = best["panel"], "ocr_overrides_tag", True
+            # The writer chose this panel while looking at it. Word overlap with a
+            # panel's own text is weak evidence (names, numbers), and overriding the
+            # tag showed the wrong picture while the narrator spoke. The tag stands.
+            selected, confidence, needs_review = tag, "tag_confirmed_in_window", False
         elif tag:
             # Forward, just beyond the normal lookahead window - the window was too
             # small for this stretch, not the tag wrong. Trust it, flag for a glance.
@@ -176,6 +178,12 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
                   confidence=confidence, needs_review=needs_review)
         if selected:
             cursor = order[selected]
+            # More than one tag: the sentence shows all of them (plan.py splits its time).
+            if selected == tag:
+                others = [p for p in usable[1:] if p != selected and order[p] >= order[selected]]
+                if others:
+                    seg["tagged_extras"] = others
+                    cursor = max(cursor, *(order[p] for p in others))
         segments.append(seg)
 
     return segments
@@ -195,8 +203,8 @@ def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]],
     order = {p["id"]: i for i, p in enumerate(panels)}
     shows = [k for k, s in enumerate(segments) if s.get("selected_panel")]
     for s in segments:
-        s["extra_panels"] = []
-    shown = {segments[k]["selected_panel"] for k in shows}
+        s["extra_panels"] = list(s.get("tagged_extras") or [])
+    shown = {segments[k]["selected_panel"] for k in shows} | {p for s in segments for p in s["extra_panels"]}
     missing = [p["id"] for p in panels if not p.get("text_only") and p["id"] not in shown]
     # Each shot holds at most two panels, and each needs min_hold of time.
     room = 2 * int(duration // min_hold) - len(shown)
