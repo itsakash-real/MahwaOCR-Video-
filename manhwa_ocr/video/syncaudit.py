@@ -246,14 +246,22 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
 
     worst_windows = sorted(windows, key=lambda w: w["duration"], reverse=True)[:5]
 
-    # A cut later than max_late + gate_grace fails the gate even if it is short.
+    # A cut is late when the sentence's FIRST picture (the first drawn panel
+    # of its sequence) is not up when its words start. Panels later in the
+    # sequence arrive on their own piece's words by design, so they are not
+    # judged here - only the cut itself is. A cut later than
+    # max_late + gate_grace fails the gate even if it is short.
     late: List[Dict[str, Any]] = []
     for si, seg in enumerate(segments):
-        if seg.get("display_action") != "SHOW" or not exp_sets[si]:
+        if seg.get("display_action") != "SHOW":
             continue
-        off = _cut_offset(shots, exp_sets[si], float(seg["start"]))
+        seq = [p for p in (seg.get("sequence") or []) if p not in text_only]
+        first = seq[:1] or exp_sets[si][:1]
+        if not first:
+            continue
+        off = _cut_offset(shots, first, float(seg["start"]))
         if off is not None and off > st["max_late"] + st["gate_grace"] + 1e-6:
-            late.append({"sentence": seg.get("sentence"), "offset": round(off, 3)})
+            late.append({"sentence": seg.get("sentence"), "panel": first[0], "offset": round(off, 3)})
 
     over: List[Dict[str, Any]] = []
     t = 0.0

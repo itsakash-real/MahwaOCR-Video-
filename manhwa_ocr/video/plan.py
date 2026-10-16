@@ -77,7 +77,7 @@ def even_units(panels: List[Dict[str, Any]], duration: float, vcfg: Dict[str, An
     """No tags: every drawn panel, in story order, shares the narration's length.
     Longer and text-heavier panels get a little more time. Nothing is dropped:
     text-only panels (captions, blank pages, credits) are the only exclusion,
-    and hold_groups() makes sure no shot is shorter than min_hold."""
+    and hold_groups() packs them into shots under the cut budget."""
     if not panels:
         raise UserError("No panels to put in the video.")
     art = [p for p in panels if not p.get("text_only")] or list(panels)
@@ -236,99 +236,101 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return units
 
 
-def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Pack timed single-panel units into shots that each hold >= min_hold.
+def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
+                lead: float | None = None, max_late: float | None = None,
+                min_hold_short: float | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Pack timed single-panel units into shots with a bounded cut budget.
 
-    A unit shorter than min_hold is paired with its neighbour: the two panels
-    share one shot (one after the other, the second sliding in). A pair that is
-    still too short takes time from a neighbouring shot by moving only the
-    boundary between them, so the total length and every panel stay as they are.
-    Returns (shots, stats). Raises UserError if the narration can't hold them.
+    Every cut may move only inside [sentence_start - lead, sentence_start +
+    max_late]. A picture can no longer borrow seconds from a far-away
+    neighbour - the old donor pass was what made the shot drift away from the
+    voice. A unit shorter than min_hold shares one shot with the next unit
+    (two cards, the second arriving on its own words); a shot still shorter
+    than min_hold_short after that takes at most `lead` more from its start
+    and `max_late` from its end. A shot that even then can't reach the floor
+    is left short and counted in stats["short_shots"] - the plan QA reports
+    it; the timing never silently drifts to hide it.
+
+    Returns (shots, stats). `lead`, `max_late` and `min_hold_short` default to
+    the video.sync values (sync.SYNC_DEFAULTS); build_plan passes the effective
+    settings from manhwa-ocr.yaml.
     """
+    lead = float(sync_mod.SYNC_DEFAULTS["lead"]) if lead is None else float(lead)
+    max_late = float(sync_mod.SYNC_DEFAULTS["max_late"]) if max_late is None else float(max_late)
+    min_hold = float(min_hold)
+    # The floor can never be above the configured min_hold: a user who asks for
+    # 1s cuts gets 1s cuts, not a 2s floor they never set.
+    floor = min(min_hold, float(sync_mod.SYNC_DEFAULTS["min_hold_short"]) if min_hold_short is None
+                else float(min_hold_short))
     if not units:
-        return [], {"min_hold": min_hold, "shots": 0, "pairs": 0, "retimed": 0, "moved_seconds": 0.0}
+        return [], {"min_hold": min_hold, "shots": 0, "pairs": 0, "nudged": 0,
+                    "moved_seconds": 0.0, "short_shots": 0}
+
+    def span(g: List[Dict[str, Any]]) -> float:
+        return float(g[-1]["end"]) - float(g[0]["start"])
+
     groups: List[List[Dict[str, Any]]] = []
     i = 0
     while i < len(units):
-        g = [units[i]]
-        i += 1
-        while sum(u["end"] - u["start"] for u in g) < min_hold and len(g) < 2 and i < len(units):
-            g.append(units[i])
+        if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units):
+            groups.append([units[i], units[i + 1]])
+            i += 2
+        else:
+            groups.append([units[i]])
             i += 1
-        groups.append(g)
+
+    # A lone short tail after a pair sometimes fits better as that pair's
+    # second card (its first panel becomes the short one): slide the last
+    # three units while that lowers the total shortfall.
+    while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2:
+        x, y = groups[-2]
+        z = groups[-1][0]
+        now = max(0.0, floor - span(groups[-2])) + max(0.0, floor - span(groups[-1]))
+        cand = [[x], [y, z]]
+        better = sum(max(0.0, floor - span(c)) for c in cand)
+        if better < now - 1e-9:
+            groups[-2:] = cand
+        else:
+            break
 
     n = len(groups)
-    b = [g[0]["start"] for g in groups] + [groups[-1][-1]["end"]]  # group k spans b[k]..b[k+1]
-    # Every sentence_start must stay inside its own shot, or the panel would
-    # appear after its words started. A boundary move that pushes a start
-    # outside is rejected and another donor is tried.
-    grp_starts: List[List[float]] = []
-    for g in groups:
-        ss: List[float] = []
-        for u in g:
-            ss.extend(float(t) for t in (u.get("sentence_starts") or []))
-        grp_starts.append(ss)
-    retimed: set = set()
-    moved = 0.0
-    drifted = 0.0
+    b = [0.0] + [float(g[0]["start"]) for g in groups[1:]] + [float(groups[-1][-1]["end"])]
 
-    def _keeps_starts(nb: List[float]) -> bool:
-        for k in range(n):
-            for t in grp_starts[k]:
-                if t < nb[k] - 1e-6 or t > nb[k + 1] - 0.2 - 1e-6:
-                    return False
-        return True
+    # Every cut sits inside its own budget and in order (shots never overlap).
+    tight = 0
+    for k in range(1, n):
+        s = float(groups[k][0]["start"])
+        b[k] = min(max(b[k], s - lead), s + max_late)
+        if b[k] < b[k - 1] + 0.2:
+            b[k] = b[k - 1] + 0.2
+            tight += 1
 
-    def _drift_of(nb: List[float]) -> float:
-        worst = 0.0
-        for k in range(n):
-            for t in grp_starts[k]:
-                if t < nb[k]:
-                    worst = max(worst, nb[k] - t)
-        return worst
-
-    for _ in range(4 * n + 4):
-        short = next((k for k in range(n) if b[k + 1] - b[k] < min_hold - 1e-6), None)
-        if short is None:
-            break
-        need = min_hold - (b[short + 1] - b[short])
-        donor = None
-        for j in sorted(range(n), key=lambda j: abs(j - short)):
-            if j == short or b[j + 1] - b[j] - need < min_hold - 1e-6:
-                continue
-            nb = list(b)
-            if j > short:
-                for m in range(short + 1, j + 1):
-                    nb[m] += need
-            else:
-                for m in range(j + 1, short + 1):
-                    nb[m] -= need
-            if _keeps_starts(nb):
-                donor = j
-                b = nb
-                break
-        if donor is None:
-            # No drift-free donor: fall back to the nearest donor with room
-            # (old behavior) so short narrations still build, but record the
-            # worst panel-after-words drift instead of hiding it.
-            for j in sorted(range(n), key=lambda j: abs(j - short)):
-                if j == short or b[j + 1] - b[j] - need < min_hold - 1e-6:
-                    continue
-                donor = j
-                break
-            if donor is None:
-                raise UserError(
-                    f"The narration is too short to hold {len(units)} panels for {min_hold:g}s each. "
-                    f"Record a longer narration, or lower min_hold in manhwa-ocr.yaml.")
-            if donor > short:
-                for m in range(short + 1, donor + 1):
-                    b[m] += need
-            else:
-                for m in range(donor + 1, short + 1):
-                    b[m] -= need
-            drifted = max(drifted, _drift_of(b))
-        retimed.update({short, donor})
-        moved += need
+    nudged, moved, short_shots = 0, 0.0, 0
+    for k in range(n):
+        if b[k + 1] - b[k] >= floor - 1e-6:
+            continue
+        want = floor - (b[k + 1] - b[k])
+        before = b[k + 1] - b[k]
+        if k + 1 < n:                       # take from the end first (the next shot is often long)
+            room = (float(groups[k + 1][0]["start"]) + max_late) - b[k + 1]
+            take = min(want, max(0.0, room))
+            if take > 1e-9:
+                b[k + 1] += take
+                want -= take
+        if want > 1e-9:                     # then from the start, sparing the previous shot's floor
+            room = b[k] - (float(groups[k][0]["start"]) - lead)
+            if k > 0:
+                room = min(room, b[k] - (b[k - 1] + 0.2),
+                           max(0.0, (b[k] - b[k - 1]) - floor))
+            take = min(want, max(0.0, room))
+            if take > 1e-9:
+                b[k] -= take
+        after = b[k + 1] - b[k]
+        if after > before + 1e-9:
+            nudged += 1
+            moved += after - before
+        if after < floor - 1e-6:
+            short_shots += 1
 
     shots: List[Dict[str, Any]] = []
     pairs = 0
@@ -347,8 +349,8 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD) -> Tupl
     shots[0]["start"] = 0.0
     shots[-1]["end"] = units[-1]["end"]
     stats = {"min_hold": min_hold, "shots": len(shots), "pairs": pairs,
-             "retimed": len(retimed), "moved_seconds": round(moved, 3),
-             "drifted_seconds": round(drifted, 3)}
+             "short_floor": floor, "nudged": nudged, "moved_seconds": round(moved, 3),
+             "short_shots": short_shots, "tight_cuts": tight}
     return shots, stats
 
 
@@ -495,7 +497,7 @@ class _Designer:
 
         if len(ids) >= 2:
             # Both panels are cards, whatever the shot's length (hold_groups() has
-            # already given it at least min_hold). The inset layout would turn one
+            # already given it the short floor). The inset layout would turn one
             # panel into a blurred background only, so it is never used here.
             layout = "pair"
         elif self.panel_aspect(first) >= 1.45:
@@ -636,7 +638,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     st = settings or sync_mod.effective_settings(vcfg, log=lambda _msg: None)
     timing = None
     if alignment_units is not None:
-        shots_units, timing = hold_groups(alignment_units, st["min_hold"])
+        shots_units, timing = hold_groups(alignment_units, st["min_hold"], lead=st["lead"],
+                                          max_late=st["max_late"], min_hold_short=st["min_hold_short"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
         # not a generic "aligned" label - video render's refusal of an
@@ -647,7 +650,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                          float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         mode = "synced"
     else:
-        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), st["min_hold"])
+        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), st["min_hold"],
+                                          lead=st["lead"], max_late=st["max_late"],
+                                          min_hold_short=st["min_hold_short"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
     designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes)

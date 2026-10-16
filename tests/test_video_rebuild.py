@@ -7,7 +7,6 @@ import math
 import pytest
 from PIL import Image, ImageDraw
 
-from manhwa_ocr.util import UserError
 from manhwa_ocr.video import align_engine
 from manhwa_ocr.video.build import quality_report
 from manhwa_ocr.video.crops import FIGURE_MIN, face_top, figure_share, shape_crop, choose_shape, _panel_maps
@@ -83,7 +82,7 @@ def test_every_shape_in_a_layout_has_the_same_card_area(layout):
         assert cw * ch == pytest.approx(area, rel=0.03)
 
 
-def test_hold_groups_gives_every_shot_the_minimum_and_keeps_every_panel():
+def test_hold_groups_reaches_the_short_floor_and_keeps_every_panel():
     units = [{"start": 0.0, "end": 1.0, "panels": ["A"], "cues": [], "emphasis": [], "sentence": "a",
               "sentence_starts": [0.0]},
              {"start": 1.0, "end": 2.0, "panels": ["B"], "cues": [], "emphasis": [], "sentence": "b",
@@ -91,17 +90,30 @@ def test_hold_groups_gives_every_shot_the_minimum_and_keeps_every_panel():
              {"start": 2.0, "end": 9.0, "panels": ["C"], "cues": [], "emphasis": [], "sentence": "c",
               "sentence_starts": [2.0]}]
     shots, stats = hold_groups(units, MIN_HOLD)
-    assert all(s["end"] - s["start"] >= MIN_HOLD - 1e-6 for s in shots)
+    # A and B pair into one 2.0s shot (the short floor); C keeps its 7s.
+    assert all(s["end"] - s["start"] >= 2.0 - 1e-6 for s in shots)
     assert {p for s in shots for p in s["panels"]} == {"A", "B", "C"}
     assert shots[0]["start"] == 0.0 and shots[-1]["end"] == pytest.approx(9.0)
     assert all(len(s["panels"]) <= 2 for s in shots)
+    assert stats["short_shots"] == 0
+    # Every cut sits within its budget of the unit it belongs to.
+    for s in shots[1:]:
+        s0 = s["sentence_starts"][0]
+        assert s0 - 0.2 - 1e-6 <= s["start"] <= s0 + 0.3 + 1e-6
 
 
-def test_hold_groups_refuses_when_the_narration_cannot_hold_the_panels():
+def test_hold_groups_never_drifts_a_cut_outside_its_budget():
+    # The old donor pass moved boundaries by seconds to reach min_hold; the new
+    # budget forbids that. 5 x 1s units: pairs of 2s, one short shot remains.
     units = [{"start": float(i), "end": float(i + 1), "panels": [f"P{i}"], "cues": [], "emphasis": [],
               "sentence": None, "sentence_starts": [float(i)]} for i in range(5)]
-    with pytest.raises(UserError, match="too short"):
-        hold_groups(units, MIN_HOLD)      # 5 s of narration cannot hold 5 panels for 3 s each
+    shots, stats = hold_groups(units, MIN_HOLD)
+    assert {p for s in shots for p in s["panels"]} == {f"P{i}" for i in range(5)}
+    for s in shots[1:]:
+        s0 = s["sentence_starts"][0]
+        assert s0 - 0.2 - 1e-6 <= s["start"] <= s0 + 0.3 + 1e-6
+    assert stats["short_shots"] >= 1          # honestly reported, not hidden by drift
+    assert stats["moved_seconds"] <= 0.5 + 1e-6
 
 
 def test_even_timing_shows_every_drawn_panel_and_skips_only_text():

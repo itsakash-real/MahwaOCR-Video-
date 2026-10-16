@@ -109,6 +109,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "placed_by_order": (align_cov or {}).get("placed_by_order", []),
         "text_only_excluded": [p["id"] for p in panels["panels"] if p.get("text_only")],
         "shots": len(shots), "shortest_shot": round(shortest, 2), "timing": plan.get("timing"),
+        "short_shots": (plan.get("timing") or {}).get("short_shots", 0),
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
         "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
         "low_confidence_heads": cs.get("low_confidence_heads", []),
@@ -374,7 +375,8 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
-    qa = quality_report(plan, panels, align_cov, sync_settings["min_hold"])
+    qa = quality_report(plan, panels, align_cov,
+                        min(sync_settings["min_hold"], sync_settings["min_hold_short"]))
     atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
     if qa["failures"]:
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])
