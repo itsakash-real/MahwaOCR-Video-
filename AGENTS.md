@@ -288,6 +288,11 @@ refuses the file and nothing is applied.
   `whisper_model` in `manhwa-ocr.yaml`. Do not use `--force` on render to skip it.
 - Sentences flagged for review in the alignment are warnings, listed in the QA file.
   `video render --strict` makes them stop the render instead.
+- The sync gate: `video render` (and so `video build`) audits the plan against the
+  recording — wrong-picture time, the worst five-second windows, late cuts
+  (`video.sync.gate_*`). A failing plan stops the render with the numbers; run
+  `video sync-audit --chapter N` for the report, fix the alignment/plan, render
+  again. Never pass `--force` to get past it.
 - `video review` approves only when the reviewer approves. `video approve` approves the current
   plan by hand. With `video.require_review: true`, `video render` refuses unless the current plan is
   approved, and `--force` never bypasses that gate. Don't set `reviewed` in a plan or empty the

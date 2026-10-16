@@ -474,6 +474,14 @@ actually decides which picture shows — it must pass its own validation before
 the next step will run), `video plan --chapter N --force`, and
 `video render --chapter N`.
 
+**Render refuses: "sync gate"?** Before rendering, the plan is audited against
+your recording: total wrong-picture time, the worst five-second windows, and
+cuts that land too late. A plan that fails stops with the numbers. The full
+report is `python -m manhwa_ocr video sync-audit --chapter N` (also written to
+`video\chapter_N.syncaudit.json`), with the worst stretches and their causes.
+Fix the pairing (above) and render again. `--force` on render bypasses the
+gate; use it only after reading the storyboard and the audit report.
+
 The video always follows these rules: each panel is shown once, panels keep
 their full width (only top and bottom are trimmed), text-only panels are never
 used, and caption boxes and bubbles at a panel's top or bottom are cut off.
@@ -663,6 +671,8 @@ python -m manhwa_ocr video render --chapter 8 --session "manhwa-2"
   model in `provider:` or set `video.review.model`.
 - `--force` does not skip the review gate. With `require_review: true`, a render
   needs an approval for the current plan.
+- It does bypass the estimated-timing stop and the sync gate. Use it only after
+  reading the storyboard and the `video sync-audit` report.
 
 **Summary of the commands**
 
@@ -672,7 +682,8 @@ python -m manhwa_ocr video render --chapter 8 --session "manhwa-2"
 | `video storyboard --chapter N` | rebuild the storyboard sheets and NARRATION.md |
 | `video review --chapter N` | DeepSeek (or your vision model) reviews, fixes, and approves |
 | `video approve --chapter N` | approve the current plan by hand |
-| `video render --chapter N` | render the MP4 (needs approval if `require_review` is true) |
+| `video sync-audit --chapter N` | audit the current plan against the recording (no AI); the check a render gates on |
+| `video render --chapter N` | render the MP4 (needs approval if `require_review` is true; refuses a plan that fails the sync gate) |
 
 ## The intro (chapter 0)
 
@@ -826,6 +837,8 @@ All in `manhwa-ocr.yaml` in the program folder; changes are picked up next run.
 | `video.music`, `video.music_volume` | background music bed |
 | `video.whisper_model` | `small.en` (default), `base.en` is faster; `small` for Hindi |
 | `video.whisper_language` | e.g. `hi` for Hindi narration |
+| `video.sync.max_unmatched` | stop when this many seconds of narration have no trustworthy timing (default 6) |
+| `video.sync.gate_wrong`, `gate_window`, `gate_grace` | the sync gate's tolerances (see Step 6) |
 | `slicing.target_height` | lower to `1000` if transcripts have many `[unclear]` |
 
 ---
@@ -856,6 +869,7 @@ All in `manhwa-ocr.yaml` in the program folder; changes are picked up next run.
 | Speech bubbles or text-only panels in the video | Same: `video align --chapter N` then `video plan --chapter N --force` (the panel check improved). Contact sheets mark them "TEXT - don't use". |
 | Pictures drift out of sync with your voice | Make sure you recorded the *current* `tts.txt`. Then `video align --chapter N`, `video plan --chapter N --force` and `video render --chapter N`. |
 | Right picture, wrong moment it appears | That's timing, not selection — check `video status` for "estimated" (see above). If it says "synced", it's a pairing issue: see "Pictures don't match the words" in Step 6. |
+| Render refuses with `sync gate` | The pictures don't match your voice (wrong-picture time or late cuts). Run `video sync-audit --chapter N` for the worst stretches and causes, fix the pairing (Step 6), then render again. |
 | `the plan was edited ... left alone` | You changed the audio or recap after editing the plan. Re-run `video align --chapter N` (so the alignment reflects the new audio/tags), then `video plan --chapter N --force` rebuilds the plan (your plan edits are lost). |
 | Panels split strangely | Check `media\chN\panels_sheet_*.png`. Tune `video.panels` in `manhwa-ocr.yaml`, then `video panels --chapter N --force` |
 | Want to start a series over | `session archive "<name>" --yes`, then `start` |
