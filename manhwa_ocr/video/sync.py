@@ -123,7 +123,8 @@ def tokens(text: str) -> List[str]:
     return out
 
 
-def _file_hash(path: Path) -> str:
+def file_hash(path: Path) -> str:
+    """The audio-file hash the timeline cache is keyed on (first 24 hex chars)."""
     h = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -149,7 +150,7 @@ def transcribe(audio: Path, *, model: str = "small.en", language: str | None = N
                initial_prompt: str | None = None, cache: Path | None = None,
                log=print) -> List[Dict[str, Any]]:
     """[{"w": word, "start": s, "end": s}, ...] for the whole recording."""
-    key = {"audio": _file_hash(audio), "model": model, "language": language}
+    key = {"audio": file_hash(audio), "model": model, "language": language}
     if cache and cache.exists():
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
@@ -185,6 +186,53 @@ def transcribe(audio: Path, *, model: str = "small.en", language: str | None = N
 
 
 MIN_SEGMENT = 0.25   # seconds; video.sync.min_segment overrides it
+
+# Every sync/hold knob this package reads, where it lives and what it means.
+# The single place defaults are written down; config.py's DEFAULT_CONFIG ships
+# the same values under `video:` / `video.sync:`. A key missing from the
+# config is warned about loudly (effective_settings) - never silently replaced.
+SYNC_DEFAULTS: Dict[str, float] = {
+    "min_hold": 3.0,          # video.min_hold: no picture stays up for less
+    "min_segment": 0.25,      # video.sync.min_segment: shortest sentence segment
+    "max_late": 0.3,          # video.sync.max_late: a cut may start at most this much after its sentence
+    "lead": 0.2,              # video.sync.lead: hard early bound - a cut may lead its sentence by at most this
+    "min_hold_short": 2.0,    # video.sync.min_hold_short: shortest hold allowed when merging is impossible
+    "max_hold": 8.0,          # video.sync.max_hold: a picture held longer than this gets split
+    "max_unmatched": 6.0,     # video.sync.max_unmatched: a run of unmatched (interpolated) speech longer than this stops the build
+    "override_evidence": 20,  # video.sync.override_evidence: OCR-overlap score needed to override a tag
+    "filler_full": 6.0,       # video.sync.filler_full: only sentences this long may be filled end to end
+    "gate_overall": 0.92,     # video.sync.gate_overall: overall picture/voice match minimum
+    "gate_window": 0.70,      # video.sync.gate_window: minimum match inside any 5s window
+    "gate_grace": 0.2,        # video.sync.gate_grace: extra lateness tolerated before the gate fails
+}
+_SETTING_PATHS = {k: (f"video.{k}" if k == "min_hold" else f"video.sync.{k}") for k in SYNC_DEFAULTS}
+
+
+def effective_settings(vcfg: Dict[str, Any], log=print) -> Dict[str, float]:
+    """The sync/hold settings actually in force, read only from their documented
+    spots (`video.min_hold`, `video.sync.*`). Missing keys use the default but
+    are warned about by name, so a half-set config never changes timing quietly."""
+    sync_cfg = vcfg.get("sync") if isinstance(vcfg.get("sync"), dict) else {}
+    out: Dict[str, float] = {}
+    missing: List[str] = []
+    for key, default in SYNC_DEFAULTS.items():
+        if key == "min_hold":
+            value = vcfg.get("min_hold")
+        else:
+            value = sync_cfg.get(key)
+        if value is None:
+            missing.append(key)
+            out[key] = float(default)
+        else:
+            try:
+                out[key] = float(value)
+            except (TypeError, ValueError):
+                raise UserError(f"{_SETTING_PATHS[key]} must be a number, not {value!r}.") from None
+    if missing:
+        log("  ! manhwa-ocr.yaml is missing sync/hold settings; using defaults: "
+            + ", ".join(f"{_SETTING_PATHS[k]}={out[k]:g}" for k in missing))
+        log("    Add them under `video:` (see manhwa-ocr.yaml) so plans match what you expect.")
+    return out
 
 
 def _spread_collisions(raw: List[float], weights: List[int], duration: float) -> tuple[List[float], int]:
@@ -242,6 +290,57 @@ def _enforce_min_segment(starts: List[float], duration: float, min_segment: floa
     return t
 
 
+def _script_align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]]):
+    """Both sequences tokenised and lined up: (script tokens, per-sentence
+    offsets into them, heard words, {script index -> whisper start time})."""
+    script: List[str] = []
+    offsets: List[int] = []
+    for s in sentences:
+        offsets.append(len(script))
+        script.extend(tokens(s.get("text", "")))
+    heard = []
+    for w in words:
+        for t in tokens(w["w"]):
+            heard.append((t, w["start"], w["end"]))
+
+    to_time: Dict[int, float] = {}
+    if script and heard:
+        sm = difflib.SequenceMatcher(None, script, [h[0] for h in heard], autojunk=False)
+        for a, b, size in sm.get_matching_blocks():
+            for k in range(size):
+                to_time[a + k] = heard[b + k][1]
+    return script, offsets, heard, to_time
+
+
+def _anchors(script: List[str], offsets: List[int], to_time: Dict[int, float],
+             sentences: List[Dict[str, Any]]) -> List[Dict[str, float] | None]:
+    out: List[Dict[str, float] | None] = []
+    for i in range(len(sentences)):
+        lo = offsets[i]
+        hi = offsets[i + 1] if i + 1 < len(sentences) else len(script)
+        anchor = next((j for j in range(lo, hi) if j in to_time), None)
+        if anchor is None:
+            out.append(None)
+        else:
+            # The first word may have been misheard: back off from the first
+            # matched word at a typical speaking rate (~0.33s per word).
+            out.append({"time": float(to_time[anchor]),
+                        "raw_start": max(0.0, to_time[anchor] - 0.33 * (anchor - lo))})
+    return out
+
+
+def sentence_anchors(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]]) -> List[Dict[str, float] | None]:
+    """First matched whisper word per sentence: [{"time", "raw_start"} | None].
+
+    None means the sentence had no matched word at all (it gets interpolated).
+    `raw_start` is align()'s own start for it: the matched word's time with the
+    speaking-rate back-off already applied. `video sync-audit` reads these back
+    to tell real anchors from interpolated guesses and to measure residuals.
+    """
+    script, offsets, _heard, to_time = _script_align(sentences, words)
+    return _anchors(script, offsets, to_time, sentences)
+
+
 def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration: float,
           min_segment: float = MIN_SEGMENT) -> Dict[str, Any]:
     """Give every sentence a start time, and every emphasised word a time.
@@ -255,37 +354,9 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
     Every sentence ends up at least `min_segment` seconds long (as far as the
     audio length allows), so no segment is ever zero-length.
     """
-    script: List[str] = []
-    owner: List[int] = []
-    offsets: List[int] = []
-    for i, s in enumerate(sentences):
-        offsets.append(len(script))
-        toks = tokens(s.get("text", ""))
-        script.extend(toks)
-        owner.extend([i] * len(toks))
-    heard = []
-    for w in words:
-        for t in tokens(w["w"]):
-            heard.append((t, w["start"], w["end"]))
-
-    to_time: Dict[int, float] = {}
-    if script and heard:
-        sm = difflib.SequenceMatcher(None, script, [h[0] for h in heard], autojunk=False)
-        for a, b, size in sm.get_matching_blocks():
-            for k in range(size):
-                to_time[a + k] = heard[b + k][1]
-
-    starts: List[float | None] = []
-    for i, s in enumerate(sentences):
-        lo = offsets[i]
-        hi = offsets[i + 1] if i + 1 < len(sentences) else len(script)
-        anchor = next((j for j in range(lo, hi) if j in to_time), None)
-        if anchor is None:
-            starts.append(None)
-            continue
-        # The first word may have been misheard: back off from the first
-        # matched word at a typical speaking rate (~0.33s per word).
-        starts.append(max(0.0, to_time[anchor] - 0.33 * (anchor - lo)))
+    script, offsets, heard, to_time = _script_align(sentences, words)
+    starts: List[float | None] = [None if a is None else float(a["raw_start"])
+                                  for a in _anchors(script, offsets, to_time, sentences)]
 
     # Fill gaps: a sentence whisper didn't anchor is placed between the nearest
     # anchored neighbours in proportion to how much text precedes it.

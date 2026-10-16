@@ -699,6 +699,14 @@ def cmd_video(args) -> int:
             _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
         return 0
 
+    if action == "sync-audit":
+        from .video import syncaudit
+
+        for c in chapters(default_all=False):
+            _log(f"=== Chapter {c} ===")
+            syncaudit.run(sess.path, c, cfg, log=_log)
+        return 0
+
     if action == "pair":
         from .video import pairing
 
@@ -953,7 +961,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")

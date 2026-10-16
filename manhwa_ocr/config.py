@@ -96,9 +96,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "effects": {"shake": True, "punch": False, "flash": False, "end_fade": True},
         "music": None,              # path to a music file, relative to the series folder
         "music_volume": 0.22,
-        # Narration sync. min_segment: no sentence is shorter than this many seconds,
-        # so clusters of tiny sentences sharing one whisper anchor never collapse to 0s.
-        "sync": {"min_segment": 0.25},
+        # Narration sync and hold limits. These are the numbers `video plan` and
+        # `video sync-audit` actually use; sync.effective_settings() reads them
+        # from here (video.min_hold and video.sync.*) or warns by name.
+        #   min_hold:        no picture stays up for less than this (seconds).
+        #   max_late:        a cut may start at most this long after its sentence starts.
+        #   lead:            hard early bound - a cut may lead its sentence by at most this.
+        #   min_hold_short:  shortest hold allowed when a sentence can't be merged.
+        #   max_hold:        a single picture held longer than this gets split.
+        #   max_unmatched:   a run of whisper-unmatched speech longer than this stops the build.
+        #   override_evidence: OCR overlap needed to override a recap tag.
+        #   filler_full:     only sentences longer than this may be filled end to end.
+        #   gate_*:          `video build` picture/voice match gates.
+        "min_hold": 3.0,
+        "sync": {
+            "min_segment": 0.25, "max_late": 0.3, "lead": 0.2, "min_hold_short": 2.0,
+            "max_hold": 8.0, "max_unmatched": 6.0, "override_evidence": 20, "filler_full": 6.0,
+            "gate_overall": 0.92, "gate_window": 0.70, "gate_grace": 0.2,
+        },
         # Recording text. spell_numbers: the NEW recaps/chapter_N.tts.txt (and the spoken text in
         # cues.json) write digits as words (99 -> ninety nine). Existing files with audio are never touched.
         "tts": {"spell_numbers": True},

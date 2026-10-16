@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Tuple
 from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
+from . import sync as sync_mod
 from .crops import _panel_maps, head_of, tone
 from .verify import pick_card
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
@@ -615,7 +616,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                sync_report: Dict[str, Any] | None = None,
                alignment_units: List[Dict[str, Any]] | None = None,
                fixes: Dict[str, Any] | None = None,
-               alignment_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+               alignment_meta: Dict[str, Any] | None = None,
+               settings: Dict[str, float] | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
     this function makes no panel decisions of its own - it only lays out,
@@ -623,14 +625,18 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     (cues.json-driven) and the no-tags `even` fallback remain only for direct
     callers/tests exercising the shot-design logic in isolation; the live
     `video plan` pipeline (build.py) always passes `alignment_units`.
+
+    `settings` are sync.effective_settings() values; the caller (make_plan)
+    prints them and warns about missing config keys. Stored in the plan meta so
+    a finished video can be traced back to the numbers that made it.
     """
     panels = panels_data["panels"]
     fmt = format_from(vcfg.get("format", "16:9"), int(vcfg.get("fps", 30)))
     by_id = {p["id"]: p for p in panels}
+    st = settings or sync_mod.effective_settings(vcfg, log=lambda _msg: None)
     timing = None
     if alignment_units is not None:
-        shots_units, timing = hold_groups(
-            alignment_units, float(vcfg.get("min_hold", vcfg.get("min_shot", MIN_HOLD))))
+        shots_units, timing = hold_groups(alignment_units, st["min_hold"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
         # not a generic "aligned" label - video render's refusal of an
@@ -641,8 +647,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                          float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         mode = "synced"
     else:
-        shots_units, timing = hold_groups(
-            even_units(panels, duration, vcfg), float(vcfg.get("min_hold", vcfg.get("min_shot", MIN_HOLD))))
+        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), st["min_hold"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
     designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes)
@@ -656,6 +661,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "duration": round(duration, 3),
         "sync": mode,
         "sync_report": sync_report,
+        "sync_settings": st,
         "alignment_review_queue": (alignment_meta or {}).get("review_queue"),
         "music": vcfg.get("music"),
         "music_volume": float(vcfg.get("music_volume", 0.22)),

@@ -1,0 +1,328 @@
+"""The sync fixes: `video sync-audit`, effective settings, and the plan meta.
+
+The audit is a pure function over plan + alignment + cached whisper words, so
+every cause it can report is exercised here with a hand-built two-shot plan -
+no audio, no whisper, no rendering.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import wave
+from pathlib import Path
+
+import pytest
+from PIL import Image, ImageDraw
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from manhwa_ocr.config import load_config  # noqa: E402
+from manhwa_ocr.util import UserError  # noqa: E402
+from manhwa_ocr.video import sync, syncaudit  # noqa: E402
+from manhwa_ocr.video.plan import build_plan  # noqa: E402
+
+
+# ------------------------------------------------------------------ helpers
+
+
+def _words(text: str, start=0.5, per=0.35):
+    out, t = [], start
+    for w in text.split():
+        out.append({"w": w, "start": round(t, 3), "end": round(t + per * 0.8, 3)})
+        t += per
+    return out
+
+
+def _shot(i: int, start: float, end: float, cards):
+    return {"id": f"S{i:03d}", "start": round(start, 3), "end": round(end, 3), "layout": "single",
+            "background": "blur", "exit": "cut", "effects": [], "sentence": None,
+            "cards": [{"panel": pid, "crop": [0, 0, 1, 1], "enter": "cut", "at": at, "motion": "hold"}
+                      for pid, at in cards]}
+
+
+def _seg(n: int, start: float, end: float, text: str, tags, *, action="SHOW",
+         selected=None, sequence=None):
+    sel = selected if selected is not None else (tags[0] if tags else None)
+    return {"sentence": n, "text": text, "start": float(start), "end": float(end), "tagged_panels": list(tags),
+            "display_action": action, "selected_panel": sel, "selected_by_align": sel,
+            "candidates": [], "confidence": "test",
+            "sequence": list(sequence) if sequence is not None else ([sel] if sel else [])}
+
+
+def _plan(shots, duration):
+    return {"chapter": "1", "duration": duration, "shots": shots}
+
+
+def _align(segs):
+    return {"segments": segs}
+
+
+def _run_audit(shots, segs, words, duration, **kw):
+    return syncaudit.audit(_plan(shots, duration), _align(segs), words, **kw)
+
+
+# ------------------------------------------------------------------ causes
+
+
+def test_audit_flags_a_late_cut_as_min_hold_shift():
+    # Sentence 1 is tagged P2 but the plan holds P1 for 4s first: the classic
+    # min_hold retiming drift.
+    segs = [_seg(1, 0.0, 10.0, "Ron draws his sword fast", ["P2"])]
+    shots = [_shot(1, 0.0, 4.0, [("P1", 0.0)]), _shot(2, 4.0, 10.0, [("P2", 0.0)])]
+    rep = _run_audit(shots, segs, _words("Ron draws his sword fast"), 10.0)
+    assert len(rep["windows"]) == 1
+    w = rep["windows"][0]
+    assert w["cause"] == "min_hold_shift" and w["cut_offset"] == 4.0
+    assert w["start"] == 0.0 and w["end"] == 4.0
+    assert w["shown"] == "P1" and w["expected"] == ["P2"]
+    assert rep["gate"]["pass"] is False and any("cut(s)" in f for f in rep["gate"]["failures"])
+
+
+def test_audit_flags_filler_before_the_tagged_panel_as_filler_panel():
+    # P9 was placed by coverage and is shown the whole sentence; the tagged P2
+    # never appears. No late cut exists, so the filler is the cause.
+    segs = [_seg(1, 0.0, 6.0, "The gate opens now", ["P2"], sequence=["P2", "P9"])]
+    shots = [_shot(1, 0.0, 6.0, [("P9", 0.0)])]
+    rep = _run_audit(shots, segs, _words("The gate opens now"), 6.0)
+    assert [w["cause"] for w in rep["windows"]] == ["filler_panel"]
+    assert rep["windows"][0]["shown"] == "P9"
+
+
+def test_audit_flags_a_replaced_tag_as_tag_override():
+    # The alignment engine selected P5 while the writer tagged P2; the plan
+    # shows P5 on time. No lateness, no filler - a real tag override.
+    segs = [_seg(1, 0.0, 6.0, "His sword breaks", ["P2"], selected="P5", sequence=["P5"])]
+    shots = [_shot(1, 0.0, 6.0, [("P5", 0.0)])]
+    rep = _run_audit(shots, segs, _words("His sword breaks"), 6.0)
+    assert [w["cause"] for w in rep["windows"]] == ["tag_override"]
+
+
+def test_audit_flags_a_mismatch_on_an_interpolated_sentence():
+    # Sentence 2 has no matched whisper word at all (interpolated); the stale
+    # plan still shows P1 while the sentence was tagged P2.
+    segs = [_seg(1, 0.0, 5.0, "The tower stands tall", ["P1"]),
+            _seg(2, 5.0, 10.0, "and the gate opens wide", ["P2"])]
+    shots = [_shot(1, 0.0, 10.0, [("P1", 0.0)])]
+    rep = _run_audit(shots, segs, _words("The tower stands tall"), 10.0)
+    assert [w["cause"] for w in rep["windows"]] == ["interpolated_timing"]
+    assert rep["interpolated"]["count"] == 1
+
+
+def test_audit_flags_a_picture_held_past_max_hold_as_long_hold():
+    # One 9.5s shot of P1 spans two sentences; sentence 2 (tagged P2) never
+    # gets its own picture. Nothing is late; the hold itself is the cause.
+    segs = [_seg(1, 0.0, 3.0, "One two three", ["P1"]),
+            _seg(2, 3.0, 9.5, "Four five six", ["P2"])]
+    words = _words("One two three four five six")
+    shots = [_shot(1, 0.0, 9.5, [("P1", 0.0)])]
+    rep = _run_audit(shots, segs, words, 9.5)
+    assert [w["cause"] for w in rep["windows"]] == ["long_hold"]
+    assert rep["windows"][0]["sentence"] == 2
+
+
+def test_audit_falls_back_to_unknown_when_nothing_upstream_explains_it():
+    segs = [_seg(1, 0.0, 6.0, "She looks away", ["P2"])]
+    shots = [_shot(1, 0.0, 3.0, [("P7", 0.0)]), _shot(2, 3.0, 6.0, [("P7", 0.0)])]
+    rep = _run_audit(shots, segs, _words("She looks away"), 6.0)
+    assert [w["cause"] for w in rep["windows"]] == ["unknown"]
+
+
+def test_audit_holds_are_judged_against_what_the_shot_legitimately_shows():
+    # {same} sentence: no tags of its own. The previous sentence's sequence
+    # included the coverage extra P9, so showing it during the hold is fine.
+    segs = [_seg(1, 0.0, 4.0, "The gate opens now", ["P2"], sequence=["P2", "P9"]),
+            _seg(2, 4.0, 9.0, "It creaks loudly", [], action="HOLD_PREVIOUS", selected=None, sequence=[])]
+    shots = [_shot(1, 0.0, 4.0, [("P2", 0.0), ("P9", 2.0)]), _shot(2, 4.0, 9.0, [("P9", 0.0)])]
+    rep = _run_audit(shots, segs, _words("The gate opens now it creaks loudly"), 9.0)
+    assert rep["windows"] == []
+    assert rep["overall_match"] == 1.0
+
+
+def test_audit_ignores_text_only_tags():
+    # A sentence tagged only with a caption panel can't be judged: the video
+    # legitimately shows the nearest art instead.
+    segs = [_seg(1, 0.0, 6.0, "Three days later", ["P0"])]
+    shots = [_shot(1, 0.0, 6.0, [("P2", 0.0)])]
+    rep = _run_audit(shots, segs, _words("Three days later"), 6.0, text_only=["P0"])
+    assert rep["windows"] == [] and rep["judged_samples"] == 0
+
+
+# ------------------------------------------------------------------ validity extras
+
+
+def test_audit_reports_interpolated_runs_longer_than_five_seconds():
+    segs = [_seg(1, 0.0, 2.0, "The road begins here", ["P1"])]
+    for i in range(2, 8):     # 6 sentences x 2s = 12s with no matched words
+        segs.append(_seg(i, (i - 1) * 2.0, i * 2.0, f"and it goes on number {i}", ["P1"]))
+    shots = [_shot(1, 0.0, 14.0, [("P1", 0.0)])]
+    rep = _run_audit(shots, segs, _words("The road begins here"), 14.0)
+    assert rep["interpolated"]["count"] == 6
+    assert len(rep["interpolated"]["long_runs"]) == 1
+    run = rep["interpolated"]["long_runs"][0]
+    assert run["first_sentence"] == 2 and run["last_sentence"] == 7 and run["seconds"] == 12.0
+
+
+def test_audit_reports_leading_trailing_offsets_and_anchor_residuals():
+    segs = [_seg(1, 0.0, 10.0, "Ron draws his sword fast", ["P2"])]
+    words = _words("Ron draws his sword fast", start=2.0)
+    shots = [_shot(1, 0.0, 10.0, [("P2", 0.0)])]
+    rep = _run_audit(shots, segs, words, 11.0)
+    assert rep["leading_offset"] == 2.0          # first word 2s after the first sentence starts
+    assert rep["trailing_offset"] == round(float(shots[-1]["end"]) - words[-1]["end"], 3)
+    res = rep["anchor_residuals"]
+    assert res["count"] == 1
+    assert res["worst"]["matched_word"] == 2.0
+    assert res["worst"]["residual"] == -2.0      # sent to time from the anchor's back-off
+
+
+def test_audit_compares_plan_length_with_audio_length():
+    segs = [_seg(1, 0.0, 6.0, "Ron draws his sword fast", ["P2"])]
+    shots = [_shot(1, 0.0, 6.0, [("P2", 0.0)])]
+    long_plan = _run_audit(shots, segs, _words("Ron draws his sword fast"), 12.0,
+                           audio={"duration": 6.0, "speech_end": 5.5})
+    assert long_plan["audio_length_ok"] is False
+    assert any("longer than the audio" in n for n in long_plan["length_notes"])
+    short_plan = _run_audit(shots, segs, _words("Ron draws his sword fast", start=8.0,
+                                                per=0.35), 8.0,
+                            audio={"duration": 12.0, "speech_end": 11.5})
+    assert any("before the last word" in n for n in short_plan["length_notes"])
+
+
+def test_audit_marks_a_stale_timeline_in_its_summary():
+    segs = [_seg(1, 0.0, 6.0, "Ron draws his sword fast", ["P2"])]
+    shots = [_shot(1, 0.0, 6.0, [("P2", 0.0)])]
+    stale = _run_audit(shots, segs, [], 6.0, timeline={
+        "present": True, "fresh": False, "cached_audio": "aaaa", "current_audio": "bbbb",
+        "model": "base.en", "configured_model": "small.en"})
+    assert stale["settings"]["max_late"] == 0.3
+    text = "\n".join(syncaudit.summary_lines(stale))
+    assert "timeline: STALE" in text
+    assert "'base.en'" in text and "'small.en'" in text
+
+
+def test_audit_gate_reports_five_second_windows_under_the_threshold():
+    # One good sentence, then a broken stretch: the gate must fail on both the
+    # overall ratio and at least one five-second window.
+    segs = [_seg(1, 0.0, 6.0, "Ron draws his sword fast", ["P2"]),
+            _seg(2, 6.0, 12.0, "The demon king laughs loud", ["P3"])]
+    shots = [_shot(1, 0.0, 12.0, [("P2", 0.0)])]
+    rep = _run_audit(shots, segs, _words("Ron draws his sword fast the demon king laughs loud"), 12.0)
+    assert rep["gate"]["pass"] is False
+    assert rep["five_second"]["worst"] is not None
+    assert rep["five_second"]["worst"]["match"] == 0.0
+
+
+# ------------------------------------------------------------------ summary output
+
+
+def test_summary_lines_name_everything_the_report_found():
+    segs = [_seg(1, 0.0, 10.0, "Ron draws his sword fast", ["P2"])]
+    shots = [_shot(1, 0.0, 4.0, [("P1", 0.0)]), _shot(2, 4.0, 10.0, [("P2", 0.0)])]
+    rep = _run_audit(shots, segs, _words("Ron draws his sword fast"), 10.0)
+    text = "\n".join(syncaudit.summary_lines(rep))
+    assert "Chapter 1 sync audit" in text
+    assert "min_hold_shift" in text and "sentence 1" in text
+    assert "gate: FAIL" in text
+
+
+# ------------------------------------------------------------------ settings
+
+
+def test_effective_settings_reads_its_own_keys_and_warns_loudly_about_missing_ones():
+    logs = []
+    st = sync.effective_settings({"sync": {"max_late": 1.0}}, log=logs.append)
+    assert st["max_late"] == 1.0
+    assert st["min_hold"] == sync.SYNC_DEFAULTS["min_hold"]
+    assert st["gate_window"] == sync.SYNC_DEFAULTS["gate_window"]
+    text = "\n".join(logs)
+    assert "video.min_hold" in text and "video.sync.max_late" not in text
+    assert "video.sync.min_hold_short" in text
+
+
+def test_effective_settings_is_silent_when_the_config_is_complete():
+    logs = []
+    st = sync.effective_settings(dict(load_config().video), log=logs.append)
+    assert logs == []
+    assert st["min_hold"] == 3.0 and st["max_late"] == 0.3 and st["lead"] == 0.2
+
+
+def test_effective_settings_rejects_a_non_number():
+    with pytest.raises(UserError):
+        sync.effective_settings({"min_hold": "soon", "sync": {}}, log=lambda *_: None)
+
+
+# ------------------------------------------------------------------ the plan meta
+
+
+def test_build_plan_stores_the_effective_settings_in_its_meta():
+    vcfg = dict(load_config().video)
+    panels = [{"id": f"P001-0{i}", "width": 300, "height": 700 if i % 2 else 300, "text": ""}
+              for i in range(1, 4)]
+
+    def img_for(p):
+        img = Image.new("RGB", (int(p["width"]), int(p["height"])), (120, 90, 70))
+        ImageDraw.Draw(img).line((0, 0, img.width, img.height), fill=(20, 20, 20))
+        return img
+
+    units = [{"start": 0.0, "end": 8.0, "panels": ["P001-01"], "cues": [], "emphasis": [],
+              "sentence": "x", "sentence_starts": [0.0]}]
+    plan = build_plan(chapter="1", panels_data={"panels": panels, "fingerprint": "x"}, duration=8.0,
+                      audio=None, vcfg=vcfg, image_for=img_for, alignment_units=units)
+    assert plan["sync_settings"]["min_hold"] == 3.0
+    assert plan["sync_settings"]["max_late"] == 0.3
+    assert plan["sync_settings"]["gate_overall"] == 0.92
+
+
+# ------------------------------------------------------------------ make_report plumbing
+
+
+def test_make_report_writes_the_json_and_survives_missing_audio(tmp_path):
+    root = tmp_path / "ws"
+    (root / "video").mkdir(parents=True)
+    segs = [_seg(1, 0.0, 6.0, "Ron draws his sword fast", ["P2"])]
+    (root / "video" / "chapter_1.alignment.json").write_text(json.dumps({
+        "segments": segs, "sync_mode": "synced", "coverage": {}, "validation": {"status": "PASS"},
+        "review_queue": []}), encoding="utf-8")
+    (root / "video" / "chapter_1.plan.json").write_text(json.dumps(
+        _plan([_shot(1, 0.0, 6.0, [("P2", 0.0)])], 6.0)), encoding="utf-8")
+    (root / "video" / "chapter_1.timeline.json").write_text(json.dumps({
+        "key": {"audio": "abc123", "model": "base.en"}, "words": _words("Ron draws his sword fast")}),
+        encoding="utf-8")
+
+    rep = syncaudit.make_report(root, "1", load_config(), log=lambda *_: None)
+    saved = json.loads((root / "video" / "chapter_1.syncaudit.json").read_text(encoding="utf-8"))
+    assert saved["chapter"] == "1" and saved["gate"]["pass"] is True
+    assert saved["timeline"]["fresh"] is False          # audio file is missing
+    assert "not found" in saved["timeline"]["note"]
+    assert saved["audio"] is None
+    assert any("no narration audio found" in n for n in saved["length_notes"])
+
+
+def test_make_report_checks_a_real_audio_file_for_staleness_and_length(tmp_path):
+    root = tmp_path / "ws"
+    audio_dir = root / "audio"
+    video = root / "video"
+    audio_dir.mkdir(parents=True)
+    video.mkdir(parents=True)
+    wav = audio_dir / "chapter_1.wav"
+    with wave.open(str(wav), "wb") as fh:
+        fh.setnchannels(1)
+        fh.setsampwidth(2)
+        fh.setframerate(16000)
+        fh.writeframes(b"\x00\x00" * 16000)             # 1 second of silence
+    segs = [_seg(1, 0.0, 30.0, "Ron draws his sword fast", ["P2"])]
+    (video / "chapter_1.alignment.json").write_text(json.dumps({
+        "segments": segs, "sync_mode": "synced", "coverage": {}, "validation": {"status": "PASS"},
+        "review_queue": []}), encoding="utf-8")
+    (video / "chapter_1.plan.json").write_text(json.dumps(
+        _plan([_shot(1, 0.0, 30.0, [("P2", 0.0)])], 30.0)), encoding="utf-8")
+    (video / "chapter_1.timeline.json").write_text(json.dumps({
+        "key": {"audio": sync.file_hash(wav), "model": "base.en"},
+        "words": _words("Ron draws his sword fast")}), encoding="utf-8")
+
+    rep = syncaudit.make_report(root, "1", load_config(), log=lambda *_: None)
+    assert rep["timeline"]["fresh"] is True
+    assert rep["audio"]["duration"] == 1.0
+    assert rep["audio_length_ok"] is False
+    assert any("longer than the audio" in n for n in rep["length_notes"])

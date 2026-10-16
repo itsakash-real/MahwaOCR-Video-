@@ -303,7 +303,7 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
     for seg, t in zip(segments, timed):
         seg["start"], seg["end"] = round(float(t["start"]), 3), round(float(t["end"]), 3)
 
-    min_hold = float(vcfg.get("min_hold", vcfg.get("min_shot", 3.0)))
+    min_hold = sync_mod.effective_settings(vcfg, log=log)["min_hold"]
     coverage = place_coverage(segments, plist, duration, min_hold)
     coverage["art_panels"] = sum(1 for p in plist if not p.get("text_only"))
     coverage["text_only_excluded"] = [p["id"] for p in plist if p.get("text_only")]

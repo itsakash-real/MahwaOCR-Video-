@@ -48,6 +48,7 @@ video:
   lead: 0.15              # panel appears this long before its sentence
   min_shot: 1.0           # recap pacing: ~2.7s average shot, 1-5s range
   max_shot: 5.0
+  min_hold: 3.0           # no picture stays up for less than this (seconds)
   target_shot: 2.7        # average seconds per shot (recap channels: about 2.7)
   pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
   workers: 0              # parallel renders; 0 = all your CPU cores
@@ -82,7 +83,19 @@ video:
   tts:
     spell_numbers: true     # new recaps/chapter_N.tts.txt spell digits out (99 -> ninety nine)
   sync:
+    # Narration sync. `video sync-audit` checks a finished plan against these;
+    # `video build` refuses to render when the match gates fail.
     min_segment: 0.25    # no sentence is shorter than this (seconds); stops zero-length segments
+    max_late: 0.3        # a cut may start at most this long after its sentence starts
+    lead: 0.2            # hard early bound: a cut may lead its sentence by at most this
+    min_hold_short: 2.0  # shortest hold allowed when a sentence can't be merged into a pair
+    max_hold: 8.0        # a single picture held longer than this is split by a slide-in
+    max_unmatched: 6.0   # speech whisper couldn't match for this long stops the build
+    override_evidence: 20  # OCR-overlap score needed to override a recap tag
+    filler_full: 6.0     # only sentences longer than this may be filled end to end
+    gate_overall: 0.92   # build gate: overall picture/voice match minimum
+    gate_window: 0.70    # build gate: minimum match inside any five-second window
+    gate_grace: 0.2      # build gate: extra lateness tolerated before a cut fails
   whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
   whisper_language: null  # e.g. "hi"
   # true: a chapter's video must be approved (video review, or video approve) before rendering

@@ -25,6 +25,7 @@ from PIL import Image
 from ..util import UserError, atomic_save_image, atomic_write_text, require_chapter, sort_chapters
 from . import align_engine
 from . import cues as cues_mod
+from . import sync as sync_mod
 from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, run, video_info
 from .frames import background, format_from, shapes_for
 from . import fixes as fixes_mod
@@ -133,7 +134,7 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
     ap = align_engine.alignment_path(root, chapter)
     st = audio.stat() if audio else None
     knobs = {k: vcfg.get(k) for k in ("min_shot", "max_shot", "target_shot", "lead", "pair_ratio", "fps",
-                                      "music", "music_volume", "effects")}
+                                      "min_hold", "sync", "music", "music_volume", "effects")}
     # Framing options join the hash only when changed from their defaults, so plans built
     # before they existed stay current (a rebuild would re-frame every card).
     crop_opts = {k: v for k, v in map_options(vcfg).items()
@@ -242,6 +243,13 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     vcfg = dict(cfg.video)
     fmt = fmt or vcfg.get("format", "16:9")
     ensure_gitignore(root)
+    # The numbers that decide timing, printed before any work so the plan's
+    # meta can always be traced back to what the config said.
+    sync_settings = sync_mod.effective_settings(vcfg, log=log)
+    log(f"  chapter {chapter}: sync/hold settings: min_hold={sync_settings['min_hold']:g}s, "
+        f"lead={sync_settings['lead']:g}s, max_late={sync_settings['max_late']:g}s, "
+        f"min_hold_short={sync_settings['min_hold_short']:g}s, max_hold={sync_settings['max_hold']:g}s, "
+        f"max_unmatched={sync_settings['max_unmatched']:g}s")
 
     if pages_from:
         from ..images import import_pages, list_images
@@ -359,13 +367,14 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
 
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
-                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True), fixes=fixes)
+                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True), fixes=fixes,
+                      settings=sync_settings)
     plan["inputs"] = inputs
     plan["generated_hash"] = _shots_hash(plan)
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
-    qa = quality_report(plan, panels, align_cov, float(vcfg.get("min_hold", vcfg.get("min_shot", 3.0))))
+    qa = quality_report(plan, panels, align_cov, sync_settings["min_hold"])
     atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
     if qa["failures"]:
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])
