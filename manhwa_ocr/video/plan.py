@@ -517,10 +517,14 @@ class _Designer:
         for k, pid in enumerate(card_ids):
             crop = self.crop(pid, layout)
             if layout == "pair" and k == 1:
+                # A pair shorter than a second (a one-word sentence in dense
+                # narration) has no room for a later entrance: the second card
+                # arrives with the first inside the sentence, instead of the
+                # cut drifting away from the voice.
                 if unit.get("second_at") is not None:   # arrives on its own words
-                    at = round(min(max(0.6, float(unit["second_at"])), dur - 1.0), 3)
+                    at = round(max(0.0, min(max(0.6, float(unit["second_at"])), dur - 1.0)), 3)
                 else:
-                    at = round(min(max(0.8, 0.45 * dur), dur - 1.2), 3)
+                    at = round(max(0.0, min(max(0.8, 0.45 * dur), dur - 1.2)), 3)
                 enter = "slide_up" if self.fmt.portrait else "slide_left"
                 motion = "push_in"
             else:

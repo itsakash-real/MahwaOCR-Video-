@@ -175,14 +175,26 @@ def test_quality_gate_stops_a_build_that_would_skip_a_panel():
     assert any("would never appear" in f for f in qa["failures"])
 
 
-def test_quality_gate_flags_a_shot_under_the_minimum_and_a_wrong_shape():
+def test_quality_gate_flags_a_too_short_shot_and_a_wrong_shape():
     panels = {"panels": [{"id": "A", "width": 300, "height": 300, "text_only": False}]}
     plan = {"format": "16:9", "fps": 30, "chapter": "1", "shots": [
         {"id": "S001", "start": 0.0, "end": 1.0, "layout": "single",
          "cards": [{"panel": "A", "crop": [0, 0, 1, 0.5]}]}]}     # 2:1 card: not an allowed shape
     qa = quality_report(plan, panels, None, 3.0)
     assert any("allowed shapes" in f for f in qa["failures"])
-    assert any("under the 3s minimum" in f for f in qa["failures"])
+    # dense narration: a shot under the floor warns (short_shots/shortest), it
+    # does not stop the build; only a shot nobody can see is a failure
+    assert not any("too short" in f for f in qa["failures"])
+    assert qa["shortest_shot"] == 1.0 and qa["floor"] == 3.0
+
+
+def test_quality_gate_stops_a_shot_too_short_to_be_seen():
+    panels = {"panels": [{"id": "A", "width": 300, "height": 300, "text_only": False}]}
+    plan = {"format": "16:9", "fps": 30, "chapter": "1", "shots": [
+        {"id": "S001", "start": 0.0, "end": 0.15, "layout": "single",
+         "cards": [{"panel": "A", "crop": [0, 0, 1, 1]}]}]}
+    qa = quality_report(plan, panels, None, 3.0)
+    assert any("too short to be seen" in f for f in qa["failures"])
 
 
 def test_figure_share_sees_a_character_and_not_a_blank_page():

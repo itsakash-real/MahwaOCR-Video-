@@ -101,8 +101,12 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     if cs.get("bubble"):
         failures.append(f"{len(cs['bubble'])} panel(s) would show a speech bubble or caption in their card: "
                         f"{', '.join(cs['bubble'][:8])}")
-    if shots and shortest < min_hold - 0.01:
-        failures.append(f"a shot lasts {shortest:.2f}s, under the {min_hold:g}s minimum")
+    # A shot under the floor is the honest price of dense narration (one-word
+    # sentences): it is counted in timing.short_shots and never fixed by
+    # stealing time from neighbours, so only a shot too short to be seen at
+    # all (under 0.2s) stops the build.
+    if shots and shortest < 0.2 - 1e-6:
+        failures.append(f"a shot lasts {shortest:.2f}s - too short to be seen (under 0.2s)")
     return {
         "chapter": plan.get("chapter"),
         "failures": failures,
@@ -110,6 +114,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "placed_by_order": (align_cov or {}).get("placed_by_order", []),
         "text_only_excluded": [p["id"] for p in panels["panels"] if p.get("text_only")],
         "shots": len(shots), "shortest_shot": round(shortest, 2), "timing": plan.get("timing"),
+        "floor": round(float(min_hold), 3),
         "short_shots": (plan.get("timing") or {}).get("short_shots", 0),
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
         "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
@@ -409,8 +414,10 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
                         + f"\nDetails: video/chapter_{chapter}.qa.json")
     save_plan(root, chapter, plan)
     log(f"  chapter {chapter}: {len(plan['shots'])} shots, {mode_note}")
+    short_note = (f"; {qa['short_shots']} shot(s) under the {qa['floor']:g}s floor (dense narration, "
+                  f"left honest instead of stealing time)") if qa["short_shots"] else ""
     log(f"    all {qa['shown_panels']}/{qa['art_panels']} drawn panels shown; shortest shot "
-        f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order")
+        f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order{short_note}")
     if qa["head_risk"]:
         log(f"    ! {len(qa['head_risk'])} panel(s) where a head may be cut: {', '.join(qa['head_risk'][:8])}")
     if qa["review_queue"]:

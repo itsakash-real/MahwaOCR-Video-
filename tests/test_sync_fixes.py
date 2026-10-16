@@ -21,7 +21,7 @@ from manhwa_ocr.config import load_config  # noqa: E402
 from manhwa_ocr.util import UserError  # noqa: E402
 from manhwa_ocr.video import build as vb  # noqa: E402
 from manhwa_ocr.video import align_engine, sync, syncaudit  # noqa: E402
-from manhwa_ocr.video.plan import build_plan  # noqa: E402
+from manhwa_ocr.video.plan import build_plan, validate  # noqa: E402
 
 
 # ------------------------------------------------------------------ helpers
@@ -382,6 +382,33 @@ def test_build_plan_stores_the_effective_settings_in_its_meta():
     assert plan["sync_settings"]["min_hold"] == 3.0
     assert plan["sync_settings"]["max_late"] == 0.3
     assert plan["sync_settings"]["gate_wrong"] == sync.SYNC_DEFAULTS["gate_wrong"]
+
+
+def test_a_sub_second_pair_keeps_its_second_card_visible():
+    # Real case (ch1 "Flesh."): a one-word sentence carrying two tags. The pair
+    # cannot reach the floor without drifting off the voice, so it stays honest
+    # and short - but both cards must remain on screen and the plan must be
+    # valid (the second card used to be scheduled at a negative time).
+    vcfg = dict(load_config().video)
+    panels = [{"id": f"P001-0{i}", "width": 300, "height": 300, "text": ""} for i in (1, 2)]
+
+    def img_for(p):
+        img = Image.new("RGB", (int(p["width"]), int(p["height"])), (120, 90, 70))
+        ImageDraw.Draw(img).line((0, 0, img.width, img.height), fill=(20, 20, 20))
+        return img
+
+    units = [{"start": 0.0, "end": 0.25, "panels": ["P001-01"], "cues": [], "emphasis": [],
+              "sentence": "Flesh.", "sentence_starts": [0.0]},
+             {"start": 0.25, "end": 0.5, "panels": ["P001-02"], "cues": [], "emphasis": [],
+              "sentence": "Jack says it plain.", "sentence_starts": [0.25]}]
+    plan = build_plan(chapter="1", panels_data={"panels": panels, "fingerprint": "x"}, duration=0.5,
+                      audio=None, vcfg=vcfg, image_for=img_for, alignment_units=units)
+    assert validate(plan, {"P001-01", "P001-02"}) == []
+    shot = plan["shots"][0]
+    assert len(shot["cards"]) == 2
+    at = shot["cards"][1]["at"]
+    assert 0.0 <= at <= (shot["end"] - shot["start"]) - 0.2 + 1e-9
+    assert plan["timing"]["short_shots"] == 1
 
 
 # ------------------------------------------------------------------ make_report plumbing

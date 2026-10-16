@@ -265,8 +265,9 @@ Check a chapter's state with `video status --session "<name>"`.
    at least `min_hold` seconds (`manhwa-ocr.yaml`); a short sentence shares its shot with the next
    one. Crops avoid speech bubbles and never cut a detected head.
 4. **QA** (`video/chapter_N.qa.json`): objective checks. The build stops only on hard failures: a
-   drawn panel that would never appear, a card that isn't an allowed shape, or a shot under the
-   minimum.
+   drawn panel that would never appear, a card that isn't an allowed shape, or a shot too short to
+   be seen at all (under 0.2s). A shot under the 2s floor that dense narration forces is counted
+   (`short_shots` in the QA file) and left honest — never fixed by stealing time from neighbours.
 5. **Render** (`video render`): 1080p MP4.
 
 ### Where each kind of fix goes (this decides whether it survives a rebuild)
