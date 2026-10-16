@@ -20,9 +20,13 @@ sentence, the panel shown, the panel expected and the likely cause:
   long_hold             one picture held past max_hold while the voice moved on
   unknown               none of the above (needs eyes)
 
-The report goes to video/chapter_N.syncaudit.json. `video build` refuses to
-finish when the gate fails (overall match, any five-second window, or a cut
-more than max_late + gate_grace late).
+The report goes to video/chapter_N.syncaudit.json with the calibration numbers:
+strict_match (the exact tagged panel is on screen), wrong_picture (time where a
+panel belonging to another sentence's tag is on screen; legitimate coverage
+fillers and pair second cards are excluded) and a per-minute curve of both. The
+gate `video build` enforces is on wrong-picture time and cut lateness - overall
+wrong-picture share (gate_wrong), wrong-picture inside any five-second window
+(gate_window), and cuts later than max_late + gate_grace.
 """
 
 from __future__ import annotations
@@ -185,6 +189,16 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
     anchors = sync_mod.sentence_anchors(segments, words)
     interpolated = {i for i, a in enumerate(anchors) if a is None}
 
+    # Wrong-picture attribution: a panel on screen that some OTHER sentence
+    # tagged. Coverage fillers (tagged by nobody) and a pair shot's second card
+    # don't count - only a foreign sentence's panel does.
+    owners: Dict[str, set] = {}
+    for si, seg in enumerate(segments):
+        for p in (seg.get("tagged_panels") or []):
+            if p not in text_only:
+                owners.setdefault(p, set()).add(si)
+    all_owned = set(owners)
+
     duration = float(plan.get("duration") or 0.0)
     samples: List[Dict[str, Any]] = []
     for k in range(max(0, int(round(duration / SAMPLE_STEP)))):
@@ -193,8 +207,10 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         vis = _visible(shots[sh], t)
         exp = exp_sets[si]
         judged = bool(exp)
+        match = judged and bool(set(vis) & set(exp))
+        wrong = (not match and any(p in all_owned and si not in owners[p] for p in vis))
         samples.append({"t": t, "seg": si, "shot": sh, "shown": vis, "judged": judged,
-                        "match": judged and bool(set(vis) & set(exp))})
+                        "match": match, "wrong": wrong})
 
     windows: List[Dict[str, Any]] = []
     i = 0
@@ -212,6 +228,23 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
 
     judged = [s for s in samples if s["judged"]]
     overall = round(sum(1 for s in judged if s["match"]) / len(judged), 4) if judged else 0.0
+    wrong_n = sum(1 for s in judged if s["wrong"])
+    wrong = {"samples": wrong_n, "seconds": round(wrong_n * SAMPLE_STEP, 3),
+             "ratio": round(wrong_n / len(judged), 4) if judged else 0.0}
+
+    # Per-minute curve: cumulative drift (starting at one sentence) shows as a
+    # cliff that never recovers; local mistakes show as one low minute.
+    minute_curve: List[Dict[str, Any]] = []
+    for m in range(int(samples[-1]["t"] // 60) + 1 if samples else 0):
+        win = [s for s in judged if int(s["t"] // 60) == m]
+        minute_curve.append({
+            "minute": m,
+            "match": round(sum(1 for s in win if s["match"]) / len(win), 4) if win else None,
+            "wrong": round(sum(1 for s in win if s["wrong"]) / len(win), 4) if win else None,
+            "judged": len(win),
+        })
+
+    worst_windows = sorted(windows, key=lambda w: w["duration"], reverse=True)[:5]
 
     # A cut later than max_late + gate_grace fails the gate even if it is short.
     late: List[Dict[str, Any]] = []
@@ -222,23 +255,26 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         if off is not None and off > st["max_late"] + st["gate_grace"] + 1e-6:
             late.append({"sentence": seg.get("sentence"), "offset": round(off, 3)})
 
-    under: List[Dict[str, Any]] = []
+    over: List[Dict[str, Any]] = []
     t = 0.0
     while t + GATE_SPAN <= duration + 1e-6:
         win = [s for s in judged if t <= s["t"] < t + GATE_SPAN]
         if win:
-            frac = sum(1 for s in win if s["match"]) / len(win)
-            if frac < st["gate_window"] - 1e-9:
-                under.append({"start": round(t, 2), "match": round(frac, 4), "samples": len(win)})
+            wfrac = sum(1 for s in win if s["wrong"]) / len(win)
+            if wfrac > st["gate_window"] + 1e-9:
+                over.append({"start": round(t, 2), "wrong": round(wfrac, 4),
+                             "match": round(sum(1 for s in win if s["match"]) / len(win), 4),
+                             "samples": len(win)})
         t += SAMPLE_STEP
-    worst_window = min(under, key=lambda w: w["match"]) if under else None
+    worst_window = max(over, key=lambda w: w["wrong"]) if over else None
 
     failures: List[str] = []
-    if overall < st["gate_overall"] - 1e-9:
-        failures.append(f"overall picture/voice match {overall:.1%} is under {st['gate_overall']:.0%}")
-    if under and worst_window:
-        failures.append(f"{len(under)} five-second window(s) under {st['gate_window']:.0%} "
-                        f"(worst {worst_window['match']:.0%} at {_mmss(worst_window['start'])})")
+    if wrong["ratio"] > st["gate_wrong"] + 1e-9:
+        failures.append(f"wrong-picture time {wrong['seconds']:.1f}s ({wrong['ratio']:.1%} of judged) "
+                        f"is over {st['gate_wrong']:.0%}")
+    if over and worst_window:
+        failures.append(f"{len(over)} five-second window(s) over {st['gate_window']:.0%} wrong-picture "
+                        f"(worst {worst_window['wrong']:.0%} at {_mmss(worst_window['start'])})")
     if late:
         worst_late = max(late, key=lambda x: x["offset"])
         failures.append(f"{len(late)} cut(s) more than {st['max_late'] + st['gate_grace']:.1f}s after their "
@@ -294,11 +330,13 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         "audio": audio,
         "timeline": timeline,
         "settings": st,
-        "overall_match": overall,
+        "strict_match": overall,
+        "wrong_picture": wrong,
         "judged_samples": len(judged), "total_samples": len(samples),
-        "windows": windows,
+        "windows": windows, "worst_windows": worst_windows,
         "late_cuts": late,
-        "five_second": {"under_gate": under, "worst": worst_window},
+        "five_second": {"over_gate": over, "worst": worst_window},
+        "minute_curve": minute_curve,
         "interpolated": {"sentences": [segments[i].get("sentence") for i in sorted(interpolated)],
                          "count": len(interpolated), "runs": runs, "long_runs": long_runs},
         "anchor_residuals": {"count": len(residuals), "worst": worst_res,
@@ -319,8 +357,11 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
 
     out.append(f"=== Chapter {report.get('chapter')} sync audit ===")
     judged, total = report["judged_samples"], report["total_samples"]
-    out.append(f"  picture matches the voiced sentence: {report['overall_match']:.1%} "
+    wp = report["wrong_picture"]
+    out.append(f"  strict match (the tagged panel itself): {report['strict_match']:.1%} "
                f"of {judged} judged samples ({total} total)")
+    out.append("  wrong-picture time (another sentence's panel; fillers and pair second cards "
+               f"excluded): {wp['seconds']:.1f}s ({wp['ratio']:.1%} of judged time)")
     if judged < total:
         out.append(f"  ({total - judged} samples had no showable tag on their sentence and were not judged)")
 
@@ -328,22 +369,39 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
     if wins:
         out.append(f"  mismatched stretches >= {WINDOW_MIN:g}s: {len(wins)}, "
                    f"{sum(w['duration'] for w in wins):.1f}s total")
-        for w in wins[:12]:
+        for w in wins[:8]:
             shown = w["shown"] or "(nothing)"
             tag = ", ".join(w["expected"]) or "-"
             cut = "" if w["cut_offset"] in (None, 0.0) else f"; cut {w['cut_offset']:+.1f}s"
             out.append(f"   {_mmss(w['start'])}-{_mmss(w['end'])} ({w['duration']:.1f}s) "
                        f"sentence {w['sentence']} \"{w['text'][:60]}\"")
             out.append(f"      shows {shown}, sentence tagged {tag}{cut}  [{w['cause']}]")
-        if len(wins) > 12:
-            out.append(f"   ... and {len(wins) - 12} more (full list in the JSON report)")
+        if len(wins) > 8:
+            out.append(f"   ... and {len(wins) - 8} more (full list in the JSON report)")
+        out.append("  worst stretches by length (open the rendered MP4 at these times):")
+        for w in report.get("worst_windows") or []:
+            shown = w["shown"] or "(nothing)"
+            tag = ", ".join(w["expected"]) or "-"
+            cut = "" if w["cut_offset"] in (None, 0.0) else f", cut {w['cut_offset']:+.1f}s"
+            out.append(f"   {_mmss(w['start'])}-{_mmss(w['end'])} ({w['duration']:.1f}s) sent {w['sentence']} "
+                       f"shows {shown} / tagged {tag}{cut}  [{w['cause']}]")
     else:
         out.append(f"  mismatched stretches >= {WINDOW_MIN:g}s: none")
 
+    mc = report.get("minute_curve") or []
+    if mc:
+        def _pct(v: Any) -> str:
+            return "--" if v is None else f"{v:.0%}"
+
+        out.append("  per-minute strict match:  "
+                   + "  ".join(f"{m['minute']}:{_pct(m['match'])}" for m in mc))
+        out.append("  per-minute wrong-picture: "
+                   + "  ".join(f"{m['minute']}:{_pct(m['wrong'])}" for m in mc))
+
     worst = (report.get("five_second") or {}).get("worst")
-    out.append(f"  five-second windows under {report['settings']['gate_window']:.0%}: "
-               + (f"{len(report['five_second']['under_gate'])} "
-                  f"(worst {worst['match']:.0%} at {_mmss(worst['start'])})" if worst else "none"))
+    out.append(f"  five-second windows over {report['settings']['gate_window']:.0%} wrong-picture: "
+               + (f"{len(report['five_second']['over_gate'])} "
+                  f"(worst {worst['wrong']:.0%} at {_mmss(worst['start'])})" if worst else "none"))
     late = report["late_cuts"]
     if late:
         shown = ", ".join(f"{x['sentence']} ({x['offset']:+.1f}s)" for x in late[:8])

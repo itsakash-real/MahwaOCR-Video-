@@ -107,12 +107,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         #   max_unmatched:   a run of whisper-unmatched speech longer than this stops the build.
         #   override_evidence: OCR overlap needed to override a recap tag.
         #   filler_full:     only sentences longer than this may be filled end to end.
-        #   gate_*:          `video build` picture/voice match gates.
+        #   gate_wrong:      most wrong-picture time (another sentence's panel on screen)
+        #                    allowed overall; fillers and pair cards are excluded.
+        #   gate_window:     most wrong-picture time allowed in any five-second window.
+        #   gate_grace:      extra cut lateness tolerated before the gate fails.
         "min_hold": 3.0,
         "sync": {
             "min_segment": 0.25, "max_late": 0.3, "lead": 0.2, "min_hold_short": 2.0,
             "max_hold": 8.0, "max_unmatched": 6.0, "override_evidence": 20, "filler_full": 6.0,
-            "gate_overall": 0.92, "gate_window": 0.70, "gate_grace": 0.2,
+            "gate_wrong": 0.05, "gate_window": 0.25, "gate_grace": 0.2,
         },
         # Recording text. spell_numbers: the NEW recaps/chapter_N.tts.txt (and the spoken text in
         # cues.json) write digits as words (99 -> ninety nine). Existing files with audio are never touched.

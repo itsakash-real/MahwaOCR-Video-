@@ -93,8 +93,10 @@ video:
     max_unmatched: 6.0   # speech whisper couldn't match for this long stops the build
     override_evidence: 20  # OCR-overlap score needed to override a recap tag
     filler_full: 6.0     # only sentences longer than this may be filled end to end
-    gate_overall: 0.92   # build gate: overall picture/voice match minimum
-    gate_window: 0.70    # build gate: minimum match inside any five-second window
+    gate_wrong: 0.05     # build gate: most wrong-picture time (another sentence's panel on
+                         # screen) allowed overall; fillers and pair second cards are excluded.
+                         # PROVISIONAL - will be set from the calibrated after-distribution.
+    gate_window: 0.25    # build gate: most wrong-picture time allowed in any five-second window
     gate_grace: 0.2      # build gate: extra lateness tolerated before a cut fails
   whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
   whisper_language: null  # e.g. "hi"

@@ -201,8 +201,8 @@ SYNC_DEFAULTS: Dict[str, float] = {
     "max_unmatched": 6.0,     # video.sync.max_unmatched: a run of unmatched (interpolated) speech longer than this stops the build
     "override_evidence": 20,  # video.sync.override_evidence: OCR-overlap score needed to override a tag
     "filler_full": 6.0,       # video.sync.filler_full: only sentences this long may be filled end to end
-    "gate_overall": 0.92,     # video.sync.gate_overall: overall picture/voice match minimum
-    "gate_window": 0.70,      # video.sync.gate_window: minimum match inside any 5s window
+    "gate_wrong": 0.05,       # video.sync.gate_wrong: most wrong-picture time allowed overall (provisional until calibration)
+    "gate_window": 0.25,      # video.sync.gate_window: most wrong-picture time allowed in any 5s window (provisional)
     "gate_grace": 0.2,        # video.sync.gate_grace: extra lateness tolerated before the gate fails
 }
 _SETTING_PATHS = {k: (f"video.{k}" if k == "min_hold" else f"video.sync.{k}") for k in SYNC_DEFAULTS}

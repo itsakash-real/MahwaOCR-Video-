@@ -136,7 +136,8 @@ def test_audit_holds_are_judged_against_what_the_shot_legitimately_shows():
     shots = [_shot(1, 0.0, 4.0, [("P2", 0.0), ("P9", 2.0)]), _shot(2, 4.0, 9.0, [("P9", 0.0)])]
     rep = _run_audit(shots, segs, _words("The gate opens now it creaks loudly"), 9.0)
     assert rep["windows"] == []
-    assert rep["overall_match"] == 1.0
+    assert rep["strict_match"] == 1.0
+    assert rep["wrong_picture"]["ratio"] == 0.0
 
 
 def test_audit_ignores_text_only_tags():
@@ -201,16 +202,57 @@ def test_audit_marks_a_stale_timeline_in_its_summary():
     assert "'base.en'" in text and "'small.en'" in text
 
 
-def test_audit_gate_reports_five_second_windows_under_the_threshold():
-    # One good sentence, then a broken stretch: the gate must fail on both the
-    # overall ratio and at least one five-second window.
+def test_audit_gate_reports_five_second_windows_over_the_wrong_picture_threshold():
+    # One good sentence, then a broken stretch where sentence 1's panel keeps
+    # playing under sentence 2: the gate must fail on the wrong-picture ratio
+    # and on at least one five-second window.
     segs = [_seg(1, 0.0, 6.0, "Ron draws his sword fast", ["P2"]),
             _seg(2, 6.0, 12.0, "The demon king laughs loud", ["P3"])]
     shots = [_shot(1, 0.0, 12.0, [("P2", 0.0)])]
     rep = _run_audit(shots, segs, _words("Ron draws his sword fast the demon king laughs loud"), 12.0)
     assert rep["gate"]["pass"] is False
+    assert rep["wrong_picture"]["ratio"] == 0.5
     assert rep["five_second"]["worst"] is not None
-    assert rep["five_second"]["worst"]["match"] == 0.0
+    assert rep["five_second"]["worst"]["wrong"] == 1.0
+    assert rep["five_second"]["worst"]["start"] == 6.0
+
+
+def test_audit_wrong_picture_excludes_legitimate_fillers():
+    # The tagged P2 never appears; a coverage extra (owned by no sentence) is
+    # shown instead. Strict match is 0% but no OTHER sentence's panel is on
+    # screen, so wrong-picture time is 0 and the gate is not what fails.
+    segs = [_seg(1, 0.0, 6.0, "The gate opens now", ["P2"], sequence=["P2", "P9"])]
+    shots = [_shot(1, 0.0, 6.0, [("P9", 0.0)])]
+    rep = _run_audit(shots, segs, _words("The gate opens now"), 6.0)
+    assert rep["strict_match"] == 0.0
+    assert rep["wrong_picture"] == {"samples": 0, "seconds": 0.0, "ratio": 0.0}
+    assert rep["gate"]["pass"] is True
+    assert [w["cause"] for w in rep["windows"]] == ["filler_panel"]
+
+
+def test_audit_minute_curve_splits_match_and_wrong_by_minute():
+    # Minute 0 is perfectly voiced; in minute 1 sentence 1's panel keeps
+    # playing under sentence 2 - the cliff shows in minute 1 only.
+    segs = [_seg(1, 0.0, 60.0, "one two three four", ["P1"]),
+            _seg(2, 60.0, 120.0, "five six seven eight", ["P2"])]
+    shots = [_shot(1, 0.0, 60.0, [("P1", 0.0)]), _shot(2, 60.0, 120.0, [("P1", 0.0)])]
+    rep = _run_audit(shots, segs, _words("one two three four five six seven eight"), 120.0)
+    mc = rep["minute_curve"]
+    assert [(m["minute"], m["match"], m["wrong"]) for m in mc] == [
+        (0, 1.0, 0.0), (1, 0.0, 1.0)]
+
+
+def test_audit_lists_the_worst_stretches_by_length():
+    # Mismatches of 3s, 6s and 4s: worst_windows is ordered by duration, the
+    # full windows list stays in time order.
+    segs = [_seg(1, 0.0, 8.0, "a", ["P9"]), _seg(2, 8.0, 16.0, "b", ["P9"])]
+    shots = [_shot(1, 0.0, 3.0, [("P1", 0.0)]), _shot(2, 3.0, 4.0, [("P9", 0.0)]),
+             _shot(3, 4.0, 10.0, [("P1", 0.0)]), _shot(4, 10.0, 11.0, [("P9", 0.0)]),
+             _shot(5, 11.0, 15.0, [("P1", 0.0)]), _shot(6, 15.0, 16.0, [("P9", 0.0)])]
+    rep = _run_audit(shots, segs, _words("a b"), 16.0)
+    assert [w["duration"] for w in rep["windows"]] == [3.0, 6.0, 4.0]
+    assert [w["duration"] for w in rep["worst_windows"]] == [6.0, 4.0, 3.0]
+    assert [w["start"] for w in rep["worst_windows"]] == [4.0, 11.0, 0.0]
 
 
 # ------------------------------------------------------------------ summary output
@@ -222,7 +264,9 @@ def test_summary_lines_name_everything_the_report_found():
     rep = _run_audit(shots, segs, _words("Ron draws his sword fast"), 10.0)
     text = "\n".join(syncaudit.summary_lines(rep))
     assert "Chapter 1 sync audit" in text
+    assert "strict match" in text and "wrong-picture time" in text
     assert "min_hold_shift" in text and "sentence 1" in text
+    assert "worst stretches by length" in text
     assert "gate: FAIL" in text
 
 
@@ -271,7 +315,7 @@ def test_build_plan_stores_the_effective_settings_in_its_meta():
                       audio=None, vcfg=vcfg, image_for=img_for, alignment_units=units)
     assert plan["sync_settings"]["min_hold"] == 3.0
     assert plan["sync_settings"]["max_late"] == 0.3
-    assert plan["sync_settings"]["gate_overall"] == 0.92
+    assert plan["sync_settings"]["gate_wrong"] == sync.SYNC_DEFAULTS["gate_wrong"]
 
 
 # ------------------------------------------------------------------ make_report plumbing
