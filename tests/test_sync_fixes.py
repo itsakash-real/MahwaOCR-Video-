@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from manhwa_ocr.config import load_config  # noqa: E402
 from manhwa_ocr.util import UserError  # noqa: E402
+from manhwa_ocr.video import build as vb  # noqa: E402
 from manhwa_ocr.video import align_engine, sync, syncaudit  # noqa: E402
 from manhwa_ocr.video.plan import build_plan  # noqa: E402
 
@@ -513,3 +514,106 @@ def test_a_filler_is_never_dropped_when_every_sentence_is_short():
     cov = align_engine.place_coverage(segs, _coverage_panels(3), 6.0, 3.0)
     assert cov["placed_by_order"] == ["P001-01"]
     assert "P001-01" in segs[0]["sequence"]
+
+
+# ------------------------------------------------------------------ FIX 5: the render sync gate
+
+
+class _Sess:
+    def __init__(self, path):
+        self.path, self.slug = path, "ws"
+
+
+def _gate_workspace(tmp_path, *, shown: str):
+    """Two sentences (P001-01 then P001-02); the first shot shows `shown`.
+    `shown` = P001-01 is a clean plan; P001-02 shows the other sentence's
+    picture over sentence 1, which is exactly what the gate is about."""
+    root = tmp_path / "ws"
+    (root / "video").mkdir(parents=True)
+    (root / "media" / "ch1").mkdir(parents=True)
+    (root / "audio").mkdir()
+    wav = root / "audio" / "chapter_1.wav"
+    with wave.open(str(wav), "wb") as fh:
+        fh.setnchannels(1)
+        fh.setsampwidth(2)
+        fh.setframerate(16000)
+        fh.writeframes(b"\x00\x00" * (16000 * 4))
+    (root / "media" / "ch1" / "panels.json").write_text(json.dumps({
+        "panels": [{"id": p, "width": 300, "height": 300, "text": "", "text_only": False}
+                   for p in ("P001-01", "P001-02")],
+        "norm_width": 900, "fingerprint": "x"}), encoding="utf-8")
+    (root / "video" / "chapter_1.alignment.json").write_text(json.dumps({
+        "segments": [_seg(1, 0.0, 2.0, "Ron draws his sword fast", ["P001-01"]),
+                     _seg(2, 2.0, 4.0, "He blocks the blow", ["P001-02"])],
+        "sync_mode": "synced", "coverage": {}, "validation": {"status": "PASS"},
+        "review_queue": []}), encoding="utf-8")
+    (root / "video" / "chapter_1.plan.json").write_text(json.dumps({
+        "version": 2, "chapter": "1", "duration": 4.0, "sync": "synced",
+        "format": "16:9", "fps": 30,
+        "shots": [_shot(1, 0.0, 2.0, [(shown, 0.0)]), _shot(2, 2.0, 4.0, [("P001-02", 0.0)])]}),
+        encoding="utf-8")
+    (root / "video" / "chapter_1.timeline.json").write_text(json.dumps({
+        "key": {"audio": sync.file_hash(wav), "model": "base.en"},
+        "words": _words("Ron draws his sword fast he blocks the blow")}), encoding="utf-8")
+    return root, _Sess(root), load_config()
+
+
+def _stub_render(monkeypatch):
+    calls = []
+    monkeypatch.setattr(vb, "render",
+                        lambda *a, **k: calls.append(a[2]) or (a[0] / "video" / "chapter_x.mp4"))
+    return calls
+
+
+def test_render_sync_gate_passes_a_clean_plan(monkeypatch, tmp_path):
+    root, sess, cfg = _gate_workspace(tmp_path, shown="P001-01")
+    calls = _stub_render(monkeypatch)
+    logs = []
+    vb.render_chapter(sess, "1", cfg, log=logs.append)
+    assert len(calls) == 1
+    assert any("sync gate: PASS" in line for line in logs)
+    assert json.loads((root / "video" / "chapter_1.syncaudit.json").read_text(encoding="utf-8"))["gate"]["pass"]
+
+
+def test_render_sync_gate_stops_a_wrong_picture_plan(monkeypatch, tmp_path):
+    root, sess, cfg = _gate_workspace(tmp_path, shown="P001-02")
+    calls = _stub_render(monkeypatch)
+    with pytest.raises(UserError, match="sync gate"):
+        vb.render_chapter(sess, "1", cfg, log=lambda *_: None)
+    assert calls == []                      # nothing was rendered
+    saved = json.loads((root / "video" / "chapter_1.syncaudit.json").read_text(encoding="utf-8"))
+    assert saved["gate"]["pass"] is False   # the report is there to inspect
+
+
+def test_render_sync_gate_can_be_forced(monkeypatch, tmp_path):
+    root, sess, cfg = _gate_workspace(tmp_path, shown="P001-02")
+    calls = _stub_render(monkeypatch)
+    logs = []
+    vb.render_chapter(sess, "1", cfg, allow_sync_fail=True, log=logs.append)
+    assert len(calls) == 1
+    assert any("sync gate failed" in line for line in logs)
+
+
+def test_render_sync_gate_does_not_apply_to_estimated_plans(monkeypatch, tmp_path):
+    root, sess, cfg = _gate_workspace(tmp_path, shown="P001-02")
+    plan_file = root / "video" / "chapter_1.plan.json"
+    plan = json.loads(plan_file.read_text(encoding="utf-8"))
+    plan["sync"] = "estimated"
+    plan_file.write_text(json.dumps(plan), encoding="utf-8")
+    calls = _stub_render(monkeypatch)
+    vb.render_chapter(sess, "1", cfg, allow_estimated=True, log=lambda *_: None)
+    assert len(calls) == 1                  # rendered despite the wrong picture: no gate without real timing
+    assert not (root / "video" / "chapter_1.syncaudit.json").exists()
+
+
+def test_chapter_status_reports_the_saved_sync_gate(tmp_path):
+    root, sess, cfg = _gate_workspace(tmp_path, shown="P001-02")
+    assert vb.chapter_status(root, "1")["sync_audit"] is None
+    syncaudit.make_report(root, "1", cfg, log=lambda *_: None)
+    st = vb.chapter_status(root, "1")
+    assert st["sync_audit"]["pass"] is False and st["sync_audit"]["fresh"] is True
+    plan_file = root / "video" / "chapter_1.plan.json"
+    plan = json.loads(plan_file.read_text(encoding="utf-8"))
+    plan["generated_hash"] = "rebuilt"
+    plan_file.write_text(json.dumps(plan), encoding="utf-8")
+    assert vb.chapter_status(root, "1")["sync_audit"]["fresh"] is False

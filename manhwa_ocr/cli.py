@@ -641,7 +641,7 @@ def cmd_video(args) -> int:
         if not rows:
             _log("No transcribed chapters yet.")
             return 0
-        _log(f"{'ch':<6}{'recap':<8}{'tags':<7}{'audio':<10}{'panels':<8}{'align':<12}{'plan':<26}video")
+        _log(f"{'ch':<6}{'recap':<8}{'tags':<7}{'audio':<10}{'panels':<8}{'align':<12}{'plan':<26}{'sync':<10}video")
         for r in rows:
             plan = r["plan"]
             align = r["alignment"]
@@ -650,14 +650,28 @@ def cmd_video(args) -> int:
                       else f"{align['review_queue']} review" if align["review_queue"] else "ok")
             plan_s = "-" if not plan else ("BROKEN" if plan["broken"] else "old style: rebuild" if plan["outdated"] else
                                            f"{plan['sync']}{' reviewed' if plan['reviewed'] else ''}{' edited' if plan['edited'] else ''}")
+            audit = r.get("sync_audit")
+            if not audit:
+                sync_s = "-"
+            elif audit.get("broken"):
+                sync_s = "BROKEN"
+            elif not audit.get("fresh"):
+                sync_s = "stale"
+            elif audit.get("pass"):
+                sync_s = "ok"
+            else:
+                wrong = audit.get("wrong_ratio")
+                sync_s = f"FAIL{f' {wrong:.0%}' if wrong is not None else ''}"
             audio_s = f"{r['duration']:.0f}s" if r["duration"] else ("yes" if r["audio"] else "-")
             video_s = "-" if not r["video"] else ("ok" if r["video_up_to_date"] else "outdated")
             tags = f"{r['tagged']:.0%}" if r["tagged"] is not None else "-"
             _log(f"{r['chapter']:<6}{'yes' if r['recap'] else '-':<8}{tags:<7}{audio_s:<10}{r['panels'] or '-':<8}"
-                 f"{align_s:<12}{plan_s:<25} {video_s}")
+                 f"{align_s:<12}{plan_s:<25} {sync_s:<9}{video_s}")
         _log("\n'align' is video align's own check: a sentence it couldn't resolve with full "
             "confidence (never confirmed by you) shows as \"N review\" - open its pairing sheet "
             "(video pair) before trusting the video for that stretch.")
+        _log("'sync' is the last sync-audit gate result for the current plan (ok / FAIL / stale; "
+            "run  video sync-audit --chapter N  for the details).")
         _log(f"\nAudio goes in: {sess.path / 'audio'}  (chapter_N.mp3 / .wav / .m4a)")
         return 0
 
@@ -822,7 +836,7 @@ def cmd_video(args) -> int:
             _log(f"=== Chapter {c} ===")
             vb.render_chapter(sess, c, cfg, preview=args.preview, workers=args.workers,
                               allow_estimated=args.force, allow_unreviewed=args.force,
-                              strict=args.strict, log=_log)
+                              allow_sync_fail=args.force, strict=args.strict, log=_log)
         return 0
 
     if action == "build":

@@ -26,6 +26,7 @@ from ..util import UserError, atomic_save_image, atomic_write_text, require_chap
 from . import align_engine
 from . import cues as cues_mod
 from . import sync as sync_mod
+from . import syncaudit
 from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, run, video_info
 from .frames import background, format_from, shapes_for
 from . import fixes as fixes_mod
@@ -176,6 +177,30 @@ def _alignment_status(root: Path, chapter: str) -> Dict[str, Any] | None:
     }
 
 
+def _sync_audit_status(root: Path, chapter: str, plan_file: Path) -> Dict[str, Any] | None:
+    """Read-only peek at chapter_N.syncaudit.json for `video status`: the sync
+    gate result of the last audit, and whether that audit still belongs to the
+    current plan (a rebuilt plan invalidates it)."""
+    path = syncaudit.audit_path(root, chapter)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"broken": True}
+    if not isinstance(data, dict):
+        return {"broken": True}
+    fresh = plan_file.exists() and path.stat().st_mtime >= plan_file.stat().st_mtime
+    gate = data.get("gate") or {}
+    return {
+        "broken": False,
+        "fresh": fresh,
+        "pass": bool(gate.get("pass")),
+        "failures": [str(f) for f in (gate.get("failures") or [])],
+        "wrong_ratio": (data.get("wrong_picture") or {}).get("ratio"),
+    }
+
+
 def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str, Any]:
     """What exists for one chapter's video. probe=True also reads audio length (slower)."""
     chapter = require_chapter(chapter)
@@ -231,6 +256,7 @@ def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str
         "video": video.name if video.exists() else None,
         "video_up_to_date": up_to_date,
         "preview": preview.name if preview.exists() else None,
+        "sync_audit": _sync_audit_status(root, chapter, plan_file),
         "storyboards": [p.name for p in storyboard_paths(root, chapter)],
     }
 
@@ -397,7 +423,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
 
 def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: int = 0,
                    allow_estimated: bool = False, allow_unreviewed: bool = False, strict: bool = False,
-                   log: Callable = print) -> Path:
+                   allow_sync_fail: bool = False, log: Callable = print) -> Path:
     root, chapter = sess.path, require_chapter(chapter)
     panels = load_panels(root, chapter)
     if not panels:
@@ -418,6 +444,28 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
             f"Fix the sync first: lower `whisper_model` in manhwa-ocr.yaml (e.g. to base.en or tiny.en if your "
             f"machine is low on RAM), then rebuild the plan:  video plan --chapter {chapter} --force\n"
             f"To render with the estimated timing anyway, pass --force to render.")
+    if plan.get("sync") == "synced":
+        # The sync gate: the audit samples the plan against the narration and
+        # fails on wrong-picture time and late cuts. It runs here, on the plan
+        # about to be rendered, and its report stays beside it for status.
+        report = syncaudit.make_report(root, chapter, cfg, log=log)
+        gate = report["gate"]
+        if gate["failures"]:
+            detail = "; ".join(gate["failures"])
+            if not allow_sync_fail:
+                raise UserError(
+                    f"Chapter {chapter}'s pictures don't match the narration closely enough to render "
+                    f"(sync gate): {detail}.\n"
+                    f"See the worst stretches:  video sync-audit --chapter {chapter}\n"
+                    f"If these thresholds are wrong for this series, adjust video.sync.gate_wrong, "
+                    f"gate_window or gate_grace in manhwa-ocr.yaml.\n"
+                    f"To render anyway, pass --force to render.")
+            log(f"  ! sync gate failed ({detail}); rendering anyway (--force)")
+        else:
+            worst = ((report.get("five_second") or {}).get("worst") or {}).get("wrong")
+            worst_s = "none" if worst is None else f"{worst:.0%}"
+            log(f"  sync gate: PASS (wrong-picture {report['wrong_picture']['ratio']:.1%} of judged time, "
+                f"worst 5s window {worst_s})")
     queue = plan.get("alignment_review_queue") or []
     if queue and not strict:
         log(f"  ! {len(queue)} sentence(s) flagged for review; rendering anyway "
@@ -458,7 +506,8 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
                 log(f"  {out.name} is up to date")
                 continue
             path = render_chapter(sess, chapter, cfg, preview=preview, workers=workers,
-                                  allow_estimated=force, allow_unreviewed=force, log=log)
+                                  allow_estimated=force, allow_unreviewed=force,
+                                  allow_sync_fail=force, log=log)
             results[chapter] = f"rendered: {path.name}"
         except UserError as exc:
             results[chapter] = f"failed: {exc}"
