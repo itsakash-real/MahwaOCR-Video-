@@ -51,7 +51,8 @@ C:\Users\akash\Documents\ManhwaRecaps\the-hero-cannot-rest\
 │   └── chapter_1.mp3       ← STEP 4: YOU put your recording here
 ├── video\
 │   ├── chapter_1.mp4       ← STEP 5: the finished video
-│   ├── chapter_1.plan.json ←   the edit (what shows when); editable
+│   ├── chapter_1.plan.json ←   the edit (what shows when); rebuilt each time, don't edit
+│   ├── chapter_1.fixes.json←   your framing fixes (drop, face, crop, shot); kept across rebuilds
 │   └── chapter_1.storyboard_01.png ← one frame per shot, for review
 ├── media\ch1\              ←   page images + panel sheets (used by video)
 └── .work\                  ←   scratch; cleaned automatically, ignore it
@@ -234,6 +235,26 @@ is marked as needing a rebuild.
 **Important:** record from the *current* script. If a recap is rewritten later,
 record it again, or the pictures won't line up with your words.
 
+### Before you record audio: the checklist
+
+The pictures are matched to the script as it stands now, so settle the script
+first. If the agent says a chapter is ready, check these (the tool warns about
+most of them when the recap is finalized):
+
+- [ ] **At least 95% of the sentences carry a panel tag.** Under 90% is a warning.
+- [ ] **One panel per sentence** wherever possible (a few sentences may show two).
+- [ ] **Drawn panels only.** No tag on a caption, a blank page or a credits panel;
+      finalize refuses those and names the sentence.
+- [ ] **Numbers are spelled out** in `chapter_N.tts.txt` (new recaps do this
+      automatically: 99 becomes "ninety nine"), so the voice and the text agree.
+- [ ] **No run of three or more very short sentences** (under six words each);
+      they flash by too quickly to show a picture.
+- [ ] **Enough words for every panel**: about 7.5 words per drawn panel, so each
+      picture can stay up for its minimum time.
+- [ ] **Never record from a script that was edited after finalizing.** If the
+      recap text changes at all, have the agent run `recap --finalize` again and
+      record the new `chapter_N.tts.txt`. Never re-record from a hand-edited script.
+
 ---
 
 ## Step 5 — Build the videos (agent)
@@ -255,11 +276,13 @@ chapter that has audio):
 > (see above) and re-run `video align` + `video plan --chapter N --force` for
 > that chapter — never edit a shot's `panel` field directly in
 > video/chapter_N.plan.json, it gets overwritten the next time the plan is
-> rebuilt. For a pure presentation fix (crop, entrance, background), edit that
-> shot in video/chapter_N.plan.json as REVIEW.md describes, set
-> "reviewed": true, then run
+> rebuilt. For a framing fix (drop a panel, head position, exact crop, a shot's
+> background or entrance), add an entry to video/chapter_N.fixes.json (the
+> format is in Step 5b), re-run `video plan --chapter N --force`, then
+> `video verify`, `video review` (or `video approve`) and
 > `python -m manhwa_ocr video render --chapter N --session "the-hero-cannot-rest"`
-> for each chapter you changed.
+> for each chapter you changed. Never edit the plan by hand and never set
+> "reviewed" yourself.
 
 You can also run the build yourself without an agent:
 
@@ -298,7 +321,7 @@ The editing follows the usual recap channel style:
 - **Layouts.** Sometimes one card sits in the centre. Sometimes it slides left
   while a second card slides in from the right. Sometimes a small card sits
   over a blurred close-up.
-- **Backgrounds** switch between blurred, black and white.
+- **Backgrounds** switch between a blurred copy of the panel and black.
 - **Calm CapCut-style entrances** (Fade In, Slide Up, Blur In, Zoom In, Fit in
   Frame, Swing Right, Pull Down) take 0.6–0.8s. The image then drifts slowly
   for a couple of seconds and holds still. Nothing is rushed.
@@ -366,19 +389,23 @@ On the dashboard's **Video** tab, each chapter has:
 - **Preview** / **Video:** play it in the browser. You can seek.
 
 If a shot has the wrong *picture*, that's a pairing/alignment fix (see above),
-not a plan edit — `video\chapter_N.plan.json` is only presentation now.
-Everything else, the agent (or you) edits directly in the plan and renders
-again. **Only the changed shots are redrawn, so a fix takes seconds.**
+not a plan edit. Everything else (framing, background, entrance, a panel that
+shouldn't show) goes in `video\chapter_N.fixes.json`. `video\chapter_N.plan.json`
+is presentation only: `video plan --force` rebuilds it from the alignment and
+applies `fixes.json` every time, so anything typed into the plan is lost.
+**Only the changed shots are redrawn, so a fix takes seconds.**
 
 | To fix… | Change | Then |
 |---|---|---|
 | wrong picture | `pairs.json` for that sentence (ids are on `media\chN\panels_sheet_*.png`) | `video align --chapter N`, `video plan --chapter N --force`, `video render --chapter N` |
-| wrong part of the picture | that shot's `cards[0].crop` in the plan: `[left, top, right, bottom]` as fractions, e.g. `[0, 0.2, 1, 0.7]` | `video render --chapter N` |
-| animation | that shot's `cards[0].enter` in the plan (`cut`, `fade_in`, `slide_up`, `blur_in`, `zoom_in`, …) | same |
-| background | that shot's `background` in the plan: `blur`, `black` or `white` | same |
+| wrong part of the picture | a `crop` entry in `fixes.json` (`panel`, `shape` such as `3:4`, `box` `[left, top, right, bottom]`; the box must keep that shape) | `video plan --chapter N --force`, then `video render --chapter N` |
+| head cut off | a `face` entry (`panel`, `top`, `bottom` of the head as fractions) | same |
+| panel that shouldn't show | a `drop` entry (`panel`, `reason`) | same |
+| animation or background | a `shot` entry (`panel`, `enter` such as `cut`, `fade_in`, `slide_up`, `blur_in`, `zoom_in`; `background` `blur` or `black`) | same |
 
-A plan you've edited is never overwritten automatically. `video plan --chapter N
---force` throws your edits away and starts fresh.
+`video plan --chapter N --force` rebuilds the plan from the alignment and applies
+`fixes.json` again, so your fixes stay and any hand edit to the plan is gone. A
+`fixes.json` with one bad entry is refused whole, with a message per problem.
 
 ---
 
@@ -451,7 +478,11 @@ and you run only "python -m manhwa_ocr ..." commands.
    {"version": 1,
     "drop": [{"panel": "P016-06", "reason": "sound-effect lettering only"}],
     "face": [{"panel": "P017-02", "top": 0.12, "bottom": 0.46}],
-    "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}]}
+    "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}],
+    "shot": [{"panel": "P019-01", "background": "black", "enter": "fade_in"}]}
+
+   ("shot" is optional: background blur or black for the shot that opens with that
+   panel, and/or how that panel's card enters.)
 
 6. Rebuild and look again:
      python -m manhwa_ocr video verify --chapter 8 --session "manhwa-2"
@@ -550,6 +581,21 @@ python -m manhwa_ocr video render --chapter 8 --session "manhwa-2"
 | `video review --chapter N` | DeepSeek (or your vision model) reviews, fixes, and approves |
 | `video approve --chapter N` | approve the current plan by hand |
 | `video render --chapter N` | render the MP4 (needs approval if `require_review` is true) |
+
+## The intro (chapter 0)
+
+A short trailer in front of the series, built from panels of any chapters. Run
+`python -m manhwa_ocr video intro --prepare` to get a template `intro\intro.json`
+and contact sheets of every chapter's drawn panels (`intro\sheets\`). Write one
+entry per narrated sentence: its text and one to three panels such as
+`ch2:P010-14`. A panel may be used once, and text-only panels are rejected. Mark a
+big moment with `"beat": true` (shake, flash, fade-out). Record that narration as
+`audio\chapter_0.mp3`, then run `python -m manhwa_ocr video intro` to get
+`video\chapter_0.mp4`. Pictures hold at least 2 seconds (`video: intro:` in
+`manhwa-ocr.yaml`). Framing fixes go in `video\chapter_0.fixes.json`, using the
+same `ch2:P010-14` ids.
+
+---
 
 ## Step 7 — Finish: one long video, Shorts, the full script
 

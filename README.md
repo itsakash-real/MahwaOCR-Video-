@@ -9,7 +9,7 @@ Get a 1080p video, cut to your narration, from one terminal command.
 
 ![python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![tests](https://img.shields.io/badge/tests-293%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-354%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/tested%20on-Windows-lightgrey)
 ![deps](https://img.shields.io/badge/runtime%20deps-4-blue)
 ![no sdks](https://img.shields.io/badge/vendor%20SDKs-none-orange)
@@ -141,8 +141,10 @@ Fixes are validated as a whole: a bad entry rejects the file and nothing is appl
 | `prepare` · `assemble` · `finalize` | The same job done by an agent, as file handoffs (no key) |
 | `recap --chapters 1-4 --prepare` | Write recap narration, one file per chapter |
 | `compile --chapters 1-4,11` | Stitch recaps into one video script, with a runtime table |
+| `video pair` | Check every sentence's picture; flags sentences that carry several tags |
 | `video build` | Align, plan, check and render, in one go |
 | `video verify` · `review` · `approve` | Check cards, run the reviewer, approve a plan |
+| `video intro` (`--prepare` first) | Build chapter 0, a trailer from panels of any chapters |
 | `video clip --from A --to B` | Cut a short preview or a Shorts clip |
 | `video compile --chapters 1-7` | Join chapter videos with title cards |
 | `status` · `video status` | Progress per chapter |
@@ -213,7 +215,7 @@ ManhwaRecaps/<series>/           your output (kept outside the program folder)
 
 ## ⚠️ Honest limits
 
-- **Faces:** finding a head without an AI model uses skin colour and outline heuristics. It misses pale or white-haired characters, so some heads can still be cut. The verify report lists the risky panels, and the reviewer step exists for exactly this.
+- **Faces:** finding a head without an AI model uses skin colour and outline heuristics. It also looks for pale, silver-haired and gray-skinned heads, and never starts a card in the top quarter of a figure it cannot place, but those are the least certain heads. The verify report lists them under `low_confidence_heads`, and the reviewer step exists for exactly this.
 - **Long holds:** when several sentences in a row describe one panel, that panel can stay on screen for 10+ seconds. A maximum hold per panel is planned.
 - **Terminal reviewer:** `video review` is built and tested with a fake provider, but has not yet been run against a real chapter with a live model.
 - **Build time:** about 11 minutes per 5-minute chapter on 4 cores. Rendering is the slow part; changed shots only are re-rendered on a second run.
@@ -225,7 +227,7 @@ ManhwaRecaps/<series>/           your output (kept outside the program folder)
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -q        # 293 tests
+python -m pytest tests/ -q        # 354 tests
 ```
 
 - **New site:** subclass `Scraper` in `scrapers.py`.

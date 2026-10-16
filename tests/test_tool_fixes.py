@@ -1067,3 +1067,21 @@ def test_plan_force_reapplies_every_kind_of_fix(intro_session):
     fixes_mod.save(sess.path, "1", {"version": 1, "shot": [{"panel": first, "background": "red"}]})
     with pytest.raises(UserError, match="nothing from it was applied"):
         vb.make_plan(sess, "1", cfg, sync="off", force=True, log=lambda *_: None)
+
+
+# ====================================================================== FIX 8: agent rules and docs
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_claude_md_only_points_at_agents_md_and_agents_md_has_one_video_section():
+    assert (ROOT / "CLAUDE.md").read_text(encoding="utf-8").strip() == "@AGENTS.md"
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert agents.count("\n## Making videos") == 1
+    for needle in ("video pair", "video verify", "video review", "video approve", "video intro",
+                   "fixes.json", "presentation only"):
+        assert needle in agents
+    guide = (ROOT / "docs" / "manhwa_ocr_architecture_and_workflow_guide.md").read_text(encoding="utf-8")
+    assert "Set reviewed: true" not in guide and "Compute clean_art_bounds" not in guide
+    user = (ROOT / "USER_GUIDE.md").read_text(encoding="utf-8")
+    assert "that shot's `cards[0].crop` in the plan" not in user and "Before you record audio" in user

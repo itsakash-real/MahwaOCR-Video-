@@ -58,7 +58,7 @@ flowchart TD
         VA["python -m manhwa_ocr video align --chapter N"]
         AUD --> VA
         VPA --> VA
-        WSP["Local Whisper base.en (Word Timestamps)"]
+        WSP["Local Whisper (video.whisper_model, small.en by default)"]
         OCR_MATCH["Lexical OCR Text Matching"]
         VA --> WSP
         VA --> OCR_MATCH
@@ -99,59 +99,72 @@ flowchart TD
 
 ---
 
-### 2.3 Why Terminal Commands Fail Without AI Agent Intervention
+### 2.3 Why a Terminal Build Can Stop, and What Fixes Each Stop
 
-When running purely in the terminal (`python -m manhwa_ocr video build --chapter N`), you frequently see:
-```text
-FAILED: Chapter N has 31 sentence(s) `video align` couldn't resolve with full confidence, never reviewed...
-To render anyway, pass --force to render.
-```
+Running `python -m manhwa_ocr video build --chapter N` on a chapter whose recap and panel tags are
+sound just works. When it stops, the message names the cause. These are the three usual ones:
 
-There are three architectural reasons for this:
+1. **The alignment review queue (`--strict`) or a failed alignment check.**
+   - `video align` decides the panel for each sentence from, in order, the recap's tag, the story
+     order, and the overlap between the sentence and each panel's own text. A sentence whose tag it
+     could not confirm is listed in `review_queue`; a tag sequence that jumps ahead without support
+     fails `no_unexplained_jumps`.
+   - The usual cause is **grouped tags**: one sentence carrying three or more tags followed by an
+     untagged sentence. `video pair` reports it in `PAIRING.md` and writes a suggested redistribution
+     into `pairs.json` (`_suggestions`, never applied for you); align's message names the exact
+     sentence to move each tag to.
+   - The fix is always in the tags: edit `pairs.json` (or the recap's `cues.json`), run
+     `video pair --apply`, then `video align`. Nobody empties the queue or sets `reviewed` by hand;
+     the only ways to clear the review gate are `video review` (the reviewer approves) and
+     `video approve`.
+2. **Framing.** Cards use only the allowed shapes (3:4, 1:1, 4:3, 16:9 landscape; 9:16, 3:4, 1:1
+   portrait). The planner keeps every card full width with no white gutters, never starts a card
+   below the top quarter of a panel whose head it cannot find, and shows a panel that is too wide for
+   any shape whole on a blurred backdrop. `video verify` lists the panels it is unsure about
+   (`low_confidence_heads`, `needs_eyes`) in `video/chapter_N.verify.json`.
+3. **Speech bubbles.** The planner slides each crop away from lettering, vertical moves first, and
+   narrows a card sideways only as a last resort (never below `video.crop.min_width_kept`).
 
-1. **The Alignment Review Queue Gatekeeper**:
-   - `video align` relies on three weak signals when the recap was written without strict panel tags:
-     1. Text overlap between speech and panel OCR text.
-     2. Relative chronological position in the chapter.
-     3. Internal thought detection (`INTERNAL` sentences).
-   - If speech doesn't literally repeat words written inside the manhwa speech bubbles (which good narration rarely does), confidence drops below 0.70.
-   - The CLI refuses to render automatically to prevent showing unrelated panels. It requires either manual review or the AI Agent to review and mark `"reviewed": true`.
-2. **Fixed-Aspect Cropping vs Tall Webtoon Art**:
-   - Manhwa panels are vertical (often 900x2500 px or taller).
-   - The default plan generator tries to fit panels into landscape/card boxes (`0.75` to `1.2` aspect ratios).
-   - Without custom crop bounds (`[x0, y0, x1, y1]`), the default algorithm slices off the top 30-40% (cutting off hair, heads, or eyes) or the bottom 30-40% (cutting off bodies, hands, and actions).
-3. **Dialogue Bubble Clutter**:
-   - Default bounding boxes capture speech bubbles. In a recap video, speech bubbles with source text compete with the narrator's voice and look unprofessional.
+Nobody computes `y0`/`y1` crop bounds by hand. If a panel still looks wrong after `video verify`,
+the correction is one entry in `video/chapter_N.fixes.json` (`drop`, `face`, `crop`, or a `shot`
+override of background or entrance). `video plan --force` re-applies that file every time it
+rebuilds, so a fix is never lost; edits made directly in `chapter_N.plan.json` are.
 
 ---
 
-### 2.4 How the AI Agent ("Brain") Intervenes to Fix the Video
+### 2.4 How the AI Agent ("Brain") Helps, and the Lines It Does Not Cross
 
 ```mermaid
 flowchart TD
-    subgraph Problem_State ["Problem State (Raw CLI)"]
-        E1["31 Review Queue Flags"]
-        E2["Severed Heads (y0 > 0.20)"]
-        E3["Speech Bubbles on Card Borders"]
-        E4["Audio Drift / Offset on Re-records"]
+    subgraph Tool ["Tool (deterministic)"]
+        T1["align: panel per sentence"]
+        T2["plan: shots, full-width crops, no gutters, head and bubble avoidance"]
+        T3["verify: non-AI check of every drawn panel"]
+        T4["review / approve: the gate before render"]
     end
 
-    subgraph Agent_Intervention ["AI Agent (Brain) Work"]
-        A1["1. Parse Review Queue & Verify Story Context"]
-        A2["2. Compute clean_art_bounds: Gutters + Protected Headroom (y0 <= 0.14, y1 >= 0.90)"]
-        A3["3. Re-align Whisper Word Timestamps to exact Spoken Audio"]
-        A4["4. Split Long Sentences (>10s) into Dynamic Sub-shots"]
-        A5["5. Apply Staggered Pair Entrances (Card 1 at 0.0s, Card 2 at 0.45 dur)"]
-        A6["6. Set reviewed: true and alignment_review_queue: []"]
+    subgraph Agent ["Agent (judgement, through named files only)"]
+        A1["Look at pair sheets; fix wrong pictures in pairs.json / cues.json"]
+        A2["Look at the storyboard; record framing fixes in chapter_N.fixes.json"]
+        A3["Re-run: pair --apply, align, plan --force, verify"]
     end
 
-    subgraph Pristine_Output ["Pristine Output"]
-        OUT["Smooth 1080p MP4: 0 Cuts on Heads, 0 Speech Bubbles, Perfect Audio Sync"]
+    subgraph Never ["Never by hand"]
+        N1["y0 / y1 crop numbers in the plan"]
+        N2['"reviewed": true or an emptied review queue']
+        N3["cards[k].panel in the plan"]
     end
 
-    Problem_State --> Agent_Intervention
-    Agent_Intervention --> Pristine_Output
+    Tool --> Agent
+    Agent --> Tool
+    Agent -. no .-> Never
+    T4 --> OUT["Render: 1080p MP4"]
 ```
+
+The agent's job is to look at pictures and decide, then write the decision into `pairs.json`,
+`cues.json` or `fixes.json`. The tool does the arithmetic, the timing and the checks, and the plan
+is always rebuilt from those files. Recording audio is the user's job, and a recap is never rewritten
+once its chapter has audio.
 
 ---
 
@@ -230,7 +243,7 @@ How much of this system requires an AI Agent vs local code?
 | **Tile OCR Transcription** | 10% | **90%** (in API mode) | **90%** (in Agent mode) | Reading text inside artwork requires vision models. |
 | **Assembly & Series Lore Tracking** | 30% | **70%** | **70%** | Reconciling character names, removing tile overlap duplicates. |
 | **Writing Recap Narration Scripts** | 10% | **90%** | **90%** | Creative commentary, comedic timing, tagging panels (`{P004-05}`). |
-| **Audio Speech Sync (Whisper)** | **100%** | 0% | 0% | Local Whisper (`base.en` / `small.en`) timestamps words deterministically. |
+| **Audio Speech Sync (Whisper)** | **100%** | 0% | 0% | Local Whisper (`video.whisper_model`; `small.en` by default, `base.en` is the faster option) timestamps words deterministically. |
 | **Initial Video Alignment (`video align`)** | **85%** | 15% | 0% | Heuristic matching of speech against tags. |
 | **Review Queue & Alignment Fixes** | 0% | 20% | **80%** | **Crucial:** Resolves flagged mismatches when text doesn't match OCR. |
 | **Crop Bounds (`clean_art_bounds`)** | 40% | 0% | **60%** | **Crucial:** Prevents severed heads (`y0 <= 0.14`) and cut bodies (`y1 >= 0.90`). |
@@ -272,12 +285,22 @@ python -m manhwa_ocr video status --session "manhwa-2"
 python -m manhwa_ocr video pair --chapter N --session "manhwa-2"
 python -m manhwa_ocr video pair --chapter N --apply --session "manhwa-2"
 
-# 3. Align audio and build plan (or let the AI Agent compile pristine plan)
+# 3. Align audio and build the plan (framing fixes live in video/chapter_N.fixes.json;
+#    `plan --force` re-applies them every time)
 python -m manhwa_ocr video align --chapter N --session "manhwa-2"
 python -m manhwa_ocr video plan --chapter N --force --session "manhwa-2"
 
-# 4. Render the 1080p video
+# 4. Check, review and approve the plan
+python -m manhwa_ocr video verify --chapter N --session "manhwa-2"
+python -m manhwa_ocr video review --chapter N --session "manhwa-2"
+python -m manhwa_ocr video approve --chapter N --session "manhwa-2"
+
+# 5. Render the 1080p video
 python -m manhwa_ocr video render --chapter N --session "manhwa-2" --workers 1
+
+# Optional: the intro (chapter 0), built from panels of any chapter
+python -m manhwa_ocr video intro --prepare --session "manhwa-2"
+python -m manhwa_ocr video intro --session "manhwa-2"
 ```
 
 ---
@@ -291,10 +314,10 @@ graph TD
     OUTPUT["Pristine 1080p Recap Video"]
 
     CLI -->|Provides raw timestamps & panel cuts| AGENT
-    AGENT -->|Calculates exact art headroom, fixes speech cuts, clears review queues| CLI
+    AGENT -->|Fixes wrong pictures in pairs.json and framing in fixes.json| CLI
     CLI --> OUTPUT
 ```
 
 1. **The CLI provides speed and stability**: It runs Whisper locally on CPU/GPU, detects gutters, generates contact sheets, and multiplexes 1080p frames at 30 FPS.
-2. **The AI Agent provides aesthetic judgment**: It examines the contact sheets, detects where character heads and eyes sit in vertical manhwa panels, adjusts `y0/y1` crops to preserve full character anatomy, eliminates speech bubbles, and splits long sentences into cinematic cuts.
+2. **The AI Agent provides aesthetic judgment**: It examines the contact sheets and storyboards and records what it sees as fixes (`pairs.json`, `cues.json`, `fixes.json`); the tool turns those into crops, timing and shots, so nothing is hand-computed.
 3. **Together**: They eliminate manual video editing work while ensuring zero visual drift, zero severed heads, and zero terminal errors.
