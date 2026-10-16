@@ -26,7 +26,11 @@ panel belonging to another sentence's tag is on screen; legitimate coverage
 fillers and pair second cards are excluded) and a per-minute curve of both. The
 gate `video build` enforces is on wrong-picture time and cut lateness - overall
 wrong-picture share (gate_wrong), wrong-picture inside any five-second window
-(gate_window), and cuts later than max_late + gate_grace.
+(gate_window), and cuts later than max_late + gate_grace. A window judges
+settled time only - samples inside a sentence's own cut budget (lead before its
+words, max_late after) are excluded, so a cut landing on its budget is not
+drift - and needs at least a full second of wrong picture to fail, not just a
+share of a sparse window.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ from .plan import plan_path
 SAMPLE_STEP = 0.5     # the plan is sampled every half second
 WINDOW_MIN = 3.0      # mismatches shorter than this are noise, not reported windows
 GATE_SPAN = 5.0       # "any five-second window" size for the gate
+GATE_WRONG_SECONDS = 1.0  # a window needs at least this much wrong picture (settled time) to fail
 RUN_MIN = 5.0         # an interpolated stretch longer than this is a long run
 
 CAUSES = ("min_hold_shift", "interpolated_timing", "filler_panel", "tag_override", "long_hold", "unknown")
@@ -263,14 +268,31 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         if off is not None and off > st["max_late"] + st["gate_grace"] + 1e-6:
             late.append({"sentence": seg.get("sentence"), "panel": first[0], "offset": round(off, 3)})
 
+    # The gate windows judge settled time only: right around a sentence's start
+    # the cut may still be up to lead early or max_late late by design, so those
+    # samples are excluded; and a window needs at least GATE_WRONG_SECONDS of
+    # wrong picture, not just a share of a sparse window, to fail - one
+    # straddling sample is a cut on budget, not drift.
+    lead_b, late_b = float(st["lead"]), float(st["max_late"])
+
+    def _settled(t: float) -> bool:
+        k = bisect_right(seg_starts, t)
+        if k and t - seg_starts[k - 1] <= late_b + 1e-9:
+            return False
+        if k < len(seg_starts) and seg_starts[k] - t <= lead_b + 1e-9:
+            return False
+        return True
+
     over: List[Dict[str, Any]] = []
     t = 0.0
     while t + GATE_SPAN <= duration + 1e-6:
-        win = [s for s in judged if t <= s["t"] < t + GATE_SPAN]
+        win = [s for s in judged if t <= s["t"] < t + GATE_SPAN and _settled(s["t"])]
         if win:
-            wfrac = sum(1 for s in win if s["wrong"]) / len(win)
-            if wfrac > st["gate_window"] + 1e-9:
+            nw = sum(1 for s in win if s["wrong"])
+            wfrac = nw / len(win)
+            if wfrac > st["gate_window"] + 1e-9 and nw * SAMPLE_STEP >= GATE_WRONG_SECONDS - 1e-9:
                 over.append({"start": round(t, 2), "wrong": round(wfrac, 4),
+                             "wrong_seconds": round(nw * SAMPLE_STEP, 2),
                              "match": round(sum(1 for s in win if s["match"]) / len(win), 4),
                              "samples": len(win)})
         t += SAMPLE_STEP
@@ -282,7 +304,7 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
                         f"is over {st['gate_wrong']:.0%}")
     if over and worst_window:
         failures.append(f"{len(over)} five-second window(s) over {st['gate_window']:.0%} wrong-picture "
-                        f"(worst {worst_window['wrong']:.0%} at {_mmss(worst_window['start'])})")
+                        f"in settled time (worst {worst_window['wrong']:.0%} at {_mmss(worst_window['start'])})")
     if late:
         worst_late = max(late, key=lambda x: x["offset"])
         failures.append(f"{len(late)} cut(s) more than {st['max_late'] + st['gate_grace']:.1f}s after their "
@@ -407,7 +429,8 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
                    + "  ".join(f"{m['minute']}:{_pct(m['wrong'])}" for m in mc))
 
     worst = (report.get("five_second") or {}).get("worst")
-    out.append(f"  five-second windows over {report['settings']['gate_window']:.0%} wrong-picture: "
+    out.append(f"  five-second windows over {report['settings']['gate_window']:.0%} wrong-picture "
+               f"(settled time, at least {GATE_WRONG_SECONDS:g}s): "
                + (f"{len(report['five_second']['over_gate'])} "
                   f"(worst {worst['wrong']:.0%} at {_mmss(worst['start'])})" if worst else "none"))
     late = report["late_cuts"]

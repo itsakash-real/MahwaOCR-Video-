@@ -218,6 +218,45 @@ def test_audit_gate_reports_five_second_windows_over_the_wrong_picture_threshold
     assert rep["five_second"]["worst"]["start"] == 6.0
 
 
+def test_gate_windows_judge_settled_time_only():
+    # Six 1.5s sentences, every shot cut 0.25s late - inside each sentence's
+    # max_late budget, by design. Five wrong-picture samples land on the
+    # boundaries; the old gate counted them and failed on share alone (40% at
+    # t=3). The gate now judges settled time only, so none of these on-budget
+    # cuts fail a window - the honest wrong-picture count is still reported.
+    segs, shots = [], []
+    for k in range(1, 7):
+        a, b = 1.5 * (k - 1), 1.5 * k
+        segs.append(_seg(k, a, b, f"sentence number {k}", [f"P{k:02d}"]))
+        shots.append(_shot(k, a + 0.25, b + 0.25, [(f"P{k:02d}", 0.0)]))
+    words = _words(" ".join(f"sentence number {k}" for k in range(1, 7)))
+    rep = _run_audit(shots, segs, words, 9.25)
+    assert rep["wrong_picture"]["samples"] == 5         # the honest number never hides
+    assert rep["five_second"]["over_gate"] == []
+    assert rep["windows"] == []
+    assert not any("five-second window" in f for f in rep["gate"]["failures"])
+
+
+def test_gate_window_needs_a_full_second_of_wrong_picture():
+    # A stray flash of sentence 2's panel sits in settled time (t=23.0): with a
+    # lowered share bar that is 11% of the window - over the bar - but 0.5s is
+    # under the full second of wrong picture a window needs to fail. A short
+    # straddle must not fail the gate just because the window is sparse.
+    segs = [_seg(1, 0.0, 20.0, "Ron draws his sword fast", ["P2"]),
+            _seg(2, 20.0, 22.0, "He raises the blade", ["P1"]),
+            _seg(3, 22.0, 30.0, "The demon king laughs loud", ["P3"])]
+    shots = [_shot(1, 0.0, 20.0, [("P2", 0.0)]), _shot(2, 20.0, 22.4, [("P1", 0.0)]),
+             _shot(3, 22.4, 23.0, [("P3", 0.0)]), _shot(4, 23.0, 23.5, [("P1", 0.0)]),
+             _shot(5, 23.5, 30.0, [("P3", 0.0)])]
+    rep = _run_audit(shots, segs, _words("Ron draws his sword fast he raises the blade "
+                                         "the demon king laughs loud"), 30.0,
+                     settings={"gate_window": 0.05})
+    assert rep["wrong_picture"]["samples"] == 2
+    assert rep["five_second"]["over_gate"] == []
+    assert rep["windows"] == []
+    assert rep["gate"]["pass"] is True
+
+
 def test_audit_wrong_picture_excludes_legitimate_fillers():
     # The tagged P2 never appears; a coverage extra (owned by no sentence) is
     # shown instead. Strict match is 0% but no OTHER sentence's panel is on
