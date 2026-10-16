@@ -49,7 +49,13 @@ def available() -> bool:
         return False
 
 
+_SCALES = ((10 ** 12, "trillion"), (10 ** 9, "billion"), (10 ** 6, "million"), (1000, "thousand"))
+_ORDINAL = {"one": "first", "two": "second", "three": "third", "five": "fifth", "eight": "eighth",
+            "nine": "ninth", "twelve": "twelfth"}
+
+
 def _number_words(n: int) -> List[str]:
+    """Any non-negative integer as spoken words: 99 -> ninety nine, 100 -> one hundred."""
     if n < 20:
         return [_SMALL[n]]
     if n < 100:
@@ -61,21 +67,59 @@ def _number_words(n: int) -> List[str]:
         if rest:
             out.extend(_number_words(rest))
         return out
-    return [str(n)]
+    for size, name in _SCALES:
+        if n >= size:
+            head, rest = divmod(n, size)
+            out = _number_words(head) + [name]
+            if rest:
+                out.extend(_number_words(rest))
+            return out
+    return [str(n)]  # pragma: no cover - unreachable
+
+
+def spell_number(n: int) -> List[str]:
+    """Like _number_words, but four-digit years (1100-1999) read as a narrator says
+    them: 1999 -> nineteen ninety nine."""
+    if 1100 <= n <= 1999 and n % 100:
+        return _number_words(n // 100) + _number_words(n % 100)
+    return _number_words(n)
+
+
+def _ordinal_words(n: int) -> List[str]:
+    words = spell_number(n)
+    last = words[-1]
+    if last in _ORDINAL:
+        words[-1] = _ORDINAL[last]
+    elif last.endswith("y"):
+        words[-1] = last[:-1] + "ieth"
+    else:
+        words[-1] = last + "th"
+    return words
+
+
+_ORD_RE = re.compile(r"^(\d+)(?:st|nd|rd|th)$")
 
 
 def tokens(text: str) -> List[str]:
-    """Comparable words: casefolded, punctuation gone, small numbers spelled out."""
+    """Comparable words: casefolded, punctuation gone, every integer spelled out.
+
+    Hyphenated spoken numbers ("ninety-nine") split into separate words so the
+    script's "99" and whisper's "ninety-nine" or "99" all compare equal.
+    """
     out: List[str] = []
-    for raw in re.split(r"\s+", text or ""):
-        w = "".join(ch for ch in unicodedata.normalize("NFKC", raw).casefold()
-                    if unicodedata.category(ch)[0] in "LMN")
-        if not w:
-            continue
-        if w.isdigit() and len(w) <= 3:
-            out.extend(_number_words(int(w)))
-        else:
-            out.append(w)
+    for chunk in re.split(r"\s+", text or ""):
+        for raw in re.split(r"[-‐-―]", chunk):
+            w = "".join(ch for ch in unicodedata.normalize("NFKC", raw).casefold()
+                        if unicodedata.category(ch)[0] in "LMN")
+            if not w:
+                continue
+            m = _ORD_RE.match(w)
+            if w.isdigit() and len(w) <= 15:
+                out.extend(spell_number(int(w)))
+            elif m and len(m.group(1)) <= 15:
+                out.extend(_ordinal_words(int(m.group(1))))
+            else:
+                out.append(w)
     return out
 
 
@@ -140,12 +184,76 @@ def transcribe(audio: Path, *, model: str = "small.en", language: str | None = N
     return words
 
 
-def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration: float) -> Dict[str, Any]:
+MIN_SEGMENT = 0.25   # seconds; video.sync.min_segment overrides it
+
+
+def _spread_collisions(raw: List[float], weights: List[int], duration: float) -> tuple[List[float], int]:
+    """Sentences whose raw start is not later than an earlier sentence's start
+    form a cluster with that earlier one. Give each cluster member a share of
+    the window [cluster start, next cluster start] in proportion to its words."""
+    n = len(raw)
+    out = list(raw)
+    leaders: List[int] = []
+    run = float("-inf")
+    for i in range(n):
+        if i == 0 or raw[i] > run + 1e-3:
+            leaders.append(i)
+            run = raw[i]
+    spread = 0
+    for k, lead in enumerate(leaders):
+        stop = leaders[k + 1] if k + 1 < len(leaders) else n
+        if stop - lead < 2:
+            continue
+        begin = raw[lead]
+        end = raw[stop] if stop < n else duration
+        end = max(end, begin)
+        total = float(sum(weights[lead:stop]))
+        acc = 0.0
+        for i in range(lead, stop):
+            out[i] = begin + (end - begin) * acc / total
+            acc += weights[i]
+        spread += stop - lead
+    return out, spread
+
+
+def _enforce_min_segment(starts: List[float], duration: float, min_segment: float) -> List[float]:
+    """Make every gap between consecutive starts, and the last sentence's tail,
+    at least `min_segment` without breaking order or passing the audio end.
+
+    A backward pass first (pull starts earlier: a panel showing a moment early is
+    harmless, showing late is not), then a forward pass for what is left at the
+    front. Both together are always feasible when n * min_segment <= duration."""
+    n = len(starts)
+    if n == 0:
+        return []
+    duration = max(0.0, float(duration))
+    m = max(0.0, float(min_segment))
+    if duration > 0:
+        m = min(m, 0.999 * duration / n)
+    t = [max(0.0, x) for x in starts]
+    for i in range(1, n):                 # never backwards
+        t[i] = max(t[i], t[i - 1])
+    t[-1] = min(t[-1], max(0.0, duration - m))
+    for i in range(n - 2, -1, -1):        # backward: leave room for the next one
+        t[i] = min(t[i], t[i + 1] - m)
+    t[0] = max(t[0], 0.0)
+    for i in range(1, n):                 # forward: repair anything pushed below zero
+        t[i] = max(t[i], t[i - 1] + m)
+    return t
+
+
+def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration: float,
+          min_segment: float = MIN_SEGMENT) -> Dict[str, Any]:
     """Give every sentence a start time, and every emphasised word a time.
 
     Returns {"sentences": [... with "start" and "emphasis" times ...],
              "matched": fraction of sentences anchored to real word timings,
-             "unmatched": [texts that had to be interpolated]}.
+             "unmatched": [texts that had to be interpolated],
+             "spread": sentences whose start collided with a neighbour and were
+                       redistributed by word count}.
+
+    Every sentence ends up at least `min_segment` seconds long (as far as the
+    audio length allows), so no segment is ever zero-length.
     """
     script: List[str] = []
     owner: List[int] = []
@@ -203,11 +311,16 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
     if starts and starts[0] is None:
         starts[0] = speech_start
 
-    # Starts must never go backwards, or shots would have negative length.
-    out, last = [], 0.0
+    # Several short sentences can land on one anchor ("Number 99." then a run of
+    # one-word names). Spread each such cluster across its window by word count
+    # instead of collapsing them all onto the same instant.
+    weights = [max(1, len(tokens(s.get("text", "")))) for s in sentences]
+    times, spread = _spread_collisions([float(x or 0.0) for x in starts], weights, duration)
+    times = _enforce_min_segment(times, duration, min_segment)
+
+    out = []
     for i, s in enumerate(sentences):
-        t = max(last, float(starts[i] or 0.0))
-        t = min(t, max(0.0, duration - 0.3))
+        t = times[i]
         emphasis_times = []
         sent_tokens = script[offsets[i]:(offsets[i + 1] if i + 1 < len(sentences) else len(script))]
         for phrase in s.get("emphasis") or []:
@@ -219,10 +332,9 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
                     emphasis_times.append(to_time[offsets[i] + k])
                     break
         out.append({**s, "start": round(t, 3), "emphasis": sorted(emphasis_times)})
-        last = t
 
     matched = len(known) / len(sentences) if sentences else 0.0
-    return {"sentences": out, "matched": round(matched, 3), "unmatched": unmatched}
+    return {"sentences": out, "matched": round(matched, 3), "unmatched": unmatched, "spread": spread}
 
 
 def character_prompt(memory) -> str | None:

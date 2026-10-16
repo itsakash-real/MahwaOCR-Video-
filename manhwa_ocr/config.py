@@ -83,6 +83,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "effects": {"shake": True, "punch": False, "flash": False, "end_fade": True},
         "music": None,              # path to a music file, relative to the series folder
         "music_volume": 0.22,
+        # Narration sync. min_segment: no sentence is shorter than this many seconds,
+        # so clusters of tiny sentences sharing one whisper anchor never collapse to 0s.
+        "sync": {"min_segment": 0.25},
         "whisper_model": "small.en",
         "whisper_language": None,   # e.g. "hi" for Hindi narration (use a multilingual model)
     },

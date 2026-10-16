@@ -274,7 +274,9 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
             mode = "estimated"
     elif sync != "off":
         log(f"  note: install whisper for exact sync:  {sync_mod.SYNC_HINT}")
-    aligned = sync_mod.align(sentences, words, duration)
+    sync_cfg = vcfg.get("sync") if isinstance(vcfg.get("sync"), dict) else {}
+    aligned = sync_mod.align(sentences, words, duration,
+                             min_segment=float(sync_cfg.get("min_segment", sync_mod.MIN_SEGMENT)))
     timed = aligned["sentences"]
     for i, s in enumerate(timed):
         s["end"] = float(timed[i + 1]["start"]) if i + 1 < len(timed) else duration
