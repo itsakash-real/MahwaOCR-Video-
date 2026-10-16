@@ -85,6 +85,24 @@ class _Page:
     norm_h: float = 0.0
 
 
+def _is_flat_banner(path: Path) -> bool:
+    """Landscape credit banners are near-uniform; story spreads are not."""
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+            if h >= 600:
+                small = img.convert("L").resize((60, max(4, round(60 * h / max(1, w)))), Image.BILINEAR)
+                import numpy as _np
+
+                g = _np.asarray(small, dtype=_np.float32)
+                if float(g.std()) >= 12.0:
+                    return False  # detailed art: a story spread, keep it
+                return True
+            return True
+    except OSError:
+        return True
+
+
 def _row_stats(path: Path, norm_w: int) -> tuple[np.ndarray, np.ndarray]:
     """Per-row mean brightness and non-uniformity, at normalised height."""
     with Image.open(path) as img:
@@ -194,8 +212,8 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
                 w, h = img.size
         except OSError as exc:
             raise UserError(f"Can't read page {p.name}: {exc}") from None
-        if s["skip_landscape"] and w > h:
-            continue  # credit banners and cover cards, not story strip
+        if s["skip_landscape"] and w > h and _is_flat_banner(p):
+            continue  # landscape credit banners, not detailed story spreads
         pages.append(_Page(i, p, w, h))
     if not pages:
         raise UserError("No usable page images (all were landscape credit pages, or none found).")
@@ -337,7 +355,12 @@ def _fingerprint(pages: List[Path], s: Dict[str, Any]) -> str:
     h = hashlib.sha256(json.dumps({"v": PANELS_VERSION, **s}, sort_keys=True).encode())
     for p in pages:
         st = p.stat()
-        h.update(f"{p.name}:{st.st_size}:{int(st.st_mtime)}".encode())
+        try:
+            with p.open("rb") as fh:
+                head = fh.read(65536)
+            h.update(f"{p.name}:{st.st_size}:".encode() + hashlib.sha256(head).digest())
+        except OSError:
+            h.update(f"{p.name}:{st.st_size}".encode())
     return h.hexdigest()[:16]
 
 
@@ -408,8 +431,12 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
         # A panel with a character in it is art even when it has little
         # texture (a pale portrait, a plain background): only lettering, caption
         # boxes and blank pages are text-only.
-        row["text_only"] = row["credits"] or (is_text_only(row["art"], row["crop_art"])
-                                              and row["figure"] < FIGURE_MIN)
+        has_notes = bool((row.get("scene") or "").strip() or (row.get("text") or "").strip())
+        row["text_only"] = row["credits"] or (
+            is_text_only(row["art"], row["crop_art"])
+            and row["figure"] < FIGURE_MIN
+            and not has_notes
+        )
         rows.append(row)
 
     data = {

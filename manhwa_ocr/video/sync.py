@@ -55,6 +55,12 @@ def _number_words(n: int) -> List[str]:
     if n < 100:
         tens, ones = divmod(n, 10)
         return [_TENS[tens - 2]] + ([_SMALL[ones]] if ones else [])
+    if n < 1000:
+        hundreds, rest = divmod(n, 100)
+        out = [_SMALL[hundreds], "hundred"]
+        if rest:
+            out.extend(_number_words(rest))
+        return out
     return [str(n)]
 
 
@@ -66,7 +72,7 @@ def tokens(text: str) -> List[str]:
                     if unicodedata.category(ch)[0] in "LMN")
         if not w:
             continue
-        if w.isdigit() and len(w) <= 2:
+        if w.isdigit() and len(w) <= 3:
             out.extend(_number_words(int(w)))
         else:
             out.append(w)
@@ -182,8 +188,12 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
     for s in sentences:
         cum.append(cum[-1] + (len(s.get("text", "")) or 1))
     anchors = [(i, float(starts[i])) for i in known]
+    speech_start = float(heard[0][1]) if heard else 0.0
     if not anchors or anchors[0][0] != 0:
-        anchors.insert(0, (0, 0.0))          # the first sentence starts the audio
+        # Video shot 1 still starts at 0 in plan.py, but speech timing must
+        # keep the first heard word's time so leading silence doesn't pull
+        # every interpolated sentence early.
+        anchors.insert(0, (0, speech_start))
     anchors.append((n, duration))            # virtual anchor at the very end
     for (ia, ta), (ib, tb) in zip(anchors, anchors[1:]):
         span = cum[ib] - cum[ia] or 1
@@ -191,7 +201,7 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
             if starts[i] is None:
                 starts[i] = ta + (tb - ta) * (cum[i] - cum[ia]) / span
     if starts and starts[0] is None:
-        starts[0] = 0.0
+        starts[0] = speech_start
 
     # Starts must never go backwards, or shots would have negative length.
     out, last = [], 0.0

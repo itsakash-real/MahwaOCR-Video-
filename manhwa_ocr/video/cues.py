@@ -57,10 +57,24 @@ def tts_text(narration: str) -> str:
     return "\n\n".join(paragraphs) + "\n"
 
 
+_ABBREV = ("Mr.", "Mrs.", "Ms.", "Dr.", "No.", "St.", "vs.", "e.g.", "i.e.")
+_DOT = "\u0001"
+
+def _protect_abbrev(text: str) -> str:
+    for a in _ABBREV:
+        text = text.replace(a, a.replace(".", _DOT))
+    return text
+
+
+def _restore_abbrev(text: str) -> str:
+    return text.replace(_DOT, ".")
+
+
 def parse(narration: str, known_panels: Set[str] | None = None) -> Dict[str, Any]:
     """Split tagged narration into spoken sentences with their panels and cues."""
     body = "\n".join(ln for ln in (narration or "").splitlines() if not CUE_LINE.match(ln))
     body = re.sub(r"\s+", " ", body).strip()
+    body = _protect_abbrev(body)
     sentences: List[Dict[str, Any]] = []
     unknown: List[str] = []
     tagged = 0
@@ -84,14 +98,17 @@ def parse(narration: str, known_panels: Set[str] | None = None) -> Dict[str, Any
                         panels.append(pid)
                     else:
                         unknown.append(pid)
-        emphasis = [_spoken(m) for m in re.findall(r"\*{1,2}([^*\n]{1,60})\*{1,2}", chunk)]
-        text = _spoken(chunk)
+        emphasis = [_spoken(_restore_abbrev(m)) for m in re.findall(r"\*{1,2}([^*\n]{1,60})\*{1,2}", chunk)]
+        text = _restore_abbrev(_spoken(chunk))
+        chunk = _restore_abbrev(chunk)
         if not text:
             # A tag-only fragment: carry its tags onto the next sentence.
             if sentences is not None and (panels or cues):
                 sentences.append({"text": "", "panels": panels, "cues": cues, "emphasis": []})
             continue
-        if sentences and not sentences[-1]["text"]:
+        # Merge *all* consecutive tag-only fragments, so stacked tags like
+        # {P001} {P002} sentence keep every panel instead of dropping the first.
+        while sentences and not sentences[-1]["text"]:
             carry = sentences.pop()
             panels = carry["panels"] + panels
             cues = carry["cues"] + cues

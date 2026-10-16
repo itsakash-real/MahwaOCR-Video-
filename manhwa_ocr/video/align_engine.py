@@ -43,7 +43,7 @@ from .panels import load_panels
 
 WINDOW = 6          # how many panels ahead of the current story position are candidates
 JUMP_TOLERANCE = 2  # a tag this far "behind" the running position isn't trusted blindly
-MIN_WORD = 4        # a matched token shorter than this is too common to count as evidence
+MIN_WORD = 3        # a matched token shorter than this is too common to count as evidence
 
 # Common words long enough to slip past MIN_WORD but still carry no distinguishing
 # evidence ("the", "was" would already be excluded by length; these are the
@@ -58,6 +58,8 @@ STOPWORDS = {
     "both", "being", "been", "does", "did", "doing", "there", "here", "your",
     "his", "her", "him", "himself", "herself", "itself", "who", "whom", "whose",
     "again", "still", "once", "upon", "like", "much", "many", "though",
+    "the", "and", "are", "was", "you", "she", "not", "but", "for", "all",
+    "any", "can", "one", "two", "six", "ten", "our",
 }
 
 
@@ -134,6 +136,18 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
             segments.append(seg)
             continue
 
+        # Tags the writer gave this sentence, in order. A text-only panel
+        # can't be shown, unless it carries scene/text notes (pale-art guard
+        # against a bad text_only flag); the rest are the sentence's pictures.
+        def _usable(pid: str) -> bool:
+            p = by_id[pid]
+            if not p.get("text_only"):
+                return True
+            return bool((p.get("scene") or "").strip() or (p.get("text") or "").strip())
+
+        usable = [p for p in tagged if _usable(p)]
+        tag = usable[0] if usable else None
+
         window = window_from(cursor)
         candidates = []
         for pid in window:
@@ -144,11 +158,6 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
         candidates.sort(key=lambda c: (-c["ocr_overlap"], -c["sequence_score"]))
         best = candidates[0] if candidates else None
         best_ocr = best["ocr_overlap"] if best else 0
-
-        # Tags the writer gave this sentence, in order. A tag on a text-only panel can't be
-        # shown, so it is not usable; the rest are the sentence's own pictures.
-        usable = [p for p in tagged if not by_id[p].get("text_only")]
-        tag = usable[0] if usable else None
         if tag and order[tag] < cursor - JUMP_TOLERANCE:
             # A real backward jump: don't trust it blindly, search the forward window instead.
             selected, confidence, needs_review = (best["panel"] if best else tag), "tag_behind_cursor", True
@@ -292,7 +301,7 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
     for seg, t in zip(segments, timed):
         seg["start"], seg["end"] = round(float(t["start"]), 3), round(float(t["end"]), 3)
 
-    min_hold = float(vcfg.get("min_hold", 3.0))
+    min_hold = float(vcfg.get("min_hold", vcfg.get("min_shot", 3.0)))
     coverage = place_coverage(segments, plist, duration, min_hold)
     coverage["art_panels"] = sum(1 for p in plist if not p.get("text_only"))
     coverage["text_only_excluded"] = [p["id"] for p in plist if p.get("text_only")]

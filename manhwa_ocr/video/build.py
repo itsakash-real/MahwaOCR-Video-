@@ -354,7 +354,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
-    qa = quality_report(plan, panels, align_cov, float(vcfg.get("min_hold", 3.0)))
+    qa = quality_report(plan, panels, align_cov, float(vcfg.get("min_hold", vcfg.get("min_shot", 3.0))))
     atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
     if qa["failures"]:
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])

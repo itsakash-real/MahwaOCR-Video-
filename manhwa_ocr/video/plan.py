@@ -257,25 +257,74 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD) -> Tupl
 
     n = len(groups)
     b = [g[0]["start"] for g in groups] + [groups[-1][-1]["end"]]  # group k spans b[k]..b[k+1]
+    # Every sentence_start must stay inside its own shot, or the panel would
+    # appear after its words started. A boundary move that pushes a start
+    # outside is rejected and another donor is tried.
+    grp_starts: List[List[float]] = []
+    for g in groups:
+        ss: List[float] = []
+        for u in g:
+            ss.extend(float(t) for t in (u.get("sentence_starts") or []))
+        grp_starts.append(ss)
     retimed: set = set()
     moved = 0.0
+    drifted = 0.0
+
+    def _keeps_starts(nb: List[float]) -> bool:
+        for k in range(n):
+            for t in grp_starts[k]:
+                if t < nb[k] - 1e-6 or t > nb[k + 1] - 0.2 - 1e-6:
+                    return False
+        return True
+
+    def _drift_of(nb: List[float]) -> float:
+        worst = 0.0
+        for k in range(n):
+            for t in grp_starts[k]:
+                if t < nb[k]:
+                    worst = max(worst, nb[k] - t)
+        return worst
+
     for _ in range(4 * n + 4):
         short = next((k for k in range(n) if b[k + 1] - b[k] < min_hold - 1e-6), None)
         if short is None:
             break
         need = min_hold - (b[short + 1] - b[short])
-        donor = next((j for j in sorted(range(n), key=lambda j: abs(j - short))
-                      if j != short and b[j + 1] - b[j] - need >= min_hold - 1e-6), None)
+        donor = None
+        for j in sorted(range(n), key=lambda j: abs(j - short)):
+            if j == short or b[j + 1] - b[j] - need < min_hold - 1e-6:
+                continue
+            nb = list(b)
+            if j > short:
+                for m in range(short + 1, j + 1):
+                    nb[m] += need
+            else:
+                for m in range(j + 1, short + 1):
+                    nb[m] -= need
+            if _keeps_starts(nb):
+                donor = j
+                b = nb
+                break
         if donor is None:
-            raise UserError(
-                f"The narration is too short to hold {len(units)} panels for {min_hold:g}s each. "
-                f"Record a longer narration, or lower min_hold in manhwa-ocr.yaml.")
-        if donor > short:
-            for m in range(short + 1, donor + 1):
-                b[m] += need
-        else:
-            for m in range(donor + 1, short + 1):
-                b[m] -= need
+            # No drift-free donor: fall back to the nearest donor with room
+            # (old behavior) so short narrations still build, but record the
+            # worst panel-after-words drift instead of hiding it.
+            for j in sorted(range(n), key=lambda j: abs(j - short)):
+                if j == short or b[j + 1] - b[j] - need < min_hold - 1e-6:
+                    continue
+                donor = j
+                break
+            if donor is None:
+                raise UserError(
+                    f"The narration is too short to hold {len(units)} panels for {min_hold:g}s each. "
+                    f"Record a longer narration, or lower min_hold in manhwa-ocr.yaml.")
+            if donor > short:
+                for m in range(short + 1, donor + 1):
+                    b[m] += need
+            else:
+                for m in range(donor + 1, short + 1):
+                    b[m] -= need
+            drifted = max(drifted, _drift_of(b))
         retimed.update({short, donor})
         moved += need
 
@@ -296,7 +345,8 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD) -> Tupl
     shots[0]["start"] = 0.0
     shots[-1]["end"] = units[-1]["end"]
     stats = {"min_hold": min_hold, "shots": len(shots), "pairs": pairs,
-             "retimed": len(retimed), "moved_seconds": round(moved, 3)}
+             "retimed": len(retimed), "moved_seconds": round(moved, 3),
+             "drifted_seconds": round(drifted, 3)}
     return shots, stats
 
 
@@ -487,8 +537,19 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
             wide = lambda p: float(p.get("width") or 1) / max(1.0, float(p.get("height") or 1)) > 1.0  # noqa: E731
             # Synced: each card must be on screen long enough for its words, but not too long.
             long_enough = (not timed or (1.2 <= u["end"] - u["start"] <= 4.0 and 1.5 <= v["end"] - v["start"] <= 4.0))
+            # Only neighbours in story order pair up; impact/reveal stay solo
+            # so their hit reads instead of sharing a card.
+            story_close = True
+            try:
+                all_ids = list(by_id.keys())
+                story_close = abs(all_ids.index(u["panels"][0]) - all_ids.index(v["panels"][0])) <= 6
+            except ValueError:
+                story_close = True
+            solo_cues = set(u.get("cues") or []) | set(v.get("cues") or [])
+            same_sentence = (u.get("sentence") or "") == (v.get("sentence") or "") and bool(u.get("sentence"))
             if (long_enough and len(u["panels"]) == 1 and len(v["panels"]) == 1
                     and u["panels"][0] != v["panels"][0] and not wide(a) and not wide(b)
+                    and story_close and (same_sentence or not (solo_cues & {"impact", "reveal"}))
                     and (2.8 <= (v["end"] - u["start"]) <= MAX_PAIR_SHOT)
                     and _rng(chapter, 10_000 + i).random() < ratio):
                 # The second card slides in exactly when its own part starts.
@@ -524,7 +585,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     by_id = {p["id"]: p for p in panels}
     timing = None
     if alignment_units is not None:
-        shots_units, timing = hold_groups(alignment_units, float(vcfg.get("min_hold", MIN_HOLD)))
+        shots_units, timing = hold_groups(
+            alignment_units, float(vcfg.get("min_hold", vcfg.get("min_shot", MIN_HOLD))))
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
         # not a generic "aligned" label - video render's refusal of an
@@ -535,7 +597,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                          float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         mode = "synced"
     else:
-        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), float(vcfg.get("min_hold", MIN_HOLD)))
+        shots_units, timing = hold_groups(
+            even_units(panels, duration, vcfg), float(vcfg.get("min_hold", vcfg.get("min_shot", MIN_HOLD))))
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
     designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes)

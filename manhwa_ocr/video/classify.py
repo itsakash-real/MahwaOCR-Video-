@@ -27,14 +27,14 @@ import re
 from typing import Tuple
 
 INTERNAL_PATTERNS = [
-    (re.compile(r"\bin (?:his|her|their|its) (?:own )?(?:head|mind)\b", re.I), "in his/her head"),
+    (re.compile(r"\bin (?:his|her|their|its) (?:own )?(?:head|mind|thoughts)\b", re.I), "in his/her head"),
     (re.compile(r"\bto (?:himself|herself|themselves|itself)\b", re.I), "to himself/herself"),
+    (re.compile(r"\bthought to (?:himself|herself|themselves|itself)\b", re.I), "thought to himself/herself"),
     (re.compile(r"\bunder (?:his|her|their|its) breath\b", re.I), "under his/her breath"),
-    (re.compile(r"\b(?:he|she|they)\s+thinks?\b", re.I), "he/she thinks"),
-    (re.compile(r"\b(?:he|she|they)\s+wonders?\b", re.I), "he/she wonders"),
+    (re.compile(r"\b(?:he|she|they)\s+(?:thinks?|thought|mused?|muses|recalled?|recalls?|realiz(?:ed|es)|wonders?)\b", re.I), "he/she thinks"),
     (re.compile(r"\binternally\b", re.I), "internally"),
     (re.compile(r"\bin (?:his|her|their|its) mind'?s eye\b", re.I), "in his/her mind's eye"),
-    (re.compile(r"\b(?:silently|mutely) (?:tells?|begs?|pleads?)\b", re.I), "silently tells/begs"),
+    (re.compile(r"\b(?:silently|mutely) (?:tells?|begs?|pleads?|screams?|whispers?)\b", re.I), "silently tells/begs"),
 ]
 
 _SOUND_NOUN = r"(?:roar|chirp|scream|growl|hiss|screech|shriek|cry|howl|whisper|murmur|buzz|wail|noise|sound|echo)"
@@ -42,7 +42,7 @@ _PROPAGATION_VERB = (r"(?:echo(?:es|ed)?|rings? out|pierces?|pierced|fills?|fill
                      r"sounds?|sounded|breaks? the silence|broke the silence|cuts?|cut through)")
 
 PURE_AUDIO_SUBJECT = re.compile(
-    rf"^\s*(?:[A-Z][a-z]+[,\s]+)?(?:a|an|the)\s+(?:\w+\s+){{0,2}}{_SOUND_NOUN}s?\b", re.I)
+    rf"^\s*(?:[A-Z][a-z]+[,\s]+)?(?:a|an|the)?\s*(?:\w+\s+){{0,2}}{_SOUND_NOUN}s?\b", re.I)
 PURE_AUDIO_VERB = re.compile(_PROPAGATION_VERB, re.I)
 
 
