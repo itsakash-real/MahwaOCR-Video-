@@ -475,3 +475,209 @@ def test_verify_lists_low_confidence_heads_and_never_drops_a_pale_character(tmp_
     import json
     saved = json.loads((tmp_path / "video" / "chapter_1.verify.json").read_text(encoding="utf-8"))
     assert [e["panel"] for e in saved["low_confidence_heads"]] == ["P001-01", "P001-02"]
+
+
+# ====================================================================== FIX 4: recap finalize guards
+
+import json  # noqa: E402
+
+from manhwa_ocr.config import load_config  # noqa: E402
+from manhwa_ocr.script import RecapBuilder  # noqa: E402
+from manhwa_ocr.util import UserError  # noqa: E402
+from manhwa_ocr.video import cues as cues_mod  # noqa: E402
+
+
+def _rows(spec):
+    """panels.json rows: 'D' drawn, 'T' text-only, 'C' credits."""
+    out = []
+    for i, kind in enumerate(spec, start=1):
+        out.append({"id": f"P001-{i:02d}", "index": i, "y0": 0.0, "y1": 100.0, "x0": 0.0, "x1": 100.0,
+                    "width": 100.0, "height": 100.0, "tall": False, "scene": "", "text": "",
+                    "segments": [{"page": 1, "file": "a.png", "y0": 0, "y1": 100, "page_w": 100}],
+                    "text_only": kind in "TC", "credits": kind == "C"})
+    return out
+
+
+def _sentence(i, words=14):
+    return " ".join(f"word{i}x{k}" for k in range(words)) + "."
+
+
+def _tagged(tags, words=14):
+    return " ".join(f"{{{t}}} {_sentence(i, words)}" if t else _sentence(i, words) for i, t in enumerate(tags, 1))
+
+
+def test_tag_on_a_text_only_panel_is_an_error_naming_sentence_panel_and_nearest_drawn():
+    panels = _rows("DTDC")
+    narration = _tagged(["P001-01", "P001-02", "P001-03", "P001-03"])
+    report = cues_mod.check(narration, panels)
+    assert len(report["errors"]) == 1
+    msg = report["errors"][0]
+    assert "sentence 2" in msg and "P001-02" in msg and "text-only" in msg
+    assert "{P001-03}" in msg, "the nearest drawn panel (the later one on a tie) is suggested"
+    assert "word2x0" in msg                                   # the sentence is quoted
+
+
+def test_tag_on_a_credits_panel_is_an_error():
+    panels = _rows("DDDC")
+    report = cues_mod.check(_tagged(["P001-01", "P001-02", "P001-03", "P001-04"]), panels)
+    assert len(report["errors"]) == 1 and "credits" in report["errors"][0]
+    assert "sentence 4" in report["errors"][0] and "{P001-03}" in report["errors"][0]
+
+
+def test_a_clean_recap_has_no_errors_and_no_warnings():
+    panels = _rows("DDDD")
+    report = cues_mod.check(_tagged(["P001-01", "P001-02", "P001-03", "P001-04"], words=14), panels)
+    assert report == {"errors": [], "warnings": []}
+
+
+def test_warns_when_tagged_share_is_under_90_percent():
+    panels = _rows("DDDD")
+    tags = ["P001-01", "P001-02", "P001-03", "P001-04"] + [None] * 4
+    report = cues_mod.check(_tagged(tags, words=14), panels)
+    assert not report["errors"]
+    assert any("50% of sentences name a panel" in w for w in report["warnings"])
+    ok = cues_mod.check(_tagged(["P001-01", "P001-02", "P001-03", "P001-04"] * 3, words=14), panels)
+    assert not any("name a panel" in w for w in ok["warnings"])
+
+
+def test_warns_on_a_run_of_three_tiny_sentences_but_not_two():
+    panels = _rows("DDDD")
+    long = _sentence(1, 14)
+    three = f"{{P001-01}} {long} {{P001-02}} Rem. {{P001-03}} Ram. {{P001-04}} Emilia. {{P001-04}} {long}"
+    two = f"{{P001-01}} {long} {{P001-02}} Rem. {{P001-03}} Ram. {{P001-04}} {long} {{P001-04}} {long}"
+    w3 = cues_mod.check(three, panels)["warnings"]
+    assert any("sentences 2-4 are 3 in a row under 6 words" in w for w in w3)
+    assert not any("in a row" in w for w in cues_mod.check(two, panels)["warnings"])
+    tail = f"{{P001-01}} {long} {{P001-02}} {long} {{P001-03}} A. {{P001-04}} B. {{P001-04}} C."
+    assert any("3 in a row" in w for w in cues_mod.check(tail, panels)["warnings"])      # a run at the very end
+
+
+def test_warns_about_digits_and_says_what_will_happen():
+    panels = _rows("DDDD")
+    narration = _tagged(["P001-01", "P001-02", "P001-03", "P001-04"], words=14).replace("word1x0", "99")
+    on = cues_mod.check(narration, panels, spell=True)["warnings"]
+    off = cues_mod.check(narration, panels, spell=False)["warnings"]
+    assert any("contains digits (99)" in w and "spelled out" in w for w in on)
+    assert any("contains digits (99)" in w and "spell them out" in w for w in off)
+
+
+def test_warns_when_there_are_too_few_words_for_the_drawn_panels():
+    panels = _rows("DDDDDDDDDD") + _rows("T")[:0]
+    short = _tagged([f"P001-{i:02d}" for i in range(1, 11)], words=6)       # 60 words for 10 panels = 6.0 per panel
+    warn = [w for w in cues_mod.check(short, panels)["warnings"] if "per panel" in w]
+    assert len(warn) == 1 and "6.0 per panel" in warn[0] and "7.5" in warn[0]
+    enough = _tagged([f"P001-{i:02d}" for i in range(1, 11)], words=8)      # 80 words >= 75
+    assert not [w for w in cues_mod.check(enough, panels)["warnings"] if "per panel" in w]
+    # text-only and credits panels do not count as drawn panels
+    mixed = _rows("DDDDDDDDDD") + _rows("TTTTTTTTCC")
+    mixed = [{**p, "id": f"P002-{i:02d}"} if i >= 10 else p for i, p in enumerate(mixed)]
+    assert not [w for w in cues_mod.check(enough, mixed)["warnings"] if "per panel" in w]
+
+
+def test_min_hold_is_configurable_in_the_words_per_panel_rule():
+    panels = _rows("DDDD")
+    narration = _tagged(["P001-01", "P001-02", "P001-03", "P001-04"], words=5)         # 20 words, 4 panels
+    assert any("per panel" in w for w in cues_mod.check(narration, panels, min_hold=3.0)["warnings"])
+    assert not any("per panel" in w for w in cues_mod.check(narration, panels, min_hold=1.5)["warnings"])
+
+
+# ---- finalize
+
+def _series(tmp_path, spec="DTDD", labels=("1",), spell=None):
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    for c in labels:
+        (ws / f"chapter_{c}.md").write_text(f"# Ch {c}\n\nSomething happens in chapter {c}.\n", encoding="utf-8")
+        media = ws / "media" / f"ch{c}"
+        media.mkdir(parents=True, exist_ok=True)
+        rows = [{**r, "id": r["id"].replace("P001", f"P{int(c):03d}")} for r in _rows(spec)]
+        (media / "panels.json").write_text(json.dumps({"version": 4, "chapter": c, "fingerprint": "x",
+                                                       "norm_width": 100, "pages": ["a.png"], "panels": rows}),
+                                           encoding="utf-8")
+    overrides = {"series__workdir": str(ws), "series__name": "T"}
+    cfg = load_config(**overrides)
+    if spell is not None:
+        cfg.video["tts"] = {"spell_numbers": spell}
+    logs = []
+    return ws, RecapBuilder(cfg, log=logs.append), logs
+
+
+def _parts(builder, narrations):
+    (builder.task_dir / "parts.json").write_text(
+        json.dumps({c: {"narration": n, "hook": "h"} for c, n in narrations.items()}), encoding="utf-8")
+
+
+def test_finalize_rejects_a_tag_on_a_text_only_panel_and_keeps_the_task_open(tmp_path):
+    ws, b, _ = _series(tmp_path, "DTDD", labels=("1", "2"))
+    b.prepare(["1", "2"], 6)
+    bad = _tagged(["P001-01", "P001-02", "P001-03", "P001-04"] * 4, words=14)
+    good = _tagged(["P002-01", "P002-03", "P002-04"] * 4, words=14)
+    _parts(b, {"1": bad, "2": good})
+    with pytest.raises(UserError) as exc:
+        b.finalize()
+    text = str(exc.value)
+    assert "Chapter 1 was NOT saved" in text and "P001-02" in text and "sentence 2" in text
+    assert "{P001-03}" in text
+    assert not (ws / "recaps" / "chapter_1.md").exists()                    # nothing saved for the bad chapter
+    assert (ws / "recaps" / "chapter_2.md").exists()                        # the good one was
+    assert b.pending_task() == ["1"]
+
+
+def test_finalize_warns_but_still_saves(tmp_path):
+    ws, b, logs = _series(tmp_path, "DDDD")
+    b.prepare(["1"], 6)
+    narration = " ".join([f"{{P001-01}} {_sentence(1, 14)}", "Rem.", "Ram.", "Emilia.", f"{{P001-02}} {_sentence(2, 14)}"] * 3)
+    _parts(b, {"1": narration})
+    assert [p.name for p in b.finalize()] == ["chapter_1.md"]
+    joined = "\n".join(logs)
+    assert "in a row under 6 words" in joined and "name a panel" in joined
+
+
+def test_new_tts_spells_numbers_but_the_reading_copy_keeps_digits(tmp_path):
+    ws, b, _ = _series(tmp_path, "DDDD")
+    b.prepare(["1"], 6)
+    s = "{P001-01} Number 99 stood among the first 100 survivors of the 16 who made it out of the old tower alive."
+    _parts(b, {"1": " ".join([s, s.replace("{P001-01}", "{P001-02}")] * 3)})
+    b.finalize()
+    tts = (ws / "recaps" / "chapter_1.tts.txt").read_text(encoding="utf-8")
+    assert "ninety nine" in tts and "one hundred" in tts and "sixteen" in tts
+    assert not any(ch.isdigit() for ch in tts)
+    assert "Number 99" in (ws / "recaps" / "chapter_1.md").read_text(encoding="utf-8")
+    cues = json.loads((ws / "recaps" / "chapter_1.cues.json").read_text(encoding="utf-8"))
+    assert "ninety nine" in cues["sentences"][0]["text"]          # cues.json text == the recorded text
+
+
+def test_spell_numbers_can_be_switched_off(tmp_path):
+    ws, b, _ = _series(tmp_path, "DDDD", spell=False)
+    b.prepare(["1"], 6)
+    s = "{P001-01} Number 99 stood among the first 100 survivors of the 16 who made it out of the old tower alive."
+    _parts(b, {"1": " ".join([s, s.replace("{P001-01}", "{P001-02}")] * 3)})
+    b.finalize()
+    assert "99" in (ws / "recaps" / "chapter_1.tts.txt").read_text(encoding="utf-8")
+
+
+def test_a_chapter_with_audio_never_has_its_recap_or_tts_rewritten(tmp_path):
+    ws, b, logs = _series(tmp_path, "DDDD")
+    b.prepare(["1"], 6)
+    _parts(b, {"1": _tagged(["P001-01", "P001-02", "P001-03", "P001-04"] * 3, words=14)})
+    b.finalize()
+    recap, tts = ws / "recaps" / "chapter_1.md", ws / "recaps" / "chapter_1.tts.txt"
+    before = (recap.read_bytes(), tts.read_bytes())
+    (ws / "audio").mkdir()
+    (ws / "audio" / "chapter_1.mp3").write_bytes(b"ID3 not really audio")
+    b.prepare(["1"], 6, force=True)
+    _parts(b, {"1": _tagged(["P001-04", "P001-03", "P001-02", "P001-01"] * 3, words=15)})
+    assert b.finalize() == []
+    assert (recap.read_bytes(), tts.read_bytes()) == before
+    assert any("already has audio" in m and "NOT rewritten" in m for m in logs)
+    assert b.pending_task() is None                     # handled, not left owing a rewrite
+
+
+def test_without_audio_a_forced_rewrite_still_works(tmp_path):
+    ws, b, _ = _series(tmp_path, "DDDD")
+    b.prepare(["1"], 6)
+    _parts(b, {"1": _tagged(["P001-01", "P001-02", "P001-03", "P001-04"] * 3, words=14)})
+    b.finalize()
+    b.prepare(["1"], 6, force=True)
+    _parts(b, {"1": _tagged(["P001-04", "P001-03", "P001-02", "P001-01"] * 3, words=15)})
+    assert len(b.finalize()) == 1

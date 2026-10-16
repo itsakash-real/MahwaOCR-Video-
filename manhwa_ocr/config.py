@@ -99,6 +99,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # Narration sync. min_segment: no sentence is shorter than this many seconds,
         # so clusters of tiny sentences sharing one whisper anchor never collapse to 0s.
         "sync": {"min_segment": 0.25},
+        # Recording text. spell_numbers: the NEW recaps/chapter_N.tts.txt (and the spoken text in
+        # cues.json) write digits as words (99 -> ninety nine). Existing files with audio are never touched.
+        "tts": {"spell_numbers": True},
         "whisper_model": "small.en",
         "whisper_language": None,   # e.g. "hi" for Hindi narration (use a multilingual model)
     },

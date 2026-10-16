@@ -71,6 +71,8 @@ video:
   heads:
     pale: true
     keep_top: 0.25          # a figure but no located head: a card never starts this far down the panel (0 = off)
+  tts:
+    spell_numbers: true     # new recaps/chapter_N.tts.txt spell digits out (99 -> ninety nine)
   sync:
     min_segment: 0.25    # no sentence is shorter than this (seconds); stops zero-length segments
   whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
