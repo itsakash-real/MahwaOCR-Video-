@@ -354,6 +354,9 @@ def _panel_maps(img: Image.Image, options: Dict[str, Any] | None = None) -> Dict
     gray = rgb.mean(axis=2)
     m: Dict[str, Any] = {"soft": soft, "texty": np.clip(hard + flat_white, 0, 1), "skin": _skin(rgb),
                          "blank": flat_white, "gray": gray, "gray_hi": _small(img, 240).mean(axis=2)}
+    m["sat"] = (rgb.max(axis=2) - rgb.min(axis=2)) / 255.0
+    m["pale_heads"] = bool(opts.get("pale_heads", True))
+    m["keep_top"] = float(opts.get("keep_top", KEEP_TOP))
     m["full_width"] = bool(opts.get("full_width", True))
     m["min_width_kept"] = float(opts.get("min_width_kept", MIN_WIDTH_KEPT))
     m["edge_rows"] = edge_rows(m["gray_hi"], int(opts.get("white_threshold", 242)), int(opts.get("black_threshold", 13)))
@@ -507,6 +510,113 @@ def face_top(maps: Dict[str, Any]) -> float | None:
     return None
 
 
+FIGURE_CLEAR = 0.01      # skin share above this: a character is clearly in the panel
+KEEP_TOP = 0.25          # no head found but a figure is: a window never starts this far down the panel
+PALE_LEVELS = (170, 140, 110)   # brightness floors tried for a pale/gray head blob
+PALE_CONTRAST = 35       # a head blob must differ from its surroundings by at least this much gray
+
+
+def _ring(pix: np.ndarray, r: int = 2) -> np.ndarray:
+    """The pixels within r of a region but not in it (padded by r, so the ring fits)."""
+    pad = np.pad(pix, r)
+    out = np.zeros_like(pad)
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            out |= np.roll(np.roll(pad, dy, axis=0), dx, axis=1)
+    return out & ~pad
+
+
+def pale_head(maps: Dict[str, Any]) -> Dict[str, float] | None:
+    """A head for characters the skin-colour test cannot see: white or silver hair, gray or
+    very pale skin. Deterministic and deliberately modest (the result is flagged
+    low-confidence):
+
+      - find compact blobs that are bright or mid-gray *and* nearly colourless,
+        at a few brightness floors;
+      - keep blobs that stand clearly apart from their surroundings (a gray-level step
+        around the whole blob), are not a wall or sky (not spanning the panel, not too
+        big) and are not a speech bubble;
+      - the head is the topmost such blob, in the upper 65% of the panel (position
+        prior); its extent is estimated from the blob's width near its top.
+
+    Returns {"top", "bottom"} as panel fractions, or None."""
+    gray, sat = maps["gray"], maps["sat"]
+    h, w = gray.shape
+    if h < 12 or w < 12:
+        return None
+    bubbles = list(maps.get("bubbles") or [])
+    best = None
+    for level in PALE_LEVELS:
+        mask = (sat < 0.14) & (gray > level)
+        for y0, y1, x0, x1, area, pix in _components(mask):
+            bh, bw = y1 - y0, x1 - x0
+            frac = area / float(h * w)
+            if not 0.012 <= frac <= 0.45 or bh < 0.05 * h or bw < 0.05 * w:
+                continue
+            if bw > 0.85 * w or (x0 <= 0 and x1 >= w) or y0 > 0.65 * h:
+                continue                               # a wall, a sky, or too low to be a head
+            if area / float(bh * bw) < 0.25:
+                continue                               # thin lines, not a body of colour
+            box = (x0 / w, y0 / h, x1 / w, y1 / h)
+            if any(_overlap_share(box, b) >= 0.5 for b in bubbles):
+                continue                               # lettering's white, not hair
+            ring = _ring(pix, 2)
+            # Surroundings only where the picture really is (the ring may fall off an edge).
+            gy0, gx0 = max(0, y0 - 2), max(0, x0 - 2)
+            frame = gray[gy0:min(h, y1 + 2), gx0:min(w, x1 + 2)]
+            ry0, rx0 = gy0 - (y0 - 2), gx0 - (x0 - 2)
+            ring = ring[ry0:ry0 + frame.shape[0], rx0:rx0 + frame.shape[1]]
+            if ring.sum() < 8:
+                continue
+            inside = float(np.median(gray[y0:y1, x0:x1][pix]))
+            around = float(np.median(frame[ring]))
+            if abs(inside - around) < PALE_CONTRAST:
+                continue
+            top_rows = pix[:max(2, int(0.3 * bh))]
+            head_w = int(top_rows.sum(axis=1).max())
+            head_h = min(bh, 1.15 * max(head_w, 1))      # hair and face are about as tall as wide
+            cand = (y0, -level, max(0.0, y0 / h - 0.01), min(1.0, (y0 + head_h) / h + 0.01))
+            if best is None or cand[:2] < best[:2]:
+                best = cand
+    if best is None:
+        return None
+    return {"top": best[2], "bottom": best[3]}
+
+
+def head_of(maps: Dict[str, Any]) -> Dict[str, Any]:
+    """Where the head is, and how sure we are. {"top", "bottom", "source", "confident",
+    "figure", "keep_top"}.
+
+    source "fixes" (a reviewer's face entry) and "skin" (the skin-colour test) are confident.
+    source "pale" (white/silver/gray heads, see pale_head) is a guess: used to keep the head
+    in the card but listed for a reviewer. With no head found and a clear figure
+    (skin share >= FIGURE_CLEAR), keep_top is set: a window must not start further down
+    than maps["keep_top"] of the panel. Switch off with video.heads (pale: false, keep_top: 0).
+    """
+    if maps.get("face_override"):
+        fe, fb = maps["face_override"]
+        return {"top": fe, "bottom": fb, "source": "fixes", "confident": True, "figure": True, "keep_top": None}
+    if "_head" in maps:
+        return maps["_head"]
+    skin_share = float(maps["skin"].mean())
+    fe = face_top(maps)
+    if fe is not None:
+        info = {"top": fe, "bottom": face_bottom(maps, fe), "source": "skin", "confident": True,
+                "figure": True, "keep_top": None}
+    else:
+        pale = pale_head(maps) if maps.get("pale_heads", True) else None
+        if pale:
+            info = {"top": pale["top"], "bottom": pale["bottom"], "source": "pale", "confident": False,
+                    "figure": True, "keep_top": None}
+        else:
+            keep = float(maps.get("keep_top", KEEP_TOP))
+            clear = skin_share >= FIGURE_CLEAR and keep > 0
+            info = {"top": None, "bottom": None, "source": None, "confident": False,
+                    "figure": skin_share >= FIGURE_MIN, "keep_top": keep if clear else None}
+    maps["_head"] = info
+    return info
+
+
 def face_bottom(maps: Dict[str, Any], top: float) -> float:
     """Fraction of the panel's height where the skin from `top` ends (the chin),
     allowing gaps of up to two rows."""
@@ -611,11 +721,9 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
     m = maps or _panel_maps(img)
     gh, gw = m["soft"].shape
     panel_aspect = img.width / max(1, img.height) if img is not None else gw / gh
-    if m.get("face_override"):
-        fe, fb = m["face_override"]
-    else:
-        fe = face_top(m)
-        fb = face_bottom(m, fe) if fe is not None else None
+    head = head_of(m)
+    fe, fb = head["top"], head["bottom"]
+    keep_top = head["keep_top"]
 
     full_width = bool(m.get("full_width", True))
     boxes: List[Tuple[float, float, float, float, float, float]] = []      # x0, y0, x1, y1, extra cost, pad_y
@@ -652,6 +760,11 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
         head_ok &= y0 <= fe - HEAD_MARGIN
         if fb is not None:
             head_ok &= y1 >= fb + HEAD_MARGIN
+    keep_cost = 0.0
+    if keep_top:
+        # A figure but no head located: never crop the top of the panel away; prefer keeping it all.
+        head_ok &= y0 < keep_top
+        keep_cost = 4.0 * y0
 
     def worst_overlap(regions) -> np.ndarray:
         worst = np.zeros(len(B))
@@ -665,7 +778,7 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
 
     bubble = worst_overlap(m["bubbles"])
     painted = worst_overlap(m["painted"])
-    score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + extra
+    score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + extra + keep_cost
              + (soft < 0.02).astype(float) + np.where(head_ok, 0.0, 5.0)
              + 3.0 * painted                                    # a painted patch is flat: avoid it
              + 20.0 * bubble + np.where(bubble > BUBBLE_OK, 30.0, 0.0))  # bubble text outranks a head risk

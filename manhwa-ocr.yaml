@@ -54,6 +54,23 @@ video:
   effects: {shake: true, punch: false, flash: false, end_fade: true}   # calm by default
   music: null             # e.g. "music/bed.mp3" (relative to the series folder); ducks under narration
   music_volume: 0.22
+  # Panel detection edges. Rows at a panel's top/bottom that are all white (gray above
+  # white_threshold) or all near-black (below black_threshold) are gutter and are trimmed off.
+  # Existing panels.json files are not re-detected on their own: run `video panels --force`.
+  panels:
+    tighten_edges: true
+    white_threshold: 242
+    black_threshold: 13
+  # Card framing: cards keep the panel's full width and slide a vertical window; a panel too wide
+  # for any allowed shape is shown whole on blurred padding. false = the old zoomed side-cropping.
+  crop:
+    full_width: true
+    min_width_kept: 0.9     # last-resort bubble avoidance may narrow a card, never below this
+  # Heads the skin-colour test cannot see (white/silver hair, gray skin). Such panels are listed
+  # under "low_confidence_heads" in video/chapter_N.verify.json for a reviewer.
+  heads:
+    pale: true
+    keep_top: 0.25          # a figure but no located head: a card never starts this far down the panel (0 = off)
   sync:
     min_segment: 0.25    # no sentence is shorter than this (seconds); stops zero-length segments
   whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration

@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from PIL import Image
 
-from .crops import BUBBLE_OK, FIGURE_MIN, _panel_maps, figure_share, shape_candidates
+from .crops import BUBBLE_OK, FIGURE_MIN, _panel_maps, head_of, shape_candidates
 from ..util import atomic_write_text, require_chapter
 from .media import video_dir
 
@@ -91,13 +91,21 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
     dropped: List[Dict[str, Any]] = []
     needs_eyes: List[str] = []
     recropped: List[str] = []
+    low_confidence: List[Dict[str, Any]] = []
     for p in panels:
         if p.get("text_only"):
             continue
         img = image_for(p)
         maps = _panel_maps(img, options)
         shape, box, probs, clean = pick_crop(img, shapes, maps)
-        figure = figure_share(img) >= FIGURE_MIN
+        head = head_of(maps)
+        figure = bool(head["figure"])           # skin colour, or a pale/gray head blob
+        if not head["confident"] and (head["source"] == "pale" or head["keep_top"]):
+            low_confidence.append({"panel": p["id"], "reason": (
+                "head found by shape and brightness, not skin colour (white/silver hair or gray skin): "
+                "check it is whole in the card" if head["source"] == "pale" else
+                "a character is in the panel but no head was located: the card keeps the top "
+                "of the panel, check the head is whole")})
         if clean:
             action = "ok"
         elif figure:
@@ -108,11 +116,13 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             action = "dropped"
             dropped.append({"panel": p["id"], "reason": ", ".join(probs) or "no character"})
         rows[p["id"]] = {"shape": shape, "box": list(box), "problems": probs, "action": action,
-                         "figure": figure}
+                         "figure": figure, "head": head["source"], "head_confident": bool(head["confident"])}
         if action == "dropped":
             log(f"    {p['id']}: {', '.join(probs) or 'no character'} -> dropped")
     report = {"chapter": chapter, "panels": rows, "dropped": dropped,
-              "needs_eyes": needs_eyes, "recropped": recropped}
+              "needs_eyes": needs_eyes, "recropped": recropped,
+              # Heads the heuristic is not sure of (it cannot be): where a reviewer should look first.
+              "low_confidence_heads": low_confidence}
     if root is not None and chapter is not None:
         atomic_write_text(video_dir(root) / f"chapter_{require_chapter(chapter)}.verify.json",
                           json.dumps(report, indent=1, ensure_ascii=False))

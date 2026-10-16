@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, List, Tuple
 from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
-from .crops import _panel_maps, tone
+from .crops import _panel_maps, head_of, tone
 from .verify import pick_card
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
 from .media import video_dir
@@ -358,10 +358,13 @@ def map_options(vcfg: Dict[str, Any]) -> Dict[str, Any]:
     """Crop-analysis options from the video config: video.crop and video.panels thresholds."""
     crop = vcfg.get("crop") if isinstance(vcfg.get("crop"), dict) else {}
     panels = vcfg.get("panels") if isinstance(vcfg.get("panels"), dict) else {}
+    heads = vcfg.get("heads") if isinstance(vcfg.get("heads"), dict) else {}
     return {"full_width": bool(crop.get("full_width", True)),
             "min_width_kept": float(crop.get("min_width_kept", 0.9)),
             "white_threshold": int(panels.get("white_threshold", 242)),
-            "black_threshold": int(panels.get("black_threshold", 13))}
+            "black_threshold": int(panels.get("black_threshold", 13)),
+            "pale_heads": bool(heads.get("pale", True)),
+            "keep_top": float(heads.get("keep_top", 0.25))}
 
 
 class _Designer:
@@ -378,7 +381,8 @@ class _Designer:
         self._pads: Dict[tuple, float] = {}
         self._maps: Dict[str, Any] = {}
         self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": [], "bubble": [],
-                                                 "padded": [], "white_edge": []}
+                                                 "padded": [], "white_edge": [],
+                                                 "low_confidence_heads": []}
         self.map_options = map_options(vcfg)
         self._tone: Dict[str, str] = {}
         self.uses: Dict[str, int] = {}
@@ -422,6 +426,10 @@ class _Designer:
             maps = self._maps[pid]
             if pid in self.fixes["face"]:                   # a reviewer's head position replaces the skin guess
                 maps = {**maps, "face_override": self.fixes["face"][pid]}
+            head = head_of(maps)
+            if not head["confident"] and (head["source"] == "pale" or head["keep_top"]) \
+                    and pid not in self.crop_stats["low_confidence_heads"]:
+                self.crop_stats["low_confidence_heads"].append(pid)
             card = pick_card(self.img(pid), shapes_for(layout, self.fmt), maps)
             shape, box, probs = card["shape"], card["box"], card["problems"]
             if card["pad_y"] > 0:

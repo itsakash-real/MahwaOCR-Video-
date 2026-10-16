@@ -110,6 +110,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "shots": len(shots), "shortest_shot": round(shortest, 2), "timing": plan.get("timing"),
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
         "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
+        "low_confidence_heads": cs.get("low_confidence_heads", []),
         "review_queue": plan.get("alignment_review_queue") or [],
         "sync": plan.get("sync"),
     }
@@ -137,7 +138,7 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
     # before they existed stay current (a rebuild would re-frame every card).
     crop_opts = {k: v for k, v in map_options(vcfg).items()
                  if v != {"full_width": True, "min_width_kept": 0.9, "white_threshold": 242,
-                          "black_threshold": 13}[k]}
+                          "black_threshold": 13, "pale_heads": True, "keep_top": 0.25}[k]}
     if crop_opts:
         knobs["crop"] = crop_opts
     return {

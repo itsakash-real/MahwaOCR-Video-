@@ -370,3 +370,108 @@ def test_qa_shape_check_still_applies_to_padded_cards_and_is_not_loosened():
     assert validate(exact, {"A"}) != []
     exact["shots"][0]["cards"][0].update(pad_y=0.1, crop=[0, -0.2, 1, 1.2])     # crop stays inside the panel
     assert validate(exact, {"A"}) != []
+
+
+# ====================================================================== FIX 3: pale heads
+
+from manhwa_ocr.video.crops import face_top, figure_share, head_of  # noqa: E402
+from manhwa_ocr.video.verify import verify_chapter  # noqa: E402
+
+
+def _dark_bg(w, h, base=(25, 25, 45), seed=11):
+    return _art(w, h, base=base, seed=seed)
+
+
+def _white_haired(w=900, h=1600):
+    """A white-haired, pale-skinned figure on a dark background: no skin colour anywhere."""
+    img = _dark_bg(w, h)
+    d = ImageDraw.Draw(img)
+    d.ellipse((int(0.28 * w), int(0.20 * h), int(0.72 * w), int(0.47 * h)), fill=(246, 246, 250))   # hair
+    d.ellipse((int(0.38 * w), int(0.28 * h), int(0.62 * w), int(0.45 * h)), fill=(236, 232, 236))   # face
+    d.rectangle((int(0.25 * w), int(0.47 * h), int(0.75 * w), h), fill=(240, 240, 244))             # dress
+    return img
+
+
+def _gray_skinned(w=900, h=1600):
+    img = _art(w, h, base=(30, 70, 120), seed=5)
+    d = ImageDraw.Draw(img)
+    d.ellipse((int(0.30 * w), int(0.25 * h), int(0.70 * w), int(0.33 * h)), fill=(15, 15, 25))      # dark hair
+    d.ellipse((int(0.34 * w), int(0.30 * h), int(0.66 * w), int(0.50 * h)), fill=(140, 142, 146))   # gray face
+    d.rectangle((int(0.25 * w), int(0.50 * h), int(0.75 * w), h), fill=(40, 40, 60))                # clothes
+    return img
+
+
+def _skin_figure_low(w=900, h=2800):
+    """A character clearly present (skin colour) but nowhere a head the detector can find."""
+    img = _art(w, h, base=(60, 60, 90), seed=9)
+    ImageDraw.Draw(img).rectangle((int(0.3 * w), int(0.72 * h), int(0.7 * w), int(0.92 * h)), fill=(225, 175, 145))
+    return img
+
+
+def test_the_skin_colour_test_misses_these_figures_so_the_old_detector_found_nothing():
+    for img in (_white_haired(), _gray_skinned()):
+        assert face_top(_panel_maps(img)) is None
+        assert figure_share(img) < 0.004
+
+
+def test_white_haired_figure_head_is_found_and_kept_in_the_card():
+    img = _white_haired()
+    maps = _panel_maps(img)
+    head = head_of(maps)
+    assert head["source"] == "pale" and head["confident"] is False and head["figure"] is True
+    assert 0.15 <= head["top"] <= 0.21            # the top of the hair (0.20)
+    assert head["bottom"] <= 0.55                  # not the whole body
+    for layout in ("single", "pair"):              # (a 16:9 'wide' card is too short for a whole head here)
+        card = pick_card(img, shapes_for(layout, format_from("16:9", 30)), maps)
+        assert card["box"][1] <= head["top"] - 0.04 + 1e-6, f"{layout}: the top of the head is cut"
+        assert card["box"][3] >= head["bottom"] + 0.04 - 1e-6 or card["pad_y"] > 0
+
+
+def test_gray_skinned_figure_face_is_kept_in_the_card():
+    img = _gray_skinned()
+    maps = _panel_maps(img)
+    head = head_of(maps)
+    assert head["source"] == "pale"
+    card = pick_card(img, SINGLE, maps)
+    assert card["box"][1] <= 0.30 and card["box"][3] >= 0.50, "the whole gray face stays in the card"
+
+
+def test_pale_detection_can_be_switched_off():
+    img = _white_haired()
+    head = head_of(_panel_maps(img, {"pale_heads": False, "keep_top": 0}))
+    assert head["source"] is None and head["keep_top"] is None
+
+
+def test_white_bands_bubbles_and_plain_art_are_not_mistaken_for_heads():
+    band = _art(900, 2000)
+    ImageDraw.Draw(band).rectangle((0, 0, 900, 600), fill=(255, 255, 255))
+    assert head_of(_panel_maps(band))["source"] is None
+    assert head_of(_panel_maps(_bubble_panel()))["source"] is None
+    assert head_of(_panel_maps(_art(900, 1600)))["source"] is None
+
+
+def test_figure_without_a_located_head_never_loses_the_top_quarter():
+    img = _skin_figure_low()
+    maps = _panel_maps(img)
+    head = head_of(maps)
+    assert head["source"] is None and head["keep_top"] == pytest.approx(0.25)
+    for layout in ("single", "pair"):
+        card = pick_card(img, shapes_for(layout, format_from("16:9", 30)), maps)
+        assert card["box"][1] < 0.25, f"{layout}: the top 25% of the panel was cropped away"
+    assert head_of(_panel_maps(img, {"keep_top": 0}))["keep_top"] is None       # video.heads.keep_top: 0 turns it off
+    assert head_of(_panel_maps(img, {"keep_top": 0.4}))["keep_top"] == pytest.approx(0.4)
+
+
+def test_verify_lists_low_confidence_heads_and_never_drops_a_pale_character(tmp_path):
+    panels = [{"id": "P001-01", "text_only": False}, {"id": "P001-02", "text_only": False},
+              {"id": "P001-03", "text_only": False}]
+    imgs = {"P001-01": _white_haired(), "P001-02": _skin_figure_low(), "P001-03": _art(900, 1600)}
+    report = verify_chapter(panels, lambda p: imgs[p["id"]], SINGLE, tmp_path, "1", log=lambda *_: None)
+    listed = {e["panel"]: e["reason"] for e in report["low_confidence_heads"]}
+    assert set(listed) == {"P001-01", "P001-02"}
+    assert "skin colour" in listed["P001-01"] and "no head was located" in listed["P001-02"]
+    assert report["panels"]["P001-01"]["figure"] is True and report["panels"]["P001-01"]["action"] != "dropped"
+    assert report["panels"]["P001-01"]["head"] == "pale" and report["panels"]["P001-01"]["head_confident"] is False
+    import json
+    saved = json.loads((tmp_path / "video" / "chapter_1.verify.json").read_text(encoding="utf-8"))
+    assert [e["panel"] for e in saved["low_confidence_heads"]] == ["P001-01", "P001-02"]

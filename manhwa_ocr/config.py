@@ -83,6 +83,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "black_threshold": 13,  # gray below this across a row = near-black gutter
         },
         # Card framing. Cards keep the panel's full width and pick a vertical window.
+        # Head detection beyond skin colour, for white/silver hair and gray skin.
+        "heads": {
+            "pale": True,           # try the pale/gray head detector when skin colour finds none
+            "keep_top": 0.25,       # figure but no head: a card never starts this far down (0 = off)
+        },
         "crop": {
             "full_width": True,     # false = the old behavior (zoomed, side-cropped windows)
             "min_width_kept": 0.9,  # last-resort bubble avoidance may narrow a card, never below this
