@@ -1002,3 +1002,68 @@ def test_intro_command_is_wired_and_preset_has_defaults(intro_session, monkeypat
     assert cfg.video["intro"]["min_hold"] == 2.0
     assert cli(["video", "intro", "--prepare", "--session", sess.slug]) == 0
     assert (sess.path / "intro" / "intro.json").exists() and (sess.path / "intro" / "sheets" / "ch1_01.png").exists()
+
+
+# ====================================================================== FIX 7: fixes.json covers hand edits
+
+from manhwa_ocr.video import fixes as fixes_mod  # noqa: E402
+from manhwa_ocr.video import review as review_mod  # noqa: E402
+
+_DIMS = {"P001-01": (300.0, 240.0), "P001-02": (300.0, 240.0)}
+
+
+def test_fixes_accept_and_validate_shot_overrides():
+    clean, problems = fixes_mod.validate(
+        {"shot": [{"panel": "P001-01", "background": "black", "enter": "fade_in"},
+                  {"panel": "P001-02", "enter": "zoom_in"}]}, _DIMS)
+    assert problems == []
+    assert clean["shot"] == {"P001-01": {"background": "black", "enter": "fade_in"},
+                             "P001-02": {"enter": "zoom_in"}}
+    _, problems = fixes_mod.validate(
+        {"shot": [{"panel": "P009-09", "enter": "cut"}, {"panel": "P001-01", "background": "red"},
+                  {"panel": "P001-01", "enter": "teleport"}, {"panel": "P001-02"}]}, _DIMS)
+    assert len(problems) == 4 and "unknown panel" in problems[0] and "background must be" in problems[1]
+    assert "enter must be" in problems[2] and "give a" in problems[3]
+
+
+def test_reviewer_merge_keeps_shot_overrides():
+    merged = review_mod.merge({"shot": [{"panel": "P001-01", "background": "black"}], "drop": []},
+                              {"drop": [{"panel": "P001-02", "reason": "lettering"}]})
+    assert merged["shot"] == [{"panel": "P001-01", "background": "black"}]
+    assert merged["drop"][0]["panel"] == "P001-02" and fixes_mod.empty()["shot"] == []
+
+
+@needs_ffmpeg
+def test_plan_force_reapplies_every_kind_of_fix(intro_session):
+    """Hand edits to plan.json are lost on `plan --force`; what lives in fixes.json is not."""
+    from manhwa_ocr.video import build as vb
+    from manhwa_ocr.video.ffmpeg import run
+    from manhwa_ocr.video.plan import plan_path
+
+    _, sess, cfg = intro_session
+    cfg.video["min_hold"] = 1.0
+    (sess.path / "audio").mkdir()
+    run(["-f", "lavfi", "-i", "sine=frequency=440:duration=9", "-c:a", "libmp3lame",
+         str(sess.path / "audio" / "chapter_1.mp3")])
+    plan = vb.make_plan(sess, "1", cfg, sync="off", log=lambda *_: None)
+    panels = load_panels(sess.path, "1")["panels"]
+    shot0 = plan["shots"][0]
+    first = shot0["cards"][0]["panel"]
+    dropped = next(p["id"] for p in panels if p["id"] not in {c["panel"] for s in plan["shots"][:1] for c in s["cards"]}
+                   and p["id"] != first)
+    fixes_mod.save(sess.path, "1", {"version": 1, "drop": [{"panel": dropped, "reason": "no art worth showing"}],
+                                    "shot": [{"panel": first, "background": "black", "enter": "fade_in"}]})
+    # a hand edit straight into the plan file ...
+    pf = plan_path(sess.path, "1")
+    edited = json.loads(pf.read_text(encoding="utf-8"))
+    edited["shots"][0]["background"] = "blur"
+    edited["shots"][0]["cards"][0]["enter"] = "cut"
+    pf.write_text(json.dumps(edited), encoding="utf-8")
+    # ... is replaced by a forced rebuild, which applies the fixes file
+    again = vb.make_plan(sess, "1", cfg, sync="off", force=True, log=lambda *_: None)
+    assert again["shots"][0]["background"] == "black" and again["shots"][0]["cards"][0]["enter"] == "fade_in"
+    assert dropped not in {c["panel"] for s in again["shots"] for c in s["cards"]}
+    # a bad fixes file stops the rebuild instead of being half-applied
+    fixes_mod.save(sess.path, "1", {"version": 1, "shot": [{"panel": first, "background": "red"}]})
+    with pytest.raises(UserError, match="nothing from it was applied"):
+        vb.make_plan(sess, "1", cfg, sync="off", force=True, log=lambda *_: None)

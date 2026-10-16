@@ -373,7 +373,7 @@ class _Designer:
     def __init__(self, chapter: str, panels: List[Dict[str, Any]], fmt: Format, vcfg: Dict[str, Any],
                  image_for: Callable[[Dict[str, Any]], Image.Image], fixes: Dict[str, Any] | None = None):
         self.chapter, self.fmt, self.vcfg = chapter, fmt, vcfg
-        self.fixes = fixes or {"crop": {}, "face": {}}
+        self.fixes = {"crop": {}, "face": {}, "shot": {}, **(fixes or {})}
         self.by_id = {p["id"]: p for p in panels}
         self.image_for = image_for
         self._img: Dict[str, Image.Image] = {}
@@ -524,6 +524,7 @@ class _Designer:
                 at = 0.0
                 enter = self.entrance(rng, unit["cues"], layout)
                 motion = "push_in" if "beat" in unit["cues"] else self.motion(rng, crop)
+            enter = (self.fixes["shot"].get(pid) or {}).get("enter", enter)   # fixes.json "shot" override
             card = {"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion}
             pad = self.pad(pid, layout)
             if pad > 0:
@@ -548,9 +549,11 @@ class _Designer:
                     effects.append({"type": "punch", "t": round(t, 3)})
                     self.last_punch = t
 
+        background = self.background(rng, (bg_panel or first), layout)
+        background = (self.fixes["shot"].get(first) or {}).get("background", background)
         shot = {
             "id": f"S{i + 1:03d}", "start": round(start, 3), "end": round(end, 3),
-            "layout": layout, "background": self.background(rng, (bg_panel or first), layout),
+            "layout": layout, "background": background,
             "cards": cards, "exit": "fade_out" if last else "cut", "effects": effects,
             "sentence": (unit.get("sentence") or "")[:300] or None,
         }

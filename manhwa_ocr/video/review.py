@@ -101,8 +101,8 @@ def parse_reply(text: str) -> Dict[str, Any]:
 def merge(current: Dict[str, Any], reply: Dict[str, Any]) -> Dict[str, Any]:
     """Add the reviewer's entries to the chapter's fixes. A later entry for the same
     panel and kind replaces the earlier one."""
-    out = {"version": fixes_mod.VERSION, "drop": [], "face": [], "crop": []}
-    for kind, key in (("drop", "panel"), ("face", "panel"), ("crop", "panel")):
+    out = {"version": fixes_mod.VERSION, "drop": [], "face": [], "crop": [], "shot": []}
+    for kind, key in (("drop", "panel"), ("face", "panel"), ("crop", "panel"), ("shot", "panel")):
         by_panel = {e.get(key): e for e in (current.get(kind) or []) if isinstance(e, dict)}
         for e in reply.get(kind) or []:
             if isinstance(e, dict) and e.get(key):

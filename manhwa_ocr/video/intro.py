@@ -257,7 +257,8 @@ def _segments(sentences: List[Dict[str, Any]], timed: List[Dict[str, Any]]) -> L
     return segs
 
 
-def style_plan(plan: Dict[str, Any], segments: List[Dict[str, Any]], icfg: Dict[str, Any]) -> Dict[str, Any]:
+def style_plan(plan: Dict[str, Any], segments: List[Dict[str, Any]], icfg: Dict[str, Any],
+               fixes: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """The intro look on top of the normal planner output: strong first shot, push-in/zoom-in
     moves, staggered pairs, shake/flash/fade-out on beats, blurred backdrop, darker grade."""
     shots = plan["shots"]
@@ -300,6 +301,13 @@ def style_plan(plan: Dict[str, Any], segments: List[Dict[str, Any]], icfg: Dict[
                 shot["effects"].append({"type": fx, "t": round(hit, 3)})
         if "fade_out" in beat_fx:
             shot["exit"] = "fade_out"
+    for shot in shots:      # chapter_0.fixes.json "shot" overrides always win over the intro look
+        over = (fixes or {}).get("shot") or {}
+        if (over.get(shot["cards"][0]["panel"]) or {}).get("background"):
+            shot["background"] = over[shot["cards"][0]["panel"]]["background"]
+        for card in shot["cards"]:
+            if (over.get(card["panel"]) or {}).get("enter"):
+                card["enter"] = over[card["panel"]]["enter"]
     plan["effects_enabled"] = {**(plan.get("effects_enabled") or {}), "shake": True, "flash": "flash" in beat_fx}
     plan["intro"] = True
     return plan
@@ -348,7 +356,7 @@ def build_intro(sess, cfg, *, sync: str = "auto", fmt: str | None = None, log=pr
                       alignment_meta={"sync_mode": mode, "review_queue": []},
                       image_for=lambda p: panel_image(root, p["src_chapter"], p, p["src_norm_w"], clean=True),
                       fixes=fixes)
-    style_plan(plan, segments, icfg)
+    style_plan(plan, segments, icfg, fixes)
     shown = {c["panel"] for s in plan["shots"] for c in s["cards"]}
     missing = [r for r in refs if r not in shown]
     if missing:
