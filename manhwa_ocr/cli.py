@@ -685,6 +685,20 @@ def cmd_video(args) -> int:
                  f"--chapter {c}{_pin(sess)}")
         return 0
 
+    if action == "intro":
+        from .video import intro as intro_mod
+
+        if args.prepare:
+            intro_mod.prepare(sess, log=_log)
+            _log("  next: write intro/intro.json, record audio/chapter_0.mp3, then:  "
+                 f"python -m manhwa_ocr video intro{_pin(sess)}")
+            return 0
+        out = intro_mod.run(sess, cfg, sync="off" if args.no_sync else "auto", fmt=args.format,
+                            preview=args.preview, workers=args.workers, plan_only=args.dry_run, log=_log)
+        if out is not None:
+            _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+        return 0
+
     if action == "pair":
         from .video import pairing
 
@@ -940,7 +954,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
     p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "storyboard", "render",
-                                      "build", "clip", "compile", "verify", "review", "approve"])
+                                      "build", "clip", "compile", "verify", "review", "approve", "intro"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
     p.add_argument("--force", action="store_true", help="rebuild even if up to date (discards plan edits)")
@@ -957,7 +971,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-titles", dest="no_titles", action="store_true", help="compile without title cards")
     p.add_argument("--name", help="compiled output name")
     p.add_argument("--apply", action="store_true", help="pair: save the fixed tags from pairs.json")
-    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing")
+    p.add_argument("--prepare", action="store_true",
+                   help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing; intro: plan only, no render")
     p.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
                    help="review: how many review-and-fix rounds to allow (default 3)")
     ws(p)

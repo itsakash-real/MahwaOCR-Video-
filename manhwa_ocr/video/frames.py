@@ -438,6 +438,10 @@ class ShotRenderer:
         self.punches = [float(e["t"]) for e in fx if e["type"] == "punch"]
         self.flashes = [float(e["t"]) for e in fx if e["type"] == "flash"]
 
+        try:     # a darker grade for the whole shot (the intro preset sets it)
+            self.darken = max(0.0, min(0.6, float(shot.get("darken") or 0.0)))
+        except (TypeError, ValueError):
+            self.darken = 0.0
         self.exit = shot.get("exit") if shot.get("exit") in EXITS else "cut"
         self.fade_from = self.end - EXIT_FADE if self.exit == "fade_out" else None
         if end_fade and video_end is not None and abs(video_end - self.end) < 0.05:
@@ -483,6 +487,8 @@ class ShotRenderer:
             y = int(round(cy + ent["dy"] + dy_s - spr.height / 2))
             img.paste(spr.convert("RGB"), (x, y), alpha)
         out = np.asarray(img, dtype=np.uint8)
+        if self.darken > 0:
+            out = (out.astype(np.float32) * (1.0 - self.darken)).astype(np.uint8)
         fa = flash_alpha(t, self.flashes)
         if fa > 0.001:
             out = _mix(out, np.full_like(out, 255), fa)

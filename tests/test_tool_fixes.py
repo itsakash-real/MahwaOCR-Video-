@@ -792,3 +792,213 @@ def test_pair_stays_quiet_when_tags_are_spread_or_the_next_sentence_is_tagged(tm
     assert pairing.grouped_tags(_pair_workspace(tmp_path / "b", tagged_next), "1") == []
     plain = [["P001-01"], [], ["P001-03"]]
     assert pairing.grouped_tags(_pair_workspace(tmp_path / "c", plain), "1") == []
+
+
+# ====================================================================== FIX 6: video intro
+
+import json  # noqa: E402
+
+from PIL import Image, ImageDraw  # noqa: E402
+
+from manhwa_ocr.cli import main as cli  # noqa: E402
+from manhwa_ocr.config import load_config  # noqa: E402
+from manhwa_ocr.sessions import SessionStore  # noqa: E402
+from manhwa_ocr.util import UserError  # noqa: E402
+from manhwa_ocr.video import intro as intro_mod  # noqa: E402
+from manhwa_ocr.video.media import pages_dir  # noqa: E402
+from manhwa_ocr.video.panels import build_panels, load_panels, panels_path  # noqa: E402
+
+
+def _ffmpeg_present() -> bool:
+    try:
+        from manhwa_ocr.video.ffmpeg import ffmpeg_exe
+
+        ffmpeg_exe()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+needs_ffmpeg = pytest.mark.skipif(not _ffmpeg_present(), reason="FFmpeg not available")
+
+
+def _fake_chapter(folder: Path, seed: int) -> None:
+    """One page of five coloured, textured panels separated by white gutters."""
+    folder.mkdir(parents=True, exist_ok=True)
+    img = Image.new("RGB", (300, 1500), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    colours = [(200, 60, 60), (60, 160, 60), (60, 60, 200), (180, 160, 40), (150, 60, 170)]
+    y = 40
+    for k, c in enumerate(colours):
+        c = tuple((v + seed * 20 + k * 7) % 256 for v in c)
+        d.rectangle((10, y, 289, y + 240), fill=c)
+        for x in range(10, 290, 7):
+            d.line((x, y, x, y + 240), fill=(c[0] // 2, c[1] // 2, c[2] // 2))
+        y += 300
+    img.save(folder / "page_001.png")
+
+
+@pytest.fixture()
+def intro_session(tmp_path):
+    store = SessionStore(tmp_path)
+    sess = store.create("IntroSeries")
+    for c, seed in (("1", 1), ("2", 2)):
+        (sess.path / f"chapter_{c}.md").write_text(f"# {c}\n\ntext\n")
+        _fake_chapter(pages_dir(sess.path, c), seed)
+    cfg = load_config(series__workdir=str(sess.path), series__name="IntroSeries")
+    cfg.video["workers"] = 1
+    for c in ("1", "2"):
+        build_panels(sess.path, c, cfg.video.get("panels"), log=lambda *_: None)
+    return store, sess, cfg
+
+
+def _ids(sess, c):
+    return [p["id"] for p in load_panels(sess.path, c)["panels"] if not p.get("text_only")]
+
+
+def _write_intro(sess, sentences):
+    p = intro_mod.intro_json_path(sess.path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"version": 1, "sentences": sentences}), encoding="utf-8")
+
+
+def _good_intro(sess):
+    a, b = _ids(sess, "1"), _ids(sess, "2")
+    return [
+        {"text": "He chopped trees for a living every single day of his quiet life.", "panels": [f"ch1:{a[0]}"]},
+        {"text": "Then something woke up inside him and everything began to change.",
+         "panels": [f"ch1:{a[1]}", f"ch2:{b[0]}"], "beat": True},
+        {"text": "Nobody in the village would ever look at him the same way again.", "panels": [f"ch2:{b[1]}"]},
+    ]
+
+
+def test_intro_prepare_writes_template_and_sheets_without_touching_chapters(intro_session):
+    _, sess, _ = intro_session
+    before = {c: panels_path(sess.path, c).read_bytes() for c in ("1", "2")}
+    written = intro_mod.prepare(sess, log=lambda *_: None)
+    names = {w.name for w in written}
+    assert {"ch1_01.png", "ch2_01.png", "intro.json"} <= names
+    tpl = json.loads(intro_mod.intro_json_path(sess.path).read_text(encoding="utf-8"))
+    assert tpl["sentences"][0]["panels"][0].startswith("ch1:")
+    assert {c: panels_path(sess.path, c).read_bytes() for c in ("1", "2")} == before
+    # a second --prepare keeps what you wrote
+    _write_intro(sess, _good_intro(sess))
+    intro_mod.prepare(sess, log=lambda *_: None)
+    assert len(json.loads(intro_mod.intro_json_path(sess.path).read_text(encoding="utf-8"))["sentences"]) == 3
+
+
+def test_intro_reads_panels_from_their_chapters(intro_session):
+    _, sess, _ = intro_session
+    _write_intro(sess, _good_intro(sess))
+    chapters = intro_mod._chapters_with_panels(sess)
+    sentences, data = intro_mod.load_intro(sess.path, chapters)
+    assert [s["refs"] for s in sentences][1][1].startswith("ch2:")
+    by_id = {p["id"]: p for p in data["panels"]}
+    ref = sentences[1]["refs"][1]
+    assert by_id[ref]["src_chapter"] == "2" and by_id[ref]["src_id"] == ref.split(":", 1)[1]
+    assert not (sess.path / "media" / "ch0").exists()          # nothing was copied
+
+
+def test_intro_rejects_every_bad_entry_at_once(intro_session):
+    _, sess, _ = intro_session
+    a, b = _ids(sess, "1"), _ids(sess, "2")
+    data = json.loads(panels_path(sess.path, "2").read_text(encoding="utf-8"))
+    data["panels"][-1]["text_only"] = True
+    textonly = data["panels"][-1]["id"]
+    panels_path(sess.path, "2").write_text(json.dumps(data), encoding="utf-8")
+    _write_intro(sess, [
+        {"text": "one", "panels": [f"ch1:{a[0]}"]},
+        {"text": "two", "panels": [f"ch1:{a[0]}"]},                                   # reused
+        {"text": "three", "panels": [f"ch2:{textonly}"]},                             # text-only
+        {"text": "four", "panels": [f"ch1:{a[1]}", f"ch1:{a[2]}", f"ch1:{a[3]}", f"ch2:{b[0]}"]},  # four
+        {"text": "five", "panels": ["ch9:P001-01"]},                                  # no such chapter
+        {"text": "", "panels": ["nonsense"]},                                         # no text, bad ref
+    ])
+    with pytest.raises(UserError) as exc:
+        intro_mod.load_intro(sess.path, intro_mod._chapters_with_panels(sess))
+    msg = str(exc.value)
+    assert "already used in sentence 1" in msg and "text-only panel" in msg
+    assert "1 to 3 panels" in msg and "chapter 9 has no panels" in msg
+    assert "has no text" in msg and "not a panel reference" in msg
+
+
+@needs_ffmpeg
+def test_intro_builds_a_full_width_styled_plan_and_renders(intro_session):
+    from manhwa_ocr.video.ffmpeg import run, video_info
+    from manhwa_ocr.video.plan import validate as validate_plan
+
+    _, sess, cfg = intro_session
+    (sess.path / "audio").mkdir()
+    run(["-f", "lavfi", "-i", "sine=frequency=440:duration=9", "-c:a", "libmp3lame",
+         str(sess.path / "audio" / "chapter_0.mp3")])
+    _write_intro(sess, _good_intro(sess))
+    chapter_files = sorted(p.name for p in (sess.path / "video").glob("chapter_[12]*")) if (sess.path / "video").exists() else []
+
+    plan, data = intro_mod.build_intro(sess, cfg, sync="off", log=lambda *_: None)
+    vdir = sess.path / "video"
+    assert (vdir / "chapter_0.alignment.json").exists() and (vdir / "chapter_0.plan.json").exists()
+    assert validate_plan(plan, {p["id"] for p in data["panels"]}) == []
+    refs = [r for s in _good_intro(sess) for r in s["panels"]]
+    shown = [c["panel"] for s in plan["shots"] for c in s["cards"]]
+    assert sorted(shown) == sorted(refs)                       # every panel once, none twice
+    assert all(s["background"] == "blur" for s in plan["shots"])       # no black bars
+    assert all(s["darken"] == pytest.approx(0.15) for s in plan["shots"])
+    first = plan["shots"][0]
+    assert first["cards"][0]["enter"] == "zoom_in" and any(e["type"] == "shake" for e in first["effects"])
+    seg = next(s for s in json.loads((vdir / "chapter_0.alignment.json").read_text(encoding="utf-8"))["segments"]
+               if s["beat"])
+    beat = next(s for s in plan["shots"] if s["start"] - 1e-6 <= seg["start"] < s["end"])
+    assert {"shake", "flash"} <= {e["type"] for e in beat["effects"]} and beat["exit"] == "fade_out"
+    assert min(s["end"] - s["start"] for s in plan["shots"]) >= cfg.video["intro"]["min_hold"] - 0.05
+    assert any(s["layout"] == "pair" for s in plan["shots"])
+    for s in plan["shots"]:
+        for c in s["cards"]:
+            if not c.get("pad_y"):
+                assert c["crop"][2] - c["crop"][0] >= 0.9            # full-width framing rules apply
+    assert sorted(p.name for p in vdir.glob("chapter_[12]*")) == chapter_files   # chapters untouched
+
+    out = intro_mod.run(sess, cfg, sync="off", preview=True, workers=1, log=lambda *_: None)
+    info = video_info(out)
+    assert out.name == "chapter_0.preview.mp4" and info["audio"] and info["duration"] == pytest.approx(9.0, abs=0.2)
+
+
+@needs_ffmpeg
+def test_intro_reapplies_its_fixes_file_on_every_rebuild(intro_session):
+    from manhwa_ocr.video.ffmpeg import run
+
+    _, sess, cfg = intro_session
+    (sess.path / "audio").mkdir()
+    run(["-f", "lavfi", "-i", "sine=frequency=440:duration=9", "-c:a", "libmp3lame",
+         str(sess.path / "audio" / "chapter_0.mp3")])
+    _write_intro(sess, _good_intro(sess))
+    ref = _good_intro(sess)[2]["panels"][0]
+    plan, data = intro_mod.build_intro(sess, cfg, sync="off", log=lambda *_: None)
+    card = next(c for s in plan["shots"] for c in s["cards"] if c["panel"] == ref)
+    panel = next(p for p in data["panels"] if p["id"] == ref)
+    w, h = float(panel["width"]), float(panel["height"])
+    # a 1:1 crop of the top of the panel, expressed in fixes.json
+    side = min(1.0, w / h)
+    box = [0.0, 0.0, round(side, 4), round(min(1.0, h / w) if h > w else 1.0, 4)] if w <= h else [0.0, 0.0, 0.5, 1.0]
+    box = [0.0, 0.0, 1.0, round(w / h, 4)] if w <= h else [0.0, 0.0, round(h / w, 4), 1.0]
+    (sess.path / "video" / "chapter_0.fixes.json").write_text(
+        json.dumps({"version": 1, "crop": [{"panel": ref, "shape": "1:1", "box": box}]}), encoding="utf-8")
+    again, _ = intro_mod.build_intro(sess, cfg, sync="off", log=lambda *_: None)
+    fixed = next(c for s in again["shots"] for c in s["cards"] if c["panel"] == ref)
+    assert fixed["crop"] == pytest.approx(box) and fixed["crop"] != card["crop"]
+
+
+def test_intro_needs_audio_and_a_file(intro_session):
+    _, sess, cfg = intro_session
+    with pytest.raises(UserError, match="video intro --prepare"):
+        intro_mod.build_intro(sess, cfg, sync="off", log=lambda *_: None)
+    _write_intro(sess, _good_intro(sess))
+    with pytest.raises(UserError, match="audio/chapter_0.mp3"):
+        intro_mod.build_intro(sess, cfg, sync="off", log=lambda *_: None)
+
+
+def test_intro_command_is_wired_and_preset_has_defaults(intro_session, monkeypatch):
+    store, sess, cfg = intro_session
+    monkeypatch.setenv("MANHWA_SESSIONS_ROOT", str(store.root))
+    assert cfg.video["intro"]["min_hold"] == 2.0
+    assert cli(["video", "intro", "--prepare", "--session", sess.slug]) == 0
+    assert (sess.path / "intro" / "intro.json").exists() and (sess.path / "intro" / "sheets" / "ch1_01.png").exists()

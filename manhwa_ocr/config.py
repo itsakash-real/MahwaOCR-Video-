@@ -102,6 +102,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # Recording text. spell_numbers: the NEW recaps/chapter_N.tts.txt (and the spoken text in
         # cues.json) write digits as words (99 -> ninety nine). Existing files with audio are never touched.
         "tts": {"spell_numbers": True},
+        # `video intro`: the chapter-0 trailer built from panels of several chapters.
+        # min_hold: shortest time a picture stays up. pair_ratio: share of neighbouring panels shown
+        # two at a time. darken: darker grade (0-0.6). backdrop: always the blurred panel, never black bars.
+        "intro": {"min_hold": 2.0, "pair_ratio": 0.5, "darken": 0.15, "backdrop": "blur",
+                  "beat_effects": ["shake", "flash", "fade_out"]},
         "whisper_model": "small.en",
         "whisper_language": None,   # e.g. "hi" for Hindi narration (use a multilingual model)
     },
