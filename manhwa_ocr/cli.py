@@ -657,7 +657,7 @@ def cmd_video(args) -> int:
                  f"{align_s:<12}{plan_s:<25} {video_s}")
         _log("\n'align' is video align's own check: a sentence it couldn't resolve with full "
             "confidence (never confirmed by you) shows as \"N review\" - open its pairing sheet "
-            "or PROMPTS.md before trusting the video for that stretch.")
+            "(video pair) before trusting the video for that stretch.")
         _log(f"\nAudio goes in: {sess.path / 'audio'}  (chapter_N.mp3 / .wav / .m4a)")
         return 0
 

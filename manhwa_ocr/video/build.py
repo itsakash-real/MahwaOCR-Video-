@@ -418,7 +418,7 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
             f"confidence, never reviewed (sentence numbers: {shown}) — one of these may be the wrong "
             f"picture for its sentence.\n"
             f"Look at them first: open .work/video/ch{chapter}/pairing_NN.png for those sentence numbers, "
-            f"or use the checkpointed review template in PROMPTS.md. Fix pairs.json if anything's wrong, "
+            f"or run `video pair --chapter {chapter}`. Fix pairs.json if anything's wrong, "
             f"then `video align --chapter {chapter}` and `video plan --chapter {chapter} --force` again.\n"
             f"To render anyway, pass --force to render.")
     if plan.get("panels_fingerprint") and plan["panels_fingerprint"] != panels.get("fingerprint"):

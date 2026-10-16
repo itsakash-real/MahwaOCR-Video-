@@ -423,6 +423,8 @@ function renderMain() {
         <button class="btn sm primary" data-act="agent-ocr">Copy agent prompt: transcribe</button>
         <button class="btn sm" data-act="agent-recap">Copy agent prompt: recaps</button>
         <button class="btn sm" data-act="agent-video">Copy agent prompt: build videos</button>
+        <button class="btn sm" data-act="agent-fix">Copy agent prompt: fix chapter</button>
+        <button class="btn sm" data-act="agent-intro">Copy agent prompt: intro</button>
       </div>
     </div>
 
@@ -570,7 +572,7 @@ function renderVideo(p, d) {
     <div class="toolbar">
       <span class="hint"><b>1.</b> Press <b>Script</b> and record it (or paste it into your TTS tool).
         <b>2.</b> <b>Upload</b> the recording (or save it as <code>audio/chapter_N.mp3</code> in the series folder).
-        <b>3.</b> Copy the agent prompt and paste it into Antigravity.</span>
+        <b>3.</b> Copy the agent prompt and paste it into your agent.</span>
       <span class="grow"></span>
       <button class="btn sm primary" data-act="agent-video">Copy agent prompt: build videos</button>
     </div>
@@ -700,20 +702,13 @@ function download(name, text) {
 }
 
 // ------------------------------------------------------------ actions
-function agentOcrPrompt() {
-  return `Read AGENTS.md. Work only on the series "${S.detail.name}". ` +
-    `Keep running \`${cmd(`next ${sessArg()}`)}\` and doing exactly what it says ` +
-    `(every command it prints already includes ${sessArg()}), until it reports every chapter is transcribed. ` +
-    `Do not stop after one chapter. If you get interrupted, run the same next command again to pick up where you left off.`;
+// The prompt texts come from manhwa_ocr/agent_prompts.py (filled in by the server); nothing is copied by hand here.
+const AGENT_PROMPTS = __AGENT_PROMPTS_JSON__;
+function agentPrompt(name, vals) {
+  return AGENT_PROMPTS[name].replace(/\{(series|session|chapters|minutes|N|detail)\}/g,
+    (m, k) => (vals[k] !== undefined ? String(vals[k]) : m));
 }
-function agentRecapPrompt(chs) {
-  const sp = chs && chs.length ? spec(chs) : "";
-  const chArg = sp ? ` --chapters ${sp}` : "";
-  return `Read AGENTS.md. Run \`${cmd(`recap ${sessArg()}${chArg} --prepare --minutes ${S.minutes}`)}\`, ` +
-    `then read the TASK.md it prints and write the narration it asks for into the parts.json it names. ` +
-    `Write original narration in your own words and quote the source only briefly. ` +
-    `Finish with \`${cmd(`recap ${sessArg()} --finalize`)}\`.`;
-}
+const promptVals = (extra) => Object.assign({ series: S.detail.name, session: S.detail.slug, minutes: S.minutes }, extra || {});
 
 document.addEventListener("click", async (ev) => {
   const t = ev.target.closest("[data-slug],[data-tab],[data-filter],[data-act],[data-doc],[data-media]");
@@ -735,15 +730,15 @@ document.addEventListener("click", async (ev) => {
     case "cancel-new": S.creating = false; renderMain(); break;
     case "live": S.live = !S.live; renderMain(); break;
     case "copy-path": copy(d.path, "Folder path copied"); break;
-    case "agent-ocr": copy(agentOcrPrompt(), "Agent prompt copied — paste into Antigravity"); break;
+    case "agent-ocr": copy(agentPrompt("transcribe", promptVals()), "Agent prompt copied — paste into your agent"); break;
     case "agent-recap": {
       const need = d.chapters.filter((c) => c.transcribed && !c.recapped).map((c) => c.chapter);
-      copy(agentRecapPrompt(need), need.length ? `Prompt copied for ${need.length} chapter(s)` : "Prompt copied");
+      copy(agentPrompt("recaps", promptVals({ chapters: need.length ? spec(need) : "N" })), need.length ? `Prompt copied for ${need.length} chapter(s)` : "Prompt copied");
       break;
     }
     case "cmd-recap": {
       const chs = [...S.picked].filter((c) => d.chapters.find((x) => x.chapter === c && x.transcribed));
-      copy(agentRecapPrompt(chs), `Recap prompt copied for chapters ${spec(chs)}`);
+      copy(agentPrompt("recaps", promptVals({ chapters: spec(chs) || "N" })), `Recap prompt copied for chapters ${spec(chs)}`);
       break;
     }
     case "cmd-compile": {
@@ -754,14 +749,17 @@ document.addEventListener("click", async (ev) => {
     case "clear": S.picked.clear(); renderMain(); break;
     case "agent-video": {
       const ready = (d.video || []).filter((v) => v.audio && v.recap).map((v) => v.chapter);
-      const chArg = ready.length ? ` --chapters ${spec(ready)}` : "";
-      copy(`Read AGENTS.md (section "Making videos"). First run \`${cmd(`video pair${chArg} ${sessArg()}`)}\`, look at every pairing sheet it lists and fix pairs.json so every sentence has the panel that shows it, then run the same command with --apply. ` +
-        `Then run \`${cmd(`video build${chArg} ${sessArg()}`)}\`. ` +
-        `For each chapter it builds, open the storyboard images listed in .work/video/chN/REVIEW.md and check that every shot's panel matches the sentence spoken over it. ` +
-        `Fix wrong shots in video/chapter_N.plan.json exactly as REVIEW.md describes, set "reviewed": true, then run \`${cmd(`video render --chapter N ${sessArg()}`)}\` for each chapter you changed.`,
+      copy(agentPrompt("build", promptVals({ chapters: ready.length ? spec(ready) : "N" })),
         ready.length ? `Prompt copied for chapters ${spec(ready)}` : "Prompt copied (no chapter has audio yet)");
       break;
     }
+    case "agent-fix": {
+      const ch = [...S.picked][0] || "N";
+      copy(agentPrompt("fix", promptVals({ N: ch, detail: "(paste the exact error, or the shot ids that are wrong, here)" })),
+        `Fix prompt copied for chapter ${ch}`);
+      break;
+    }
+    case "agent-intro": copy(agentPrompt("intro", promptVals()), "Intro prompt copied"); break;
     case "upload": {
       const pick = $("audioPick");
       pick.dataset.ch = t.dataset.ch;

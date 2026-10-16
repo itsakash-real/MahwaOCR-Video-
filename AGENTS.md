@@ -14,6 +14,13 @@ bottom of this file, and anything under "Architecture"/"Extending", is for
 whoever edits this package's code — it is not a hint to call those internals
 from your own one-off scripts.
 
+## Prompts
+
+The rules every pasted prompt starts with (COMMON_RULES) and the prompts themselves live in one file,
+`manhwa_ocr/agent_prompts.py`. USER_GUIDE.md ("Which prompt do I use?") lists them; the dashboard buttons, `next`,
+REVIEW.md and the reviewer all use that file.
+Do not copy prompt text into other files. Change `agent_prompts.py` and USER_GUIDE.md together; a test fails if they differ.
+
 ## What this project is
 
 `manhwa-ocr` turns webtoon/manhwa chapters into recap videos:
@@ -168,7 +175,7 @@ put it under `.work/`.
 this repo's root). Don't write scripts into the program folder either. If the
 tool does something wrong, stop and tell the user what you saw; don't patch the
 code to get past it. Fix outputs only through the files these instructions name
-(`pairs.json`, `fixes.json`, `cues.json`, `tile_results.json`, `parts.json`, ...).
+(`pairs.json`, `fixes.json`, `cues.json`, `tile_results.json`, `parts.json`, `.work\agent_log.md`, ...).
 
 ## Writing recaps
 
@@ -277,8 +284,8 @@ refuses the file and nothing is applied.
 
 ### Gates
 
-- Timing that is only estimated (whisper unavailable) stops the render, unless `--force` is given.
-  Fix it by lowering `whisper_model` in `manhwa-ocr.yaml`.
+- Timing that is only estimated (whisper unavailable) stops the render. Fix it by lowering
+  `whisper_model` in `manhwa-ocr.yaml`. Do not use `--force` on render to skip it.
 - Sentences flagged for review in the alignment are warnings, listed in the QA file.
   `video render --strict` makes them stop the render instead.
 - `video review` approves only when the reviewer approves. `video approve` approves the current

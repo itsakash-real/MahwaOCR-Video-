@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .agent_prompts import RECAP_RULES
 from .config import Config
 from .memory import SeriesMemory
 from .util import (
@@ -547,6 +548,12 @@ series context as of that chapter. Work through them in order.
 
 {listing}
 {panel_note}
+
+---
+
+## Rules finalize checks
+
+{RECAP_RULES}
 
 ---
 
