@@ -10,10 +10,11 @@ actually decide a panel are, in order:
      INTERNAL/PURE_AUDIO sentences hold whatever panel is already up.
   2. the story's own order - a panel can only be chosen from a window ahead
      of wherever the story currently is (never a blind, unconstrained pick).
-  3. the recap's original tag - the writer's own choice, so it stands even
-     when it glances backwards in the story (flagged for review, not
-     overridden). Only strong lexical evidence against it - overlap above
-     video.sync.override_evidence - wins over a tag.
+  3. the recap's original tag - the writer's own choice, so it always stands:
+     even when it glances backwards in the story, and even when another
+     panel's own OCR'd text has a strong word overlap with the sentence
+     (overlap above video.sync.override_evidence only flags the disagreement
+     for review - it never replaces the tag).
   4. lexical overlap with each candidate panel's own OCR'd text - exact or
      near-exact word/number matches, not fuzzy semantic similarity (which
      testing showed is unreliable for this art style).
@@ -104,8 +105,8 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
     I/O - every segment here still needs "start"/"end" added by the caller.
 
     `override_evidence` is the OCR-overlap score (video.sync.override_evidence)
-    another panel needs before it may overrule a recap tag; defaults to the
-    shipped value.
+    above which another panel's word overlap with the sentence flags a recap
+    tag for review (the tag still shows); defaults to the shipped value.
     """
     if override_evidence is None:
         override_evidence = float(sync_mod.SYNC_DEFAULTS["override_evidence"])
@@ -176,20 +177,17 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
             # showed the wrong picture. Trust the tag, flag the glance.
             selected, confidence, needs_review = tag, "tag_behind_cursor_accepted", True
         elif tag and tag in window:
-            if best and best["panel"] != tag and best_ocr > override_evidence:
-                # Only real, strong overlap with another panel's own OCR'd text
-                # (video.sync.override_evidence, e.g. a quoted line) may overrule
-                # the writer's tag; anything weaker stands behind it. Evidence
-                # exactly at the bar is not decisive: the chapter 8 mismatch
-                # (scattered generic words summing to exactly 20) must not
-                # override the tag.
-                selected, confidence, needs_review = best["panel"], "ocr_override_tag", True
-            else:
-                # The writer chose this panel while looking at it. Word overlap
-                # with a panel's own text is weak evidence (names, numbers), and
-                # overriding the tag showed the wrong picture while the narrator
-                # spoke. The tag stands.
-                selected, confidence, needs_review = tag, "tag_confirmed_in_window", False
+            # The writer chose this panel while looking at it, and the real
+            # chapters settled the rest: overriding the tag because another
+            # panel's own OCR'd text overlapped the sentence replaced the tag
+            # with the wrong picture every time it fired (chapter 3: overlap
+            # 56 - the vision model had filed a nearby bubble's line under
+            # that panel - and the recording still matched the tag). The tag
+            # always stands; overlap above video.sync.override_evidence only
+            # flags the disagreement so video pair surfaces it for review.
+            disagree = bool(best and best["panel"] != tag and best_ocr > override_evidence)
+            selected, confidence = tag, "tag_confirmed_in_window"
+            needs_review = disagree
         elif tag:
             # Forward, just beyond the normal lookahead window - the window was too
             # small for this stretch, not the tag wrong. Trust it, flag for a glance.

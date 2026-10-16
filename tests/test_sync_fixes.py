@@ -472,24 +472,28 @@ def _panel(pid: str, text: str = "") -> dict:
     return {"id": pid, "text": text, "text_only": False}
 
 
-def test_strong_ocr_evidence_overrides_an_in_window_tag():
-    """video.sync.override_evidence is the one bar another panel must clear to
-    replace the writer's tag: overlap strictly above it means the panel's own
-    OCR'd text really is what the narrator is reading out."""
+def test_strong_ocr_evidence_flags_the_disagreement_but_the_tag_still_shows():
+    """The writer tagged this sentence while looking at the panels, and the
+    field chapters settled it: overlap above video.sync.override_evidence is
+    real evidence against the tag (usually a nearby bubble the vision model
+    filed under the wrong panel), but replacing the tag with it showed the
+    wrong picture every time - the recording matches the tag. The tag shows,
+    the disagreement is flagged and recorded, never silently shown over it."""
     panels = [_panel("P001-01"), _panel("P001-02"),
               _panel("P001-03", text="Zarithium darkphantom overload cracked the seal")]
     sentences = [{"text": "He steps through the gate.", "panels": ["P001-01"]},
                  {"text": "The zarithium darkphantom overload triggered everywhere.",
                   "panels": ["P001-02"]}]
     seg = align_engine.align_sentences(sentences, panels)[1]
-    assert seg["selected_panel"] == "P001-03"
-    assert seg["confidence"] == "ocr_override_tag"
+    assert seg["selected_panel"] == "P001-02"
+    assert seg["confidence"] == "tag_confirmed_in_window"
     assert seg["needs_review"] is True
+    assert seg["candidates"][0]["panel"] == "P001-03"
 
 
 def test_a_tag_survives_evidence_below_override_evidence():
-    """The same overlap, with the knob raised above it: the tag stands. The bar
-    is a setting, not a hidden constant."""
+    """The same overlap, with the knob raised above it: the tag stands and
+    nothing is flagged. The flag bar is a setting, not a hidden constant."""
     panels = [_panel("P001-01"), _panel("P001-02"),
               _panel("P001-03", text="Zarithium darkphantom overload cracked the seal")]
     sentences = [{"text": "He steps through the gate.", "panels": ["P001-01"]},

@@ -91,7 +91,7 @@ video:
     min_hold_short: 2.0  # shortest hold allowed when a sentence can't be merged into a pair
     max_hold: 8.0        # a single picture held longer than this is split by a slide-in
     max_unmatched: 6.0   # speech whisper couldn't match for this long stops the build
-    override_evidence: 20  # OCR-overlap score needed to override a recap tag
+    override_evidence: 20  # OCR-overlap score above which a tag/OCR disagreement is flagged (the tag still shows)
     filler_full: 6.0     # only sentences longer than this may be filled end to end
     gate_wrong: 0.05     # build gate: most wrong-picture time (another sentence's panel on
                          # screen) allowed overall; fillers and pair second cards are excluded.

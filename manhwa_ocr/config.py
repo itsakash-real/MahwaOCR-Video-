@@ -105,7 +105,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         #   min_hold_short:  shortest hold allowed when a sentence can't be merged.
         #   max_hold:        a single picture held longer than this gets split.
         #   max_unmatched:   a run of whisper-unmatched speech longer than this stops the build.
-        #   override_evidence: OCR overlap needed to override a recap tag.
+        #   override_evidence: OCR overlap above which a tag/OCR disagreement is flagged (tag still shows).
         #   filler_full:     only sentences longer than this may be filled end to end.
         #   gate_wrong:      most wrong-picture time (another sentence's panel on screen)
         #                    allowed overall; fillers and pair cards are excluded.

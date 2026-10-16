@@ -199,7 +199,7 @@ SYNC_DEFAULTS: Dict[str, float] = {
     "min_hold_short": 2.0,    # video.sync.min_hold_short: shortest hold allowed when merging is impossible
     "max_hold": 8.0,          # video.sync.max_hold: a picture held longer than this gets split
     "max_unmatched": 6.0,     # video.sync.max_unmatched: a run of unmatched (interpolated) speech longer than this stops the build
-    "override_evidence": 20,  # video.sync.override_evidence: OCR-overlap score needed to override a tag
+    "override_evidence": 20,  # video.sync.override_evidence: OCR-overlap score above which a tag/OCR disagreement is flagged (tag still shows)
     "filler_full": 6.0,       # video.sync.filler_full: only sentences this long may be filled end to end
     "gate_wrong": 0.05,       # video.sync.gate_wrong: most wrong-picture time allowed overall (provisional until calibration)
     "gate_window": 0.25,      # video.sync.gate_window: most wrong-picture time allowed in any 5s window (provisional)
