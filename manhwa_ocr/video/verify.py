@@ -49,27 +49,42 @@ def problems_of(c: Dict[str, Any]) -> List[str]:
     return out
 
 
-def pick_crop(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None = None) -> Tuple[float, Tuple, List[str], bool]:
-    """(shape, box, problems, clean). Clean windows beat unclean ones; among equals
-    the lower score wins. The shape choice keeps the panel's own shape close."""
+def pick_card(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """The card for one panel: {"shape", "box", "pad_y", "problems", "clean"}.
+
+    Clean windows beat unclean ones; among equals the lower score wins. The shape choice
+    keeps the panel's own shape close. `box` always lies inside the panel; `pad_y` > 0 means
+    the card is taller than the box by that many panel-heights above and below (a panel
+    too wide for any allowed shape is shown whole on blurred padding, not side-cropped).
+    """
     m = maps or _panel_maps(img)
-    gw, gh = m["soft"].shape[1], m["soft"].shape[0]
-    panel_aspect = gw / gh
+    panel_aspect = img.width / max(1, img.height)
     best = None
-    for a in shapes:
-        for c in shape_candidates(img, a, m)[:40]:
-            probs = problems_of(c)
-            cost = c["score"] + 0.4 * max(0.0, math.log(panel_aspect / a)) + 0.02 * abs(math.log(a / panel_aspect))
-            key = (len(probs) > 0, cost)
-            if best is None or key < best[0]:
-                best = (key, a, c["box"], probs)
-    _, shape, box, probs = best
-    return shape, box, probs, not probs
+    for fallback in (False, True):       # a shape that would cost the panel its sides only if none else works
+        for a in shapes:
+            for c in shape_candidates(img, a, m, fallback=fallback, allow_pad=True)[:40]:
+                probs = problems_of(c)
+                cost = (c["score"] + 0.4 * max(0.0, math.log(panel_aspect / a))
+                        + 0.02 * abs(math.log(a / panel_aspect)))
+                key = (len(probs) > 0, cost)
+                if best is None or key < best[0]:
+                    best = (key, a, c["box"], c.get("pad_y", 0.0), probs)
+        if best is not None:
+            break
+    _, shape, box, pad_y, probs = best
+    return {"shape": shape, "box": box, "pad_y": pad_y, "problems": probs, "clean": not probs}
+
+
+def pick_crop(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None = None) -> Tuple[float, Tuple, List[str], bool]:
+    """(shape, box, problems, clean) of pick_card(), for callers that don't draw the card
+    (a padded card's box is the whole panel; its padding is in pick_card()["pad_y"])."""
+    card = pick_card(img, shapes, maps)
+    return card["shape"], card["box"], card["problems"], card["clean"]
 
 
 def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, Any]], Image.Image],
                    shapes: List[float], root: Path | None = None, chapter: str | None = None,
-                   log: Callable = print) -> Dict[str, Any]:
+                   log: Callable = print, options: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Check every drawn panel. Returns the report (also written to
     video/chapter_N.verify.json when root and chapter are given)."""
     rows: Dict[str, Any] = {}
@@ -80,7 +95,7 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
         if p.get("text_only"):
             continue
         img = image_for(p)
-        maps = _panel_maps(img)
+        maps = _panel_maps(img, options)
         shape, box, probs, clean = pick_crop(img, shapes, maps)
         figure = figure_share(img) >= FIGURE_MIN
         if clean:

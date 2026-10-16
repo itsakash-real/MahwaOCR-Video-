@@ -33,6 +33,9 @@ ANALYSIS_WIDTH = 240     # rows are summarised at this width; plenty for gutter 
 MAX_PANEL_RATIO = 3.2    # height/width beyond which a gutterless stretch gets split
 TALL_RATIO = 1.6         # height/width at which a panel scrolls instead of zooming
 SHEET_PER_PAGE = 12
+WHITE_THRESHOLD = 242    # a row whose pixels are (almost) all brighter than this is white gutter
+BLACK_THRESHOLD = 13     # ... or all darker than this, near-black gutter
+EDGE_ROW_SHARE = 0.985   # share of a row's pixels that must be white/black for it to count
 
 
 @dataclass
@@ -69,6 +72,12 @@ def _settings(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
         "drop_below": max(0, int(cfg.get("drop_below", 80))),
         "merge_below": max(0, int(cfg.get("merge_below", 220))),
         "skip_landscape": bool(cfg.get("skip_landscape", True)),
+        # Edge tightening: after a panel's bounds are found, rows at its top and bottom
+        # that are all white (gray > white_threshold) or all near-black (gray <
+        # black_threshold) are manhwa gutter, not artwork, and are trimmed off.
+        "tighten_edges": bool(cfg.get("tighten_edges", True)),
+        "white_threshold": min(255, max(128, int(cfg.get("white_threshold", WHITE_THRESHOLD)))),
+        "black_threshold": min(127, max(0, int(cfg.get("black_threshold", BLACK_THRESHOLD)))),
     }
 
 
@@ -202,6 +211,28 @@ def _trim_x(img: Image.Image, norm_w: int) -> tuple[float, float]:
     return round(max(0.0, x0 - pad), 1), round(min(float(norm_w), x1 + pad), 1)
 
 
+def trim_edge_rows(img: Image.Image, white: int = WHITE_THRESHOLD, black: int = BLACK_THRESHOLD) -> tuple[int, int]:
+    """(rows to cut from the top, rows to cut from the bottom) so the picture starts
+    and ends flush against artwork. A row is margin when at least EDGE_ROW_SHARE of
+    its pixels are white (> white) or near-black (< black). Only the two outer edges
+    are scanned; a white band inside the art is never touched. (0, 0) when nothing
+    would be left."""
+    g = np.asarray(img.convert("L"), dtype=np.uint8)
+    if g.size == 0:
+        return 0, 0
+    margin = ((g > white).mean(axis=1) >= EDGE_ROW_SHARE) | ((g < black).mean(axis=1) >= EDGE_ROW_SHARE)
+    n = len(margin)
+    top = 0
+    while top < n and margin[top]:
+        top += 1
+    if top >= n:
+        return 0, 0                      # an all-margin panel: leave it for the text-only check
+    bottom = 0
+    while bottom < n - top and margin[n - 1 - bottom]:
+        bottom += 1
+    return top, bottom
+
+
 def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[List[Panel], int]:
     """Find panels across a chapter. Returns (panels, normalised_width)."""
     s = _settings(cfg)
@@ -253,7 +284,16 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
         panel = Panel(id=f"P{start_page:03d}-{per_page[start_page]:02d}", index=idx,
                       y0=float(a), y1=float(b), x0=0.0, x1=float(norm_w), segments=segs)
         try:
-            x0, x1 = _trim_x(_stitch(panel, {p.path.name: p.path for p in pages}), norm_w)
+            strip = _stitch(panel, {p.path.name: p.path for p in pages})
+            if s["tighten_edges"]:
+                cut_top, cut_bottom = trim_edge_rows(strip, s["white_threshold"], s["black_threshold"])
+                scale = norm_w / max(1, strip.width)
+                kept = (b - a) - (cut_top + cut_bottom) * scale
+                if (cut_top or cut_bottom) and kept >= max(s["drop_below"], 0.3 * (b - a)):
+                    panel.y0, panel.y1 = float(a + cut_top * scale), float(b - cut_bottom * scale)
+                    panel.segments = _segments(panel.y0, panel.y1, pages) or panel.segments
+                    strip = strip.crop((0, cut_top, strip.width, strip.height - cut_bottom))
+            x0, x1 = _trim_x(strip, norm_w)
         except OSError:
             x0, x1 = 0.0, float(norm_w)
         panel.x0, panel.x1 = x0, x1
@@ -352,7 +392,13 @@ def _attach_notes(panels: List[Panel], root: Path, chapter: str, pages_meta: Dic
 def _fingerprint(pages: List[Path], s: Dict[str, Any]) -> str:
     # The version is in the hash so panels.json files from older releases
     # (missing fields like "art") are re-detected instead of half-used.
-    h = hashlib.sha256(json.dumps({"v": PANELS_VERSION, **s}, sort_keys=True).encode())
+    # Edge tightening settings join the hash only when changed from their defaults, so
+    # panels.json files made before they existed are not silently re-detected (which
+    # would shift framing under recordings that already exist). `video panels --force`
+    # re-detects with tightening.
+    defaults = {"tighten_edges": True, "white_threshold": WHITE_THRESHOLD, "black_threshold": BLACK_THRESHOLD}
+    keyed = {k: v for k, v in s.items() if defaults.get(k, object()) != v}
+    h = hashlib.sha256(json.dumps({"v": PANELS_VERSION, **keyed}, sort_keys=True).encode())
     for p in pages:
         st = p.stat()
         try:
@@ -444,6 +490,7 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
         "chapter": chapter,
         "fingerprint": fp,
         "norm_width": norm_w,
+        "tight": bool(s["tighten_edges"]),
         "pages": [p.name for p in pages],
         "panels": rows,
     }

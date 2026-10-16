@@ -78,6 +78,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "drop_below": 80,       # px; smaller fragments are dropped
             "merge_below": 220,     # px; small fragments merge into a neighbour
             "skip_landscape": True, # skip wide pages (scanlation credit banners)
+            "tighten_edges": True,  # trim white/black gutter rows off a panel's top and bottom
+            "white_threshold": 242, # gray above this across a row = white gutter
+            "black_threshold": 13,  # gray below this across a row = near-black gutter
+        },
+        # Card framing. Cards keep the panel's full width and pick a vertical window.
+        "crop": {
+            "full_width": True,     # false = the old behavior (zoomed, side-cropped windows)
+            "min_width_kept": 0.9,  # last-resort bubble avoidance may narrow a card, never below this
         },
         # Recap style is calm: only a gentle shake on {impact} lines by default.
         "effects": {"shake": True, "punch": False, "flash": False, "end_fade": True},

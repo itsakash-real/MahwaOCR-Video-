@@ -204,6 +204,25 @@ def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
 # ------------------------------------------------------------------ cards
 
 
+def padded_region(panel: Image.Image, box: List[float], pad_y: float) -> Image.Image:
+    """The card's picture when it is taller than its crop: the crop in full width, centred,
+    with `pad_y` panel-heights above and below filled by a blurred, darkened copy of the
+    panel itself (a wide panel is shown whole rather than losing its sides)."""
+    x0, y0, x1, y1 = (max(0.0, min(1.0, float(v))) for v in box)
+    pw, ph = panel.size
+    inner = panel.convert("RGB").crop((int(x0 * pw), int(y0 * ph), max(int(x0 * pw) + 2, int(x1 * pw)),
+                                       max(int(y0 * ph) + 2, int(y1 * ph))))
+    pad = max(0, round(float(pad_y) * ph))
+    cw, ch = inner.width, inner.height + 2 * pad
+    k = max(cw / inner.width, ch / inner.height)
+    cover = inner.resize((max(cw, round(inner.width * k)), max(ch, round(inner.height * k))), Image.BILINEAR)
+    left, top = (cover.width - cw) // 2, (cover.height - ch) // 2
+    canvas = cover.crop((left, top, left + cw, top + ch)).filter(ImageFilter.GaussianBlur(max(4, ch * 0.03)))
+    canvas = Image.eval(canvas, lambda v: int(v * 0.7))
+    canvas.paste(inner, (0, pad))
+    return canvas
+
+
 class Card:
     """One panel card: focal crop, border, rounded corners, black shadow, motion."""
 
@@ -219,6 +238,9 @@ class Card:
         pw, ph = panel.size
         region = panel.crop((int(x0 * pw), int(y0 * ph), max(int(x0 * pw) + 2, int(x1 * pw)),
                              max(int(y0 * ph) + 2, int(y1 * ph))))
+        pad_y = float(spec.get("pad_y") or 0.0)
+        if pad_y > 0:                               # a wide panel shown whole on blurred padding
+            region = padded_region(panel, [x0, y0, x1, y1], pad_y)
         aspect = region.width / region.height
         self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
         self.border = max(1, round(3 * u))

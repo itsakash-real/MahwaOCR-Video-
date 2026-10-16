@@ -129,3 +129,244 @@ def test_well_spaced_sentences_are_untouched():
     res = sync.align(sents, _w("The hero wakes up. Then the ground explodes.", 0.5), 10.0)
     assert res["spread"] == 0
     assert res["sentences"][1]["start"] == pytest.approx(0.5 + 4 * 0.35, abs=0.01)
+
+
+# ====================================================================== FIX 2: framing
+
+import math  # noqa: E402
+
+import numpy as np  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+
+from manhwa_ocr.video import panels as panels_mod  # noqa: E402
+from manhwa_ocr.video.crops import _panel_maps, shape_candidates  # noqa: E402
+from manhwa_ocr.video.frames import format_from, padded_region, shapes_for  # noqa: E402
+from manhwa_ocr.video.verify import pick_card, pick_crop  # noqa: E402
+
+SINGLE = shapes_for("single", format_from("16:9", 30))
+
+
+def _art(w, h, base=(80, 100, 130), seed=7):
+    rng = np.random.default_rng(seed)
+    blocks = rng.normal(0, 22, (h // 8 + 1, w // 8 + 1, 1)).repeat(8, axis=0).repeat(8, axis=1)[:h, :w]
+    arr = np.clip(np.array(base, dtype=np.float32) + blocks, 0, 255).astype("uint8")
+    return Image.fromarray(arr, "RGB")
+
+
+def _edge_margin_rows(img: Image.Image):
+    return panels_mod.trim_edge_rows(img)
+
+
+def _crop(img: Image.Image, box):
+    w, h = img.size
+    return img.crop((round(box[0] * w), round(max(0.0, box[1]) * h), round(box[2] * w), round(min(1.0, box[3]) * h)))
+
+
+def _aspect(box, w, h):
+    return ((box[2] - box[0]) * w) / ((box[3] - box[1]) * h)
+
+
+def _card_aspect(card, w, h):
+    """Aspect of the drawn card: the crop plus blurred padding above and below."""
+    box = card["box"]
+    return ((box[2] - box[0]) * w) / (((box[3] - box[1]) + 2 * card["pad_y"]) * h)
+
+
+def _is_allowed(aspect):
+    return min(abs(math.log(aspect / a)) for a in SINGLE) <= 0.02
+
+
+def _page_with_gutters(path: Path, panel_heights=(900, 1500), width=900, white_strip=14):
+    """A strip page: white gutters between panels, and a thin white strip (shorter than
+    the gutter finder's minimum) clinging to each panel's top and bottom edge."""
+    total = 120 + sum(panel_heights) + 120 * len(panel_heights)
+    page = Image.new("RGB", (width, total), (255, 255, 255))
+    y = 120
+    for i, h in enumerate(panel_heights):
+        art = _art(width, h, seed=3 + i)
+        page.paste(art, (0, y + white_strip))
+        y += h + white_strip * 2 + 120
+        page = page if y <= total else page
+    page = page.crop((0, 0, width, y))
+    page.save(path)
+    return page
+
+
+def _detect_panels(tmp_path, **cfg):
+    page_path = tmp_path / "page_01.png"
+    _page_with_gutters(page_path)
+    panels, norm_w = panels_mod.detect([page_path], cfg or None)
+    files = {page_path.name: page_path}
+    imgs = []
+    for p in panels:
+        strip = panels_mod._stitch(p, files)
+        scale = strip.width / norm_w
+        imgs.append(strip.crop((int(p.x0 * scale), 0, int(round(p.x1 * scale)), strip.height)))
+    return panels, imgs
+
+
+def test_trim_edge_rows_cuts_white_and_black_edges_only():
+    img = _art(600, 800)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, 600, 39), fill=(255, 255, 255))            # white gutter on top
+    d.rectangle((0, 775, 600, 800), fill=(4, 4, 4))               # near-black gutter at the bottom
+    d.rectangle((0, 400, 600, 440), fill=(255, 255, 255))         # a white band INSIDE the art stays
+    assert panels_mod.trim_edge_rows(img) == (40, 25)
+    assert panels_mod.trim_edge_rows(Image.new("RGB", (50, 50), (255, 255, 255))) == (0, 0)
+
+
+def test_white_threshold_is_configurable():
+    img = _art(300, 400)
+    ImageDraw.Draw(img).rectangle((0, 0, 300, 29), fill=(238, 238, 238))   # off-white, below 242
+    assert panels_mod.trim_edge_rows(img)[0] == 0
+    assert panels_mod.trim_edge_rows(img, white=235)[0] == 30
+
+
+def test_detected_panels_are_flush_to_the_artwork(tmp_path):
+    panels, imgs = _detect_panels(tmp_path)
+    assert len(panels) == 2
+    for img in imgs:
+        assert _edge_margin_rows(img) == (0, 0), "no white gutter rows may remain on a panel's edge"
+        assert img.height in (900, 1500) or abs(img.height - 900) < 3 or abs(img.height - 1500) < 3
+
+
+def test_tightening_can_be_switched_off(tmp_path):
+    _, imgs = _detect_panels(tmp_path, tighten_edges=False)
+    assert any(_edge_margin_rows(i) != (0, 0) for i in imgs)
+
+
+def test_settings_added_by_this_fix_do_not_change_old_fingerprints(tmp_path):
+    p = tmp_path / "a.png"
+    Image.new("RGB", (10, 10)).save(p)
+    base = panels_mod._settings(None)
+    old_style = {k: v for k, v in base.items() if k not in ("tighten_edges", "white_threshold", "black_threshold")}
+    import hashlib
+    import json
+    want = hashlib.sha256(json.dumps({"v": panels_mod.PANELS_VERSION, **old_style}, sort_keys=True).encode())
+    st = p.stat()
+    with p.open("rb") as fh:
+        head = fh.read(65536)
+    want.update(f"{p.name}:{st.st_size}:".encode() + hashlib.sha256(head).digest())
+    assert panels_mod._fingerprint([p], base) == want.hexdigest()[:16]
+    assert panels_mod._fingerprint([p], {**base, "tighten_edges": False}) != want.hexdigest()[:16]
+
+
+@pytest.mark.parametrize("make", [lambda: _art(900, 2800), lambda: _art(900, 1200), lambda: _art(1000, 1000)])
+def test_tall_and_square_panels_keep_full_width_with_a_vertical_window(make):
+    img = make()
+    shape, box, probs, _ = pick_crop(img, SINGLE, _panel_maps(img))
+    assert box[0] == 0.0 and box[2] == 1.0, "full panel width"
+    assert 0.0 <= box[1] < box[3] <= 1.0 + 1e-9
+    assert shape in SINGLE and _is_allowed(_aspect(box, img.width, img.height))
+
+
+def test_wide_panel_is_padded_not_side_cropped():
+    img = _art(2400, 800)                          # 3:1, wider than the widest shape (16:9)
+    card = pick_card(img, SINGLE, _panel_maps(img))
+    box = card["box"]
+    assert box == (0.0, 0.0, 1.0, 1.0), "the whole panel: no side crop, nothing cut"
+    assert card["pad_y"] > 0, "the rest of the card is blurred padding above and below"
+    assert card["shape"] == pytest.approx(1.777, abs=0.01)   # nearest allowed shape
+    assert _is_allowed(_card_aspect(card, img.width, img.height))
+    cand = shape_candidates(img, 1.777, _panel_maps(img), allow_pad=True)[0]
+    assert cand["pad_y"] > 0 and not cand["narrow"]
+    # Without allow_pad (an explicit single-shape request) the box stays an exact shape inside the panel.
+    plain = shape_candidates(img, 1.777, _panel_maps(img))[0]
+    assert plain["pad_y"] == 0 and _aspect(plain["box"], 2400, 800) == pytest.approx(1.777, rel=0.01)
+
+
+def test_padded_region_has_the_boxes_aspect_and_keeps_the_panel_whole():
+    img = _art(1800, 600, base=(200, 40, 40))
+    region = padded_region(img, [0.0, 0.0, 1.0, 1.0], 0.2)
+    assert region.width / region.height == pytest.approx(1800 / (1.4 * 600), rel=0.01)
+    pad = round(0.2 * 600)
+    assert np.asarray(region.crop((0, pad, 1800, pad + 600))).tolist() == np.asarray(img).tolist()
+
+
+def test_crop_with_gutters_has_zero_white_rows(tmp_path):
+    panels, imgs = _detect_panels(tmp_path)
+    for img in imgs:
+        for layout in ("single", "pair", "wide"):
+            shapes = shapes_for(layout, format_from("16:9", 30))
+            card = pick_card(img, shapes, _panel_maps(img))
+            assert _edge_margin_rows(_crop(img, card["box"])) == (0, 0)
+            assert card["box"][0] == 0.0 and card["box"][2] == 1.0
+            assert _is_allowed(_card_aspect(card, img.width, img.height)) or layout != "single"
+
+
+def _bubble_panel(w=900, h=1600):
+    img = _art(w, h)
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((int(0.52 * w), int(0.10 * h), int(0.92 * w), int(0.30 * h)), radius=60, fill=(255, 255, 255))
+    for y in range(int(0.13 * h), int(0.28 * h), 30):
+        d.rectangle((int(0.56 * w), y, int(0.88 * w), y + 14), fill=(20, 20, 20))
+    return img
+
+
+def test_bubble_is_avoided_by_the_vertical_choice_first():
+    img = _bubble_panel()
+    maps = _panel_maps(img)
+    assert maps["bubbles"]
+    shape, box, probs, clean = pick_crop(img, SINGLE, maps)
+    assert clean and "lettering" not in probs
+    assert box[0] == 0.0 and box[2] == 1.0, "bubble avoided without touching the sides"
+    assert box[1] >= 0.29                          # the window starts below the bubble
+
+
+def test_horizontal_shift_is_a_last_resort_and_never_below_min_width_kept():
+    # A small bubble cut by the panel's right edge, mid-height: every full-width window
+    # shows too much of it, but a window 90% as wide shows almost none.
+    img = _art(900, 900)
+    d = ImageDraw.Draw(img)
+    d.rectangle((716, 358, 900, 488), fill=(20, 20, 20))
+    d.rectangle((720, 362, 900, 484), fill=(255, 255, 255))
+    for y in (374, 404, 434):
+        d.rectangle((748, y, 880, y + 14), fill=(20, 20, 20))
+    maps = _panel_maps(img)
+    assert maps["bubbles"], "the bubble should be detected"
+    full = pick_crop(img, [1.0, 1.333, 1.777], _panel_maps(img, {"min_width_kept": 1.0}))
+    assert not full[3], "with no narrowing allowed, no full-width window is clean"
+    shape, box, probs, clean = pick_crop(img, [1.0, 1.333, 1.777], maps)
+    assert clean and "lettering" not in probs
+    assert 0.9 - 1e-6 <= box[2] - box[0] < 1.0
+    # Every candidate the planner considers, whatever the shape, respects the minimum width.
+    for a in SINGLE:
+        for c in shape_candidates(img, a, maps, fallback=False, allow_pad=True):
+            assert c["box"][2] - c["box"][0] >= 0.9 - 1e-3
+    strict = _panel_maps(img, {"min_width_kept": 1.0})
+    for c in shape_candidates(img, 1.0, strict, fallback=False, allow_pad=True):
+        assert c["box"][2] - c["box"][0] >= 1.0 - 1e-6
+
+
+def test_full_width_can_be_switched_off_for_the_old_behavior():
+    img = _art(2400, 800)
+    maps = _panel_maps(img, {"full_width": False})
+    box = shape_candidates(img, 1.0, maps)[0]["box"]
+    assert box[2] - box[0] < 1.0 and box[1] >= 0.0
+    assert _aspect(box, 2400, 800) == pytest.approx(1.0, rel=0.01)
+
+
+def test_qa_shape_check_still_applies_to_padded_cards_and_is_not_loosened():
+    from manhwa_ocr.video.build import quality_report
+    from manhwa_ocr.video.plan import validate
+
+    panels = {"panels": [{"id": "A", "width": 2400, "height": 800, "text_only": False}]}
+
+    def plan_with(card):
+        return {"format": "16:9", "fps": 30, "chapter": "1", "shots": [
+            {"id": "S001", "start": 0.0, "end": 4.0, "layout": "single", "background": "blur",
+             "cards": [{"panel": "A", "enter": "cut", "motion": "push_in", **card}]}]}
+
+    def bad(plan):
+        return any("allowed shapes" in f for f in quality_report(plan, panels, None, 3.0)["failures"])
+
+    assert bad(plan_with({"crop": [0, 0, 1, 1]}))                               # 3:1 unpadded: refused, as before
+    assert bad(plan_with({"crop": [0, 0, 1, 1], "pad_y": 0.1}))                 # 2400 / 960 = 2.5: still not a shape
+    exact = plan_with({"crop": [0, 0, 1, 1], "pad_y": 0.34375})                 # 2400 / (1.6875 * 800) = 16:9
+    assert not bad(exact)
+    exact["version"], exact["duration"] = 2, 4.0
+    assert validate(exact, {"A"}) == []
+    exact["shots"][0]["cards"][0]["pad_y"] = 9.0                               # absurd padding is refused
+    assert validate(exact, {"A"}) != []
+    exact["shots"][0]["cards"][0].update(pad_y=0.1, crop=[0, -0.2, 1, 1.2])     # crop stays inside the panel
+    assert validate(exact, {"A"}) != []

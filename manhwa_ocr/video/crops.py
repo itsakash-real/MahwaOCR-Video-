@@ -325,13 +325,38 @@ FIGURE_MIN = 0.004       # skin share above this means a character is drawn here
 BUBBLE_OK = 0.02         # share of a card a speech bubble may take before it counts as shown
 
 
-def _panel_maps(img: Image.Image) -> Dict[str, Any]:
-    """Analysis maps for one panel, computed once and sliced per candidate."""
+def edge_rows(gray: np.ndarray, white: int = 242, black: int = 13, share: float = 0.985) -> Tuple[float, float]:
+    """(top, bottom) fractions of a grayscale panel that are all-white or all-black rows at
+    its edges: gutter the card should not show. (0, 0) for a clean panel."""
+    if gray.size == 0:
+        return 0.0, 0.0
+    margin = ((gray > white).mean(axis=1) >= share) | ((gray < black).mean(axis=1) >= share)
+    n = len(margin)
+    top = 0
+    while top < n and margin[top]:
+        top += 1
+    if top >= n:
+        return 0.0, 0.0
+    bottom = 0
+    while bottom < n - top and margin[n - 1 - bottom]:
+        bottom += 1
+    return top / n, bottom / n
+
+
+def _panel_maps(img: Image.Image, options: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Analysis maps for one panel, computed once and sliced per candidate.
+
+    options: {"full_width": bool, "min_width_kept": float, "white_threshold": int,
+    "black_threshold": int}, normally video.crop and video.panels from the config."""
+    opts = options or {}
     rgb = _small(img, 120)
     soft, hard, flat_white = _art_maps(rgb)
     gray = rgb.mean(axis=2)
     m: Dict[str, Any] = {"soft": soft, "texty": np.clip(hard + flat_white, 0, 1), "skin": _skin(rgb),
                          "blank": flat_white, "gray": gray, "gray_hi": _small(img, 240).mean(axis=2)}
+    m["full_width"] = bool(opts.get("full_width", True))
+    m["min_width_kept"] = float(opts.get("min_width_kept", MIN_WIDTH_KEPT))
+    m["edge_rows"] = edge_rows(m["gray_hi"], int(opts.get("white_threshold", 242)), int(opts.get("black_threshold", 13)))
     m["bubble_regions"] = bubble_regions(m)
     m["bubbles"] = [r["box"] for r in m["bubble_regions"]]
     # Where clean_bubbles() painted: flat patches the crop should avoid if it can.
@@ -503,27 +528,55 @@ def figure_share(img: Image.Image) -> float:
     return round(float(_panel_maps(img)["skin"].mean()), 4)
 
 
-def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
-    """Every window of exactly `aspect` (w/h in pixels) worth showing, best first.
+NARROW_COST = 6.0        # a window narrower than the panel: only when nothing full-width is clean
+PAD_COST = 3.0           # per unit of blurred padding a card would need above/below the panel
+CUT_COST = 0.8           # per unit of the panel's height a full-width window leaves out
+PAD_MAX = 2.5            # never pad a panel to more than this multiple of its own height
+MIN_WIDTH_KEPT = 0.9
 
-    Each: {"box", "score", "head_ok", "bubble_ok", "blank", "soft", "painted", "texty"}.
-    Lower score is better. A window narrower than the panel cuts the sides; a
-    panel wider than the shape keeps its full width where it can. A face
-    position from fixes.json (maps["face_override"]) replaces the skin guess.
-    All windows are scored together with summed-area tables, so this is fast.
+
+def _full_width_boxes(aspect: float, pa: float, fe, fb, minw: float, allow_pad: bool = False):
+    """Candidate boxes that keep the panel's whole width: (x0, y0, x1, y1, extra_cost, pad_y).
+
+    - A shape at least as wide as the panel (aspect >= panel aspect): a full-width window
+      slid up and down. Only the vertical position is a choice.
+    - A shape narrower than the panel (a wide panel), when allow_pad: the whole panel, with
+      the card padded above and below by pad_y panel-heights each (the card draws the
+      padding as a blurred copy of the panel). The box itself stays inside the panel.
+    - Last resort, narrower windows no thinner than `minw`, with a heavy cost so they
+      only win when every full-width window shows a bubble or cuts a head.
     """
-    m = maps or _panel_maps(img)
-    gh, gw = m["soft"].shape
-    panel_aspect = gw / gh
-    r = aspect / panel_aspect                       # box width / box height, as fractions
-    full = (r, 1.0) if r <= 1.0 else (1.0, 1.0 / r)
-    if m.get("face_override"):
-        fe, fb = m["face_override"]
-    else:
-        fe = face_top(m)
-        fb = face_bottom(m, fe) if fe is not None else None
+    r = aspect / pa                                   # window width / height as fractions
+    out = []
 
-    boxes: List[Tuple[float, float, float, float, float]] = []      # x0, y0, x1, y1, scale
+    def vertical(bw: float, bh: float, xs, extra: float) -> None:
+        ys = [0.0] if bh >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bh, 21))
+        if fe is not None and fb is not None and bh < 1.0 - 1e-9:
+            for y in (fe - HEAD_MARGIN, fb + HEAD_MARGIN - bh):      # exact positions that keep the head
+                ys.append(min(max(0.0, y), 1.0 - bh))
+        for x0 in xs:
+            for y0 in ys:
+                out.append((x0, y0, x0 + bw, y0 + bh, extra + CUT_COST * max(0.0, 1.0 - bh), 0.0))
+
+    if r >= 1.0 - 1e-9:
+        vertical(1.0, 1.0 / r, [0.0], 0.0)
+        for bw in sorted({0.95, minw}, reverse=True):
+            if minw <= bw < 1.0 - 1e-9 and bw / r <= 1.0 + 1e-9:
+                vertical(bw, bw / r, [0.0, (1.0 - bw) / 2, 1.0 - bw], NARROW_COST)
+    else:
+        bh = 1.0 / r
+        if allow_pad and bh <= PAD_MAX:
+            out.append((0.0, 0.0, 1.0, 1.0, PAD_COST * (bh - 1.0), (bh - 1.0) / 2))
+        if r >= minw - 1e-9:                          # a slightly narrower card, no padding
+            vertical(r, 1.0, [0.0, (1.0 - r) / 2, 1.0 - r], NARROW_COST)
+    return out
+
+
+def _legacy_boxes(aspect: float, panel_aspect: float, fe, fb):
+    """The original generator: zoomed windows that may cut the sides."""
+    r = aspect / panel_aspect
+    full = (r, 1.0) if r <= 1.0 else (1.0, 1.0 / r)
+    out = []
     for s in (1.0, 0.85, 0.7, 0.55):               # no deeper zoom: the card would go soft
         bw, bh = full[0] * s, full[1] * s
         if s < 1.0 and (bw < 0.1 or bh < 0.1):
@@ -531,16 +584,51 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
         xs = [0.0] if bw >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bw, 17))
         ys = [0.0] if bh >= 1.0 - 1e-9 else list(np.linspace(0.0, 1.0 - bh, 21))
         if fe is not None and fb is not None and bh < 1.0 - 1e-9:
-            # exact positions that keep the whole head (top and chin) in the card
             for y in (fe - HEAD_MARGIN, fb + HEAD_MARGIN - bh):
                 ys.append(min(max(0.0, y), 1.0 - bh))
         for x0 in xs:
             for y0 in ys:
-                boxes.append((x0, y0, x0 + bw, y0 + bh, s))
+                out.append((x0, y0, x0 + bw, y0 + bh, (0.1 * (1.0 - s)) + (0.3 if (r > 1.0 and s < 1.0) else 0.0), 0.0))
+    return out
+
+
+def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | None = None,
+                     fallback: bool = True, allow_pad: bool = False) -> List[Dict[str, Any]]:
+    """Every window of exactly `aspect` (w/h in pixels) worth showing, best first.
+
+    Each: {"box", "score", "head_ok", "bubble_ok", "blank", "soft", "painted", "texty", "pad_y",
+    "narrow"}. Lower score is better. By default (maps["full_width"], video.crop.full_width)
+    every window keeps the panel's full width and only slides vertically. With allow_pad, a
+    panel too wide for the shape is shown whole with `pad_y` panel-heights of blurred padding
+    above and below instead of losing its sides (see _full_width_boxes); the box itself
+    always lies inside 0..1. With full_width off the original zoomed, side-cropping windows
+    are used. A face position from fixes.json (maps["face_override"]) replaces the skin guess.
+    When a shape cannot be reached at full width (and `fallback` is true) the old side-cropping
+    windows are returned for it; choosers that compare several shapes pass fallback=False so a
+    shape that would cost the panel its sides is simply not a candidate.
+    All windows are scored together with summed-area tables, so this is fast.
+    """
+    m = maps or _panel_maps(img)
+    gh, gw = m["soft"].shape
+    panel_aspect = img.width / max(1, img.height) if img is not None else gw / gh
+    if m.get("face_override"):
+        fe, fb = m["face_override"]
+    else:
+        fe = face_top(m)
+        fb = face_bottom(m, fe) if fe is not None else None
+
+    full_width = bool(m.get("full_width", True))
+    boxes: List[Tuple[float, float, float, float, float, float]] = []      # x0, y0, x1, y1, extra cost, pad_y
+    if full_width:
+        minw = min(1.0, max(0.5, float(m.get("min_width_kept", MIN_WIDTH_KEPT))))
+        boxes = _full_width_boxes(aspect, panel_aspect, fe, fb, minw, allow_pad)
+    if not boxes and (fallback or not full_width):
+        boxes = _legacy_boxes(aspect, panel_aspect, fe, fb)
     if not boxes:
         return []
     B = np.array(boxes, dtype=np.float64)
-    x0, y0, x1, y1, scale = B[:, 0], B[:, 1], B[:, 2], B[:, 3], B[:, 4]
+    x0, y0, x1, y1, extra, pad_y = B[:, 0], B[:, 1], B[:, 2], B[:, 3], B[:, 4], B[:, 5]
+    narrow = (x1 - x0) < 1.0 - 1e-9
 
     # Pixel rows and columns of each window, the same rule the scoring always used.
     r0 = (y0 * gh).astype(int)
@@ -577,9 +665,8 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
 
     bubble = worst_overlap(m["bubbles"])
     painted = worst_overlap(m["painted"])
-    score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + 0.1 * (1.0 - scale)
+    score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + extra
              + (soft < 0.02).astype(float) + np.where(head_ok, 0.0, 5.0)
-             + (0.3 if (r > 1.0) else 0.0) * (scale < 1.0)     # a narrower window cuts the sides
              + 3.0 * painted                                    # a painted patch is flat: avoid it
              + 20.0 * bubble + np.where(bubble > BUBBLE_OK, 30.0, 0.0))  # bubble text outranks a head risk
     order = np.argsort(score, kind="stable")[:60]
@@ -588,7 +675,8 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
         box = (round(float(x0[i]), 4), round(float(y0[i]), 4), round(float(x1[i]), 4), round(float(y1[i]), 4))
         out.append({"box": box, "score": float(score[i]), "head_ok": bool(head_ok[i]),
                     "bubble_ok": bool(bubble[i] <= BUBBLE_OK), "blank": float(blank[i]), "soft": float(soft[i]),
-                    "painted": float(painted[i]), "texty": float(texty[i])})
+                    "painted": float(painted[i]), "texty": float(texty[i]),
+                    "pad_y": round(float(pad_y[i]), 4), "narrow": bool(narrow[i])})
     return out
 
 

@@ -32,7 +32,7 @@ from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
 from .crops import _panel_maps, tone
-from .verify import pick_crop
+from .verify import pick_card
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
 from .media import video_dir
 
@@ -43,6 +43,7 @@ MAX_PAIR_SHOT = 6.5      # max total duration allowed for a 2-panel pair shot
 PUNCH_GAP = 4.0
 EFFECT_GRACE = 0.35
 MIN_HOLD = 3.0           # seconds: no picture is held on screen for less than this
+PAD_LIMIT = 1.5          # a card's pad_y (blurred padding above and below, in panel heights) is at most this
 
 # Reference recap (measured): hard cuts, almost still pictures, only slight drift.
 ENTRANCE_WEIGHTS = [("cut", 90), ("fade_in", 10)]
@@ -353,6 +354,16 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD) -> Tupl
 # ------------------------------------------------------------------ shot design
 
 
+def map_options(vcfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Crop-analysis options from the video config: video.crop and video.panels thresholds."""
+    crop = vcfg.get("crop") if isinstance(vcfg.get("crop"), dict) else {}
+    panels = vcfg.get("panels") if isinstance(vcfg.get("panels"), dict) else {}
+    return {"full_width": bool(crop.get("full_width", True)),
+            "min_width_kept": float(crop.get("min_width_kept", 0.9)),
+            "white_threshold": int(panels.get("white_threshold", 242)),
+            "black_threshold": int(panels.get("black_threshold", 13))}
+
+
 class _Designer:
     """Turns timing units into shots: layouts, crops, backgrounds, animation."""
 
@@ -364,8 +375,11 @@ class _Designer:
         self.image_for = image_for
         self._img: Dict[str, Image.Image] = {}
         self._crops: Dict[tuple, List[float]] = {}
+        self._pads: Dict[tuple, float] = {}
         self._maps: Dict[str, Any] = {}
-        self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": [], "bubble": []}
+        self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": [], "bubble": [],
+                                                 "padded": [], "white_edge": []}
+        self.map_options = map_options(vcfg)
         self._tone: Dict[str, str] = {}
         self.uses: Dict[str, int] = {}
         self.prev_enter: str | None = None
@@ -383,6 +397,11 @@ class _Designer:
         p = self.by_id[pid]
         return float(p.get("width") or 1) / max(1.0, float(p.get("height") or 1))
 
+    def pad(self, pid: str, layout: str) -> float:
+        """Blurred padding above and below the card's crop, in panel heights (0 for most cards)."""
+        self.crop(pid, layout)
+        return self._pads.get((pid, layout), 0.0)
+
     def crop(self, pid: str, layout: str) -> List[float]:
         """The card's crop: one exact shape from the layout's list (crops.py)."""
         key = (pid, layout)
@@ -390,21 +409,31 @@ class _Designer:
             if pid in self.fixes["crop"]:                  # a reviewer's exact crop (fixes.json)
                 shape, box = self.fixes["crop"][pid]
                 self._crops[key] = list(box)
-                if shape < self.panel_aspect(pid) and pid not in self.crop_stats["side_cut"]:
+                if box[2] - box[0] < 0.999 and pid not in self.crop_stats["side_cut"]:
                     self.crop_stats["side_cut"].append(pid)
                 return self._crops[key]
             if pid not in self._maps:
-                self._maps[pid] = _panel_maps(self.img(pid))
+                self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
+                top, bottom = self._maps[pid]["edge_rows"]
+                if (top + bottom) >= 0.01 and pid not in self.crop_stats["white_edge"]:
+                    # Gutter rows still sit on this panel's edge (panels.json predates edge
+                    # tightening). `video panels --force` re-detects it flush to the art.
+                    self.crop_stats["white_edge"].append(pid)
             maps = self._maps[pid]
             if pid in self.fixes["face"]:                   # a reviewer's head position replaces the skin guess
                 maps = {**maps, "face_override": self.fixes["face"][pid]}
-            shape, box, probs, _ = pick_crop(self.img(pid), shapes_for(layout, self.fmt), maps)
+            card = pick_card(self.img(pid), shapes_for(layout, self.fmt), maps)
+            shape, box, probs = card["shape"], card["box"], card["problems"]
+            if card["pad_y"] > 0:
+                self._pads[key] = float(card["pad_y"])
             if "head_cut" in probs and pid not in self.crop_stats["head_risk"]:
                 self.crop_stats["head_risk"].append(pid)
             if "lettering" in probs and pid not in self.crop_stats["bubble"]:
                 self.crop_stats["bubble"].append(pid)
-            if shape < self.panel_aspect(pid) and pid not in self.crop_stats["side_cut"]:
+            if box[2] - box[0] < 0.999 and pid not in self.crop_stats["side_cut"]:
                 self.crop_stats["side_cut"].append(pid)
+            if card["pad_y"] > 0 and pid not in self.crop_stats["padded"]:
+                self.crop_stats["padded"].append(pid)
             self._crops[key] = list(box)
         return self._crops[key]
 
@@ -487,7 +516,11 @@ class _Designer:
                 at = 0.0
                 enter = self.entrance(rng, unit["cues"], layout)
                 motion = "push_in" if "beat" in unit["cues"] else self.motion(rng, crop)
-            cards.append({"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion})
+            card = {"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion}
+            pad = self.pad(pid, layout)
+            if pad > 0:
+                card["pad_y"] = round(pad, 4)       # a wide panel: blurred padding above and below
+            cards.append(card)
 
         effects: List[Dict[str, Any]] = []
         on = {"shake": True, "punch": False, "flash": False}
@@ -681,6 +714,11 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     raise ValueError
             except (TypeError, ValueError):
                 errs.append(f"{cw}: crop must be [x0, y0, x1, y1] fractions of the panel, e.g. [0, 0.2, 1, 0.7]")
+            try:
+                if not 0.0 <= float(c.get("pad_y") or 0.0) <= PAD_LIMIT:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errs.append(f"{cw}: pad_y (blurred padding above and below, in panel heights) must be 0 to {PAD_LIMIT:g}")
             if c.get("enter", "cut") not in ENTRANCES:
                 errs.append(f"{cw}: enter must be one of {', '.join(ENTRANCES)}")
             if c.get("motion", "push_in") not in MOTIONS:

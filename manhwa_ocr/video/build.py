@@ -29,6 +29,7 @@ from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, r
 from .frames import background, format_from, shapes_for
 from . import fixes as fixes_mod
 from .verify import verify_chapter
+from .plan import map_options
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
 from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, units_from_alignment, validate
@@ -84,7 +85,8 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         for c in s.get("cards") or []:
             pw, ph = dims.get(c["panel"], (1.0, 1.0))
             x0, y0, x1, y1 = (float(v) for v in c["crop"])
-            aspect = ((x1 - x0) * pw) / max(1e-9, (y1 - y0) * ph)
+            pad = float(c.get("pad_y") or 0.0)          # blurred padding above and below the crop
+            aspect = ((x1 - x0) * pw) / max(1e-9, ((y1 - y0) + 2 * pad) * ph)
             if min(abs(math.log(aspect / a)) for a in allowed) > 0.02:
                 shape_bad.append(f"{s.get('id')} {c['panel']} ({aspect:.2f})")
     shortest = min((float(s["end"]) - float(s["start"]) for s in shots), default=0.0)
@@ -107,6 +109,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "text_only_excluded": [p["id"] for p in panels["panels"] if p.get("text_only")],
         "shots": len(shots), "shortest_shot": round(shortest, 2), "timing": plan.get("timing"),
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
+        "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
         "review_queue": plan.get("alignment_review_queue") or [],
         "sync": plan.get("sync"),
     }
@@ -130,6 +133,13 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
     st = audio.stat() if audio else None
     knobs = {k: vcfg.get(k) for k in ("min_shot", "max_shot", "target_shot", "lead", "pair_ratio", "fps",
                                       "music", "music_volume", "effects")}
+    # Framing options join the hash only when changed from their defaults, so plans built
+    # before they existed stay current (a rebuild would re-frame every card).
+    crop_opts = {k: v for k, v in map_options(vcfg).items()
+                 if v != {"full_width": True, "min_width_kept": 0.9, "white_threshold": 242,
+                          "black_threshold": 13}[k]}
+    if crop_opts:
+        knobs["crop"] = crop_opts
     return {
         "panels": panels_fp,
         "audio": [audio.name, st.st_size, int(st.st_mtime)] if st else None,
@@ -303,7 +313,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     fmt_obj = format_from(fmt, int(vcfg.get("fps", 30)))
     shapes = sorted({a for k in ("single", "pair", "wide") for a in shapes_for(k, fmt_obj)})
     report = verify_chapter(panels["panels"], lambda p: panel_image(root, chapter, p, norm_w, clean=True),
-                            shapes, root, chapter, log=log)
+                            shapes, root, chapter, log=log, options=map_options(vcfg))
     drop = {d["panel"]: d["reason"] for d in report["dropped"]}
     drop.update(fixes["drop"])
     for p in panels["panels"]:
