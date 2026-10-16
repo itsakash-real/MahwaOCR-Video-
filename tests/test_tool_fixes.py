@@ -681,3 +681,114 @@ def test_without_audio_a_forced_rewrite_still_works(tmp_path):
     b.prepare(["1"], 6, force=True)
     _parts(b, {"1": _tagged(["P001-04", "P001-03", "P001-02", "P001-01"] * 3, words=15)})
     assert len(b.finalize()) == 1
+
+
+# ====================================================================== FIX 5: grouped tags
+
+from manhwa_ocr.video import pairing  # noqa: E402
+from manhwa_ocr.video.align_engine import align_sentences  # noqa: E402
+from manhwa_ocr.video.validate import redistribute, validate as validate_timeline  # noqa: E402
+
+
+def test_redistribute_spreads_extra_tags_over_the_free_sentences_that_follow():
+    tags = [["A", "B", "C", "D"], [], [], [], ["E"]]
+    assert redistribute(tags, 1) == {1: ["A"], 2: ["B"], 3: ["C"], 4: ["D"]}
+    # not enough free sentences: the rest stay together on the last one used
+    assert redistribute([["A", "B", "C", "D"], [], ["X"]], 1) == {1: ["A"], 2: ["B", "C", "D"]}
+    # nothing free right after it, or only one tag: nothing to move
+    assert redistribute([["A", "B"], ["X"]], 1) == {}
+    assert redistribute([["A"], []], 1) == {}
+    # a sentence that holds the previous picture can't carry a tag
+    assert redistribute([["A", "B"], [], []], 1, holds=[False, True, False]) == {1: ["A"], 3: ["B"]}
+
+
+def _jump_segments():
+    panels = [{"id": f"P001-{i:02d}", "text": "", "text_only": False} for i in range(1, 21)]
+    order = {p["id"]: i for i, p in enumerate(panels)}
+    tags = [["P001-01"], ["P001-02"], ["P001-03"], ["P001-05", "P001-06", "P001-08", "P001-14"],
+            [], [], [], ["P001-15"]]
+    sentences = [{"text": f"Sentence number {i} walks on through the cold hallway slowly.", "panels": t}
+                 for i, t in enumerate(tags, 1)]
+    segs = align_sentences(sentences, panels)
+    t = 0.0
+    for s in segs:
+        s["start"], s["end"] = t, t + 3.0
+        t += 3.0
+    return segs, order, t
+
+
+def test_align_error_for_a_jump_says_which_tag_moves_to_which_sentence():
+    segs, order, duration = _jump_segments()
+    report = validate_timeline(segs, order, duration)
+    assert report["checks"]["no_unexplained_jumps"] == "FAIL"
+    problem = next(p for p in report["problems"] if p["check"] == "no_unexplained_jumps")
+    d = problem["detail"]
+    assert problem["sentence"] == 5
+    assert "sentence 4 carries 4 tags (P001-05, P001-06, P001-08, P001-14)" in d
+    assert '"4": ["P001-05"], "5": ["P001-06"], "6": ["P001-08"], "7": ["P001-14"]' in d
+    assert "Fix in pairs.json" in d
+
+
+def test_a_jump_with_no_grouped_cause_still_names_the_panels_skipped():
+    panels = {f"P001-{i:02d}": i for i in range(1, 30)}
+    segs = [{"sentence": 1, "start": 0, "end": 3, "selected_panel": "P001-01", "confidence": "tag_confirmed_in_window",
+             "tagged_panels": ["P001-01"], "candidate_window": ["P001-01"]},
+            {"sentence": 2, "start": 3, "end": 6, "selected_panel": "P001-20", "confidence": "no_evidence_default_sequence",
+             "tagged_panels": [], "candidate_window": ["P001-20"]}]
+    d = next(p["detail"] for p in validate_timeline(segs, panels, 6.0)["problems"] if p["check"] == "no_unexplained_jumps")
+    assert "P001-01" in d and "P001-20" in d and "tag this sentence with P001-02" in d
+
+
+def _pair_workspace(tmp_path, tags):
+    root = tmp_path / "ws"
+    pages = root / "media" / "ch1" / "pages"
+    pages.mkdir(parents=True)
+    Image.new("RGB", (100, 2000), (90, 110, 140)).save(pages / "page_01.png")
+    rows = []
+    for i in range(20):
+        rows.append({"id": f"P001-{i + 1:02d}", "index": i + 1, "y0": i * 100.0, "y1": i * 100.0 + 100, "x0": 0.0,
+                     "x1": 100.0, "width": 100.0, "height": 100.0, "tall": False, "scene": "", "text": "",
+                     "segments": [{"page": 1, "file": "page_01.png", "y0": i * 100, "y1": i * 100 + 100, "page_w": 100}],
+                     "text_only": False, "credits": False})
+    (root / "media" / "ch1" / "panels.json").write_text(json.dumps(
+        {"version": 4, "chapter": "1", "fingerprint": "x", "norm_width": 100, "pages": ["page_01.png"], "panels": rows}),
+        encoding="utf-8")
+    narration = " ".join((("{" + ",".join(t) + "} ") if t else "") + f"Sentence number {i} walks on through the cold hallway slowly."
+                         for i, t in enumerate(tags, 1))
+    cues_mod.write_outputs(root, "1", narration, {r["id"] for r in rows})
+    return root
+
+
+GROUPED = [["P001-01"], ["P001-02"], ["P001-03"], ["P001-05", "P001-06", "P001-08", "P001-14"], [], [], [], ["P001-15"]]
+
+
+def test_pair_detects_grouped_tags_and_offers_a_suggestion_without_applying_it(tmp_path):
+    root = _pair_workspace(tmp_path, GROUPED)
+    found = pairing.grouped_tags(root, "1")
+    assert [g["sentence"] for g in found] == [4]
+    assert found[0]["move"] == {4: ["P001-05"], 5: ["P001-06"], 6: ["P001-08"], 7: ["P001-14"]}
+    task = pairing.write_task(root, "1", None, log=lambda *_: None)
+    md = task.read_text(encoding="utf-8")
+    assert "## Grouped tags" in md and "sentence 4 carries 4 tags" in md and "no_unexplained_jumps" in md
+    pairs = json.loads(pairing.pairs_path(root, "1").read_text(encoding="utf-8"))
+    assert pairs["4"] == ["P001-05", "P001-06", "P001-08", "P001-14"] and pairs["5"] == []   # NOT applied
+    assert pairs["_suggestions"]["4"]["move"]["5"] == ["P001-06"]
+    assert any("sentence 4 carries 4 tags" in p for p in pairing.check(root, "1"))
+    # apply ignores the suggestion notes and changes nothing
+    assert pairing.apply(root, "1", log=lambda *_: None) == 0
+    # copying the suggestion into the numbered entries applies it
+    pairs.update({k: v for k, v in ((k, v) for k, v in pairs["_suggestions"]["4"]["move"].items())})
+    pairing.pairs_path(root, "1").write_text(json.dumps(pairs), encoding="utf-8")
+    assert pairing.apply(root, "1", log=lambda *_: None) == 4
+    new = cues_mod.load_cues(root, "1")["sentences"]
+    assert [s["panels"] for s in new[3:7]] == [["P001-05"], ["P001-06"], ["P001-08"], ["P001-14"]]
+    assert pairing.grouped_tags(root, "1") == []
+
+
+def test_pair_stays_quiet_when_tags_are_spread_or_the_next_sentence_is_tagged(tmp_path):
+    spread = [["P001-01"], ["P001-02", "P001-03"], ["P001-04"], ["P001-05"]]
+    assert pairing.grouped_tags(_pair_workspace(tmp_path / "a", spread), "1") == []
+    tagged_next = [["P001-01", "P001-02", "P001-03", "P001-04"], ["P001-05"], ["P001-06"]]
+    assert pairing.grouped_tags(_pair_workspace(tmp_path / "b", tagged_next), "1") == []
+    plain = [["P001-01"], [], ["P001-03"]]
+    assert pairing.grouped_tags(_pair_workspace(tmp_path / "c", plain), "1") == []
