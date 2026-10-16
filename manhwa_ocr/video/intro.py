@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Tuple
 from ..util import UserError, atomic_write_text, normalize_label
 from . import align_engine
 from . import fixes as fixes_mod
+from . import sync as sync_mod
 from .frames import format_from
 from .media import audio_path, video_dir
 from .panels import load_panels, panel_image
@@ -327,7 +328,8 @@ def build_intro(sess, cfg, *, sync: str = "auto", fmt: str | None = None, log=pr
     if audio is None:
         raise UserError(f"No narration for the intro. Save it as audio/chapter_0.mp3 (or .wav/.m4a) in {root}.")
     timed, mode, duration = align_engine._timed_sentences(
-        root, INTRO_CHAPTER, [{"text": s["text"], "panels": []} for s in sentences], vcfg, sync, log)
+        root, INTRO_CHAPTER, [{"text": s["text"], "panels": []} for s in sentences], vcfg, sync, log,
+        sync_mod.effective_settings(vcfg, log=log))
     segments = _segments(sentences, timed)
     refs = [r for s in sentences for r in s["refs"]]
     validation = {"status": "PASS", "problems": [],

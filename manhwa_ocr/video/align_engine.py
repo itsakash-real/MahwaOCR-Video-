@@ -238,10 +238,14 @@ def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]],
 
 
 def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], vcfg: Dict[str, Any],
-                     sync: str, log) -> tuple[List[Dict[str, Any]], str, float]:
+                     sync: str, log, settings: Dict[str, float]) -> tuple[List[Dict[str, Any]], str, float]:
     """Adds "start"/"end" to each sentence using whisper (cached if available),
     falling back to even spacing. This is the only I/O-dependent part.
-    sync="off" skips whisper entirely (fast, deterministic estimated timing)."""
+    sync="off" skips whisper entirely (fast, deterministic estimated timing).
+
+    With real timing, a run of consecutive sentences whisper never matched,
+    longer than video.sync.max_unmatched, stops the build: timing that stretch
+    would be pure interpolation, and interpolation is how drift starts."""
     audio = audio_path(root, chapter)
     if audio is None:
         raise UserError(f"No narration audio for chapter {chapter} yet.")
@@ -274,14 +278,25 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
             mode = "estimated"
     elif sync != "off":
         log(f"  note: install whisper for exact sync:  {sync_mod.SYNC_HINT}")
-    sync_cfg = vcfg.get("sync") if isinstance(vcfg.get("sync"), dict) else {}
     aligned = sync_mod.align(sentences, words, duration,
-                             min_segment=float(sync_cfg.get("min_segment", sync_mod.MIN_SEGMENT)))
+                             min_segment=float(settings.get("min_segment", sync_mod.MIN_SEGMENT)))
     timed = aligned["sentences"]
     for i, s in enumerate(timed):
         s["end"] = float(timed[i + 1]["start"]) if i + 1 < len(timed) else duration
     if mode == "synced" and not aligned.get("matched"):
         mode = "estimated"
+    if mode == "synced":
+        over = sync_mod.long_unmatched_run(aligned, settings["max_unmatched"])
+        if over is not None:
+            from .build import _mmss
+            where = (f"sentences {over['first']}-{over['last']}" if over["first"] != over["last"]
+                     else f"sentence {over['first']}")
+            raise UserError(
+                f"Chapter {chapter}: {where} ({_mmss(over['start'])}-{_mmss(over['end'])}, "
+                f"{over['seconds']:.1f}s) have no matched speech in the timeline - the pictures there "
+                f"would be timed by guesswork.\nBump video.sync.max_unmatched in manhwa-ocr.yaml if that "
+                f"stretch is really fine (currently {settings['max_unmatched']:g}s), or check the narration "
+                f"and re-run transcription.")
     return timed, mode, duration
 
 
@@ -297,13 +312,16 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
     order = {p["id"]: i for i, p in enumerate(plist)}
 
     vcfg = dict(cfg.video) if hasattr(cfg, "video") else dict(cfg)
-    timed, sync_mode, duration = _timed_sentences(root, chapter, cue_data["sentences"], vcfg, sync, log)
+    settings = sync_mod.effective_settings(vcfg, log=log)
+    timed, sync_mode, duration = _timed_sentences(root, chapter, cue_data["sentences"], vcfg, sync, log,
+                                                  settings)
 
     segments = align_sentences(cue_data["sentences"], plist)
     for seg, t in zip(segments, timed):
         seg["start"], seg["end"] = round(float(t["start"]), 3), round(float(t["end"]), 3)
+        seg["timing_source"] = t.get("timing_source", "estimated")
 
-    min_hold = sync_mod.effective_settings(vcfg, log=log)["min_hold"]
+    min_hold = settings["min_hold"]
     coverage = place_coverage(segments, plist, duration, min_hold)
     coverage["art_panels"] = sum(1 for p in plist if not p.get("text_only"))
     coverage["text_only_excluded"] = [p["id"] for p in plist if p.get("text_only")]

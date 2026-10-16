@@ -345,9 +345,15 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
           min_segment: float = MIN_SEGMENT) -> Dict[str, Any]:
     """Give every sentence a start time, and every emphasised word a time.
 
-    Returns {"sentences": [... with "start" and "emphasis" times ...],
+    Returns {"sentences": [... with "start", "emphasis" and "timing_source" ...
+                           "timing_source" is "matched" (anchored to a heard
+                           word), "interpolated" (filled between anchors) or
+                           "estimated" (no words at all) ...],
              "matched": fraction of sentences anchored to real word timings,
              "unmatched": [texts that had to be interpolated],
+             "unmatched_runs": consecutive interpolated sentences with their
+                               span, so a long guess is visible (and can stop
+                               the build), never silent,
              "spread": sentences whose start collided with a neighbour and were
                        redistributed by word count}.
 
@@ -361,6 +367,7 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
     # Fill gaps: a sentence whisper didn't anchor is placed between the nearest
     # anchored neighbours in proportion to how much text precedes it.
     known = [i for i, t in enumerate(starts) if t is not None]
+    known_set = set(known)
     unmatched = [sentences[i].get("text", "") for i, t in enumerate(starts) if t is None]
     n = len(sentences)
     cum = [0]
@@ -389,6 +396,23 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
     times, spread = _spread_collisions([float(x or 0.0) for x in starts], weights, duration)
     times = _enforce_min_segment(times, duration, min_segment)
 
+    # Consecutive interpolated sentences, with their span in the final timing:
+    # a long one means that stretch of pictures sits on guesswork.
+    runs: List[Dict[str, Any]] = []
+    if heard and sentences:
+        run_first = None
+        for i in range(len(sentences) + 1):
+            if i < len(sentences) and i not in known_set:
+                if run_first is None:
+                    run_first = i
+            elif run_first is not None:
+                last = i - 1
+                end = times[i] if i < len(sentences) else duration
+                runs.append({"first": run_first + 1, "last": last + 1,
+                             "start": round(times[run_first], 3), "end": round(end, 3),
+                             "seconds": round(end - times[run_first], 3)})
+                run_first = None
+
     out = []
     for i, s in enumerate(sentences):
         t = times[i]
@@ -402,10 +426,24 @@ def align(sentences: List[Dict[str, Any]], words: List[Dict[str, Any]], duration
                 if sent_tokens[k:k + len(ptoks)] == ptoks and (offsets[i] + k) in to_time:
                     emphasis_times.append(to_time[offsets[i] + k])
                     break
-        out.append({**s, "start": round(t, 3), "emphasis": sorted(emphasis_times)})
+        source = "estimated" if not heard else ("matched" if i in known_set else "interpolated")
+        out.append({**s, "start": round(t, 3), "emphasis": sorted(emphasis_times),
+                    "timing_source": source})
 
     matched = len(known) / len(sentences) if sentences else 0.0
-    return {"sentences": out, "matched": round(matched, 3), "unmatched": unmatched, "spread": spread}
+    return {"sentences": out, "matched": round(matched, 3), "unmatched": unmatched,
+            "unmatched_runs": runs, "spread": spread}
+
+
+def long_unmatched_run(aligned: Dict[str, Any], max_unmatched: float) -> Dict[str, Any] | None:
+    """The longest run of consecutive interpolated sentences, if it is longer
+    than `max_unmatched` seconds - the build stops on this, so a stretch of
+    guessed timing can never pass silently. None when nothing is over."""
+    runs = aligned.get("unmatched_runs") or []
+    worst = max(runs, key=lambda r: r["seconds"], default=None)
+    if worst and float(worst["seconds"]) > float(max_unmatched) + 1e-9:
+        return worst
+    return None
 
 
 def character_prompt(memory) -> str | None:

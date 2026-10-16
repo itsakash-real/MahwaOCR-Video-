@@ -255,6 +255,71 @@ def test_audit_lists_the_worst_stretches_by_length():
     assert [w["start"] for w in rep["worst_windows"]] == [4.0, 11.0, 0.0]
 
 
+# ---------------------------------------------------- anchor timing provenance
+
+
+def test_align_marks_matched_and_interpolated_sentences_and_their_runs():
+    sentences = [{"text": "The road begins here"},
+                 {"text": "and it goes on forever"},
+                 {"text": "past the broken gate"},
+                 {"text": "until the tower falls"}]
+    words = _words("The road begins here", start=0.5) + _words("until the tower falls", start=9.0)
+    aligned = sync.align(sentences, words, duration=12.0)
+    sources = [s["timing_source"] for s in aligned["sentences"]]
+    assert sources == ["matched", "interpolated", "interpolated", "matched"]
+    assert aligned["unmatched"] == ["and it goes on forever", "past the broken gate"]
+    assert len(aligned["unmatched_runs"]) == 1
+    run = aligned["unmatched_runs"][0]
+    assert run["first"] == 2 and run["last"] == 3
+    assert run["end"] == 9.0                       # ends where sentence 4's matched word starts
+    assert 0.0 < run["start"] < run["end"] and run["seconds"] == round(run["end"] - run["start"], 3)
+
+
+def test_align_marks_everything_estimated_when_there_are_no_words():
+    sentences = [{"text": "One two three"}, {"text": "four five six"}]
+    aligned = sync.align(sentences, [], duration=6.0)
+    assert [s["timing_source"] for s in aligned["sentences"]] == ["estimated", "estimated"]
+    assert aligned["unmatched_runs"] == []
+    assert sync.long_unmatched_run(aligned, 0.0) is None
+
+
+def test_long_unmatched_run_finds_only_what_is_over_the_limit():
+    aligned = {"unmatched_runs": [{"first": 2, "last": 3, "seconds": 2.0},
+                                  {"first": 7, "last": 9, "seconds": 7.5}]}
+    assert sync.long_unmatched_run(aligned, 6.0)["first"] == 7
+    assert sync.long_unmatched_run(aligned, 8.0) is None
+    assert sync.long_unmatched_run({}, 6.0) is None
+
+
+def test_timed_sentences_refuses_a_run_longer_than_max_unmatched(tmp_path, monkeypatch):
+    from manhwa_ocr.video import align_engine, ffmpeg
+
+    # Preload build.py first: it binds ffmpeg.audio_timing at import time, and
+    # without this, importing it while the patch below is active would freeze
+    # the fake into build's namespace for every later test.
+    from manhwa_ocr.video import build as _build  # noqa: F401
+
+    root = tmp_path / "ws"
+    (root / "audio").mkdir(parents=True)
+    (root / "audio" / "chapter_1.wav").write_bytes(b"not real audio")
+    monkeypatch.setattr(sync, "available", lambda: True)
+    monkeypatch.setattr(sync, "transcribe", lambda *a, **k: _words("The road begins here", start=0.0))
+    monkeypatch.setattr(ffmpeg, "audio_timing", lambda *a, **k: {"duration": 20.0, "speech_end": 20.0})
+
+    sentences = [{"text": "The road begins here"}] + [
+        {"text": f"and it goes on number {i}"} for i in range(2, 7)]
+
+    with pytest.raises(UserError, match="sentences 2-6"):
+        align_engine._timed_sentences(root, "1", sentences, {}, "auto", lambda *_: None,
+                                      dict(sync.SYNC_DEFAULTS, max_unmatched=6.0))
+
+    loosened = dict(sync.SYNC_DEFAULTS, max_unmatched=30.0)
+    timed, mode, duration = align_engine._timed_sentences(root, "1", sentences, {}, "auto",
+                                                          lambda *_: None, loosened)
+    assert mode == "synced" and duration == 20.0
+    assert [t["timing_source"] for t in timed] == ["matched"] + ["interpolated"] * 5
+
+
 # ------------------------------------------------------------------ summary output
 
 
