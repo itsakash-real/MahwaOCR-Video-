@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from manhwa_ocr.config import load_config  # noqa: E402
 from manhwa_ocr.util import UserError  # noqa: E402
-from manhwa_ocr.video import sync, syncaudit  # noqa: E402
+from manhwa_ocr.video import align_engine, sync, syncaudit  # noqa: E402
 from manhwa_ocr.video.plan import build_plan  # noqa: E402
 
 
@@ -435,3 +435,81 @@ def test_make_report_checks_a_real_audio_file_for_staleness_and_length(tmp_path)
     assert rep["audio"]["duration"] == 1.0
     assert rep["audio_length_ok"] is False
     assert any("longer than the audio" in n for n in rep["length_notes"])
+
+
+# ------------------------------------------------------------------ FIX 4: tag trust
+
+
+def _panel(pid: str, text: str = "") -> dict:
+    return {"id": pid, "text": text, "text_only": False}
+
+
+def test_strong_ocr_evidence_overrides_an_in_window_tag():
+    """video.sync.override_evidence is the one bar another panel must clear to
+    replace the writer's tag: overlap strictly above it means the panel's own
+    OCR'd text really is what the narrator is reading out."""
+    panels = [_panel("P001-01"), _panel("P001-02"),
+              _panel("P001-03", text="Zarithium darkphantom overload cracked the seal")]
+    sentences = [{"text": "He steps through the gate.", "panels": ["P001-01"]},
+                 {"text": "The zarithium darkphantom overload triggered everywhere.",
+                  "panels": ["P001-02"]}]
+    seg = align_engine.align_sentences(sentences, panels)[1]
+    assert seg["selected_panel"] == "P001-03"
+    assert seg["confidence"] == "ocr_override_tag"
+    assert seg["needs_review"] is True
+
+
+def test_a_tag_survives_evidence_below_override_evidence():
+    """The same overlap, with the knob raised above it: the tag stands. The bar
+    is a setting, not a hidden constant."""
+    panels = [_panel("P001-01"), _panel("P001-02"),
+              _panel("P001-03", text="Zarithium darkphantom overload cracked the seal")]
+    sentences = [{"text": "He steps through the gate.", "panels": ["P001-01"]},
+                 {"text": "The zarithium darkphantom overload triggered everywhere.",
+                  "panels": ["P001-02"]}]
+    seg = align_engine.align_sentences(sentences, panels, override_evidence=30.0)[1]
+    assert seg["selected_panel"] == "P001-02"
+    assert seg["confidence"] == "tag_confirmed_in_window"
+    assert seg["needs_review"] is False
+
+
+# ------------------------------------------------------------------ FIX 4: coverage placement
+
+
+def _coverage_panels(n: int):
+    return [{"id": f"P001-0{i}", "text_only": False} for i in range(1, n + 1)]
+
+
+def _show(sentence: int, selected: str, start: float, end: float) -> dict:
+    return {"sentence": sentence, "selected_panel": selected, "display_action": "SHOW",
+            "start": start, "end": end}
+
+
+def test_coverage_fillers_follow_the_sentence_s_own_panel():
+    """The sentence's own pick leads its time (that is what the narrator is
+    talking about); coverage fillers follow in story order, even when they come
+    before it in the story."""
+    segs = [_show(1, "P001-04", 0.0, 12.0)]
+    align_engine.place_coverage(segs, _coverage_panels(6), 12.0, 3.0)
+    assert segs[0]["sequence"] == ["P001-04", "P001-01", "P001-02", "P001-03", "P001-05", "P001-06"]
+
+
+def test_fillers_prefer_a_sentence_long_enough_to_share_min_hold():
+    """filler_full: a filler goes to a sentence at least that long when one is
+    near, so the sentence's own picture still holds a full min_hold beside it.
+    P001-03 sits nearer to sentence 1, but only sentence 2 (9s) can be filled
+    end to end, so that is where it goes."""
+    segs = [_show(1, "P001-02", 0.0, 3.0), _show(2, "P001-05", 3.0, 12.0)]
+    align_engine.place_coverage(segs, _coverage_panels(6), 12.0, 3.0)
+    assert "P001-03" in segs[1]["sequence"]
+    assert "P001-03" not in segs[0]["sequence"]
+
+
+def test_a_filler_is_never_dropped_when_every_sentence_is_short():
+    """When every nearby sentence is under filler_full, the nearest ones take
+    the filler anyway - a panel the artist drew never disappears just because
+    the narration was choppy."""
+    segs = [_show(1, "P001-02", 0.0, 3.0), _show(2, "P001-03", 3.0, 6.0)]
+    cov = align_engine.place_coverage(segs, _coverage_panels(3), 6.0, 3.0)
+    assert cov["placed_by_order"] == ["P001-01"]
+    assert "P001-01" in segs[0]["sequence"]

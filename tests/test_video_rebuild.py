@@ -139,7 +139,9 @@ def test_coverage_places_every_unshown_art_panel_in_story_order():
     assert cov["uncovered"] == []
     assert sorted(cov["placed_by_order"]) == ["P001-02", "P001-03", "P001-04", "P001-06"]
     for s in segs:
-        assert s["sequence"] == sorted(s["sequence"])
+        # The sentence's own pick leads its time; coverage fillers follow in story order.
+        assert s["sequence"][0] == s["selected_panel"]
+        assert s["sequence"][1:] == sorted(s["sequence"][1:])
     shown = {p for s in segs for p in s["sequence"]}
     assert shown == {p["id"] for p in panels}
 

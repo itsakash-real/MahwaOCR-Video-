@@ -156,18 +156,23 @@ def test_forward_tag_beyond_the_window_is_trusted_but_flagged():
     assert seg["confidence"] == "tag_beyond_window_accepted"
 
 
-def test_backward_tag_is_not_trusted_blindly():
-    """A tag pointing well BEHIND the current position is the genuinely suspicious
-    case (the vampire-panel bug's cousin): search the forward window instead of
-    jumping the story backwards."""
+def test_backward_tag_is_trusted_but_flagged():
+    """A tag pointing well BEHIND the current position is a deliberate backward
+    glance (the recap looks back at a face or a wound). Reviewing the real
+    chapters showed the writer is right about these far more often than the
+    forward window guess, so the tag stands and the glance is flagged for
+    review instead of being silently overridden."""
     panels = [_panel(f"P{i:03d}-01") for i in range(1, 11)]
     sentences = [{"text": "He walks down the hallway.", "panels": ["P008-01"]},
                 {"text": "He opens the door.", "panels": ["P001-01"]}]
     segments = align_sentences(sentences, panels)
     seg = segments[1]
-    assert seg["selected_panel"] != "P001-01"
+    assert seg["selected_panel"] == "P001-01"
     assert seg["needs_review"] is True
-    assert seg["confidence"] == "tag_behind_cursor"
+    assert seg["confidence"] == "tag_behind_cursor_accepted"
+    # The backward glance is legal: validation must not fail the timeline for it.
+    result = validate(segments, _order(panels), duration=8.0)
+    assert result["checks"]["no_backward_jumps"] == "PASS"
 
 
 # ------------------------------------------------------------------ validate()

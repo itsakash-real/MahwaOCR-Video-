@@ -131,7 +131,7 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
             window = seg.get("candidate_window") or []
             if window and pid not in window:
                 fail("no_outside_interval_display", n, f"{pid} was selected but isn't in its own candidate_window")
-            if pos < last_pos - JUMP_TOLERANCE:
+            if pos < last_pos - JUMP_TOLERANCE and seg.get("confidence") != "tag_behind_cursor_accepted":
                 fail("no_backward_jumps", n, f"{pid} (position {pos}) is behind the running position {last_pos}")
             span = max(1, len(window)) if window else 1
             if pos > last_pos + max(span, JUMP_TOLERANCE) and seg.get("confidence") not in {
