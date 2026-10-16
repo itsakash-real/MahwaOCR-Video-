@@ -1085,3 +1085,36 @@ def test_claude_md_only_points_at_agents_md_and_agents_md_has_one_video_section(
     assert "Set reviewed: true" not in guide and "Compute clean_art_bounds" not in guide
     user = (ROOT / "USER_GUIDE.md").read_text(encoding="utf-8")
     assert "that shot's `cards[0].crop` in the plan" not in user and "Before you record audio" in user
+
+
+# ====================================================================== found while verifying on Lumberjack
+
+
+def test_a_speech_bubble_panel_is_not_a_pale_head():
+    """A white bubble with lettering must not be read as a silver-haired head (it would keep a
+    text-only panel in the video instead of dropping it)."""
+    from manhwa_ocr.video.crops import _panel_maps, head_of, pale_head
+
+    img = Image.new("RGB", (700, 440), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.ellipse((40, 30, 660, 410), outline=(0, 0, 0), width=4)
+    for k, y in enumerate(range(130, 330, 46)):          # lines of lettering
+        d.rectangle((150, y, 550 - 30 * (k % 2), y + 24), fill=(10, 10, 10))
+    maps = _panel_maps(img, {})
+    assert pale_head(maps) is None
+    assert head_of(maps)["figure"] is False
+
+
+def test_a_card_shows_only_the_art_when_white_rows_sit_on_the_panel_edge():
+    from manhwa_ocr.video.crops import _panel_maps, shape_candidates
+
+    img = Image.new("RGB", (400, 700), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 200, 399, 499), fill=(120, 70, 50))
+    for x in range(0, 400, 6):
+        d.line((x, 200, x, 499), fill=(60, 40, 90))
+    maps = _panel_maps(img, {})
+    best = shape_candidates(img, 1.0, maps, fallback=False, allow_pad=True)[0]
+    x0, y0, x1, y1 = best["box"]
+    assert (x0, x1) == (0.0, 1.0) and y0 == pytest.approx(200 / 700, abs=0.01) and y1 == pytest.approx(500 / 700, abs=0.01)
+    assert best["pad_y"] > 0                              # the rest of the square is blurred panel, not white

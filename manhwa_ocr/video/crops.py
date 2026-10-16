@@ -513,7 +513,10 @@ def face_top(maps: Dict[str, Any]) -> float | None:
 FIGURE_CLEAR = 0.01      # skin share above this: a character is clearly in the panel
 KEEP_TOP = 0.25          # no head found but a figure is: a window never starts this far down the panel
 PALE_LEVELS = (170, 140, 110)   # brightness floors tried for a pale/gray head blob
-PALE_CONTRAST = 35       # a head blob must differ from its surroundings by at least this much gray
+PALE_CONTRAST = 35
+MOSTLY_WHITE = 0.5     # a panel more than this white has no pale head
+LETTER_DARK = 80       # gray level of lettering strokes
+LETTER_SHARE = 0.05    # share of a pale blob's middle that is lettering before it is called a bubble       # a head blob must differ from its surroundings by at least this much gray
 
 
 def _ring(pix: np.ndarray, r: int = 2) -> np.ndarray:
@@ -544,6 +547,8 @@ def pale_head(maps: Dict[str, Any]) -> Dict[str, float] | None:
     h, w = gray.shape
     if h < 12 or w < 12:
         return None
+    if float((gray > 225).mean()) > MOSTLY_WHITE:
+        return None                                    # a mostly white panel is lettering or a blank page, not a figure
     bubbles = list(maps.get("bubbles") or [])
     best = None
     for level in PALE_LEVELS:
@@ -560,6 +565,10 @@ def pale_head(maps: Dict[str, Any]) -> Dict[str, float] | None:
             box = (x0 / w, y0 / h, x1 / w, y1 / h)
             if any(_overlap_share(box, b) >= 0.5 for b in bubbles):
                 continue                               # lettering's white, not hair
+            my, mx = max(1, int(0.15 * bh)), max(1, int(0.15 * bw))
+            inner = gray[y0 + my:y1 - my, x0 + mx:x1 - mx]
+            if inner.size and float((inner < LETTER_DARK).mean()) > LETTER_SHARE and float(np.median(gray[y0:y1, x0:x1])) > 200:
+                continue                               # a white shape with writing inside: a speech bubble, not hair
             ring = _ring(pix, 2)
             # Surroundings only where the picture really is (the ring may fall off an edge).
             gy0, gx0 = max(0, y0 - 2), max(0, x0 - 2)
@@ -639,13 +648,15 @@ def figure_share(img: Image.Image) -> float:
 
 
 NARROW_COST = 6.0        # a window narrower than the panel: only when nothing full-width is clean
+ART_PAD_COST = 1.5       # per unit of padding when the card shows only the art of a panel with white edge rows
 PAD_COST = 3.0           # per unit of blurred padding a card would need above/below the panel
 CUT_COST = 0.8           # per unit of the panel's height a full-width window leaves out
 PAD_MAX = 2.5            # never pad a panel to more than this multiple of its own height
 MIN_WIDTH_KEPT = 0.9
 
 
-def _full_width_boxes(aspect: float, pa: float, fe, fb, minw: float, allow_pad: bool = False):
+def _full_width_boxes(aspect: float, pa: float, fe, fb, minw: float, allow_pad: bool = False,
+                      edge=(0.0, 0.0)):
     """Candidate boxes that keep the panel's whole width: (x0, y0, x1, y1, extra_cost, pad_y).
 
     - A shape at least as wide as the panel (aspect >= panel aspect): a full-width window
@@ -668,8 +679,14 @@ def _full_width_boxes(aspect: float, pa: float, fe, fb, minw: float, allow_pad: 
             for y0 in ys:
                 out.append((x0, y0, x0 + bw, y0 + bh, extra + CUT_COST * max(0.0, 1.0 - bh), 0.0))
 
+    et, eb = edge
     if r >= 1.0 - 1e-9:
         vertical(1.0, 1.0 / r, [0.0], 0.0)
+        ah, bh = 1.0 - et - eb, 1.0 / r
+        if allow_pad and et + eb >= 0.02 and ah >= 0.2 and ah < bh <= PAD_MAX:
+            # White rows (a gutter, or a painted-out bubble) sit on the panel's edge: show only the
+            # art, full width, and pad the rest of the shape with the blurred panel instead of white.
+            out.append((0.0, et, 1.0, 1.0 - eb, ART_PAD_COST * (bh - ah), (bh - ah) / 2))
         for bw in sorted({0.95, minw}, reverse=True):
             if minw <= bw < 1.0 - 1e-9 and bw / r <= 1.0 + 1e-9:
                 vertical(bw, bw / r, [0.0, (1.0 - bw) / 2, 1.0 - bw], NARROW_COST)
@@ -729,7 +746,7 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
     boxes: List[Tuple[float, float, float, float, float, float]] = []      # x0, y0, x1, y1, extra cost, pad_y
     if full_width:
         minw = min(1.0, max(0.5, float(m.get("min_width_kept", MIN_WIDTH_KEPT))))
-        boxes = _full_width_boxes(aspect, panel_aspect, fe, fb, minw, allow_pad)
+        boxes = _full_width_boxes(aspect, panel_aspect, fe, fb, minw, allow_pad, m.get("edge_rows") or (0.0, 0.0))
     if not boxes and (fallback or not full_width):
         boxes = _legacy_boxes(aspect, panel_aspect, fe, fb)
     if not boxes:
@@ -756,10 +773,12 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
     skin = window_mean("skin")
     blank = window_mean("blank")
     head_ok = np.ones(len(B), dtype=bool)
+    et, eb = m.get("edge_rows") or (0.0, 0.0)
     if fe is not None:
-        head_ok &= y0 <= fe - HEAD_MARGIN
+        # The margin above a head cannot reach past the art itself (beyond it is white).
+        head_ok &= y0 <= max(fe - HEAD_MARGIN, min(et, fe)) + 1e-9
         if fb is not None:
-            head_ok &= y1 >= fb + HEAD_MARGIN
+            head_ok &= y1 >= min(fb + HEAD_MARGIN, max(1.0 - eb, fb)) - 1e-9
     keep_cost = 0.0
     if keep_top:
         # A figure but no head located: never crop the top of the panel away; prefer keeping it all.
@@ -778,7 +797,8 @@ def shape_candidates(img: Image.Image, aspect: float, maps: Dict[str, Any] | Non
 
     bubble = worst_overlap(m["bubbles"])
     painted = worst_overlap(m["painted"])
-    score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + extra + keep_cost
+    white = (np.maximum(0.0, et - y0) + np.maximum(0.0, y1 - (1.0 - eb))) / np.maximum(y1 - y0, 1e-9)
+    score = (2.0 * texty + 4.0 * blank - 0.6 * soft - 0.5 * skin + extra + keep_cost + 6.0 * white
              + (soft < 0.02).astype(float) + np.where(head_ok, 0.0, 5.0)
              + 3.0 * painted                                    # a painted patch is flat: avoid it
              + 20.0 * bubble + np.where(bubble > BUBBLE_OK, 30.0, 0.0))  # bubble text outranks a head risk

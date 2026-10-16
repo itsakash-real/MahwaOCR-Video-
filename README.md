@@ -9,7 +9,7 @@ Get a 1080p video, cut to your narration, from one terminal command.
 
 ![python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![tests](https://img.shields.io/badge/tests-354%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-356%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/tested%20on-Windows-lightgrey)
 ![deps](https://img.shields.io/badge/runtime%20deps-4-blue)
 ![no sdks](https://img.shields.io/badge/vendor%20SDKs-none-orange)
@@ -227,7 +227,7 @@ ManhwaRecaps/<series>/           your output (kept outside the program folder)
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -q        # 354 tests
+python -m pytest tests/ -q        # 356 tests
 ```
 
 - **New site:** subclass `Scraper` in `scrapers.py`.

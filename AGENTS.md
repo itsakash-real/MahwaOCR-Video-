@@ -408,7 +408,7 @@ That split means prompt iteration on assembly does not re-pay for vision.
 python -m pytest tests/ -q
 ```
 
-354 tests, including a regression test for every bug found in the full audit
+356 tests, including a regression test for every bug found in the full audit
 (`tests/test_audit.py`). Run them after any change to this package. They cover slicing geometry,
 memory merge semantics, session isolation, the agent flow, link parsing, recaps,
 the `next` workflow, and video (panels, sync, plans, frames, rendering, clips).
