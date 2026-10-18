@@ -641,7 +641,7 @@ def cmd_video(args) -> int:
         if not rows:
             _log("No transcribed chapters yet.")
             return 0
-        _log(f"{'ch':<6}{'recap':<8}{'tags':<7}{'audio':<10}{'panels':<8}{'align':<12}{'plan':<26}video")
+        _log(f"{'ch':<6}{'recap':<8}{'tags':<7}{'audio':<10}{'panels':<8}{'align':<12}{'plan':<26}{'sync':<10}video")
         for r in rows:
             plan = r["plan"]
             align = r["alignment"]
@@ -650,14 +650,28 @@ def cmd_video(args) -> int:
                       else f"{align['review_queue']} review" if align["review_queue"] else "ok")
             plan_s = "-" if not plan else ("BROKEN" if plan["broken"] else "old style: rebuild" if plan["outdated"] else
                                            f"{plan['sync']}{' reviewed' if plan['reviewed'] else ''}{' edited' if plan['edited'] else ''}")
+            audit = r.get("sync_audit")
+            if not audit:
+                sync_s = "-"
+            elif audit.get("broken"):
+                sync_s = "BROKEN"
+            elif not audit.get("fresh"):
+                sync_s = "stale"
+            elif audit.get("pass"):
+                sync_s = "ok"
+            else:
+                wrong = audit.get("wrong_ratio")
+                sync_s = f"FAIL{f' {wrong:.0%}' if wrong is not None else ''}"
             audio_s = f"{r['duration']:.0f}s" if r["duration"] else ("yes" if r["audio"] else "-")
             video_s = "-" if not r["video"] else ("ok" if r["video_up_to_date"] else "outdated")
             tags = f"{r['tagged']:.0%}" if r["tagged"] is not None else "-"
             _log(f"{r['chapter']:<6}{'yes' if r['recap'] else '-':<8}{tags:<7}{audio_s:<10}{r['panels'] or '-':<8}"
-                 f"{align_s:<12}{plan_s:<25} {video_s}")
+                 f"{align_s:<12}{plan_s:<25} {sync_s:<9}{video_s}")
         _log("\n'align' is video align's own check: a sentence it couldn't resolve with full "
             "confidence (never confirmed by you) shows as \"N review\" - open its pairing sheet "
-            "or PROMPTS.md before trusting the video for that stretch.")
+            "(video pair) before trusting the video for that stretch.")
+        _log("'sync' is the last sync-audit gate result for the current plan (ok / FAIL / stale; "
+            "run  video sync-audit --chapter N  for the details).")
         _log(f"\nAudio goes in: {sess.path / 'audio'}  (chapter_N.mp3 / .wav / .m4a)")
         return 0
 
@@ -683,6 +697,28 @@ def cmd_video(args) -> int:
                          pages_from=Path(args.pages) if args.pages else None, log=_log)
             _log(f"  review: .work/video/ch{c}/REVIEW.md   then:  python -m manhwa_ocr video render "
                  f"--chapter {c}{_pin(sess)}")
+        return 0
+
+    if action == "intro":
+        from .video import intro as intro_mod
+
+        if args.prepare:
+            intro_mod.prepare(sess, log=_log)
+            _log("  next: write intro/intro.json, record audio/chapter_0.mp3, then:  "
+                 f"python -m manhwa_ocr video intro{_pin(sess)}")
+            return 0
+        out = intro_mod.run(sess, cfg, sync="off" if args.no_sync else "auto", fmt=args.format,
+                            preview=args.preview, workers=args.workers, plan_only=args.dry_run, log=_log)
+        if out is not None:
+            _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+        return 0
+
+    if action == "sync-audit":
+        from .video import syncaudit
+
+        for c in chapters(default_all=False):
+            _log(f"=== Chapter {c} ===")
+            syncaudit.run(sess.path, c, cfg, log=_log)
         return 0
 
     if action == "pair":
@@ -763,11 +799,16 @@ def cmd_video(args) -> int:
         from .video import verify as vf
 
         for c in chapters(default_all=False):
-            vb.make_plan(sess, c, cfg, force=True, sync="off" if args.no_sync else "auto",
-                         fmt=args.format, log=_log)
             from .video.media import video_dir
 
-            rep = json.loads((video_dir(sess.path) / f"chapter_{c}.verify.json").read_text(encoding="utf-8"))
+            # make_plan writes chapter_N.verify.json as part of planning, and
+            # rebuilds whenever its inputs changed -- so a second full plan
+            # buys nothing. Only force a rebuild when no verify report exists
+            # yet (e.g. it was deleted while the plan survived).
+            vpath = video_dir(sess.path) / f"chapter_{c}.verify.json"
+            vb.make_plan(sess, c, cfg, force=not vpath.exists(), sync="off" if args.no_sync else "auto",
+                         fmt=args.format, log=_log)
+            rep = json.loads(vpath.read_text(encoding="utf-8"))
             _log(f"=== Chapter {c}: checked {len(rep['panels'])} drawn panels ===")
             for pid, r in rep["panels"].items():
                 if r["action"] != "ok":
@@ -800,7 +841,7 @@ def cmd_video(args) -> int:
             _log(f"=== Chapter {c} ===")
             vb.render_chapter(sess, c, cfg, preview=args.preview, workers=args.workers,
                               allow_estimated=args.force, allow_unreviewed=args.force,
-                              strict=args.strict, log=_log)
+                              allow_sync_fail=args.force, strict=args.strict, log=_log)
         return 0
 
     if action == "build":
@@ -939,8 +980,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "storyboard", "render",
-                                      "build", "clip", "compile", "verify", "review", "approve"])
+    p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+                                      "build", "clip", "compile", "verify", "review", "approve", "intro"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
     p.add_argument("--force", action="store_true", help="rebuild even if up to date (discards plan edits)")
@@ -957,7 +998,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-titles", dest="no_titles", action="store_true", help="compile without title cards")
     p.add_argument("--name", help="compiled output name")
     p.add_argument("--apply", action="store_true", help="pair: save the fixed tags from pairs.json")
-    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing")
+    p.add_argument("--prepare", action="store_true",
+                   help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing; intro: plan only, no render")
     p.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
                    help="review: how many review-and-fix rounds to allow (default 3)")
     ws(p)

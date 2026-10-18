@@ -25,10 +25,13 @@ from PIL import Image
 from ..util import UserError, atomic_save_image, atomic_write_text, require_chapter, sort_chapters
 from . import align_engine
 from . import cues as cues_mod
+from . import sync as sync_mod
+from . import syncaudit
 from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, run, video_info
 from .frames import background, format_from, shapes_for
 from . import fixes as fixes_mod
 from .verify import verify_chapter
+from .plan import map_options
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
 from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, units_from_alignment, validate
@@ -84,7 +87,8 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         for c in s.get("cards") or []:
             pw, ph = dims.get(c["panel"], (1.0, 1.0))
             x0, y0, x1, y1 = (float(v) for v in c["crop"])
-            aspect = ((x1 - x0) * pw) / max(1e-9, (y1 - y0) * ph)
+            pad = float(c.get("pad_y") or 0.0)          # blurred padding above and below the crop
+            aspect = ((x1 - x0) * pw) / max(1e-9, ((y1 - y0) + 2 * pad) * ph)
             if min(abs(math.log(aspect / a)) for a in allowed) > 0.02:
                 shape_bad.append(f"{s.get('id')} {c['panel']} ({aspect:.2f})")
     shortest = min((float(s["end"]) - float(s["start"]) for s in shots), default=0.0)
@@ -97,8 +101,12 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     if cs.get("bubble"):
         failures.append(f"{len(cs['bubble'])} panel(s) would show a speech bubble or caption in their card: "
                         f"{', '.join(cs['bubble'][:8])}")
-    if shots and shortest < min_hold - 0.01:
-        failures.append(f"a shot lasts {shortest:.2f}s, under the {min_hold:g}s minimum")
+    # A shot under the floor is the honest price of dense narration (one-word
+    # sentences): it is counted in timing.short_shots and never fixed by
+    # stealing time from neighbours, so only a shot too short to be seen at
+    # all (under 0.2s) stops the build.
+    if shots and shortest < 0.2 - 1e-6:
+        failures.append(f"a shot lasts {shortest:.2f}s - too short to be seen (under 0.2s)")
     return {
         "chapter": plan.get("chapter"),
         "failures": failures,
@@ -106,7 +114,11 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "placed_by_order": (align_cov or {}).get("placed_by_order", []),
         "text_only_excluded": [p["id"] for p in panels["panels"] if p.get("text_only")],
         "shots": len(shots), "shortest_shot": round(shortest, 2), "timing": plan.get("timing"),
+        "floor": round(float(min_hold), 3),
+        "short_shots": (plan.get("timing") or {}).get("short_shots", 0),
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
+        "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
+        "low_confidence_heads": cs.get("low_confidence_heads", []),
         "review_queue": plan.get("alignment_review_queue") or [],
         "sync": plan.get("sync"),
     }
@@ -129,7 +141,14 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
     ap = align_engine.alignment_path(root, chapter)
     st = audio.stat() if audio else None
     knobs = {k: vcfg.get(k) for k in ("min_shot", "max_shot", "target_shot", "lead", "pair_ratio", "fps",
-                                      "music", "music_volume", "effects")}
+                                      "min_hold", "sync", "music", "music_volume", "effects")}
+    # Framing options join the hash only when changed from their defaults, so plans built
+    # before they existed stay current (a rebuild would re-frame every card).
+    crop_opts = {k: v for k, v in map_options(vcfg).items()
+                 if v != {"full_width": True, "min_width_kept": 0.9, "white_threshold": 242,
+                          "black_threshold": 13, "pale_heads": True, "keep_top": 0.25}[k]}
+    if crop_opts:
+        knobs["crop"] = crop_opts
     return {
         "panels": panels_fp,
         "audio": [audio.name, st.st_size, int(st.st_mtime)] if st else None,
@@ -160,6 +179,30 @@ def _alignment_status(root: Path, chapter: str) -> Dict[str, Any] | None:
         "sync_mode": data.get("sync_mode"),
         "validation_status": (data.get("validation") or {}).get("status"),
         "review_queue": len(data.get("review_queue") or []),
+    }
+
+
+def _sync_audit_status(root: Path, chapter: str, plan_file: Path) -> Dict[str, Any] | None:
+    """Read-only peek at chapter_N.syncaudit.json for `video status`: the sync
+    gate result of the last audit, and whether that audit still belongs to the
+    current plan (a rebuilt plan invalidates it)."""
+    path = syncaudit.audit_path(root, chapter)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"broken": True}
+    if not isinstance(data, dict):
+        return {"broken": True}
+    fresh = plan_file.exists() and path.stat().st_mtime >= plan_file.stat().st_mtime
+    gate = data.get("gate") or {}
+    return {
+        "broken": False,
+        "fresh": fresh,
+        "pass": bool(gate.get("pass")),
+        "failures": [str(f) for f in (gate.get("failures") or [])],
+        "wrong_ratio": (data.get("wrong_picture") or {}).get("ratio"),
     }
 
 
@@ -218,6 +261,7 @@ def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str
         "video": video.name if video.exists() else None,
         "video_up_to_date": up_to_date,
         "preview": preview.name if preview.exists() else None,
+        "sync_audit": _sync_audit_status(root, chapter, plan_file),
         "storyboards": [p.name for p in storyboard_paths(root, chapter)],
     }
 
@@ -231,6 +275,13 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     vcfg = dict(cfg.video)
     fmt = fmt or vcfg.get("format", "16:9")
     ensure_gitignore(root)
+    # The numbers that decide timing, printed before any work so the plan's
+    # meta can always be traced back to what the config said.
+    sync_settings = sync_mod.effective_settings(vcfg, log=log)
+    log(f"  chapter {chapter}: sync/hold settings: min_hold={sync_settings['min_hold']:g}s, "
+        f"lead={sync_settings['lead']:g}s, max_late={sync_settings['max_late']:g}s, "
+        f"min_hold_short={sync_settings['min_hold_short']:g}s, max_hold={sync_settings['max_hold']:g}s, "
+        f"max_unmatched={sync_settings['max_unmatched']:g}s")
 
     if pages_from:
         from ..images import import_pages, list_images
@@ -303,7 +354,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     fmt_obj = format_from(fmt, int(vcfg.get("fps", 30)))
     shapes = sorted({a for k in ("single", "pair", "wide") for a in shapes_for(k, fmt_obj)})
     report = verify_chapter(panels["panels"], lambda p: panel_image(root, chapter, p, norm_w, clean=True),
-                            shapes, root, chapter, log=log)
+                            shapes, root, chapter, log=log, options=map_options(vcfg))
     drop = {d["panel"]: d["reason"] for d in report["dropped"]}
     drop.update(fixes["drop"])
     for p in panels["panels"]:
@@ -348,21 +399,25 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
 
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
-                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True), fixes=fixes)
+                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True), fixes=fixes,
+                      settings=sync_settings)
     plan["inputs"] = inputs
     plan["generated_hash"] = _shots_hash(plan)
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
-    qa = quality_report(plan, panels, align_cov, float(vcfg.get("min_hold", 3.0)))
+    qa = quality_report(plan, panels, align_cov,
+                        min(sync_settings["min_hold"], sync_settings["min_hold_short"]))
     atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
     if qa["failures"]:
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])
                         + f"\nDetails: video/chapter_{chapter}.qa.json")
     save_plan(root, chapter, plan)
     log(f"  chapter {chapter}: {len(plan['shots'])} shots, {mode_note}")
+    short_note = (f"; {qa['short_shots']} shot(s) under the {qa['floor']:g}s floor (dense narration, "
+                  f"left honest instead of stealing time)") if qa["short_shots"] else ""
     log(f"    all {qa['shown_panels']}/{qa['art_panels']} drawn panels shown; shortest shot "
-        f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order")
+        f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order{short_note}")
     if qa["head_risk"]:
         log(f"    ! {len(qa['head_risk'])} panel(s) where a head may be cut: {', '.join(qa['head_risk'][:8])}")
     if qa["review_queue"]:
@@ -375,7 +430,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
 
 def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: int = 0,
                    allow_estimated: bool = False, allow_unreviewed: bool = False, strict: bool = False,
-                   log: Callable = print) -> Path:
+                   allow_sync_fail: bool = False, log: Callable = print) -> Path:
     root, chapter = sess.path, require_chapter(chapter)
     panels = load_panels(root, chapter)
     if not panels:
@@ -396,6 +451,46 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
             f"Fix the sync first: lower `whisper_model` in manhwa-ocr.yaml (e.g. to base.en or tiny.en if your "
             f"machine is low on RAM), then rebuild the plan:  video plan --chapter {chapter} --force\n"
             f"To render with the estimated timing anyway, pass --force to render.")
+    if plan.get("sync") == "synced":
+        # The sync gate: the audit samples the plan against the narration and
+        # fails on wrong-picture time and late cuts. It runs here, on the plan
+        # about to be rendered, and its report stays beside it for status.
+        # Reuse a fresh audit instead of recomputing it: the agent workflow
+        # already runs `video sync-audit` before render, and an audit is only
+        # valid for the plan it was computed from (mtime check).
+        report = None
+        audit_file = syncaudit.audit_path(root, chapter)
+        plan_file = plan_path(root, chapter)
+        if (audit_file.exists() and plan_file.exists()
+                and audit_file.stat().st_mtime >= plan_file.stat().st_mtime):
+            try:
+                cached = json.loads(audit_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cached = None
+            if (isinstance(cached, dict) and isinstance(cached.get("gate"), dict)
+                    and isinstance(cached.get("wrong_picture"), dict)
+                    and "ratio" in cached["wrong_picture"]):
+                report = cached
+                log("  sync gate: using the existing audit (plan unchanged since it ran)")
+        if report is None:
+            report = syncaudit.make_report(root, chapter, cfg, log=log)
+        gate = report["gate"]
+        if gate["failures"]:
+            detail = "; ".join(gate["failures"])
+            if not allow_sync_fail:
+                raise UserError(
+                    f"Chapter {chapter}'s pictures don't match the narration closely enough to render "
+                    f"(sync gate): {detail}.\n"
+                    f"See the worst stretches:  video sync-audit --chapter {chapter}\n"
+                    f"If these thresholds are wrong for this series, adjust video.sync.gate_wrong, "
+                    f"gate_window or gate_grace in manhwa-ocr.yaml.\n"
+                    f"To render anyway, pass --force to render.")
+            log(f"  ! sync gate failed ({detail}); rendering anyway (--force)")
+        else:
+            worst = ((report.get("five_second") or {}).get("worst") or {}).get("wrong")
+            worst_s = "none" if worst is None else f"{worst:.0%}"
+            log(f"  sync gate: PASS (wrong-picture {report['wrong_picture']['ratio']:.1%} of judged time, "
+                f"worst 5s window {worst_s})")
     queue = plan.get("alignment_review_queue") or []
     if queue and not strict:
         log(f"  ! {len(queue)} sentence(s) flagged for review; rendering anyway "
@@ -407,7 +502,7 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
             f"confidence, never reviewed (sentence numbers: {shown}) — one of these may be the wrong "
             f"picture for its sentence.\n"
             f"Look at them first: open .work/video/ch{chapter}/pairing_NN.png for those sentence numbers, "
-            f"or use the checkpointed review template in PROMPTS.md. Fix pairs.json if anything's wrong, "
+            f"or run `video pair --chapter {chapter}`. Fix pairs.json if anything's wrong, "
             f"then `video align --chapter {chapter}` and `video plan --chapter {chapter} --force` again.\n"
             f"To render anyway, pass --force to render.")
     if plan.get("panels_fingerprint") and plan["panels_fingerprint"] != panels.get("fingerprint"):
@@ -436,7 +531,8 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
                 log(f"  {out.name} is up to date")
                 continue
             path = render_chapter(sess, chapter, cfg, preview=preview, workers=workers,
-                                  allow_estimated=force, allow_unreviewed=force, log=log)
+                                  allow_estimated=force, allow_unreviewed=force,
+                                  allow_sync_fail=force, log=log)
             results[chapter] = f"rendered: {path.name}"
         except UserError as exc:
             results[chapter] = f"failed: {exc}"

@@ -2,8 +2,24 @@
 
 This guide walks the whole job in order: chapter links → transcripts → recap
 scripts → your narration → finished videos. You only do three things by hand:
-**paste links**, **record audio**, and **paste prompts into Antigravity**.
+**paste links**, **record audio**, and **paste prompts into your coding agent** (Claude Code or Antigravity).
 The agent does the rest.
+
+---
+
+## Which prompt do I use?
+
+Every prompt below is also a button on the dashboard ("Copy agent prompt: ..."). They all start with the same
+common rules, and they all come from one file, `manhwa_ocr/agent_prompts.py`, so they never disagree.
+
+| I want to... | Prompt | Where |
+|---|---|---|
+| Transcribe the chapters | A: transcribe | Step 2 |
+| Write recap scripts | B: recaps | Step 3 |
+| Make the videos | C: build | Step 5 |
+| Check a storyboard shot by shot | D: review | Step 5b, Way A (also in `.work/video/chN/REVIEW.md`) |
+| Make the intro (chapter 0) | E: intro | The intro section |
+| Fix one chapter after an error or a wrong shot | F: fix chapter | Step 6 |
 
 ---
 
@@ -51,7 +67,8 @@ C:\Users\akash\Documents\ManhwaRecaps\the-hero-cannot-rest\
 │   └── chapter_1.mp3       ← STEP 4: YOU put your recording here
 ├── video\
 │   ├── chapter_1.mp4       ← STEP 5: the finished video
-│   ├── chapter_1.plan.json ←   the edit (what shows when); editable
+│   ├── chapter_1.plan.json ←   the edit (what shows when); rebuilt each time, don't edit
+│   ├── chapter_1.fixes.json←   your framing fixes (drop, face, crop, shot); kept across rebuilds
 │   └── chapter_1.storyboard_01.png ← one frame per shot, for review
 ├── media\ch1\              ←   page images + panel sheets (used by video)
 └── .work\                  ←   scratch; cleaned automatically, ignore it
@@ -147,10 +164,24 @@ Open Antigravity CLI **in your output folder, `C:\Users\akash\Documents\ManhwaRe
 press **Copy agent prompt: transcribe** on the dashboard, which fills in the
 series for you):
 
-> Read AGENTS.md. Work only on the series "The Hero Cannot Rest". Keep running
-> `python -m manhwa_ocr next --session "the-hero-cannot-rest"` and doing exactly
-> what it says, until it reports every chapter is transcribed. Do not stop after
-> one chapter.
+```text
+Read AGENTS.md first.
+Work only on the series "The Hero Cannot Rest". Put --session "the-hero-cannot-rest" on every command. Copy commands exactly.
+Run only `python -m manhwa_ocr ...` commands.
+Never import manhwa_ocr in `python -c`. Never read or patch the program's source.
+Never edit anything under manhwa_ocr\, tests\ or the program root.
+Never create, convert, trim or generate audio. If audio is missing, stop and tell me the path.
+Never rewrite a recap whose chapter already has audio unless I ask.
+If a command fails or its output is confusing, STOP and show me the exact command and the exact error.
+Do not work around a tool bug by hand-editing generated files (alignment.json, plan.json timestamps or panels, panels.json).
+Keep a log: append every manual edit you make (file, what, why) to .work\agent_log.md.
+Ask me before running anything with --force that discards edits.
+
+Keep running `python -m manhwa_ocr next --session "the-hero-cannot-rest"` and do exactly what it says.
+Every command it prints already includes --session. Process chapters in order.
+Do not stop after one chapter. Stop only when it reports every chapter is transcribed.
+If you are interrupted, run the same `next` command again to pick up where you left off.
+```
 
 For each chapter the agent downloads the pages, cuts the tall strips into
 readable pieces, reads them, and writes `chapter_N.md`. The character memory
@@ -178,11 +209,42 @@ its own, without an agent.)
 When every chapter is transcribed, `next` moves on to recaps. Paste this into
 Antigravity (or press **Copy agent prompt: recaps**):
 
-> Read AGENTS.md. Run `python -m manhwa_ocr recap --session "the-hero-cannot-rest" --chapters 1-7 --prepare --minutes 6`,
-> then read the TASK.md it prints and write the narration it asks for into the
-> parts.json it names. Write original narration in your own words and quote the
-> source only briefly. Finish with
-> `python -m manhwa_ocr recap --session "the-hero-cannot-rest" --finalize`.
+```text
+Read AGENTS.md first.
+Work only on the series "The Hero Cannot Rest". Put --session "the-hero-cannot-rest" on every command. Copy commands exactly.
+Run only `python -m manhwa_ocr ...` commands.
+Never import manhwa_ocr in `python -c`. Never read or patch the program's source.
+Never edit anything under manhwa_ocr\, tests\ or the program root.
+Never create, convert, trim or generate audio. If audio is missing, stop and tell me the path.
+Never rewrite a recap whose chapter already has audio unless I ask.
+If a command fails or its output is confusing, STOP and show me the exact command and the exact error.
+Do not work around a tool bug by hand-editing generated files (alignment.json, plan.json timestamps or panels, panels.json).
+Keep a log: append every manual edit you make (file, what, why) to .work\agent_log.md.
+Ask me before running anything with --force that discards edits.
+
+1. Run `python -m manhwa_ocr recap --session "the-hero-cannot-rest" --chapters 1-7 --prepare --minutes 6`.
+   Read the TASK.md it prints and open the panel contact sheets it names.
+2. Write original narration: commentary, not a re-read of the dialogue.
+   Quote the source only briefly, for lines that land.
+   Do not add knowledge from later chapters.
+3. Tagging rules. Check each one before you finalize.
+   - Tag EVERY sentence. Target a tagged ratio of 95% or higher.
+   - Use only drawn panels. Never tag a panel marked text-only, credits or watermark.
+   - Put each panel tag on the sentence that is actually spoken over it.
+     Never stack several tags on one sentence and leave the next sentence untagged.
+   - Use {same} only when the next sentence really continues the same picture.
+4. Write for the ear.
+   - Spell numbers as words ("ninety-nine", "one hundred").
+   - Avoid runs of very short sentences. Keep most sentences at 8 words or more.
+   - No stage directions or brackets in spoken text, except the allowed tags.
+5. Length check: at least about 7.5 spoken words per drawn panel in the chapter
+   (3-second minimum hold at about 150 words per minute).
+   Take the panel count from the tool's own output, never from a script of your own.
+6. Run `python -m manhwa_ocr recap --session "the-hero-cannot-rest" --finalize`.
+   Fix every error. Read every warning. Report the tagged ratio and the word count per chapter.
+7. Then STOP. Tell me to record each recaps\chapter_N.tts.txt and save it as audio\chapter_N.mp3.
+   Remind me: record from the finalized tts.txt. If the recap is edited afterwards, I must record again.
+```
 
 - `--chapters` takes `3`, `1-7`, or `1-4,11`. Chapters that already have a recap
   are skipped, so asking for `1-10` after doing `1-4` only writes 5–10. Add
@@ -234,6 +296,26 @@ is marked as needing a rebuild.
 **Important:** record from the *current* script. If a recap is rewritten later,
 record it again, or the pictures won't line up with your words.
 
+### Before you record audio: the checklist
+
+The pictures are matched to the script as it stands now, so settle the script
+first. If the agent says a chapter is ready, check these (the tool warns about
+most of them when the recap is finalized):
+
+- [ ] **At least 95% of the sentences carry a panel tag.** Under 90% is a warning.
+- [ ] **One panel per sentence** wherever possible (a few sentences may show two).
+- [ ] **Drawn panels only.** No tag on a caption, a blank page or a credits panel;
+      finalize refuses those and names the sentence.
+- [ ] **Numbers are spelled out** in `chapter_N.tts.txt` (new recaps do this
+      automatically: 99 becomes "ninety nine"), so the voice and the text agree.
+- [ ] **No run of three or more very short sentences** (under six words each);
+      they flash by too quickly to show a picture.
+- [ ] **Enough words for every panel**: about 7.5 words per drawn panel, so each
+      picture can stay up for its minimum time.
+- [ ] **Never record from a script that was edited after finalizing.** If the
+      recap text changes at all, have the agent run `recap --finalize` again and
+      record the new `chapter_N.tts.txt`. Never re-record from a hand-edited script.
+
 ---
 
 ## Step 5 — Build the videos (agent)
@@ -242,24 +324,52 @@ As soon as a chapter has audio, `next` says to build its video. Paste this into
 Antigravity (or press **Copy agent prompt: build videos**, which includes every
 chapter that has audio):
 
-> Read AGENTS.md (section "Making videos"). First run
-> `python -m manhwa_ocr video pair --chapters 1-7 --session "the-hero-cannot-rest"`,
-> look at every pairing sheet and fix pairs.json so each sentence has the panel
-> that shows it, then apply it with `--apply`. Then run
-> `python -m manhwa_ocr video build --chapters 1-7 --session "the-hero-cannot-rest"`,
-> which runs the alignment step (deciding which panel shows for every sentence,
-> written to chapter_N.alignment.json) before planning and rendering each
-> chapter. For each chapter it builds, open the storyboard images listed in
-> .work/video/chN/REVIEW.md and check that every shot's picture matches the
-> sentence spoken over it. If a shot's *picture* is wrong, fix it in pairs.json
-> (see above) and re-run `video align` + `video plan --chapter N --force` for
-> that chapter — never edit a shot's `panel` field directly in
-> video/chapter_N.plan.json, it gets overwritten the next time the plan is
-> rebuilt. For a pure presentation fix (crop, entrance, background), edit that
-> shot in video/chapter_N.plan.json as REVIEW.md describes, set
-> "reviewed": true, then run
-> `python -m manhwa_ocr video render --chapter N --session "the-hero-cannot-rest"`
-> for each chapter you changed.
+```text
+Read AGENTS.md first.
+Work only on the series "The Hero Cannot Rest". Put --session "the-hero-cannot-rest" on every command. Copy commands exactly.
+Run only `python -m manhwa_ocr ...` commands.
+Never import manhwa_ocr in `python -c`. Never read or patch the program's source.
+Never edit anything under manhwa_ocr\, tests\ or the program root.
+Never create, convert, trim or generate audio. If audio is missing, stop and tell me the path.
+Never rewrite a recap whose chapter already has audio unless I ask.
+If a command fails or its output is confusing, STOP and show me the exact command and the exact error.
+Do not work around a tool bug by hand-editing generated files (alignment.json, plan.json timestamps or panels, panels.json).
+Keep a log: append every manual edit you make (file, what, why) to .work\agent_log.md.
+Ask me before running anything with --force that discards edits.
+
+Do this routine, in order, for chapters 1-7.
+1. `python -m manhwa_ocr video status --session "the-hero-cannot-rest"`.
+   Note anything marked estimated timing, old style or untagged.
+2. `python -m manhwa_ocr video pair --chapters 1-7 --session "the-hero-cannot-rest"`.
+   Open every pairing sheet. Fix pairs.json only where a sentence's panel is wrong.
+   Then run the same command again with --apply.
+3. `python -m manhwa_ocr video build --chapters 1-7 --session "the-hero-cannot-rest"`.
+   If align fails validation, read the exact sentence and reason it prints.
+   Fix picture problems in pairs.json, then run `video align --chapter N` and `video plan --chapter N --force`.
+   If the failure is about timestamps (a zero-length segment, monotonic), do NOT hand-edit timestamps.
+   Stop and report the chapter, the sentence numbers and the times.
+4. `python -m manhwa_ocr video verify --chapter N --session "the-hero-cannot-rest"`.
+   Read video\chapter_N.verify.json, including the low-confidence head list.
+5. Open every storyboard sheet and .work\video\chN\NARRATION.md.
+   For EVERY shot, compare the picture with the sentence.
+   Look for: a wrong picture; text or a watermark on screen; white or blank areas;
+   white gutters at card edges; sides cropped off; faces or heads cut;
+   patches where bubbles were erased; duplicates; missing important panels.
+6. Fix with ONLY these routes.
+   - Wrong picture: pairs.json or recaps\chapter_N.cues.json, then `video align`, then `video plan --force`.
+   - Framing (face, crop, drop): video\chapter_N.fixes.json only. Valid JSON, exact panel ids,
+     allowed shapes 9:16, 3:4, 1:1, 4:3, 16:9.
+   - Never edit cards[k].panel. Never script-edit plan files.
+   - After any re-plan, run `video verify` again so the fixes are re-applied.
+7. Repeat verify, storyboard and review until every shot is right (at most 3 rounds).
+   If a shot cannot be made right, do not approve. Say which shot and why.
+8. `python -m manhwa_ocr video approve --chapter N --session "the-hero-cannot-rest"`, then
+   `python -m manhwa_ocr video render --chapter N --session "the-hero-cannot-rest"`.
+   Do not use --force on render to skip a review or sync gate.
+9. Final report per chapter: duration, file size, each shot you changed and why,
+   every dropped panel with its reason, every sentence you changed in pairs.json,
+   and anything you stopped on.
+```
 
 You can also run the build yourself without an agent:
 
@@ -298,7 +408,7 @@ The editing follows the usual recap channel style:
 - **Layouts.** Sometimes one card sits in the centre. Sometimes it slides left
   while a second card slides in from the right. Sometimes a small card sits
   over a blurred close-up.
-- **Backgrounds** switch between blurred, black and white.
+- **Backgrounds** switch between a blurred copy of the panel and black.
 - **Calm CapCut-style entrances** (Fade In, Slide Up, Blur In, Zoom In, Fit in
   Frame, Swing Right, Pull Down) take 0.6–0.8s. The image then drifts slowly
   for a couple of seconds and holds still. Nothing is rushed.
@@ -319,32 +429,40 @@ The editing follows the usual recap channel style:
 
 ## Step 6 — Review and fix
 
-**`video render` refused with "... never reviewed"?** That's `video align`
-telling you it couldn't resolve some sentences with full confidence — the
-error names them (`sentence numbers: 2, 6, 7, ...`). You don't have to drive
-the review by hand: paste this into Antigravity (or any agent), filling in
-the chapter number and pasting the exact sentence list from the error:
+**A build stopped, or a shot looks wrong?** Press **Copy agent prompt: fix chapter** on the dashboard, or
+paste this prompt with the chapter number and the exact error (or the wrong shot ids) filled in:
 
-> Chapter {N}, series "{series name}". `video render` refused because these
-> sentences are in the alignment review queue and were never confirmed:
-> {paste the sentence numbers from the error}. For each one: work out which
-> pairing sheet covers it (`.work\video\chN\pairing_NN.png`, 6 sentences per
-> sheet — sentence S is on sheet `ceil(S/6)`), open it, and judge: does the
-> green (currently tagged) panel actually show what that sentence says? If a
-> grey "next" panel fits better, note the change. Only update
-> `.work\video\chN\pairs.json` for sentences you're actually changing — leave
-> the rest alone. Then run, in order: `video pair --chapter N --apply`,
-> `video align --chapter N`, `video plan --chapter N --force`. Some sentences
-> will likely still show in the new review queue even after you've confirmed
-> them — that's expected, the tool has no way to mark "a human already looked"
-> separately from "resolve this with full confidence on your own evidence."
-> List every sentence you kept vs. changed and why, then run
-> `video render --chapter N --force` (force is correct here because you've now
-> actually reviewed the queue, not because you're skipping the check).
+```text
+Read AGENTS.md first.
+Work only on the series "The Hero Cannot Rest". Put --session "the-hero-cannot-rest" on every command. Copy commands exactly.
+Run only `python -m manhwa_ocr ...` commands.
+Never import manhwa_ocr in `python -c`. Never read or patch the program's source.
+Never edit anything under manhwa_ocr\, tests\ or the program root.
+Never create, convert, trim or generate audio. If audio is missing, stop and tell me the path.
+Never rewrite a recap whose chapter already has audio unless I ask.
+If a command fails or its output is confusing, STOP and show me the exact command and the exact error.
+Do not work around a tool bug by hand-editing generated files (alignment.json, plan.json timestamps or panels, panels.json).
+Keep a log: append every manual edit you make (file, what, why) to .work\agent_log.md.
+Ask me before running anything with --force that discards edits.
 
-This is also exactly what to do for chapters 3 onward the first time you build
-them — `video align` flags whatever it isn't sure about, the same way it did
-here.
+Fix chapter 8.
+What is wrong (the exact error or the shot list):
+(paste the exact error, or the shot ids that are wrong)
+
+Fix it with ONLY these routes.
+- Wrong picture: pairs.json or recaps\chapter_8.cues.json, then `video align --chapter 8`, then `video plan --chapter 8 --force`.
+- Framing (face, crop, drop): video\chapter_8.fixes.json only. Valid JSON, exact panel ids,
+  allowed shapes 9:16, 3:4, 1:1, 4:3, 16:9.
+- Never edit cards[k].panel. Never script-edit plan files. Never hand-edit timestamps.
+  If the problem is a timestamp, stop and report the chapter, the sentence numbers and the times.
+Then run `python -m manhwa_ocr video verify --chapter 8 --session "the-hero-cannot-rest"`,
+`python -m manhwa_ocr video approve --chapter 8 --session "the-hero-cannot-rest"` and
+`python -m manhwa_ocr video render --chapter 8 --session "the-hero-cannot-rest"`.
+Do not use --force on render to skip a review or sync gate.
+```
+
+The agent fixes pictures in `pairs.json` and framing in `fixes.json`, then verifies, approves and renders. It
+never hand-edits the plan or the timestamps, and it never forces a render past a review or sync gate.
 
 **Pictures don't match the words?** That's the pairing. Run
 `python -m manhwa_ocr video pair --chapter N` and open the sheets it lists
@@ -356,6 +474,14 @@ actually decides which picture shows — it must pass its own validation before
 the next step will run), `video plan --chapter N --force`, and
 `video render --chapter N`.
 
+**Render refuses: "sync gate"?** Before rendering, the plan is audited against
+your recording: total wrong-picture time, the worst five-second windows, and
+cuts that land too late. A plan that fails stops with the numbers. The full
+report is `python -m manhwa_ocr video sync-audit --chapter N` (also written to
+`video\chapter_N.syncaudit.json`), with the worst stretches and their causes.
+Fix the pairing (above) and render again. `--force` on render bypasses the
+gate; use it only after reading the storyboard and the audit report.
+
 The video always follows these rules: each panel is shown once, panels keep
 their full width (only top and bottom are trimmed), text-only panels are never
 used, and caption boxes and bubbles at a panel's top or bottom are cut off.
@@ -366,19 +492,23 @@ On the dashboard's **Video** tab, each chapter has:
 - **Preview** / **Video:** play it in the browser. You can seek.
 
 If a shot has the wrong *picture*, that's a pairing/alignment fix (see above),
-not a plan edit — `video\chapter_N.plan.json` is only presentation now.
-Everything else, the agent (or you) edits directly in the plan and renders
-again. **Only the changed shots are redrawn, so a fix takes seconds.**
+not a plan edit. Everything else (framing, background, entrance, a panel that
+shouldn't show) goes in `video\chapter_N.fixes.json`. `video\chapter_N.plan.json`
+is presentation only: `video plan --force` rebuilds it from the alignment and
+applies `fixes.json` every time, so anything typed into the plan is lost.
+**Only the changed shots are redrawn, so a fix takes seconds.**
 
 | To fix… | Change | Then |
 |---|---|---|
 | wrong picture | `pairs.json` for that sentence (ids are on `media\chN\panels_sheet_*.png`) | `video align --chapter N`, `video plan --chapter N --force`, `video render --chapter N` |
-| wrong part of the picture | that shot's `cards[0].crop` in the plan: `[left, top, right, bottom]` as fractions, e.g. `[0, 0.2, 1, 0.7]` | `video render --chapter N` |
-| animation | that shot's `cards[0].enter` in the plan (`cut`, `fade_in`, `slide_up`, `blur_in`, `zoom_in`, …) | same |
-| background | that shot's `background` in the plan: `blur`, `black` or `white` | same |
+| wrong part of the picture | a `crop` entry in `fixes.json` (`panel`, `shape` such as `3:4`, `box` `[left, top, right, bottom]`; the box must keep that shape) | `video plan --chapter N --force`, then `video render --chapter N` |
+| head cut off | a `face` entry (`panel`, `top`, `bottom` of the head as fractions) | same |
+| panel that shouldn't show | a `drop` entry (`panel`, `reason`) | same |
+| animation or background | a `shot` entry (`panel`, `enter` such as `cut`, `fade_in`, `slide_up`, `blur_in`, `zoom_in`; `background` `blur` or `black`) | same |
 
-A plan you've edited is never overwritten automatically. `video plan --chapter N
---force` throws your edits away and starts fresh.
+`video plan --chapter N --force` rebuilds the plan from the alignment and applies
+`fixes.json` again, so your fixes stay and any hand edit to the plan is gone. A
+`fixes.json` with one bad entry is refused whole, with a message per problem.
 
 ---
 
@@ -409,63 +539,64 @@ Build the storyboard, then paste this prompt into the agent. The same prompt is 
 to `.work/video/ch8/REVIEW.md` next to the storyboard sheets:
 
 ```text
-You are reviewing the storyboard of a manhwa recap video for chapter 8 of the
-series "manhwa-2". Do not edit any program code. Do not delete any file. Do not
-edit video/chapter_8.plan.json. You may only write video/chapter_8.fixes.json,
-and you run only "python -m manhwa_ocr ..." commands.
+Read AGENTS.md first.
+Work only on the series "manhwa-2". Put --session "manhwa-2" on every command. Copy commands exactly.
+Run only `python -m manhwa_ocr ...` commands.
+Never import manhwa_ocr in `python -c`. Never read or patch the program's source.
+Never edit anything under manhwa_ocr\, tests\ or the program root.
+Never create, convert, trim or generate audio. If audio is missing, stop and tell me the path.
+Never rewrite a recap whose chapter already has audio unless I ask.
+If a command fails or its output is confusing, STOP and show me the exact command and the exact error.
+Do not work around a tool bug by hand-editing generated files (alignment.json, plan.json timestamps or panels, panels.json).
+Keep a log: append every manual edit you make (file, what, why) to .work\agent_log.md.
+Ask me before running anything with --force that discards edits.
 
-1. Open every storyboard sheet: video/chapter_8.storyboard_01.png, _02, _03
-   (and any more the folder has). Open .work/video/ch8/NARRATION.md, which lists
-   each shot's time, panel ids, and the sentence spoken over it. Read it all first.
+You are reviewing the storyboard of a manhwa recap video for chapter 8 of the series "manhwa-2".
+You run only `python -m manhwa_ocr ...` commands. Do not edit any program code. Do not delete any file.
+Do not hand-edit alignment or plan files. You may only write video/chapter_8.fixes.json.
+Framing fixes survive re-planning only in fixes.json.
 
-2. For EVERY shot, compare the picture with the sentence spoken over it. If the
-   picture does not show what the sentence describes, note the shot id.
+1. Open every storyboard sheet: video/chapter_8.storyboard_01.png, _02, _03 (and any more the folder has).
+   Open .work/video/ch8/NARRATION.md. It lists each shot's time, panel ids and the sentence spoken over it.
+   Read it all first.
 
-3. Look for these problems, in every shot:
-   a. Any TEXT on screen: speech-bubble dialogue, captions, sound-effect lettering,
-      a logo, a watermark (for example ASURASCANS.COM), a "Read at" credit, or a
-      title card. These must not be shown. Propose a "drop" for a panel that is
-      only text or a logo.
-   b. A WHITE or BLANK screen, or an empty wall, door, leaf, or floor with no
-      character and no story value. Propose a "drop" for it.
-   c. A FACE or HEAD cut: half a face, a chin or forehead missing, a character cut
-      at the eyes or nose. Propose a "face" entry with the head's top and bottom as
-      fractions of the panel's height (0 is the top edge, 1 is the bottom edge), or a
-      "crop" entry whose box keeps the whole head.
-   d. A PAINTED PATCH: a flat grey or coloured blob where a bubble was removed.
-      Propose a "crop" that avoids it, if one exists.
-   e. An IMPORTANT panel that is missing: a character or story beat the narration
-      describes but no shot shows. Name the panel ids you can see are missing.
-   f. A duplicate in a row, or a clearly wrong order.
+2. For EVERY shot, compare the picture with the sentence spoken over it.
+
+3. Look for these problems in every shot:
+   a. A WRONG PICTURE: the picture does not show what the sentence describes (wrong character, wrong place, unrelated art). Note the shot id.
+   b. TEXT on screen: speech-bubble dialogue, captions, sound-effect lettering, a logo, a watermark (for example ASURASCANS.COM), a "Read at" credit, or a title card. These must not be shown. Propose a "drop" for a panel that is only text or a logo.
+   c. A WHITE or BLANK screen, or an empty wall, door, leaf or floor with no character and no story value. Propose a "drop" for it.
+   d. WHITE GUTTERS at the edges of a card: a white or black band along the top, bottom or sides of the picture. Propose a "crop" that stays inside the art.
+   e. SIDES CROPPED OFF: a card cut at the left or right so a character, hand or weapon is sliced. Propose a "crop" at full width, if one exists.
+   f. A FACE or HEAD cut: half a face, a chin or forehead missing, a character cut at the eyes or nose. Propose a "face" entry with the head's top and bottom as fractions of the panel's height (0 is the top edge, 1 is the bottom edge), or a "crop" entry whose box keeps the whole head.
+   g. A PAINTED PATCH: a flat grey or coloured blob where a bubble was removed. Propose a "crop" that avoids it, if one exists.
+   h. An IMPORTANT panel that is missing: a character or story beat the narration describes but no shot shows. Name the panel ids you can see are missing.
+   i. A DUPLICATE in a row, or a clearly wrong order.
 
 4. Rules for fixes:
-   - Drop only a panel that shows no character and no story detail. Never drop a
-     panel with a character in it, even a small one.
-   - A "crop" must keep one of these shapes: 9:16, 3:4, 1:1, 4:3, 16:9. The box is
-     [x0, y0, x1, y1] as fractions of the panel (0 to 1), and must keep that shape.
+   - Drop only a panel that shows no character and no story detail. Never drop a panel with a character in it, even a small one.
+   - A "crop" must keep one of these shapes: 9:16, 3:4, 1:1, 4:3, 16:9. The box is [x0, y0, x1, y1] as fractions of the panel (0 to 1), and must keep that shape.
    - Use the panel id exactly as the storyboard shows it, for example P016-06.
 
-5. Write your fixes to video/chapter_8.fixes.json in this exact form (keep the file
-   valid JSON; leave a list empty if you have nothing for it):
+5. Write your fixes to video/chapter_8.fixes.json in this exact form. Keep the file valid JSON.
+   Leave a list empty if you have nothing for it. "shot" is optional.
 
    {"version": 1,
     "drop": [{"panel": "P016-06", "reason": "sound-effect lettering only"}],
     "face": [{"panel": "P017-02", "top": 0.12, "bottom": 0.46}],
-    "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}]}
+    "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}],
+    "shot": [{"panel": "P019-01", "background": "black", "enter": "fade_in"}]}
 
 6. Rebuild and look again:
      python -m manhwa_ocr video verify --chapter 8 --session "manhwa-2"
      python -m manhwa_ocr video storyboard --chapter 8 --session "manhwa-2"
-   Then repeat from step 1 with the NEW storyboard images. Stop when every shot is
-   right and no fixes are needed.
+   Then repeat from step 1 with the NEW storyboard images. Stop when every shot is right and no fixes are needed.
+   Run at most 3 rounds.
 
-7. When the chapter is clean, run:
-     python -m manhwa_ocr video approve --chapter 8 --session "manhwa-2"
-   Then reply exactly: "yes, you can render the video".
-   If you cannot make a shot right, do not approve. Say which shot and why.
+7. When every shot is right, run `python -m manhwa_ocr video approve --chapter 8 --session "manhwa-2"`.
+   If a shot cannot be made right, do not approve. Say which shot and why.
 
-8. Final message: list each shot id you changed, what was wrong, and what you did.
-   List every dropped panel by its page and panel id, with its reason.
+8. Your final message must list every shot you changed and why, and every dropped panel with its reason.
 ```
 
 ### Way B: the terminal (DeepSeek flash, no IDE agent)
@@ -540,6 +671,8 @@ python -m manhwa_ocr video render --chapter 8 --session "manhwa-2"
   model in `provider:` or set `video.review.model`.
 - `--force` does not skip the review gate. With `require_review: true`, a render
   needs an approval for the current plan.
+- It does bypass the estimated-timing stop and the sync gate. Use it only after
+  reading the storyboard and the `video sync-audit` report.
 
 **Summary of the commands**
 
@@ -549,7 +682,46 @@ python -m manhwa_ocr video render --chapter 8 --session "manhwa-2"
 | `video storyboard --chapter N` | rebuild the storyboard sheets and NARRATION.md |
 | `video review --chapter N` | DeepSeek (or your vision model) reviews, fixes, and approves |
 | `video approve --chapter N` | approve the current plan by hand |
-| `video render --chapter N` | render the MP4 (needs approval if `require_review` is true) |
+| `video sync-audit --chapter N` | audit the current plan against the recording (no AI); the check a render gates on |
+| `video render --chapter N` | render the MP4 (needs approval if `require_review` is true; refuses a plan that fails the sync gate) |
+
+## The intro (chapter 0)
+
+A short trailer in front of the series, built from panels of any chapters. Run
+`python -m manhwa_ocr video intro --prepare` to get a template `intro\intro.json`
+and contact sheets of every chapter's drawn panels (`intro\sheets\`). Write one
+entry per narrated sentence: its text and one to three panels such as
+`ch2:P010-14`. A panel may be used once, and text-only panels are rejected. Mark a
+big moment with `"beat": true` (shake, flash, fade-out). Record that narration as
+`audio\chapter_0.mp3`, then run `python -m manhwa_ocr video intro` to get
+`video\chapter_0.mp4`. Pictures hold at least 2 seconds (`video: intro:` in
+`manhwa-ocr.yaml`). Framing fixes go in `video\chapter_0.fixes.json`, using the
+same `ch2:P010-14` ids.
+
+To have an agent do it, paste this (or press **Copy agent prompt: intro**):
+
+```text
+Read AGENTS.md first.
+Work only on the series "The Hero Cannot Rest". Put --session "the-hero-cannot-rest" on every command. Copy commands exactly.
+Run only `python -m manhwa_ocr ...` commands.
+Never import manhwa_ocr in `python -c`. Never read or patch the program's source.
+Never edit anything under manhwa_ocr\, tests\ or the program root.
+Never create, convert, trim or generate audio. If audio is missing, stop and tell me the path.
+Never rewrite a recap whose chapter already has audio unless I ask.
+If a command fails or its output is confusing, STOP and show me the exact command and the exact error.
+Do not work around a tool bug by hand-editing generated files (alignment.json, plan.json timestamps or panels, panels.json).
+Keep a log: append every manual edit you make (file, what, why) to .work\agent_log.md.
+Ask me before running anything with --force that discards edits.
+
+1. Run `python -m manhwa_ocr video intro --prepare --session "the-hero-cannot-rest"`. Open the contact sheets it writes.
+2. Fill intro\intro.json. Give every sentence 1 to 3 drawn panel references written like "ch2:P010-14".
+   Use each panel once. Never use a text-only panel.
+3. Build it: `python -m manhwa_ocr video intro --session "the-hero-cannot-rest"`.
+4. Then follow the same verify, review, approve and render steps as the build routine, for chapter 0.
+Do not build the intro by hand-copying images, and do not write alignment or plan files yourself.
+```
+
+---
 
 ## Step 7 — Finish: one long video, Shorts, the full script
 
@@ -665,6 +837,8 @@ All in `manhwa-ocr.yaml` in the program folder; changes are picked up next run.
 | `video.music`, `video.music_volume` | background music bed |
 | `video.whisper_model` | `small.en` (default), `base.en` is faster; `small` for Hindi |
 | `video.whisper_language` | e.g. `hi` for Hindi narration |
+| `video.sync.max_unmatched` | stop when this many seconds of narration have no trustworthy timing (default 6) |
+| `video.sync.gate_wrong`, `gate_window`, `gate_grace` | the sync gate's tolerances (see Step 6) |
 | `slicing.target_height` | lower to `1000` if transcripts have many `[unclear]` |
 
 ---
@@ -690,11 +864,12 @@ All in `manhwa-ocr.yaml` in the program folder; changes are picked up next run.
 | Plan says **Old style** | Made by an older version. `video build --chapters N` rebuilds it; if you had edited it, use `video align --chapter N` then `video plan --chapter N --force`. |
 | `has no alignment yet` | Tagged chapters need `video align --chapter N` run before `video plan` — this is expected, not an error in your setup; `video build` does it for you automatically. |
 | `alignment failed validation` | `video align --chapter N` found a structural problem (a missing panel, a timing gap, an unexplained jump). It prints exactly which sentence and why; fix that in `pairs.json` and re-run `video align`. |
-| `... never reviewed` when rendering | `video align` flagged some sentences it wasn't fully sure about — rendering refuses until you've actually looked. See the agent prompt at the top of Step 6, or `PROMPTS.md`'s checkpointed review. Fix `pairs.json` if needed, re-run `video align` + `video plan --chapter N --force`, then render. (`--force` on render skips this check — only use it once you've actually looked, or deliberately accept the risk.) |
+| `... never reviewed` when rendering | `video align` flagged some sentences it wasn't fully sure about. Run `video pair --chapter N`, look at the sheets, fix `pairs.json`, then `video pair --chapter N --apply`, `video align --chapter N`, `video plan --chapter N --force`. If you have already looked at them, `video render --strict` is what stops on them; a plain render only warns. |
 | Video is longer than your narration, or ends on a blank/credits page | Fixed in the current version: rebuild with `video align --chapter N` and `video plan --chapter N --force`, then `video render --chapter N` |
 | Speech bubbles or text-only panels in the video | Same: `video align --chapter N` then `video plan --chapter N --force` (the panel check improved). Contact sheets mark them "TEXT - don't use". |
 | Pictures drift out of sync with your voice | Make sure you recorded the *current* `tts.txt`. Then `video align --chapter N`, `video plan --chapter N --force` and `video render --chapter N`. |
 | Right picture, wrong moment it appears | That's timing, not selection — check `video status` for "estimated" (see above). If it says "synced", it's a pairing issue: see "Pictures don't match the words" in Step 6. |
+| Render refuses with `sync gate` | The pictures don't match your voice (wrong-picture time or late cuts). Run `video sync-audit --chapter N` for the worst stretches and causes, fix the pairing (Step 6), then render again. |
 | `the plan was edited ... left alone` | You changed the audio or recap after editing the plan. Re-run `video align --chapter N` (so the alignment reflects the new audio/tags), then `video plan --chapter N --force` rebuilds the plan (your plan edits are lost). |
 | Panels split strangely | Check `media\chN\panels_sheet_*.png`. Tune `video.panels` in `manhwa-ocr.yaml`, then `video panels --chapter N --force` |
 | Want to start a series over | `session archive "<name>" --yes`, then `start` |

@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import time
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -47,17 +48,25 @@ def _cache_dir(root: Path, chapter: str, preview: bool, name: str | None = None)
 
 # ------------------------------------------------------------------ worker (runs in a child process)
 
-_PANEL_CACHE: Dict[tuple, Any] = {}
+_PANEL_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_PANEL_CACHE_MAX = 32
 
 
 def _panel(root: str, chapter: str, panel: Dict[str, Any], norm_w: int, fingerprint: str):
-    key = (root, chapter, panel["id"], fingerprint)
+    # An intro panel is read straight from the chapter it came from (src_chapter / src_norm_w).
+    chapter = panel.get("src_chapter") or chapter
+    norm_w = panel.get("src_norm_w") or norm_w
+    key = (root, chapter, panel["id"], fingerprint, panel.get("src_fingerprint"))
     img = _PANEL_CACHE.get(key)
     if img is None:
-        if len(_PANEL_CACHE) > 6:
-            _PANEL_CACHE.clear()
         img = panel_image(Path(root), chapter, panel, norm_w, clean=True)
         _PANEL_CACHE[key] = img
+        # LRU: evict one entry, never wipe the whole cache (the old
+        # `clear()` made workers re-decode panels they had just loaded).
+        while len(_PANEL_CACHE) > _PANEL_CACHE_MAX:
+            _PANEL_CACHE.popitem(last=False)
+    else:
+        _PANEL_CACHE.move_to_end(key)
     return img
 
 
@@ -137,9 +146,10 @@ def _audio_graph(has_music: bool, duration: float, volume: float) -> str:
 
 
 def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any], *, preview: bool = False,
-           workers: int = 0, log: Callable[[str], None] = print, name: str | None = None) -> Path:
+           workers: int = 0, log: Callable[[str], None] = print, name: str | None = None,
+           panels_data: Dict[str, Any] | None = None) -> Path:
     chapter = require_chapter(chapter)
-    panels_data = load_panels(root, chapter)
+    panels_data = panels_data or load_panels(root, chapter)
     if not panels_data:
         raise UserError(f"No panels for chapter {chapter}. Run:  video panels --chapter {chapter}")
     fmt = format_from(plan.get("format", "16:9"), int(plan.get("fps", 30)), preview)

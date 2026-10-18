@@ -8,6 +8,7 @@ panel shows a forest", then fix that one shot in the plan.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List
@@ -45,7 +46,7 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
     text_h, pad = 92, 10
     font, small = _font(18), _font(15)
     shots = plan["shots"]
-    cache: Dict[str, Image.Image] = {}
+    cache: "OrderedDict[str, Image.Image]" = OrderedDict()
     out = []
     for n, start in enumerate(range(0, len(shots), PER_SHEET), start=1):
         chunk = shots[start:start + PER_SHEET]
@@ -62,10 +63,13 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
             if not missing and ids:
                 images = {}
                 for pid in dict.fromkeys(ids):
-                    if pid not in cache:
-                        if len(cache) > 16:
-                            cache.clear()
+                    if pid in cache:
+                        cache.move_to_end(pid)
+                    else:
                         cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"], clean=True)
+                        # LRU: evict one entry, never wipe the whole cache.
+                        while len(cache) > 32:
+                            cache.popitem(last=False)
                     images[pid] = cache[pid]
                 # 85% through: entrances done and a pair's second card has arrived.
                 when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))
@@ -104,11 +108,14 @@ def write_review_task(root: Path, chapter: str, plan: Dict[str, Any], session: s
     sync_note = ("Shots follow the narration sentence by sentence."
                  if plan.get("sync") == "synced" else
                  "This plan uses even timing (no sentence sync), so only check for broken or unreadable shots.")
-    from .review import CHECKLIST  # imported here: review.py imports this module
+    from .. import agent_prompts
 
+    brief = agent_prompts.render("review", series=session or "this series", session=session or "<session>", N=chapter)
     doc = f"""# Video review — chapter {chapter}
 
 {sync_note}
+
+The brief below is the canonical review prompt (manhwa_ocr/agent_prompts.py). Follow it exactly.
 
 ## Look at
 
@@ -118,64 +125,9 @@ Storyboard (each shot's middle frame, its time, panel id, and the words being sp
 Panel contact sheets (every available panel with its id):
 {sheets}
 
-## Check each shot
+## Brief
 
-- Does the panel match what the sentence describes? If not, find the right panel id on the contact sheets.
-- Never show speech bubbles, captions, sound-effect lettering, blank pages, or credits/"Read at" pages.
-  Those are marked "TEXT - don't use" on the contact sheets, and a red "TEXT PANEL" box on the storyboard.
-  The narration already tells that part; show the drawn panel next to it instead.
-- Is anything unreadable or badly cropped (a face cut in half, a card that is mostly a caption)?
-
-## How to fix
-
-Edit `video/chapter_{chapter}.plan.json`. Useful fields per shot:
-
-- `cards[k].panel`: a panel id from the contact sheets
-- `cards[k].crop`: `[x0, y0, x1, y1]` as fractions of the panel. Use it to frame a face or the action, and
-  to keep speech bubbles out. Example: `[0, 0.15, 1, 0.6]` is the upper-middle part.
-- `cards[k].enter`: cut, fade_in, slide_left, slide_right, slide_up, slide_down, pull_down, zoom_in,
-  fit_in_frame, blur_in, swing_right
-- `cards[k].motion`: push_in, pull_out, pan_left, pan_right, pan_up, pan_down, hold
-- `layout`: single, pair (2 cards; the 2nd slides in at `cards[1].at` seconds), inset (small card over
-  `bg_panel` blurred), wide
-- `background`: blur, black, white
-- `effects`: list of {{"type": "shake"|"punch"|"flash", "t": seconds}}, with t inside the shot.
-  Use them sparingly.
-
-Don't change `start`/`end` unless you keep shots back to back. Never edit the MP4 or anything in `.work/`.
-
-## Fixes that survive a rebuild (preferred)
-
-Write them in `video/chapter_{chapter}.fixes.json` instead of the plan:
-
-- `drop`: a panel that is only lettering, a logo, or a blank screen (no character, no story).
-- `face`: a head's top and bottom as fractions of the panel's height, so the crop keeps the whole head.
-- `crop`: an exact box for a panel, with `shape` one of 9:16, 3:4, 1:1, 4:3, 16:9.
-
-Then rebuild the plan and look at the new storyboard:
-
-```bash
-python -m manhwa_ocr video verify --chapter {chapter}{pin}
-python -m manhwa_ocr video storyboard --chapter {chapter}{pin}
-```
-
-When every shot is right, approve it so it can be rendered:
-
-```bash
-python -m manhwa_ocr video approve --chapter {chapter}{pin}
-```
-
-## Full checklist
-
-{CHECKLIST}
-
-When the plan is right, set `"reviewed": true` in it and render:
-
-```bash
-python -m manhwa_ocr video render --chapter {chapter}{pin}
-```
-
-Only edited shots (and the one after each) are re-rendered.
+{brief}
 """
     path = work_root(root) / "video" / f"ch{chapter}" / "REVIEW.md"
     atomic_write_text(path, doc)

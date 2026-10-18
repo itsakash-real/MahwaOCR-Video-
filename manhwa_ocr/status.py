@@ -130,7 +130,11 @@ def after_transcription(sess: Session, chapters: List[str]) -> List[str]:
                   f"  1. Check the pictures:  {_cmd(f'video pair --chapters {spec}', sess)}",
                   "     Look at every pairing sheet, fix .work/video/chN/pairs.json, then run it again with --apply",
                   f"  2. Build:  {_cmd(f'video build --chapters {spec}', sess)}",
-                  "  3. Review the storyboards as .work/video/chN/REVIEW.md describes."]
+                  f"  3. Check:  {_cmd('video verify --chapter N', sess)}",
+                  "     Open the storyboards and .work/video/chN/NARRATION.md. Fix framing only in video/chapter_N.fixes.json,",
+                  "     pictures only in pairs.json. Never edit the plan by hand.",
+                  f"  4. Finish: {_cmd('video approve --chapter N', sess)}   then   {_cmd('video render --chapter N', sess)}",
+                  "  The full routine and rules: dashboard \"Copy agent prompt: build videos\", or USER_GUIDE.md (Step 5)."]
     if need_audio:
         from .video.cues import tts_path
 

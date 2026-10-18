@@ -34,6 +34,14 @@ from ..util import valid_chapter
 INDEX_HTML = Path(__file__).with_name("index.html")
 
 
+def index_bytes() -> bytes:
+    """The dashboard page, with the canonical agent prompts (agent_prompts.py) filled in."""
+    from ..agent_prompts import all_prompts_json
+
+    blob = json.dumps(all_prompts_json()).replace("</", "<\\/")
+    return INDEX_HTML.read_bytes().replace(b"__AGENT_PROMPTS_JSON__", blob.encode("utf-8"))
+
+
 class LocalServer(ThreadingHTTPServer):
     """Refuses to share its port.
 
@@ -144,7 +152,7 @@ def make_handler(store: SessionStore, log: Callable[[str], None]):
             try:
                 if not parts:
                     return self._send(
-                        HTTPStatus.OK, INDEX_HTML.read_bytes(), "text/html; charset=utf-8"
+                        HTTPStatus.OK, index_bytes(), "text/html; charset=utf-8"
                     )
                 if parts == ["api", "sessions"]:
                     active = self._active_slug()

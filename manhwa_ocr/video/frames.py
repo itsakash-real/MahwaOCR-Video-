@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -177,12 +178,20 @@ def slot_centres(layout: str, fmt: Format, size: Tuple[int, int], index: int) ->
 # ------------------------------------------------------------------ backgrounds
 
 
-def _vignette(fmt: Format) -> np.ndarray:
-    ys, xs = np.ogrid[0:fmt.height, 0:fmt.width]
-    nx = (xs - fmt.width / 2) / (fmt.width / 2)
-    ny = (ys - fmt.height / 2) / (fmt.height / 2)
+@lru_cache(maxsize=8)
+def _vignette_grid(width: int, height: int) -> np.ndarray:
+    ys, xs = np.ogrid[0:height, 0:width]
+    nx = (xs - width / 2) / (width / 2)
+    ny = (ys - height / 2) / (height / 2)
     d = np.sqrt(nx ** 2 + ny ** 2) / math.sqrt(2)
     return (1.0 - 0.45 * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
+
+
+def _vignette(fmt: Format) -> np.ndarray:
+    # The vignette depends only on the frame size: identical for every shot
+    # in a chapter, so build it once. Callers must not mutate the result
+    # (background() only multiplies by it).
+    return _vignette_grid(fmt.width, fmt.height)
 
 
 def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
@@ -204,6 +213,38 @@ def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
 # ------------------------------------------------------------------ cards
 
 
+def padded_region(panel: Image.Image, box: List[float], pad_y: float) -> Image.Image:
+    """The card's picture when it is taller than its crop: the crop in full width, centred,
+    with `pad_y` panel-heights above and below filled by a blurred, darkened copy of the
+    panel itself (a wide panel is shown whole rather than losing its sides)."""
+    x0, y0, x1, y1 = (max(0.0, min(1.0, float(v))) for v in box)
+    pw, ph = panel.size
+    inner = panel.convert("RGB").crop((int(x0 * pw), int(y0 * ph), max(int(x0 * pw) + 2, int(x1 * pw)),
+                                       max(int(y0 * ph) + 2, int(y1 * ph))))
+    pad = max(0, round(float(pad_y) * ph))
+    cw, ch = inner.width, inner.height + 2 * pad
+    k = max(cw / inner.width, ch / inner.height)
+    cover = inner.resize((max(cw, round(inner.width * k)), max(ch, round(inner.height * k))), Image.BILINEAR)
+    left, top = (cover.width - cw) // 2, (cover.height - ch) // 2
+    canvas = cover.crop((left, top, left + cw, top + ch)).filter(ImageFilter.GaussianBlur(max(4, ch * 0.03)))
+    canvas = Image.eval(canvas, lambda v: int(v * 0.7))
+    canvas.paste(inner, (0, pad))
+    return canvas
+
+
+@lru_cache(maxsize=32)
+def _shadow_mask(sw: int, sh: int, m: int, off: int, cw: int, ch: int, radius: int, u: float) -> Image.Image:
+    # The blurred drop shadow depends only on the card geometry, and cards
+    # share a handful of sizes: build it once per size instead of blurring
+    # a ~1300x1900 mask for every card. The returned image is shared
+    # (putalpha reads from it without mutating it); callers must not draw on it.
+    shadow = Image.new("L", (sw, sh), 0)
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (m - round(4 * u), m + off - round(2 * u), m + cw + round(4 * u),
+         m + ch + off + round(6 * u)), radius + 4, fill=235)
+    return shadow.filter(ImageFilter.GaussianBlur(20 * u))
+
+
 class Card:
     """One panel card: focal crop, border, rounded corners, black shadow, motion."""
 
@@ -219,6 +260,9 @@ class Card:
         pw, ph = panel.size
         region = panel.crop((int(x0 * pw), int(y0 * ph), max(int(x0 * pw) + 2, int(x1 * pw)),
                              max(int(y0 * ph) + 2, int(y1 * ph))))
+        pad_y = float(spec.get("pad_y") or 0.0)
+        if pad_y > 0:                               # a wide panel shown whole on blurred padding
+            region = padded_region(panel, [x0, y0, x1, y1], pad_y)
         aspect = region.width / region.height
         self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
         self.border = max(1, round(3 * u))
@@ -232,11 +276,8 @@ class Card:
         # Static parts of the sprite, built once: shadow + white rounded border.
         m = self.margin
         sw, sh = self.cw + 2 * m, self.ch + 2 * m
-        shadow = Image.new("L", (sw, sh), 0)
         off = round(10 * u)
-        ImageDraw.Draw(shadow).rounded_rectangle((m - round(4 * u), m + off - round(2 * u), m + self.cw + round(4 * u),
-                                                  m + self.ch + off + round(6 * u)), self.radius + 4, fill=235)
-        shadow = shadow.filter(ImageFilter.GaussianBlur(20 * u))
+        shadow = _shadow_mask(sw, sh, m, off, self.cw, self.ch, self.radius, u)
         base = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
         base.putalpha(shadow)
         card_mask = Image.new("L", (sw, sh), 0)
@@ -416,6 +457,10 @@ class ShotRenderer:
         self.punches = [float(e["t"]) for e in fx if e["type"] == "punch"]
         self.flashes = [float(e["t"]) for e in fx if e["type"] == "flash"]
 
+        try:     # a darker grade for the whole shot (the intro preset sets it)
+            self.darken = max(0.0, min(0.6, float(shot.get("darken") or 0.0)))
+        except (TypeError, ValueError):
+            self.darken = 0.0
         self.exit = shot.get("exit") if shot.get("exit") in EXITS else "cut"
         self.fade_from = self.end - EXIT_FADE if self.exit == "fade_out" else None
         if end_fade and video_end is not None and abs(video_end - self.end) < 0.05:
@@ -461,6 +506,8 @@ class ShotRenderer:
             y = int(round(cy + ent["dy"] + dy_s - spr.height / 2))
             img.paste(spr.convert("RGB"), (x, y), alpha)
         out = np.asarray(img, dtype=np.uint8)
+        if self.darken > 0:
+            out = (out.astype(np.float32) * (1.0 - self.darken)).astype(np.uint8)
         fa = flash_alpha(t, self.flashes)
         if fa > 0.001:
             out = _mix(out, np.full_like(out, 255), fa)

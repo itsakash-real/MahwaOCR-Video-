@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
+from .. import agent_prompts
 from ..util import UserError, atomic_write_text, require_chapter
 from ..workspace import work_root
 from . import fixes as fixes_mod
@@ -31,40 +32,15 @@ SYSTEM = (
     "answer with strict JSON only."
 )
 
-CHECKLIST = """Review every storyboard image below, and the narration list, before you answer.
-
-For EVERY shot (its label is S### with a time), check:
-1. Does the picture match the sentence spoken over it? Wrong character, wrong place, or
-   unrelated art means a wrong panel: report it in "notes" with the shot id.
-2. Is any important panel missing? A character, a scene, or a clear story beat that the
-   narration describes but no shot shows. List the panel ids you can see are missing.
-3. Any TEXT on screen: speech-bubble dialogue, captions, sound-effect lettering, a logo,
-   a watermark (for example ASURASCANS.COM), a "Read at" credit, or a title card. Those
-   must not be shown. Propose "drop" for a panel that is only text or logo.
-4. A WHITE or BLANK screen, or an empty wall/door/leaf with no character or story value.
-   Propose "drop" for it.
-5. A FACE or HEAD cut: half a face, a chin or forehead missing, or a character cut at the
-   eyes or nose. Propose "face" with the head's top and bottom as fractions of the PANEL's
-   height (0 = top edge, 1 = bottom edge). Or propose "crop" with a box that keeps the
-   whole head.
-6. A PAINTED PATCH: a flat grey or coloured blob where a bubble was removed. Propose a
-   "crop" that avoids it if possible.
-7. Duplicates in a row, or a shot that is clearly the wrong panel order.
-
-Rules for your fixes:
-- Only propose a "drop" for a panel that shows no character and no story detail.
-  Never drop a panel that shows a character, even a small one.
-- A "crop" box must keep the shape the panel was given. Give "shape" as one of 9:16, 3:4,
-  1:1, 4:3, 16:9 and a box [x0, y0, x1, y1] as fractions of the panel (0..1).
-- Use the panel id exactly as written on the storyboard (for example P016-06).
-
+# The numbered problem list is agent_prompts.REVIEW_PROBLEMS: the same items prompt D shows an IDE agent.
+CHECKLIST = agent_prompts.review_checklist() + """
 Answer with ONE JSON object and nothing else:
 {"approved": true or false,
  "drop":  [{"panel": "P016-06", "reason": "sound-effect lettering only"}],
  "face":  [{"panel": "P017-02", "top": 0.12, "bottom": 0.46}],
  "crop":  [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}],
  "notes": "one line per problem, with the shot id"}
-Set "approved": true only when every shot passes checks 1 to 7 with no fixes needed.
+Set "approved": true only when every shot passes checks 1 to 9 with no fixes needed.
 """
 
 
@@ -101,8 +77,8 @@ def parse_reply(text: str) -> Dict[str, Any]:
 def merge(current: Dict[str, Any], reply: Dict[str, Any]) -> Dict[str, Any]:
     """Add the reviewer's entries to the chapter's fixes. A later entry for the same
     panel and kind replaces the earlier one."""
-    out = {"version": fixes_mod.VERSION, "drop": [], "face": [], "crop": []}
-    for kind, key in (("drop", "panel"), ("face", "panel"), ("crop", "panel")):
+    out = {"version": fixes_mod.VERSION, "drop": [], "face": [], "crop": [], "shot": []}
+    for kind, key in (("drop", "panel"), ("face", "panel"), ("crop", "panel"), ("shot", "panel")):
         by_panel = {e.get(key): e for e in (current.get(kind) or []) if isinstance(e, dict)}
         for e in reply.get(kind) or []:
             if isinstance(e, dict) and e.get(key):

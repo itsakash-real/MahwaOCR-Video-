@@ -14,6 +14,13 @@ bottom of this file, and anything under "Architecture"/"Extending", is for
 whoever edits this package's code — it is not a hint to call those internals
 from your own one-off scripts.
 
+## Prompts
+
+The rules every pasted prompt starts with (COMMON_RULES) and the prompts themselves live in one file,
+`manhwa_ocr/agent_prompts.py`. USER_GUIDE.md ("Which prompt do I use?") lists them; the dashboard buttons, `next`,
+REVIEW.md and the reviewer all use that file.
+Do not copy prompt text into other files. Change `agent_prompts.py` and USER_GUIDE.md together; a test fails if they differ.
+
 ## What this project is
 
 `manhwa-ocr` turns webtoon/manhwa chapters into recap videos:
@@ -168,7 +175,7 @@ put it under `.work/`.
 this repo's root). Don't write scripts into the program folder either. If the
 tool does something wrong, stop and tell the user what you saw; don't patch the
 code to get past it. Fix outputs only through the files these instructions name
-(`pairs.json`, `plan.json`, `tile_results.json`, `parts.json`, ...).
+(`pairs.json`, `fixes.json`, `cues.json`, `tile_results.json`, `parts.json`, `.work\agent_log.md`, ...).
 
 ## Writing recaps
 
@@ -226,67 +233,103 @@ someone else's script. Do not paste transcript dialogue in bulk.
 
 ## Making videos
 
-Once the user has recorded `audio/chapter_N.mp3` (or `.wav`, `.m4a`), build the
-video with one terminal command. No agent review is needed:
+Once the user has recorded `audio/chapter_N.mp3` (or `.wav`, `.m4a`), make the video
+with these commands. Use the routine in this order, one chapter at a time:
 
 ```bash
-python -m manhwa_ocr video build --chapters 1-7 --session "<name>"
+python -m manhwa_ocr video pair    --chapter N --session "<name>"   # 1. check every picture against its sentence
+python -m manhwa_ocr video pair    --chapter N --apply --session "<name>"   # 2. save your fixes from pairs.json
+python -m manhwa_ocr video build   --chapter N --session "<name>"   # 3. align + plan (+ render, unless require_review is on)
+python -m manhwa_ocr video verify  --chapter N --session "<name>"   # 4. non-AI check of every drawn panel
+python -m manhwa_ocr video review  --chapter N --session "<name>"   # 5. vision reviewer: review, fix, rebuild, repeat
+python -m manhwa_ocr video approve --chapter N --session "<name>"   # 6. approve this exact plan
+python -m manhwa_ocr video render  --chapter N --session "<name>"   # 7. 1080p MP4
 ```
 
-What the tool does, in order, all deterministic:
+`video build --chapters 1-7` does steps 3 and 7 for many chapters at once, with no agent review.
+Check a chapter's state with `video status --session "<name>"`.
 
-1. **Align** (`video align`): decides which panel shows for each sentence, from
-   the recap's tags and the narration's timing. Writes
-   `video/chapter_N.alignment.json`.
-2. **Coverage**: every drawn panel must appear. A panel no sentence picked is
-   placed in story order, into a nearby sentence, and listed under
-   `placed_by_order` in the QA file. Text-only panels (captions, blank or white
-   pages, credits) are the only ones left out, and they are listed too.
-3. **Plan** (`video plan`): turns the alignment into shots. Every card has one of
-   the allowed shapes (landscape: 3:4, 1:1, 4:3, 16:9; portrait: 9:16, 3:4, 1:1).
-   Cards of one layout share the same area. Every shot holds at least 3 seconds
-   (`min_hold` in `manhwa-ocr.yaml`); a short sentence shares its shot with the
-   next one, as a pair of cards. Crops are slid to avoid speech bubbles and
-   captions, and never cut a detected head.
-4. **QA** (`video/chapter_N.qa.json`): objective checks. The build stops only on
-   hard failures: a drawn panel that would never appear, a card that isn't an
-   allowed shape, or a shot under the minimum. Otherwise it renders.
+### What the tool does, in order (all deterministic)
+
+1. **Align** (`video align`): decides which panel shows for each sentence, from the recap's tags
+   and the narration's timing. Writes `video/chapter_N.alignment.json`. A sentence that carries
+   several tags followed by an untagged one is reported by `video pair` (and by align's
+   `no_unexplained_jumps` message) with the exact tag to move to which sentence; the suggestion is
+   in `pairs.json` under `_suggestions` and is never applied for you.
+2. **Coverage**: every drawn panel must appear. A panel no sentence picked is placed in story
+   order, into a nearby sentence, and listed under `placed_by_order` in the QA file. Text-only
+   panels (captions, blank or white pages, credits) are the only ones left out.
+3. **Plan** (`video plan`): turns the alignment into shots. Every card has one of the allowed
+   shapes (landscape: 3:4, 1:1, 4:3, 16:9; portrait: 9:16, 3:4, 1:1), full width with no white
+   gutters; a panel too wide for any shape is shown whole on a blurred backdrop. Every shot holds
+   at least `min_hold` seconds (`manhwa-ocr.yaml`); a short sentence shares its shot with the next
+   one. Crops avoid speech bubbles and never cut a detected head.
+4. **QA** (`video/chapter_N.qa.json`): objective checks. The build stops only on hard failures: a
+   drawn panel that would never appear, a card that isn't an allowed shape, or a shot too short to
+   be seen at all (under 0.2s). A shot under the 2s floor that dense narration forces is counted
+   (`short_shots` in the QA file) and left honest — never fixed by stealing time from neighbours.
 5. **Render** (`video render`): 1080p MP4.
 
-Gates:
-- Timing that is only estimated (whisper unavailable) stops the render, unless
-  `--force` is given. Fix it by lowering `whisper_model` in `manhwa-ocr.yaml`.
-- Sentences flagged for review in the alignment are warnings, listed in the QA
-  file. `video render --strict` makes them stop the render instead.
+### Where each kind of fix goes (this decides whether it survives a rebuild)
 
-Review before rendering (see USER_GUIDE.md, "Review the video before rendering"):
-- `video verify --chapter N` rebuilds the plan and runs the non-AI check on every
-  drawn panel (lettering, painted patches, blank pages, head cuts). It writes
-  `video/chapter_N.verify.json` and drops panels that have no character and no clean crop.
-- Reviewer fixes go in `video/chapter_N.fixes.json` only: `drop`, `face`, `crop`.
-  They are validated as a whole; a bad entry refuses the file and nothing is applied.
-  Never hand-edit `cards[k].panel` in the plan.
-- `video review --chapter N` runs the vision reviewer (DeepSeek flash by default) in a
-  loop: review, fix, rebuild, review again. It approves only when the reviewer approves.
-- `video approve --chapter N` approves the current plan by hand. With
-  `video.require_review: true`, `video render` refuses unless the current plan is approved.
-  `--force` never bypasses the review gate.
+| You want to change | Edit this | Then |
+|---|---|---|
+| Which picture a sentence shows | the recap's tags (`recaps/chapter_N.cues.json`) or `pairs.json` | `video pair --apply`, `video align`, `video plan --force` |
+| Framing: drop a panel, head position, exact crop, a shot's background, how a card enters | `video/chapter_N.fixes.json` (`drop`, `face`, `crop`, `shot`) | `video plan --force` |
+| Anything else about presentation | nothing by hand | change a setting in `manhwa-ocr.yaml` |
 
-Check a chapter's state with `video status --session "<name>"`. Run
-`video build --chapter N --force` only to rebuild a plan from scratch; it
-discards hand edits, so ask the user first.
+`video/chapter_N.plan.json` is **presentation only**. `video plan --force` rebuilds it from the
+alignment and re-applies `fixes.json` every time, so a hand edit to the plan is lost. Never edit
+`cards[k].panel` or any crop in the plan. `fixes.json` is validated as a whole: one bad entry
+refuses the file and nothing is applied.
 
-**Fix a wrong picture in the recap tags, not in the plan.** The plan carries
-presentation only. To change which panel a sentence shows, edit the recap's
-panel tags (`recaps/chapter_N.cues.json`), then rebuild. Never edit
-`cards[k].panel` in the plan by hand: the next build overwrites it.
+### Gates
 
-**Never rewrite a recap whose chapter already has audio** (`audio/chapter_N.*`)
-unless the user asks. Their recording would no longer match the script.
+- Timing that is only estimated (whisper unavailable) stops the render. Fix it by lowering
+  `whisper_model` in `manhwa-ocr.yaml`. Do not use `--force` on render to skip it.
+- Sentences flagged for review in the alignment are warnings, listed in the QA file.
+  `video render --strict` makes them stop the render instead.
+- The sync gate: `video render` (and so `video build`) audits the plan against the
+  recording — wrong-picture time, the worst five-second windows, late cuts
+  (`video.sync.gate_*`). A failing plan stops the render with the numbers; run
+  `video sync-audit --chapter N` for the report, fix the alignment/plan, render
+  again. Never pass `--force` to get past it.
+- `video review` approves only when the reviewer approves. `video approve` approves the current
+  plan by hand. With `video.require_review: true`, `video render` refuses unless the current plan is
+  approved, and `--force` never bypasses that gate. Don't set `reviewed` in a plan or empty the
+  review queue by hand; use `video approve`.
+- Run `video build --chapter N --force` only to rebuild from scratch; ask the user first.
 
-**Tag every sentence with its panel.** Recap tags tell the video which panel
-a sentence is about. Recap writing is the one AI step left in the video
-pipeline; everything after the tags is deterministic.
+### Before the user records audio
+
+The recap must be fixed before narration, because changing it later breaks sync. When you finish a
+chapter's recap, check it against this list (`recap --finalize` refuses a tag on a text-only or credits
+panel and warns about the rest):
+
+- At least 90% of sentences carry a panel tag (aim for 95%).
+- One drawn panel per sentence where you can; never tag a text-only or credits panel.
+- Numbers are spelled out in `chapter_N.tts.txt` (the tool does this for new recaps).
+- No run of three or more sentences under six words.
+- About 7.5 or more words per drawn panel, so each panel gets its minimum time.
+- **Never rewrite a recap whose chapter already has audio** (`audio/chapter_N.*`) unless the user
+  asks. Their recording would no longer match the script.
+
+### The intro (chapter 0)
+
+A short trailer from panels of any chapters. The user records `audio/chapter_0.mp3`; you do:
+
+```bash
+python -m manhwa_ocr video intro --prepare --session "<name>"   # intro/intro.json template + contact sheets
+python -m manhwa_ocr video intro --session "<name>"             # align, plan, render video/chapter_0.mp4
+```
+
+Fill `intro/intro.json` with one entry per narrated sentence: its text and 1-3 panels written like
+`ch2:P010-14` (ids are labelled on `intro/sheets/*.png`). A panel may appear once, and text-only
+panels are rejected. Framing fixes for the intro go in `video/chapter_0.fixes.json`, using the same
+`ch2:P010-14` ids. `video intro --dry-run` plans without rendering.
+
+**Tag every sentence with its panel.** Recap tags tell the video which panel a sentence is about.
+Recap writing is the one AI step left in the video pipeline; everything after the tags is deterministic.
 
 ## Running it (provider mode)
 
@@ -353,7 +396,7 @@ pipeline.py   provider mode: stage 1 = vision per tile, stage 2 = assembly
 agentflow.py  agent mode: prepare / assemble / finalize file handoffs
 script.py     recap writing (panel-tagged narration) and compile
 status.py     `next` / `status`: what to do now, from what is on disk
-video/        panels, cues, whisper sync, plan, frames, render, clips
+video/        panels, cues, whisper sync, pairing, plan, fixes, verify/review, frames, render, clips, intro
 ui/           the local dashboard
 cli.py        argparse entry point
 ```
@@ -378,7 +421,7 @@ That split means prompt iteration on assembly does not re-pay for vision.
 python -m pytest tests/ -q
 ```
 
-225 tests, including a regression test for every bug found in the full audit
+356 tests, including a regression test for every bug found in the full audit
 (`tests/test_audit.py`). Run them after any change to this package. They cover slicing geometry,
 memory merge semantics, session isolation, the agent flow, link parsing, recaps,
 the `next` workflow, and video (panels, sync, plans, frames, rendering, clips).
