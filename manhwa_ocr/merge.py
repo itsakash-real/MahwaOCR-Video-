@@ -51,18 +51,16 @@ def flatten(tiles: Iterable[Tuple[str, Dict[str, Any] | None]], threshold: float
         normed = [_norm(str(b.get("text"))) for b in blocks]
         for i, (block, n) in enumerate(zip(blocks, normed)):
             # Short tokens ("...", "!?") are too ambiguous to call duplicates.
-            # Require a long, near-identical match: prefer a visible duplicate
-            # over silently deleting a distinct line like "I will kill you".
             if (
                 i < EDGE_BLOCKS
-                and len(n) >= 8
-                and any(difflib.SequenceMatcher(None, n, p).ratio() >= max(threshold, 0.92) for p in prev_tail)
+                and len(n) >= 4
+                and any(difflib.SequenceMatcher(None, n, p).ratio() >= threshold for p in prev_tail)
             ):
                 continue
             speaker = block.get("speaker") or "-"
             btype = block.get("type") or "dialogue"
             flag = " [truncated]" if block.get("truncated") else ""
             lines.append(f"({btype}) {speaker}: {str(block.get('text')).strip()}{flag}")
-        prev_tail = [n for n in normed[-EDGE_BLOCKS:] if len(n) >= 8]
+        prev_tail = [n for n in normed[-EDGE_BLOCKS:] if len(n) >= 4]
 
     return "\n".join(lines)

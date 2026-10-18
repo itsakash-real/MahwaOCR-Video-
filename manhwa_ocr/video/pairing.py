@@ -27,9 +27,7 @@ from PIL import Image, ImageDraw
 from ..util import UserError, atomic_save_image, atomic_write_text, read_agent_json, require_chapter
 from ..workspace import work_root
 from . import cues as cues_mod
-from . import classify as classify_mod
 from . import sync as sync_mod
-from .validate import is_grouped, redistribute
 from .panels import _font, load_panels, panel_image
 
 ROWS_PER_SHEET = 6
@@ -98,39 +96,7 @@ def check(root: Path, chapter: str) -> List[str]:
         here = [order[p] for p in tags if p in order]
         if here:
             last = max(here)     # compare with the previous sentence only (an opening hook may jump ahead)
-    problems.extend(_grouped_lines(grouped_tags(root, chapter)))
     return problems
-
-
-def grouped_tags(root: Path, chapter: str) -> List[Dict[str, Any]]:
-    """Sentences that carry several tags with the next sentence untagged: the pattern that makes
-    `video align` fail no_unexplained_jumps (the picture runs ahead of the words). Each:
-    {"sentence", "tags", "move": {sentence: [tags]}, "text"}. `move` is a suggestion only."""
-    cue_data, panels = _need(root, chapter)
-    position = {p["id"]: i for i, p in enumerate(panels["panels"])}
-    sentences = cue_data["sentences"]
-    tags = [list(s.get("panels") or []) for s in sentences]
-    holds = [bool(s.get("same")) or classify_mod.classify(s.get("text") or "")[0] in {"INTERNAL", "PURE_AUDIO"}
-             for s in sentences]
-    found = []
-    for n, tag_list in enumerate(tags, start=1):
-        nxt_free = n < len(tags) and not tags[n] and not sentences[n].get("same")
-        if not nxt_free or not is_grouped(tag_list, position):
-            continue
-        move = redistribute(tags, n, holds)
-        if move:
-            found.append({"sentence": n, "tags": list(dict.fromkeys(tag_list)), "move": move,
-                          "text": sentences[n - 1].get("text") or ""})
-    return found
-
-
-def _grouped_lines(found: List[Dict[str, Any]]) -> List[str]:
-    out = []
-    for g in found:
-        fix = ", ".join(f'"{s}": {json.dumps(t)}' for s, t in sorted(g["move"].items()))
-        out.append(f"sentence {g['sentence']} carries {len(g['tags'])} tags ({', '.join(g['tags'])}) and the next "
-                   f"sentence has none; `video align` fails no_unexplained_jumps on this. Suggested fix in pairs.json: {fix}")
-    return out
 
 
 def write_sheets(root: Path, chapter: str, log=print) -> List[Path]:
@@ -200,13 +166,7 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
     """Sheets + pairs.json (current tags) + PAIRING.md, the instructions."""
     cue_data, _ = _need(root, chapter)
     sheets = write_sheets(root, chapter, log=log)
-    pairs: Dict[str, Any] = {str(n): s.get("panels") or [] for n, s in enumerate(cue_data["sentences"], start=1)}
-    grouped = grouped_tags(root, chapter)
-    if grouped:
-        # Suggestions only: apply ignores keys starting with "_". Copy a "move" into the numbered entries to use it.
-        pairs["_suggestions"] = {str(g["sentence"]): {
-            "why": "several tags on one sentence with the next sentence untagged (align fails no_unexplained_jumps)",
-            "move": {str(s): t for s, t in sorted(g["move"].items())}} for g in grouped}
+    pairs = {str(n): s.get("panels") or [] for n, s in enumerate(cue_data["sentences"], start=1)}
     atomic_write_text(pairs_path(root, chapter), json.dumps(pairs, indent=1))
     problems = check(root, chapter)
     sess = f' --session "{session}"' if session else ""
@@ -233,23 +193,13 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
         '`"12": ["P006-02"]` or `"13": ["P006-03", "P006-04"]`. Leave sentences that are right as they are.',
         "",
         f"Then:  python -m manhwa_ocr video pair --chapter {chapter} --apply{sess}",
-        f"then:  python -m manhwa_ocr video align --chapter {chapter}{sess}",
         f"then:  python -m manhwa_ocr video plan --chapter {chapter} --force{sess}",
-        f"then:  python -m manhwa_ocr video verify --chapter {chapter}{sess}",
-        "then check the storyboard and approve it (the build prompt in USER_GUIDE.md has the full routine):",
-        f"       python -m manhwa_ocr video approve --chapter {chapter}{sess}",
         f"and:   python -m manhwa_ocr video render --chapter {chapter}{sess}",
         "",
         "## Found automatically",
         "",
         *([f"- {p}" for p in problems] or ["- nothing"]),
         "",
-        *(["## Grouped tags: fix these before `video align`", "",
-           "A sentence with several tags shows them all, so the picture races ahead of the words and the next",
-           "sentence (which has no tag) looks like a jump. Spread the tags over the sentences that follow.",
-           f"pairs.json has a `_suggestions` entry for each; nothing is applied until you copy a suggestion into the",
-           "numbered entries.", "",
-           *[f"- {line}" for line in _grouped_lines(grouped)], ""] if grouped else []),
     ]
     path = task_dir(root, chapter) / "PAIRING.md"
     atomic_write_text(path, "\n".join(lines))
@@ -265,7 +215,6 @@ def apply(root: Path, chapter: str, log=print) -> int:
     pairs = read_agent_json(path, "pairs.json")
     if not isinstance(pairs, dict):
         raise UserError(f"{path} must be an object: sentence number -> list of panel ids.")
-    pairs = {k: v for k, v in pairs.items() if not str(k).startswith("_")}      # _suggestions, _comment: notes only
     by_id = {p["id"]: p for p in panels["panels"]}
     sentences = cue_data["sentences"]
     errors, changed = [], 0

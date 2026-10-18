@@ -27,9 +27,7 @@ That's the whole job. The user decides about code changes.
 - Run `python -m manhwa_ocr ...` commands (from any folder).
 - Read `AGENTS.md` in this folder for how to drive the tool.
 - Write only the files those instructions name, inside the output folder
-  (for example `pairs.json`, `fixes.json`, `cues.json`, `tile_results.json`, `parts.json`).
-- Log every manual edit (file, what, why) in `.work\agent_log.md`. Never edit `plan.json` or `alignment.json` by hand.
-- The full rules every pasted prompt starts with are `COMMON_RULES` in `manhwa_ocr/agent_prompts.py`; read `AGENTS.md`.
+  (for example `pairs.json`, `plan.json`, `tile_results.json`, `parts.json`).
 
 The program is locked: if any file here changes, every command refuses to run
 until the user restores it. Editing it only stops your own work.

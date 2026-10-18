@@ -7,7 +7,6 @@ so nothing has to be installed by hand on Windows. The bundled build has no
 
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import subprocess
@@ -77,10 +76,6 @@ _SILENCE_START = re.compile(r"silence_start:\s*(-?\d+(?:\.\d+)?)")
 _SILENCE_END = re.compile(r"silence_end:\s*(-?\d+(?:\.\d+)?)")
 
 
-def _timing_cache_path(path: Path) -> Path:
-    return path.with_name(path.stem + ".audio_timing.json")
-
-
 def audio_timing(path: Path, *, noise_db: int = -45, min_silence: float = 1.5) -> dict:
     """{"duration": real length, "speech_end": when the last sound stops}.
 
@@ -89,23 +84,8 @@ def audio_timing(path: Path, *, noise_db: int = -45, min_silence: float = 1.5) -
       some MP3s and can be off by a lot;
     - trailing silence, which TTS exports often pad on. A video should end
       with the voice, not run on over a silent tail.
-
-    The result is cached beside the audio file, keyed by (size, mtime, noise
-    settings): plan, align and the sync audit all ask for the same file's
-    timing, and there is no reason to decode it three times per cycle.
     """
     path = Path(path)
-    cache_path = _timing_cache_path(path)
-    st = None
-    try:
-        st = path.stat()
-        cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if (isinstance(cached, dict) and cached.get("size") == st.st_size
-                and cached.get("mtime") == int(st.st_mtime)
-                and cached.get("noise_db") == noise_db and cached.get("min_silence") == min_silence):
-            return {"duration": float(cached["duration"]), "speech_end": float(cached["speech_end"])}
-    except (OSError, ValueError):
-        pass
     header = media_duration(path)
     proc = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", str(path), "-vn",
                            "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}", "-f", "null", "-"],
@@ -124,16 +104,7 @@ def audio_timing(path: Path, *, noise_db: int = -45, min_silence: float = 1.5) -
     # Silence that runs to the end of the file: it never ends, or ends at the end.
     if starts and (len(ends) < len(starts) or ends[-1] >= duration - 0.05):
         speech_end = min(duration, max(0.0, starts[-1]))
-    result = {"duration": duration, "speech_end": speech_end}
-    if st is not None:
-        try:
-            cache_path.write_text(json.dumps({**result, "size": st.st_size,
-                                              "mtime": int(st.st_mtime),
-                                              "noise_db": noise_db, "min_silence": min_silence}),
-                                  encoding="utf-8")
-        except OSError:
-            pass
-    return result
+    return {"duration": duration, "speech_end": speech_end}
 
 
 def video_info(path: Path) -> dict:
@@ -162,11 +133,6 @@ def open_encoder(out: Path, width: int, height: int, fps: int, *, crf: int, pres
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps),
         "-i", "-",
         "-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-        # Cap x264's own threads: render already runs up to cpu_count segment
-        # workers in parallel, and an uncapped x264 spawns ~1.5x cores of
-        # threads per process -- oversubscription thrash on top of the frame
-        # drawing. Let the process pool provide the parallelism.
-        "-threads", "2",
         "-pix_fmt", "yuv420p", "-r", str(fps), "-video_track_timescale", str(fps * 512),
         "-movflags", "+faststart",
         str(out),

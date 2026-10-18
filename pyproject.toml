@@ -18,10 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Recap video rendering. Brings its own FFmpeg binary; nothing else to install.
-# opencv-python-headless is the fast path for connected-component labelling in
-# video/crops.py (_label): without it, labelling falls back to a pure-numpy
-# iterative pass that dominates `video plan` on large flat panels.
-video = ["imageio-ffmpeg>=0.5", "opencv-python-headless>=4.8"]
+video = ["imageio-ffmpeg>=0.5"]
 # Exact sync of panels to the narration (word timestamps, CPU only, no PyTorch).
 # whisper.cpp (ggml), not faster-whisper (ctranslate2/MKL): MKL's allocator can
 # fail with "mkl_malloc: failed to allocate memory" under ordinary desktop

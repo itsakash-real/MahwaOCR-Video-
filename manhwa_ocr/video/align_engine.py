@@ -10,11 +10,8 @@ actually decide a panel are, in order:
      INTERNAL/PURE_AUDIO sentences hold whatever panel is already up.
   2. the story's own order - a panel can only be chosen from a window ahead
      of wherever the story currently is (never a blind, unconstrained pick).
-  3. the recap's original tag - the writer's own choice, so it always stands:
-     even when it glances backwards in the story, and even when another
-     panel's own OCR'd text has a strong word overlap with the sentence
-     (overlap above video.sync.override_evidence only flags the disagreement
-     for review - it never replaces the tag).
+  3. the recap's original tag - trusted *if* it falls inside that window and
+     nothing in the window has stronger lexical evidence against it.
   4. lexical overlap with each candidate panel's own OCR'd text - exact or
      near-exact word/number matches, not fuzzy semantic similarity (which
      testing showed is unreliable for this art style).
@@ -45,9 +42,8 @@ from .media import audio_path, video_dir
 from .panels import load_panels
 
 WINDOW = 6          # how many panels ahead of the current story position are candidates
-JUMP_TOLERANCE = 2  # a tag this far "behind" the running position is a deliberate backward
-                    # glance: still trusted, but flagged for review instead of silently taken
-MIN_WORD = 3        # a matched token shorter than this is too common to count as evidence
+JUMP_TOLERANCE = 2  # a tag this far "behind" the running position isn't trusted blindly
+MIN_WORD = 4        # a matched token shorter than this is too common to count as evidence
 
 # Common words long enough to slip past MIN_WORD but still carry no distinguishing
 # evidence ("the", "was" would already be excluded by length; these are the
@@ -62,8 +58,6 @@ STOPWORDS = {
     "both", "being", "been", "does", "did", "doing", "there", "here", "your",
     "his", "her", "him", "himself", "herself", "itself", "who", "whom", "whose",
     "again", "still", "once", "upon", "like", "much", "many", "though",
-    "the", "and", "are", "was", "you", "she", "not", "but", "for", "all",
-    "any", "can", "one", "two", "six", "ten", "our",
 }
 
 
@@ -97,19 +91,12 @@ def _lexical_overlap(text: str, panel_text: str) -> int:
     return sum(len(t) for t in hit)
 
 
-def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]], *,
-                    override_evidence: float | None = None) -> List[Dict[str, Any]]:
+def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The pure decision engine. `sentences`: [{"text": ..., "panels": [ids]}, ...]
     in story order. `panels`: the chapter's panel list, in story order, each
     with at least "id" and optionally "text_only"/"text". No timestamps, no
     I/O - every segment here still needs "start"/"end" added by the caller.
-
-    `override_evidence` is the OCR-overlap score (video.sync.override_evidence)
-    above which another panel's word overlap with the sentence flags a recap
-    tag for review (the tag still shows); defaults to the shipped value.
     """
-    if override_evidence is None:
-        override_evidence = float(sync_mod.SYNC_DEFAULTS["override_evidence"])
     by_id = {p["id"]: p for p in panels}
     order = {p["id"]: i for i, p in enumerate(panels)}
     art_positions = [i for i, p in enumerate(panels) if not p.get("text_only")]
@@ -147,18 +134,6 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
             segments.append(seg)
             continue
 
-        # Tags the writer gave this sentence, in order. A text-only panel
-        # can't be shown, unless it carries scene/text notes (pale-art guard
-        # against a bad text_only flag); the rest are the sentence's pictures.
-        def _usable(pid: str) -> bool:
-            p = by_id[pid]
-            if not p.get("text_only"):
-                return True
-            return bool((p.get("scene") or "").strip() or (p.get("text") or "").strip())
-
-        usable = [p for p in tagged if _usable(p)]
-        tag = usable[0] if usable else None
-
         window = window_from(cursor)
         candidates = []
         for pid in window:
@@ -169,25 +144,19 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
         candidates.sort(key=lambda c: (-c["ocr_overlap"], -c["sequence_score"]))
         best = candidates[0] if candidates else None
         best_ocr = best["ocr_overlap"] if best else 0
+
+        # Tags the writer gave this sentence, in order. A tag on a text-only panel can't be
+        # shown, so it is not usable; the rest are the sentence's own pictures.
+        usable = [p for p in tagged if not by_id[p].get("text_only")]
+        tag = usable[0] if usable else None
         if tag and order[tag] < cursor - JUMP_TOLERANCE:
-            # A tag pointing behind the story position. Reviewing the real
-            # chapters showed the writer is right about these far more often
-            # than the forward window guess is (the recap glances back at a
-            # face or a wound on purpose); the old code replaced the tag and
-            # showed the wrong picture. Trust the tag, flag the glance.
-            selected, confidence, needs_review = tag, "tag_behind_cursor_accepted", True
+            # A real backward jump: don't trust it blindly, search the forward window instead.
+            selected, confidence, needs_review = (best["panel"] if best else tag), "tag_behind_cursor", True
         elif tag and tag in window:
-            # The writer chose this panel while looking at it, and the real
-            # chapters settled the rest: overriding the tag because another
-            # panel's own OCR'd text overlapped the sentence replaced the tag
-            # with the wrong picture every time it fired (chapter 3: overlap
-            # 56 - the vision model had filed a nearby bubble's line under
-            # that panel - and the recording still matched the tag). The tag
-            # always stands; overlap above video.sync.override_evidence only
-            # flags the disagreement so video pair surfaces it for review.
-            disagree = bool(best and best["panel"] != tag and best_ocr > override_evidence)
-            selected, confidence = tag, "tag_confirmed_in_window"
-            needs_review = disagree
+            # The writer chose this panel while looking at it. Word overlap with a
+            # panel's own text is weak evidence (names, numbers), and overriding the
+            # tag showed the wrong picture while the narrator spoke. The tag stands.
+            selected, confidence, needs_review = tag, "tag_confirmed_in_window", False
         elif tag:
             # Forward, just beyond the normal lookahead window - the window was too
             # small for this stretch, not the tag wrong. Trust it, flag for a glance.
@@ -201,7 +170,7 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
 
         # candidate_window always reflects what was actually considered/chosen, so
         # "selected panel is in its own window" stays a true invariant even when a
-        # tag beyond the normal lookahead (or a backward tag) was used.
+        # tag beyond the normal lookahead (or a backward-jump fallback) was used.
         stored_window = window if selected is None or selected in window else [*window, selected]
         seg.update(story_position=order.get(selected, cursor), candidate_window=stored_window,
                   candidates=candidates, selected_panel=selected,
@@ -221,27 +190,16 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
 
 
 def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]], duration: float,
-                   min_hold: float, filler_full: float | None = None) -> Dict[str, Any]:
+                   min_hold: float) -> Dict[str, Any]:
     """Every drawn panel must appear in the video. A panel no sentence picked is
     placed, in story order, into one of the sentences nearest to it (the one
     with the fewest extra panels so far). Its time is shared with that
     sentence's picks; plan.py does the timing. Text-only panels (captions,
     blank pages, credits) are never placed.
 
-    `filler_full` (video.sync.filler_full): prefer sentences at least that long
-    as hosts, so a filler always shares the sentence with a full min_hold's
-    worth of its own picture instead of squeezing it (a sentence filled end to
-    end). When every nearby sentence is shorter than that, the nearest ones are
-    used anyway - a filler is never dropped because its neighbours were short.
-
-    A sentence's own pick leads its sequence (it is what the narrator is
-    talking about); fillers follow it in story order.
-
     Returns {"placed_by_order": [...], "uncovered": [...]}; `uncovered` is only
     non-empty when the narration is too short to give every panel min_hold.
     """
-    if filler_full is None:
-        filler_full = float(sync_mod.SYNC_DEFAULTS["filler_full"])
     order = {p["id"]: i for i, p in enumerate(panels)}
     shows = [k for k, s in enumerate(segments) if s.get("selected_panel")]
     for s in segments:
@@ -257,17 +215,13 @@ def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]],
             continue
         i = order[pid]
         near = sorted(shows, key=lambda k: (abs(order[segments[k]["selected_panel"]] - i), k))[:3]
-        lit = [k for k in near
-               if float(segments[k]["end"]) - float(segments[k]["start"]) >= filler_full]
-        pool = lit or near
-        k = min(pool, key=lambda k: (len(segments[k]["extra_panels"]), abs(order[segments[k]["selected_panel"]] - i)))
+        k = min(near, key=lambda k: (len(segments[k]["extra_panels"]), abs(order[segments[k]["selected_panel"]] - i)))
         segments[k]["extra_panels"].append(pid)
         placed.append(pid)
     for seg in segments:
         if seg.get("selected_panel"):
             seg["selected_by_align"] = seg["selected_panel"]
-            seq = [seg["selected_panel"]] + sorted(
-                (p for p in set(seg["extra_panels"]) if p != seg["selected_panel"]), key=lambda p: order[p])
+            seq = sorted({seg["selected_panel"], *seg["extra_panels"]}, key=lambda p: order[p])
             seg["sequence"] = seq
         if not seg["extra_panels"]:
             del seg["extra_panels"]
@@ -275,14 +229,10 @@ def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]],
 
 
 def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], vcfg: Dict[str, Any],
-                     sync: str, log, settings: Dict[str, float]) -> tuple[List[Dict[str, Any]], str, float]:
+                     sync: str, log) -> tuple[List[Dict[str, Any]], str, float]:
     """Adds "start"/"end" to each sentence using whisper (cached if available),
     falling back to even spacing. This is the only I/O-dependent part.
-    sync="off" skips whisper entirely (fast, deterministic estimated timing).
-
-    With real timing, a run of consecutive sentences whisper never matched,
-    longer than video.sync.max_unmatched, stops the build: timing that stretch
-    would be pure interpolation, and interpolation is how drift starts."""
+    sync="off" skips whisper entirely (fast, deterministic estimated timing)."""
     audio = audio_path(root, chapter)
     if audio is None:
         raise UserError(f"No narration audio for chapter {chapter} yet.")
@@ -315,25 +265,12 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
             mode = "estimated"
     elif sync != "off":
         log(f"  note: install whisper for exact sync:  {sync_mod.SYNC_HINT}")
-    aligned = sync_mod.align(sentences, words, duration,
-                             min_segment=float(settings.get("min_segment", sync_mod.MIN_SEGMENT)))
+    aligned = sync_mod.align(sentences, words, duration)
     timed = aligned["sentences"]
     for i, s in enumerate(timed):
         s["end"] = float(timed[i + 1]["start"]) if i + 1 < len(timed) else duration
     if mode == "synced" and not aligned.get("matched"):
         mode = "estimated"
-    if mode == "synced":
-        over = sync_mod.long_unmatched_run(aligned, settings["max_unmatched"])
-        if over is not None:
-            from .build import _mmss
-            where = (f"sentences {over['first']}-{over['last']}" if over["first"] != over["last"]
-                     else f"sentence {over['first']}")
-            raise UserError(
-                f"Chapter {chapter}: {where} ({_mmss(over['start'])}-{_mmss(over['end'])}, "
-                f"{over['seconds']:.1f}s) have no matched speech in the timeline - the pictures there "
-                f"would be timed by guesswork.\nBump video.sync.max_unmatched in manhwa-ocr.yaml if that "
-                f"stretch is really fine (currently {settings['max_unmatched']:g}s), or check the narration "
-                f"and re-run transcription.")
     return timed, mode, duration
 
 
@@ -349,18 +286,14 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
     order = {p["id"]: i for i, p in enumerate(plist)}
 
     vcfg = dict(cfg.video) if hasattr(cfg, "video") else dict(cfg)
-    settings = sync_mod.effective_settings(vcfg, log=log)
-    timed, sync_mode, duration = _timed_sentences(root, chapter, cue_data["sentences"], vcfg, sync, log,
-                                                  settings)
+    timed, sync_mode, duration = _timed_sentences(root, chapter, cue_data["sentences"], vcfg, sync, log)
 
-    segments = align_sentences(cue_data["sentences"], plist,
-                               override_evidence=settings["override_evidence"])
+    segments = align_sentences(cue_data["sentences"], plist)
     for seg, t in zip(segments, timed):
         seg["start"], seg["end"] = round(float(t["start"]), 3), round(float(t["end"]), 3)
-        seg["timing_source"] = t.get("timing_source", "estimated")
 
-    min_hold = settings["min_hold"]
-    coverage = place_coverage(segments, plist, duration, min_hold, settings["filler_full"])
+    min_hold = float(vcfg.get("min_hold", 3.0))
+    coverage = place_coverage(segments, plist, duration, min_hold)
     coverage["art_panels"] = sum(1 for p in plist if not p.get("text_only"))
     coverage["text_only_excluded"] = [p["id"] for p in plist if p.get("text_only")]
     coverage["placed_by_order_count"] = len(coverage["placed_by_order"])
