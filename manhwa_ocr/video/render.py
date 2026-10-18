@@ -27,7 +27,7 @@ from .ffmpeg import close_encoder, open_encoder, run
 import numpy as np
 
 from .frames import Format, ShotRenderer, format_from
-from .media import video_dir
+from .media import pages_dir, video_dir
 from .panels import load_panels, panel_image
 
 RENDER_VERSION = 2
@@ -117,15 +117,37 @@ def _jobs(root: Path, chapter: str, plan: Dict[str, Any], panels_data: Dict[str,
             raise UserError(f"Shot {shot.get('id')} is shorter than one frame. Lengthen it in the plan.")
         last = i == len(shots) - 1
         used = [c["panel"] for c in shot.get("cards") or []] + ([shot["bg_panel"]] if shot.get("bg_panel") else [])
+        # Per-page stamps for exactly the page files this shot's panels come
+        # from. The old key used the chapter-wide panels fingerprint, so a
+        # no-op re-detection (one panel's geometry re-measured identically)
+        # invalidated every cached segment. Geometry is already in the key
+        # via the panels dict; the stamps catch a page file being replaced.
+        page_stamp: Dict[str, Any] = {}
+        for pid in dict.fromkeys(used):
+            p = panels.get(pid)
+            if p is None:
+                continue
+            ch = p.get("src_chapter") or chapter
+            for seg in p.get("segments") or []:
+                f = pages_dir(root, ch) / seg["file"]
+                try:
+                    st = f.stat()
+                    page_stamp[f"{ch}/{seg['file']}"] = (st.st_size, st.st_mtime)
+                except OSError:
+                    page_stamp[f"{ch}/{seg['file']}"] = None
         job = {
             "root": str(root), "chapter": chapter, "norm_w": panels_data["norm_width"],
             "fingerprint": panels_data.get("fingerprint", ""),
             "panels": {pid: panels[pid] for pid in dict.fromkeys(used) if pid in panels},
             "shot": shot, "fmt": (fmt.width, fmt.height, fmt.fps), "f0": f0, "f1": f1,
             "video_end": duration if last else None, "end_fade": end_fade and last,
-            "effects_on": effects_on, "crf": crf, "preset": preset,
+            "effects_on": effects_on, "crf": crf, "preset": preset, "page_stamp": page_stamp,
         }
-        key = hashlib.sha256(json.dumps([RENDER_VERSION, {k: v for k, v in job.items() if k != "root"}],
+        # The chapter fingerprint is deliberately NOT in the key (it feeds
+        # _panel's cleaned-panel cache instead): it changes on any
+        # re-detection, even one that leaves every panel identical.
+        key = hashlib.sha256(json.dumps([RENDER_VERSION, {k: v for k, v in job.items()
+                                                           if k not in ("root", "fingerprint")}],
                                         sort_keys=True, default=str).encode()).hexdigest()[:20]
         job["out"] = str(cache / f"{key}.mp4")
         jobs.append(job)

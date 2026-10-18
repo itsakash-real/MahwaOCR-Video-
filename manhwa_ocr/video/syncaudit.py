@@ -284,17 +284,33 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         return True
 
     over: List[Dict[str, Any]] = []
+    # Linear sweep: `judged` is sorted by t, so the [t, t+GATE_SPAN) window
+    # slides with two pointers and running counts instead of rescanning
+    # every sample for every step (which was O(n^2)).
+    settled = [_settled(s["t"]) for s in judged]
+    lo = hi = 0
+    n_win = n_wrong = n_match = 0
     t = 0.0
     while t + GATE_SPAN <= duration + 1e-6:
-        win = [s for s in judged if t <= s["t"] < t + GATE_SPAN and _settled(s["t"])]
-        if win:
-            nw = sum(1 for s in win if s["wrong"])
-            wfrac = nw / len(win)
-            if wfrac > st["gate_window"] + 1e-9 and nw * SAMPLE_STEP >= GATE_WRONG_SECONDS - 1e-9:
+        while hi < len(judged) and judged[hi]["t"] < t + GATE_SPAN:
+            if settled[hi]:
+                n_win += 1
+                n_wrong += 1 if judged[hi]["wrong"] else 0
+                n_match += 1 if judged[hi]["match"] else 0
+            hi += 1
+        while lo < len(judged) and judged[lo]["t"] < t:
+            if settled[lo]:
+                n_win -= 1
+                n_wrong -= 1 if judged[lo]["wrong"] else 0
+                n_match -= 1 if judged[lo]["match"] else 0
+            lo += 1
+        if n_win:
+            wfrac = n_wrong / n_win
+            if wfrac > st["gate_window"] + 1e-9 and n_wrong * SAMPLE_STEP >= GATE_WRONG_SECONDS - 1e-9:
                 over.append({"start": round(t, 2), "wrong": round(wfrac, 4),
-                             "wrong_seconds": round(nw * SAMPLE_STEP, 2),
-                             "match": round(sum(1 for s in win if s["match"]) / len(win), 4),
-                             "samples": len(win)})
+                             "wrong_seconds": round(n_wrong * SAMPLE_STEP, 2),
+                             "match": round(n_match / n_win, 4),
+                             "samples": n_win})
         t += SAMPLE_STEP
     worst_window = max(over, key=lambda w: w["wrong"]) if over else None
 

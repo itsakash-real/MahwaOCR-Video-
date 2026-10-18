@@ -270,7 +270,8 @@ def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str
 
 
 def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto", fmt: str | None = None,
-              duration: float | None = None, pages_from: Path | None = None, log: Callable = print) -> Dict[str, Any]:
+              duration: float | None = None, pages_from: Path | None = None, log: Callable = print,
+              storyboard: bool = True) -> Dict[str, Any]:
     root, chapter = sess.path, require_chapter(chapter)
     vcfg = dict(cfg.video)
     fmt = fmt or vcfg.get("format", "16:9")
@@ -427,8 +428,9 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if qa["review_queue"]:
         log(f"    ! {len(qa['review_queue'])} sentence(s) flagged for review (non-blocking; "
             f"see video/chapter_{chapter}.qa.json)")
-    write_storyboard(root, chapter, plan, log=log)
-    write_review_task(root, chapter, plan, sess.slug)
+    if storyboard:
+        write_storyboard(root, chapter, plan, log=log)
+        write_review_task(root, chapter, plan, sess.slug)
     return plan
 
 
@@ -515,7 +517,8 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
 
 
 def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "auto", fmt: str | None = None,
-          preview: bool = False, workers: int = 0, log: Callable = print) -> Dict[str, str]:
+          preview: bool = False, workers: int = 0, log: Callable = print,
+          storyboard: bool = True) -> Dict[str, str]:
     """Plan + storyboard + render for each chapter, skipping what's already current."""
     results: Dict[str, str] = {}
     for chapter in sort_chapters(chapters):
@@ -527,7 +530,7 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
         try:
             if cues_mod.load_cues(sess.path, chapter):
                 align_engine.build_alignment(sess.path, chapter, cfg, sync=sync, log=log)
-            make_plan(sess, chapter, cfg, force=force, sync=sync, fmt=fmt, log=log)
+            make_plan(sess, chapter, cfg, force=force, sync=sync, fmt=fmt, log=log, storyboard=storyboard)
             out = output_path(sess.path, chapter, preview)
             pf = plan_path(sess.path, chapter)
             if out.exists() and out.stat().st_mtime >= pf.stat().st_mtime and not force:

@@ -308,10 +308,13 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
 # ------------------------------------------------------------------ images
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=8)
 def _load_page(path: str, mtime: float) -> Image.Image:
-    # Panels are processed in page order, so the last two decoded pages cover
-    # almost every crop. Decoding a 16000px PNG per panel would dominate runtime.
+    # Panels are processed in page order, so a few decoded pages cover
+    # almost every crop (the old size of 2 thrashed whenever a panel
+    # spanned pages or the caller jumped back). Decoding a 16000px PNG
+    # per panel would dominate runtime. Callers only crop from the
+    # returned image, never mutate it, so sharing it is safe.
     with Image.open(path) as img:
         return img.convert("RGB")
 

@@ -119,12 +119,17 @@ def download_images(
     referer: str | None = None,
     config: Dict[str, Any] | None = None,
     log=print,
+    cache_dir: Path | None = None,
 ) -> List[Path]:
     """Fetch pages and normalize them to PNG. Reuses pages already on disk.
 
     Downloads run in parallel (8 workers). Politeness is kept by spacing
     request *starts* at least `delay` seconds apart; the downloads
     themselves overlap.
+
+    `cache_dir` is a shared, URL-keyed store (one `<sha256(url)>.png` per
+    page): a chapter re-downloaded after cleanup, or a second chapter from
+    the same URL, reads the page from there instead of the network.
     """
     cfg = config or {}
     dest.mkdir(parents=True, exist_ok=True)
@@ -154,6 +159,13 @@ def download_images(
         if out.exists() and _is_readable(out):
             return out
 
+        cache_file = None
+        if cache_dir is not None:
+            cache_file = Path(cache_dir) / f"{hashlib.sha256(url.encode()).hexdigest()}.png"
+            if cache_file.exists() and _is_readable(cache_file):
+                atomic_write_bytes(out, cache_file.read_bytes())
+                return out
+
         last_err: Exception | None = None
         for attempt in range(retries):
             try:
@@ -174,6 +186,9 @@ def download_images(
                         rgb = img.convert("RGB")
                     width, height = rgb.size
                     atomic_save_image(rgb, out)
+                if cache_file is not None:
+                    cache_file.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_bytes(cache_file, out.read_bytes())
                 log(f"  page {i:>3}  {width}x{height}")
                 return out
             except Exception as exc:  # noqa: BLE001 - surfaced below

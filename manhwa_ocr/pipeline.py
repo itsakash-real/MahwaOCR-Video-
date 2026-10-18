@@ -275,7 +275,8 @@ class Pipeline:
             self.log("  discovering pages...")
             urls = discover_pages(url, self.cfg.download)
             self.log(f"  {len(urls)} pages found; downloading...")
-            pages = download_images(urls, chapter_dir / "pages", referer=url, config=self.cfg.download, log=self.log)
+            pages = download_images(urls, chapter_dir / "pages", referer=url, config=self.cfg.download,
+                                      log=self.log, cache_dir=self.workdir / ".cache" / "pages")
         else:
             raise UserError("Give a chapter URL or --folder.")
 

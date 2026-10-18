@@ -163,7 +163,7 @@ def _panel_listing(panels: List[Dict[str, Any]]) -> str:
             hint = ""
         bits = [p["id"] + (" [tall]" if p.get("tall") else "") + hint]
         if p.get("scene"):
-            bits.append(f"shows: {p['scene'][:150]}")
+            bits.append(f"shows: {p['scene']}")
         if p.get("text"):
             bits.append(f"text: {p['text'][:120]}")
         lines.append("- " + " — ".join(bits))

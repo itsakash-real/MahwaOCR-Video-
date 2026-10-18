@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -145,12 +146,16 @@ def write_sheets(root: Path, chapter: str, log=print) -> List[Path]:
     cols = 2 + NEXT_SHOWN
     width = text_w + cols * (cell_w + pad) + pad
     row_h = THUMB_H + 2 * pad + 26
-    cache: Dict[str, Image.Image] = {}
+    cache: "OrderedDict[str, Image.Image]" = OrderedDict()
 
     def thumb(pid: str) -> Image.Image:
-        if pid not in cache:
-            if len(cache) > 40:
-                cache.clear()
+        if pid in cache:
+            cache.move_to_end(pid)
+        else:
+            # LRU: evict one entry, never wipe the whole cache (the old
+            # clear() made every sheet re-decode panels it had just loaded).
+            if len(cache) >= 40:
+                cache.popitem(last=False)
             img = panel_image(root, chapter, by_id[pid], panels["norm_width"])
             img.thumbnail((cell_w, THUMB_H), Image.LANCZOS)
             cache[pid] = img
@@ -254,6 +259,47 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
     path = task_dir(root, chapter) / "PAIRING.md"
     atomic_write_text(path, "\n".join(lines))
     return path
+
+
+def autofix(root: Path, chapter: str, log=print) -> int:
+    """Replace text-only/credits tags with the nearest drawn panel.
+
+    The mechanical fix for the problem `check()` flags: a text-only tag is
+    never shown, and the nearest drawn panel is almost always the right
+    replacement. Writes straight to the cues (like apply() does) and logs
+    every change; run `check()` afterwards for anything left over.
+    Returns how many sentences changed.
+    """
+    cue_data, panels = _need(root, chapter)
+    plist = panels["panels"]
+    by_id = {p["id"]: p for p in plist}
+    sentences = cue_data["sentences"]
+    changed = 0
+    for n, s in enumerate(sentences, start=1):
+        new_tags = []
+        dirty = False
+        for pid in s.get("panels") or []:
+            p = by_id.get(pid)
+            if p is not None and (p.get("text_only") or p.get("credits")):
+                near = cues_mod.nearest_drawn_panel(plist, pid)
+                if near and near != pid:
+                    log(f"  sentence {n}: {pid} is text-only/credits -> {near}")
+                    new_tags.append(near)
+                    dirty = True
+                else:
+                    new_tags.append(pid)  # no drawn panel to retag to; leave it
+            else:
+                new_tags.append(pid)
+        new_tags = list(dict.fromkeys(new_tags))
+        if dirty:
+            s["panels"] = new_tags
+            changed += 1
+    if changed:
+        atomic_write_text(cues_mod.cues_path(root, chapter), json.dumps(cue_data, indent=1, ensure_ascii=False))
+        log(f"  chapter {chapter}: {changed} sentence(s) re-tagged to the nearest drawn panel")
+    else:
+        log(f"  chapter {chapter}: no text-only/credits tags to fix")
+    return changed
 
 
 def apply(root: Path, chapter: str, log=print) -> int:

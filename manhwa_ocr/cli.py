@@ -695,9 +695,13 @@ def cmd_video(args) -> int:
         for c in chapters(default_all=False):
             vb.make_plan(sess, c, cfg, force=args.force or action == "sync",
                          sync="off" if args.no_sync else "auto", fmt=args.format, duration=args.duration,
-                         pages_from=Path(args.pages) if args.pages else None, log=_log)
-            _log(f"  review: .work/video/ch{c}/REVIEW.md   then:  python -m manhwa_ocr video render "
-                 f"--chapter {c}{_pin(sess)}")
+                         pages_from=Path(args.pages) if args.pages else None, log=_log,
+                         storyboard=not args.no_storyboard)
+            if not args.no_storyboard:
+                _log(f"  review: .work/video/ch{c}/REVIEW.md   then:  python -m manhwa_ocr video render "
+                     f"--chapter {c}{_pin(sess)}")
+            else:
+                _log(f"  next:  python -m manhwa_ocr video render --chapter {c}{_pin(sess)}")
         return 0
 
     if action == "intro":
@@ -726,6 +730,10 @@ def cmd_video(args) -> int:
         from .video import pairing
 
         for c in chapters(default_all=False):
+            if args.autofix:
+                pairing.autofix(sess.path, c, log=_log)
+                _log(f"  next:  python -m manhwa_ocr video align --chapter {c} --session \"{sess.slug}\"")
+                continue
             if args.apply:
                 pairing.apply(sess.path, c, log=_log)
                 _log(f"  next:  python -m manhwa_ocr video plan --chapter {c} --force --session \"{sess.slug}\"")
@@ -847,7 +855,8 @@ def cmd_video(args) -> int:
 
     if action == "build":
         results = vb.build(sess, chapters(), cfg, force=args.force, sync="off" if args.no_sync else "auto",
-                           fmt=args.format, preview=args.preview, workers=args.workers, log=_log)
+                           fmt=args.format, preview=args.preview, workers=args.workers, log=_log,
+                           storyboard=not args.no_storyboard)
         _log("")
         for c, r in results.items():
             _log(f"  ch {c:<6} {r}")
@@ -1002,6 +1011,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-titles", dest="no_titles", action="store_true", help="compile without title cards")
     p.add_argument("--name", help="compiled output name")
     p.add_argument("--apply", action="store_true", help="pair: save the fixed tags from pairs.json")
+    p.add_argument("--autofix", action="store_true",
+                   help="pair: replace text-only/credits tags with the nearest drawn panel")
+    p.add_argument("--no-storyboard", dest="no_storyboard", action="store_true",
+                   help="plan/build: skip writing the storyboard + review task")
     p.add_argument("--prepare", action="store_true",
                    help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
     p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing; intro: plan only, no render")

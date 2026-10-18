@@ -74,6 +74,11 @@ def alignment_path(root: Path, chapter: str) -> Path:
 MIN_OVERRIDE_EVIDENCE = 10  # roughly two real content words, or one long distinctive one
 
 
+def _lexical_overlap_sets(s_tokens: set, p_tokens: set) -> int:
+    """_lexical_overlap on pre-tokenized sets (see _lexical_overlap)."""
+    return sum(len(t) for t in (p_tokens & s_tokens))
+
+
 def _lexical_overlap(text: str, panel_text: str) -> int:
     """How much real evidence the panel's own OCR'd text shares with the
     sentence: the summed character length of matched, meaningful tokens.
@@ -92,9 +97,7 @@ def _lexical_overlap(text: str, panel_text: str) -> int:
     p_tokens = {t for t in sync_mod.tokens(panel_text) if len(t) >= MIN_WORD and t not in STOPWORDS}
     if not p_tokens:
         return 0
-    s_tokens = set(sync_mod.tokens(text))
-    hit = p_tokens & s_tokens
-    return sum(len(t) for t in hit)
+    return _lexical_overlap_sets(set(sync_mod.tokens(text)), p_tokens)
 
 
 def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]], *,
@@ -113,6 +116,12 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
     by_id = {p["id"]: p for p in panels}
     order = {p["id"]: i for i, p in enumerate(panels)}
     art_positions = [i for i, p in enumerate(panels) if not p.get("text_only")]
+    # Tokenize every panel's OCR text once: the old code re-tokenized the
+    # sentence AND each candidate panel on every candidate check.
+    panel_tokens = {
+        pid: {t for t in sync_mod.tokens(p.get("text", "")) if len(t) >= MIN_WORD and t not in STOPWORDS}
+        for pid, p in by_id.items()
+    }
 
     segments: List[Dict[str, Any]] = []
     cursor = -1  # position of the last panel actually shown
@@ -161,8 +170,9 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
 
         window = window_from(cursor)
         candidates = []
+        s_tokens = set(sync_mod.tokens(text))
         for pid in window:
-            ov = _lexical_overlap(text, by_id[pid].get("text", ""))
+            ov = _lexical_overlap_sets(s_tokens, panel_tokens[pid])
             dist = abs(order[pid] - cursor)
             candidates.append({"panel": pid, "ocr_overlap": ov,
                                "sequence_score": round(1.0 / (1.0 + dist), 3), "matches_tag": pid in tagged})
