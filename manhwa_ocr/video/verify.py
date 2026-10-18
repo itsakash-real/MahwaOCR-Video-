@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Tuple
 from PIL import Image
 
 from .crops import BUBBLE_OK, FIGURE_MIN, _panel_maps, head_of, shape_candidates
+from .cropcache import crop_key, load_crop, store_crop
 from ..util import atomic_write_text, require_chapter
 from .media import video_dir
 
@@ -84,7 +85,8 @@ def pick_crop(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None
 
 def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, Any]], Image.Image],
                    shapes: List[float], root: Path | None = None, chapter: str | None = None,
-                   log: Callable = print, options: Dict[str, Any] | None = None) -> Dict[str, Any]:
+                   log: Callable = print, options: Dict[str, Any] | None = None,
+                   fingerprint: str | None = None) -> Dict[str, Any]:
     """Check every drawn panel. Returns the report (also written to
     video/chapter_N.verify.json when root and chapter are given)."""
     rows: Dict[str, Any] = {}
@@ -95,10 +97,23 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
     for p in panels:
         if p.get("text_only"):
             continue
-        img = image_for(p)
-        maps = _panel_maps(img, options)
-        shape, box, probs, clean = pick_crop(img, shapes, maps)
-        head = head_of(maps)
+        # Crop cache: on a hit the panel image is never even loaded.
+        card = head = None
+        ckey = None
+        if root is not None and chapter is not None and fingerprint:
+            ckey = crop_key(fingerprint, p, shapes, options, None)
+            cached = load_crop(root, chapter, ckey)
+            if cached is not None:
+                card, head = cached["pick"], cached["head"]
+        if card is None:
+            img = image_for(p)
+            maps = _panel_maps(img, options)
+            card = pick_card(img, shapes, maps)
+            head = head_of(maps)
+            if ckey is not None:
+                store_crop(root, chapter, ckey,
+                           {"pick": card, "head": head, "edge_rows": list(maps["edge_rows"])})
+        shape, box, probs, clean = card["shape"], card["box"], card["problems"], card["clean"]
         figure = bool(head["figure"])           # skin colour, or a pale/gray head blob
         if not head["confident"] and (head["source"] == "pale" or head["keep_top"]):
             low_confidence.append({"panel": p["id"], "reason": (

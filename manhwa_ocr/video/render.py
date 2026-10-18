@@ -59,7 +59,7 @@ def _panel(root: str, chapter: str, panel: Dict[str, Any], norm_w: int, fingerpr
     if img is None:
         if len(_PANEL_CACHE) > 6:
             _PANEL_CACHE.clear()
-        img = panel_image(Path(root), chapter, panel, norm_w, clean=True)
+        img = panel_image(Path(root), chapter, panel, norm_w, clean=True, fingerprint=fingerprint)
         _PANEL_CACHE[key] = img
     return img
 

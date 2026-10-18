@@ -65,7 +65,8 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
                     if pid not in cache:
                         if len(cache) > 16:
                             cache.clear()
-                        cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"], clean=True)
+                        cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"], clean=True,
+                                                 fingerprint=panels_data.get("fingerprint"))
                     images[pid] = cache[pid]
                 # 85% through: entrances done and a pair's second card has arrived.
                 when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))
