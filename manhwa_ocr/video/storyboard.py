@@ -66,7 +66,8 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
                     if pid in cache:
                         cache.move_to_end(pid)
                     else:
-                        cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"], clean=True)
+                        cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"], clean=True,
+                                                 fingerprint=panels_data.get("fingerprint"))
                         # LRU: evict one entry, never wipe the whole cache.
                         while len(cache) > 32:
                             cache.popitem(last=False)

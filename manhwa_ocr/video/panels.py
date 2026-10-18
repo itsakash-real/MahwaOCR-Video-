@@ -26,6 +26,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from ..util import UserError, atomic_save_image, atomic_write_text, require_chapter
+from ..workspace import work_root
 from .media import list_pages, media_dir
 
 PANELS_VERSION = 4
@@ -336,12 +337,41 @@ def _stitch(panel: Panel, files: Dict[str, Path], max_side: int | None = None) -
     return out
 
 
+def _clean_cache_dir(root: Path, chapter: str) -> Path:
+    return work_root(root) / "video" / f"ch{require_chapter(chapter)}" / "panels_clean"
+
+
+def _clean_cache_key(fingerprint: str, panel: Panel, norm_w: int) -> str:
+    geo = {"id": panel.id, "x0": panel.x0, "x1": panel.x1, "y0": panel.y0, "y1": panel.y1,
+           "segments": [dict(s) for s in panel.segments]}
+    raw = json.dumps({"fp": fingerprint, "nw": norm_w, "panel": geo}, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
 def panel_image(root: Path, chapter: str, panel: Dict[str, Any] | Panel, norm_w: int | None = None,
-                clean: bool = False) -> Image.Image:
+                clean: bool = False, fingerprint: str | None = None) -> Image.Image:
     """Crop one panel from the kept pages, side margins trimmed. clean=True also
     paints out its speech bubbles: that is the picture the video shows."""
     if isinstance(panel, dict):
         panel = Panel(**{k: panel[k] for k in ("id", "index", "y0", "y1", "x0", "x1", "segments")})
+    # Cleaned-panel disk cache: stitching + bubble-cleaning (which itself runs
+    # _panel_maps) is paid once per panel per fingerprint, not once per caller
+    # (verify, designer, storyboard, render workers). The sidecar preserves
+    # `painted_boxes`, the attribute _panel_maps reads to steer crops away
+    # from painted patches -- a bare PNG would lose it.
+    cache_key = cache_png = cache_sidecar = None
+    if clean and fingerprint and norm_w is not None:
+        cache_key = _clean_cache_key(fingerprint, panel, norm_w)
+        cache_dir = _clean_cache_dir(root, chapter)
+        cache_png = cache_dir / f"{panel.id}_{cache_key}.png"
+        cache_sidecar = cache_dir / f"{panel.id}_{cache_key}.painted.json"
+        if cache_png.exists() and cache_sidecar.exists():
+            try:
+                img = Image.open(cache_png).convert("RGB")
+                img.painted_boxes = json.loads(cache_sidecar.read_text(encoding="utf-8"))
+                return img
+            except (OSError, ValueError):
+                pass
     files = {p.name: p for p in list_pages(root, chapter)}
     strip = _stitch(panel, files)
     nw = norm_w or panel.segments[0].get("page_w") or strip.width
@@ -353,6 +383,13 @@ def panel_image(root: Path, chapter: str, panel: Dict[str, Any] | Panel, norm_w:
         from .crops import clean_bubbles
 
         strip = clean_bubbles(strip)
+        if cache_key is not None:
+            try:
+                atomic_save_image(strip, cache_png)
+                atomic_write_text(cache_sidecar,
+                                  json.dumps(list(getattr(strip, "painted_boxes", []))))
+            except OSError:
+                pass
     return strip
 
 

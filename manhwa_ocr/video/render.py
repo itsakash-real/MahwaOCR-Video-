@@ -59,7 +59,7 @@ def _panel(root: str, chapter: str, panel: Dict[str, Any], norm_w: int, fingerpr
     key = (root, chapter, panel["id"], fingerprint, panel.get("src_fingerprint"))
     img = _PANEL_CACHE.get(key)
     if img is None:
-        img = panel_image(Path(root), chapter, panel, norm_w, clean=True)
+        img = panel_image(Path(root), chapter, panel, norm_w, clean=True, fingerprint=fingerprint)
         _PANEL_CACHE[key] = img
         # LRU: evict one entry, never wipe the whole cache (the old
         # `clear()` made workers re-decode panels they had just loaded).

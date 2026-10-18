@@ -34,6 +34,7 @@ from PIL import Image
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
 from . import sync as sync_mod
 from .crops import _panel_maps, head_of, tone
+from .cropcache import crop_key, load_crop, store_crop
 from .verify import pick_card
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
 from .media import video_dir
@@ -375,8 +376,10 @@ class _Designer:
     """Turns timing units into shots: layouts, crops, backgrounds, animation."""
 
     def __init__(self, chapter: str, panels: List[Dict[str, Any]], fmt: Format, vcfg: Dict[str, Any],
-                 image_for: Callable[[Dict[str, Any]], Image.Image], fixes: Dict[str, Any] | None = None):
+                 image_for: Callable[[Dict[str, Any]], Image.Image], fixes: Dict[str, Any] | None = None,
+                 root: Path | None = None, fingerprint: str | None = None):
         self.chapter, self.fmt, self.vcfg = chapter, fmt, vcfg
+        self._root, self._fingerprint = root, fingerprint
         self.fixes = {"crop": {}, "face": {}, "shot": {}, **(fixes or {})}
         self.by_id = {p["id"]: p for p in panels}
         self.image_for = image_for
@@ -424,21 +427,41 @@ class _Designer:
                 if box[2] - box[0] < 0.999 and pid not in self.crop_stats["side_cut"]:
                     self.crop_stats["side_cut"].append(pid)
                 return self._crops[key]
-            if pid not in self._maps:
-                self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
-                top, bottom = self._maps[pid]["edge_rows"]
+            # Crop cache: on a hit, no image decode and no _panel_maps.
+            shapes = shapes_for(layout, self.fmt)
+            face = self.fixes["face"].get(pid)
+            ckey = None
+            entry = None
+            if self._root is not None and self._fingerprint:
+                ckey = crop_key(self._fingerprint, self.by_id[pid], shapes, self.map_options, face)
+                entry = load_crop(self._root, self.chapter, ckey)
+            if entry is not None:
+                card = entry["pick"]
+                head = entry["head"]
+                top, bottom = entry["edge_rows"]
                 if (top + bottom) >= 0.01 and pid not in self.crop_stats["white_edge"]:
                     # Gutter rows still sit on this panel's edge (panels.json predates edge
                     # tightening). `video panels --force` re-detects it flush to the art.
                     self.crop_stats["white_edge"].append(pid)
-            maps = self._maps[pid]
-            if pid in self.fixes["face"]:                   # a reviewer's head position replaces the skin guess
-                maps = {**maps, "face_override": self.fixes["face"][pid]}
-            head = head_of(maps)
+            else:
+                if pid not in self._maps:
+                    self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
+                    top, bottom = self._maps[pid]["edge_rows"]
+                    if (top + bottom) >= 0.01 and pid not in self.crop_stats["white_edge"]:
+                        # Gutter rows still sit on this panel's edge (panels.json predates edge
+                        # tightening). `video panels --force` re-detects it flush to the art.
+                        self.crop_stats["white_edge"].append(pid)
+                maps = self._maps[pid]
+                if face is not None:                   # a reviewer's head position replaces the skin guess
+                    maps = {**maps, "face_override": face}
+                head = head_of(maps)
+                card = pick_card(self.img(pid), shapes, maps)
+                if ckey is not None:
+                    store_crop(self._root, self.chapter, ckey,
+                               {"pick": card, "head": head, "edge_rows": list(self._maps[pid]["edge_rows"])})
             if not head["confident"] and (head["source"] == "pale" or head["keep_top"]) \
                     and pid not in self.crop_stats["low_confidence_heads"]:
                 self.crop_stats["low_confidence_heads"].append(pid)
-            card = pick_card(self.img(pid), shapes_for(layout, self.fmt), maps)
             shape, box, probs = card["shape"], card["box"], card["problems"]
             if card["pad_y"] > 0:
                 self._pads[key] = float(card["pad_y"])
@@ -628,7 +651,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                alignment_units: List[Dict[str, Any]] | None = None,
                fixes: Dict[str, Any] | None = None,
                alignment_meta: Dict[str, Any] | None = None,
-               settings: Dict[str, float] | None = None) -> Dict[str, Any]:
+               settings: Dict[str, float] | None = None,
+               root: Path | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
     this function makes no panel decisions of its own - it only lays out,
@@ -664,7 +688,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                                           min_hold_short=st["min_hold_short"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
-    designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes)
+    designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes,
+                         root=root, fingerprint=panels_data.get("fingerprint"))
     shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
     return {
         "version": PLAN_VERSION,

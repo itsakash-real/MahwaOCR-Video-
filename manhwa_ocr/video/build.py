@@ -353,8 +353,11 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     fixes = fixes_mod.load(root, chapter, dims)
     fmt_obj = format_from(fmt, int(vcfg.get("fps", 30)))
     shapes = sorted({a for k in ("single", "pair", "wide") for a in shapes_for(k, fmt_obj)})
-    report = verify_chapter(panels["panels"], lambda p: panel_image(root, chapter, p, norm_w, clean=True),
-                            shapes, root, chapter, log=log, options=map_options(vcfg))
+    report = verify_chapter(panels["panels"],
+                            lambda p: panel_image(root, chapter, p, norm_w, clean=True,
+                                                  fingerprint=panels.get("fingerprint")),
+                            shapes, root, chapter, log=log, options=map_options(vcfg),
+                            fingerprint=panels.get("fingerprint"))
     drop = {d["panel"]: d["reason"] for d in report["dropped"]}
     drop.update(fixes["drop"])
     for p in panels["panels"]:
@@ -399,8 +402,9 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
 
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
-                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True), fixes=fixes,
-                      settings=sync_settings)
+                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True,
+                                                      fingerprint=panels.get("fingerprint")),
+                      fixes=fixes, settings=sync_settings, root=root)
     plan["inputs"] = inputs
     plan["generated_hash"] = _shots_hash(plan)
     errs = validate(plan, {p["id"] for p in panels["panels"]})
