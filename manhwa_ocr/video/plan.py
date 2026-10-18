@@ -21,6 +21,7 @@ Pacing follows manhwa_recap_style_spec.md: one sentence is about one shot
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import math
 import random
@@ -379,7 +380,7 @@ class _Designer:
         self.fixes = {"crop": {}, "face": {}, "shot": {}, **(fixes or {})}
         self.by_id = {p["id"]: p for p in panels}
         self.image_for = image_for
-        self._img: Dict[str, Image.Image] = {}
+        self._img: "OrderedDict[str, Image.Image]" = OrderedDict()
         self._crops: Dict[tuple, List[float]] = {}
         self._pads: Dict[tuple, float] = {}
         self._maps: Dict[str, Any] = {}
@@ -394,10 +395,14 @@ class _Designer:
         self.last_punch = -1e9
 
     def img(self, pid: str) -> Image.Image:
-        if pid not in self._img:
-            if len(self._img) > 12:
-                self._img.clear()
-            self._img[pid] = self.image_for(self.by_id[pid])
+        if pid in self._img:
+            self._img.move_to_end(pid)
+            return self._img[pid]
+        self._img[pid] = self.image_for(self.by_id[pid])
+        # LRU: evict one entry, never wipe the whole cache (the old
+        # `clear()` made the planner re-decode panels it had just loaded).
+        while len(self._img) > 32:
+            self._img.popitem(last=False)
         return self._img[pid]
 
     def panel_aspect(self, pid: str) -> float:

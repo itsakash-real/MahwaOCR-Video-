@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import time
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -47,7 +48,8 @@ def _cache_dir(root: Path, chapter: str, preview: bool, name: str | None = None)
 
 # ------------------------------------------------------------------ worker (runs in a child process)
 
-_PANEL_CACHE: Dict[tuple, Any] = {}
+_PANEL_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_PANEL_CACHE_MAX = 32
 
 
 def _panel(root: str, chapter: str, panel: Dict[str, Any], norm_w: int, fingerprint: str):
@@ -57,10 +59,14 @@ def _panel(root: str, chapter: str, panel: Dict[str, Any], norm_w: int, fingerpr
     key = (root, chapter, panel["id"], fingerprint, panel.get("src_fingerprint"))
     img = _PANEL_CACHE.get(key)
     if img is None:
-        if len(_PANEL_CACHE) > 6:
-            _PANEL_CACHE.clear()
         img = panel_image(Path(root), chapter, panel, norm_w, clean=True)
         _PANEL_CACHE[key] = img
+        # LRU: evict one entry, never wipe the whole cache (the old
+        # `clear()` made workers re-decode panels they had just loaded).
+        while len(_PANEL_CACHE) > _PANEL_CACHE_MAX:
+            _PANEL_CACHE.popitem(last=False)
+    else:
+        _PANEL_CACHE.move_to_end(key)
     return img
 
 

@@ -455,7 +455,25 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
         # The sync gate: the audit samples the plan against the narration and
         # fails on wrong-picture time and late cuts. It runs here, on the plan
         # about to be rendered, and its report stays beside it for status.
-        report = syncaudit.make_report(root, chapter, cfg, log=log)
+        # Reuse a fresh audit instead of recomputing it: the agent workflow
+        # already runs `video sync-audit` before render, and an audit is only
+        # valid for the plan it was computed from (mtime check).
+        report = None
+        audit_file = syncaudit.audit_path(root, chapter)
+        plan_file = plan_path(root, chapter)
+        if (audit_file.exists() and plan_file.exists()
+                and audit_file.stat().st_mtime >= plan_file.stat().st_mtime):
+            try:
+                cached = json.loads(audit_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cached = None
+            if (isinstance(cached, dict) and isinstance(cached.get("gate"), dict)
+                    and isinstance(cached.get("wrong_picture"), dict)
+                    and "ratio" in cached["wrong_picture"]):
+                report = cached
+                log("  sync gate: using the existing audit (plan unchanged since it ran)")
+        if report is None:
+            report = syncaudit.make_report(root, chapter, cfg, log=log)
         gate = report["gate"]
         if gate["failures"]:
             detail = "; ".join(gate["failures"])

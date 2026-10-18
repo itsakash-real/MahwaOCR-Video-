@@ -8,6 +8,7 @@ panel shows a forest", then fix that one shot in the plan.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List
@@ -45,7 +46,7 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
     text_h, pad = 92, 10
     font, small = _font(18), _font(15)
     shots = plan["shots"]
-    cache: Dict[str, Image.Image] = {}
+    cache: "OrderedDict[str, Image.Image]" = OrderedDict()
     out = []
     for n, start in enumerate(range(0, len(shots), PER_SHEET), start=1):
         chunk = shots[start:start + PER_SHEET]
@@ -62,10 +63,13 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
             if not missing and ids:
                 images = {}
                 for pid in dict.fromkeys(ids):
-                    if pid not in cache:
-                        if len(cache) > 16:
-                            cache.clear()
+                    if pid in cache:
+                        cache.move_to_end(pid)
+                    else:
                         cache[pid] = panel_image(root, chapter, panels[pid], panels_data["norm_width"], clean=True)
+                        # LRU: evict one entry, never wipe the whole cache.
+                        while len(cache) > 32:
+                            cache.popitem(last=False)
                     images[pid] = cache[pid]
                 # 85% through: entrances done and a pair's second card has arrived.
                 when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))

@@ -799,11 +799,16 @@ def cmd_video(args) -> int:
         from .video import verify as vf
 
         for c in chapters(default_all=False):
-            vb.make_plan(sess, c, cfg, force=True, sync="off" if args.no_sync else "auto",
-                         fmt=args.format, log=_log)
             from .video.media import video_dir
 
-            rep = json.loads((video_dir(sess.path) / f"chapter_{c}.verify.json").read_text(encoding="utf-8"))
+            # make_plan writes chapter_N.verify.json as part of planning, and
+            # rebuilds whenever its inputs changed -- so a second full plan
+            # buys nothing. Only force a rebuild when no verify report exists
+            # yet (e.g. it was deleted while the plan survived).
+            vpath = video_dir(sess.path) / f"chapter_{c}.verify.json"
+            vb.make_plan(sess, c, cfg, force=not vpath.exists(), sync="off" if args.no_sync else "auto",
+                         fmt=args.format, log=_log)
+            rep = json.loads(vpath.read_text(encoding="utf-8"))
             _log(f"=== Chapter {c}: checked {len(rep['panels'])} drawn panels ===")
             for pid, r in rep["panels"].items():
                 if r["action"] != "ok":

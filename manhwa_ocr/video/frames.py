@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -177,12 +178,20 @@ def slot_centres(layout: str, fmt: Format, size: Tuple[int, int], index: int) ->
 # ------------------------------------------------------------------ backgrounds
 
 
-def _vignette(fmt: Format) -> np.ndarray:
-    ys, xs = np.ogrid[0:fmt.height, 0:fmt.width]
-    nx = (xs - fmt.width / 2) / (fmt.width / 2)
-    ny = (ys - fmt.height / 2) / (fmt.height / 2)
+@lru_cache(maxsize=8)
+def _vignette_grid(width: int, height: int) -> np.ndarray:
+    ys, xs = np.ogrid[0:height, 0:width]
+    nx = (xs - width / 2) / (width / 2)
+    ny = (ys - height / 2) / (height / 2)
     d = np.sqrt(nx ** 2 + ny ** 2) / math.sqrt(2)
     return (1.0 - 0.45 * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
+
+
+def _vignette(fmt: Format) -> np.ndarray:
+    # The vignette depends only on the frame size: identical for every shot
+    # in a chapter, so build it once. Callers must not mutate the result
+    # (background() only multiplies by it).
+    return _vignette_grid(fmt.width, fmt.height)
 
 
 def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
@@ -223,6 +232,19 @@ def padded_region(panel: Image.Image, box: List[float], pad_y: float) -> Image.I
     return canvas
 
 
+@lru_cache(maxsize=32)
+def _shadow_mask(sw: int, sh: int, m: int, off: int, cw: int, ch: int, radius: int, u: float) -> Image.Image:
+    # The blurred drop shadow depends only on the card geometry, and cards
+    # share a handful of sizes: build it once per size instead of blurring
+    # a ~1300x1900 mask for every card. The returned image is shared
+    # (putalpha reads from it without mutating it); callers must not draw on it.
+    shadow = Image.new("L", (sw, sh), 0)
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (m - round(4 * u), m + off - round(2 * u), m + cw + round(4 * u),
+         m + ch + off + round(6 * u)), radius + 4, fill=235)
+    return shadow.filter(ImageFilter.GaussianBlur(20 * u))
+
+
 class Card:
     """One panel card: focal crop, border, rounded corners, black shadow, motion."""
 
@@ -254,11 +276,8 @@ class Card:
         # Static parts of the sprite, built once: shadow + white rounded border.
         m = self.margin
         sw, sh = self.cw + 2 * m, self.ch + 2 * m
-        shadow = Image.new("L", (sw, sh), 0)
         off = round(10 * u)
-        ImageDraw.Draw(shadow).rounded_rectangle((m - round(4 * u), m + off - round(2 * u), m + self.cw + round(4 * u),
-                                                  m + self.ch + off + round(6 * u)), self.radius + 4, fill=235)
-        shadow = shadow.filter(ImageFilter.GaussianBlur(20 * u))
+        shadow = _shadow_mask(sw, sh, m, off, self.cw, self.ch, self.radius, u)
         base = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
         base.putalpha(shadow)
         card_mask = Image.new("L", (sw, sh), 0)
