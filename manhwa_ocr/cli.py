@@ -305,7 +305,8 @@ def cmd_prepare(args) -> int:
 
     _log(f"=== Preparing chapter {chapter} ===")
     try:
-        task = flow.prepare(chapter=chapter, url=url, folder=Path(args.folder) if args.folder else None)
+        task = flow.prepare(chapter=chapter, url=url, folder=Path(args.folder) if args.folder else None,
+                            shards=args.shards)
     except UserError as exc:
         # Recorded so `next` can offer the --folder workaround instead of
         # telling the agent to retry the same failing download forever.
@@ -940,6 +941,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--folder", help="use local images instead of downloading")
     p.add_argument("--chapter")
     p.add_argument("--next", action="store_true", help="next pending chapter from the link list")
+    p.add_argument("--shards", type=int, default=1,
+                   help="split the tile list into N shard tasks (TASK_1.md ... TASK_N.md) so several "
+                        "agents can read in parallel; assemble merges the tile_results_shard_N.json files")
     ws(p)
     p.set_defaults(func=cmd_prepare)
 

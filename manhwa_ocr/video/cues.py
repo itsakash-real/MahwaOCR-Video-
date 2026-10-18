@@ -178,6 +178,19 @@ def _snippet(text: str, n: int = 60) -> str:
     return text if len(text) <= n else text[: n - 1].rstrip() + "\u2026"
 
 
+def nearest_drawn_panel(panels: List[Dict[str, Any]], pid: str) -> str | None:
+    """The drawn (non-text, non-credits) panel nearest `pid` in story order.
+
+    Ties go to the later panel, matching the hint `check()` has always given.
+    """
+    position = {p["id"]: i for i, p in enumerate(panels)}
+    if pid not in position:
+        return None
+    drawn_ids = [p["id"] for p in panels if not p.get("text_only") and not p.get("credits")]
+    here = position[pid]
+    return min(drawn_ids, key=lambda q: (abs(position[q] - here), -position[q]), default=None)
+
+
 def check(narration: str, panels: List[Dict[str, Any]], *, min_hold: float = MIN_HOLD,
           wpm: float = NARRATION_WPM, spell: bool = True) -> Dict[str, List[str]]:
     """What is wrong with a tagged recap before it is saved.
@@ -194,7 +207,6 @@ def check(narration: str, panels: List[Dict[str, Any]], *, min_hold: float = MIN
     if not panels:
         return {"errors": errors, "warnings": warnings}
     ids = [p["id"] for p in panels]
-    position = {pid: i for i, pid in enumerate(ids)}
     by_id = {p["id"]: p for p in panels}
 
     def drawn(p: Dict[str, Any]) -> bool:
@@ -204,17 +216,13 @@ def check(narration: str, panels: List[Dict[str, Any]], *, min_hold: float = MIN
     parsed = parse(narration, set(ids))
     sentences = parsed["sentences"]
 
-    def nearest_drawn(pid: str) -> str | None:
-        here = position[pid]
-        return min(drawn_ids, key=lambda q: (abs(position[q] - here), -position[q]), default=None)
-
     for n, s in enumerate(sentences, start=1):
         for pid in dict.fromkeys(s.get("panels") or []):
             p = by_id.get(pid)
             if p is None or drawn(p):
                 continue
             kind = "credits" if p.get("credits") else "text-only (lettering, a caption or a blank page)"
-            near = nearest_drawn(pid)
+            near = nearest_drawn_panel(panels, pid)
             hint = f" Tag it {{{near}}} instead (the nearest drawn panel)." if near else ""
             errors.append(f"sentence {n} (\"{_snippet(s['text'])}\") is tagged {pid}, which is {kind} and is never "
                           f"shown in the video.{hint}")

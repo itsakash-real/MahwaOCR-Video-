@@ -19,15 +19,18 @@ import io
 import json
 import re
 import shutil
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+import numpy as np
 import requests
 from PIL import Image, UnidentifiedImageError
 
-from .util import UserError, atomic_save_image
+from .util import UserError, atomic_save_image, atomic_write_bytes
 
 # Webtoon strips legitimately exceed Pillow's default guard (~89M px), but a
 # finite cap still stops a hostile "image" from exhausting memory.
@@ -83,8 +86,13 @@ def import_pages(sources: List[Path], dest: Path, log=print) -> List[Path]:
         target = dest / f"page_{i:03d}.png"
         if not (target.exists() and _is_readable(target)):
             try:
-                with Image.open(src) as img:
-                    atomic_save_image(img.convert("RGB"), target)
+                if src.suffix.lower() == ".png" and _is_readable(src):
+                    # Already a PNG: copy the bytes instead of decoding and
+                    # re-encoding (slow, and it can only lose information).
+                    atomic_write_bytes(target, src.read_bytes())
+                else:
+                    with Image.open(src) as img:
+                        atomic_save_image(img.convert("RGB"), target)
             except (OSError, UnidentifiedImageError) as exc:
                 raise UserError(f"Can't read image {src.name}: {exc}") from None
         out.append(target)
@@ -112,7 +120,12 @@ def download_images(
     config: Dict[str, Any] | None = None,
     log=print,
 ) -> List[Path]:
-    """Fetch pages and normalize them to PNG. Reuses pages already on disk."""
+    """Fetch pages and normalize them to PNG. Reuses pages already on disk.
+
+    Downloads run in parallel (8 workers). Politeness is kept by spacing
+    request *starts* at least `delay` seconds apart; the downloads
+    themselves overlap.
+    """
     cfg = config or {}
     dest.mkdir(parents=True, exist_ok=True)
     headers = dict(cfg.get("headers") or {})
@@ -123,46 +136,61 @@ def download_images(
     retries = max(1, int(cfg.get("max_retries", 3)))
     delay = cfg.get("delay", 0.25)
 
-    paths: List[Path] = []
-    for i, url in enumerate(urls, start=1):
+    rate = {"last_start": 0.0}
+    rate_lock = threading.Lock()
+
+    def _wait_turn() -> None:
+        if not delay:
+            return
+        with rate_lock:
+            wait = delay - (time.monotonic() - rate["last_start"])
+            if wait > 0:
+                time.sleep(wait)
+            rate["last_start"] = time.monotonic()
+
+    def _fetch_one(i: int, url: str) -> Path:
         out = dest / f"page_{i:03d}.png"
         # A page left half-written by a crash must not be trusted next time.
         if out.exists() and _is_readable(out):
-            paths.append(out)
-            continue
+            return out
 
         last_err: Exception | None = None
         for attempt in range(retries):
             try:
+                _wait_turn()
                 resp = requests.get(url, headers=headers, timeout=timeout)
                 resp.raise_for_status()
                 ctype = resp.headers.get("Content-Type", "")
                 if ctype.startswith("text/html"):
                     raise ValueError("server returned a web page, not an image (blocked or expired link?)")
-                with Image.open(io.BytesIO(resp.content)) as img:
-                    rgb = img.convert("RGB")
-                atomic_save_image(rgb, out)
-                paths.append(out)
-                log(f"  page {i:>3}  {rgb.width}x{rgb.height}")
-                break
+                if resp.content[:8] == b"\x89PNG\r\n\x1a\n":
+                    # Already a PNG: store the bytes instead of decoding and
+                    # re-encoding (slow, and it can only lose information).
+                    atomic_write_bytes(out, resp.content)
+                    with Image.open(io.BytesIO(resp.content)) as im:
+                        width, height = im.size
+                else:
+                    with Image.open(io.BytesIO(resp.content)) as img:
+                        rgb = img.convert("RGB")
+                    width, height = rgb.size
+                    atomic_save_image(rgb, out)
+                log(f"  page {i:>3}  {width}x{height}")
+                return out
             except Exception as exc:  # noqa: BLE001 - surfaced below
                 last_err = exc
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status in (401, 403, 404, 410):
                     break  # retrying won't help
                 time.sleep(1.5 * (attempt + 1))
-        else:
-            last_err = last_err or RuntimeError("unknown error")
-        if len(paths) < i:
-            raise UserError(
-                f"Couldn't download page {i} of this chapter ({last_err}).\n"
-                "If the site blocks scripts, save the images with your browser and use --folder."
-            )
+        raise UserError(
+            f"Couldn't download page {i} of this chapter ({last_err}).\n"
+            "If the site blocks scripts, save the images with your browser and use --folder."
+        )
 
-        if delay:
-            time.sleep(delay)
-
-    return paths
+    urls = list(urls)
+    workers = min(8, max(1, len(urls)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(lambda p: _fetch_one(*p), enumerate(urls, start=1)))
 
 
 def _row_detail(img: Image.Image, y: int, width: int) -> float:
@@ -176,8 +204,22 @@ def _row_detail(img: Image.Image, y: int, width: int) -> float:
     return sum(abs(p - mean) for p in pixels) / len(pixels)
 
 
-def _find_gutter(img: Image.Image, target_y: int, search: int, width: int) -> int:
-    """Find the flattest row near target_y, so cuts land between panels."""
+def _row_details(gray: np.ndarray) -> np.ndarray:
+    """Mean absolute deviation of every row, vectorized.
+
+    The same score as _row_detail (low = flat gutter), computed for all rows
+    at once instead of one crop + Python loop per row.
+    """
+    means = gray.mean(axis=1, keepdims=True)
+    return np.abs(gray - means).mean(axis=1)
+
+
+def _find_gutter(img: Image.Image, target_y: int, search: int, width: int, detail: Any = None) -> int:
+    """Find the flattest row near target_y, so cuts land between panels.
+
+    `detail` is a precomputed per-row busy-ness array (see _row_details);
+    when given, the gutter search is a lookup instead of re-reading rows.
+    """
     height = img.height
     lo = max(1, target_y - search)
     hi = min(height - 1, target_y + search)
@@ -187,7 +229,7 @@ def _find_gutter(img: Image.Image, target_y: int, search: int, width: int) -> in
     best_y, best_score = target_y, float("inf")
     step = max(1, (hi - lo) // 120)
     for y in range(lo, hi, step):
-        score = _row_detail(img, y, width)
+        score = float(detail[y]) if detail is not None else _row_detail(img, y, width)
         # Prefer flat rows, with a mild pull toward the requested position so we
         # don't drift far from the target tile height.
         score += abs(y - target_y) / search * 1.5
@@ -243,6 +285,9 @@ def slice_tall_image(
         return [Tile(page_index, 1, 1, single, 0, height, width)]
 
     target, overlap = s["target_height"], s["overlap"]
+    # One grayscale pass for every gutter search in this page, instead of
+    # re-reading ~120 rows per cut.
+    detail = _row_details(np.asarray(img.convert("L"), dtype=np.float32)) if s["snap_to_gutter"] else None
     bounds: List[tuple[int, int]] = []
     top = 0
     while top < height:
@@ -250,7 +295,7 @@ def slice_tall_image(
         if desired >= height - 200:
             bounds.append((top, height))
             break
-        cut = _find_gutter(img, desired, s["gutter_search"], width) if s["snap_to_gutter"] else desired
+        cut = _find_gutter(img, desired, s["gutter_search"], width, detail) if s["snap_to_gutter"] else desired
         cut = max(cut, top + target // 2)  # guard against pathological snaps
         bounds.append((top, cut))
         top = max(cut - overlap, top + 1)
@@ -290,9 +335,15 @@ def build_tiles(
         shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Slicing is per-page independent; Pillow releases the GIL while encoding,
+    # so threads help. Results come back in page order (executor.map).
+    workers = min(8, max(1, len(pages)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        page_results = list(pool.map(
+            lambda p: slice_tall_image(p[1], p[0], out_dir, config=settings),
+            enumerate(pages, start=1)))
     tiles: List[Tile] = []
-    for i, page in enumerate(pages, start=1):
-        page_tiles = slice_tall_image(page, i, out_dir, config=settings)
+    for i, page_tiles in enumerate(page_results, start=1):
         tiles.extend(page_tiles)
         if len(page_tiles) > 1:
             log(f"  page {i:>3} -> {len(page_tiles)} slices")

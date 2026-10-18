@@ -131,6 +131,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "pipeline": {
         # Parallel vision calls. Keep modest to respect provider rate limits.
         "concurrency": 4,
+        # Tiles per vision() call. 1 = one call per tile (the old behaviour).
+        # Higher values cut round-trips; each tile is still cached separately.
+        "vision_batch": 1,
         "cache": True,
         # Near-duplicate threshold for de-duplicating text across tile overlaps.
         "dedupe_threshold": 0.86,

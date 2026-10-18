@@ -146,12 +146,22 @@ narrator, so never mention them in the narration itself.
 
 
 def _panel_listing(panels: List[Dict[str, Any]]) -> str:
+    from .video.cues import nearest_drawn_panel
+
     lines = []
     for p in panels:
         if p.get("credits"):
             continue  # scanlator credits: never part of the story
-        bits = [p["id"] + (" [tall]" if p.get("tall") else "")
-                + (" [TEXT ONLY - don't tag; tag the drawn panel next to it]" if p.get("text_only") else "")]
+        if p.get("text_only"):
+            # Name the panel to tag instead of leaving the writer to hunt for
+            # it: a text-only tag is rejected by the checker, and the nearest
+            # drawn panel is almost always the right replacement.
+            near = nearest_drawn_panel(panels, p["id"])
+            hint = f" [TEXT ONLY - don't tag; tag {{{near}}} instead]" if near \
+                else " [TEXT ONLY - don't tag; tag the drawn panel next to it]"
+        else:
+            hint = ""
+        bits = [p["id"] + (" [tall]" if p.get("tall") else "") + hint]
         if p.get("scene"):
             bits.append(f"shows: {p['scene'][:150]}")
         if p.get("text"):
