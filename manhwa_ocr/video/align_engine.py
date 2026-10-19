@@ -285,10 +285,18 @@ def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]],
 
 
 def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], vcfg: Dict[str, Any],
-                     sync: str, log, settings: Dict[str, float]) -> tuple[List[Dict[str, Any]], str, float]:
+                     sync: str, log, settings: Dict[str, float],
+                     warnings_out: List[Dict[str, str]] | None = None) -> tuple[List[Dict[str, Any]], str, float]:
     """Adds "start"/"end" to each sentence using whisper (cached if available),
     falling back to even spacing. This is the only I/O-dependent part.
     sync="off" skips whisper entirely (fast, deterministic estimated timing).
+
+    P0 safety lock: a fallback to estimated timing is never silent. When
+    `warnings_out` is given, every fallback appends a machine-readable
+    warning {code, message, fix} there; the caller stores it in the
+    alignment (timing_warnings) and `video status` surfaces it. The
+    return value is unchanged (timed, mode, duration) so existing callers
+    keep working. Render still refuses an "estimated" plan without --force.
 
     With real timing, a run of consecutive sentences whisper never matched,
     longer than video.sync.max_unmatched, stops the build: timing that stretch
@@ -309,6 +317,11 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
     # "even" spread is a separate, earlier branch in build.py that never
     # reaches here - so no whisper words always means "estimated" (timing
     # interpolated from text length), never "even".
+    def _warn(code: str, message: str, fix: str) -> None:
+        if warnings_out is not None:
+            warnings_out.append({"code": code, "message": message, "fix": fix})
+        log(f"  ! {message} ({fix})")
+
     mode = "estimated"
     if sync != "off" and sync_mod.available():
         try:
@@ -321,16 +334,30 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
                                         cache=sync_mod.timeline_path(root, chapter), log=log)
             mode = "synced"
         except UserError as exc:
-            log(f"  ! {exc} Falling back to estimated timing.")
+            _warn("whisper_transcribe_failed",
+                  f"Whisper transcription failed ({exc}); using estimated timing, "
+                  f"so the pictures will drift from the voice.",
+                  f"Fix the transcription, then re-run: video align --chapter {chapter}")
             mode = "estimated"
     elif sync != "off":
-        log(f"  note: install whisper for exact sync:  {sync_mod.SYNC_HINT}")
+        _warn("whisper_unavailable",
+              "Whisper is not installed, so timing is estimated from text length, "
+              "not synced to the real narration.",
+              f"Install whisper for exact sync ({sync_mod.SYNC_HINT}); render refuses "
+              f"estimated timing without --force. Command: video align --chapter {chapter}")
+    else:
+        _warn("sync_off",
+              "sync=off was passed, so timing is estimated from text length.",
+              f"Re-run without --off for real sync: video align --chapter {chapter}")
     aligned = sync_mod.align(sentences, words, duration,
                              min_segment=float(settings.get("min_segment", sync_mod.MIN_SEGMENT)))
     timed = aligned["sentences"]
     for i, s in enumerate(timed):
         s["end"] = float(timed[i + 1]["start"]) if i + 1 < len(timed) else duration
     if mode == "synced" and not aligned.get("matched"):
+        _warn("whisper_no_matches",
+              "Whisper ran but matched no words, so timing fell back to estimated.",
+              f"Check the narration audio, then re-run: video align --chapter {chapter}")
         mode = "estimated"
     if mode == "synced":
         over = sync_mod.long_unmatched_run(aligned, settings["max_unmatched"])
@@ -349,7 +376,7 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
 
 def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=print) -> Dict[str, Any]:
     root, chapter = Path(root), require_chapter(chapter)
-    cue_data = cues_mod.load_cues(root, chapter)
+    cue_data = cues_mod.load_cues_strict(root, chapter)
     if not cue_data:
         raise UserError(f"Chapter {chapter}'s recap has no panel tags yet. Write the recap first.")
     panels_data = load_panels(root, chapter)
@@ -360,8 +387,9 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
 
     vcfg = dict(cfg.video) if hasattr(cfg, "video") else dict(cfg)
     settings = sync_mod.effective_settings(vcfg, log=log)
+    timing_warnings: List[Dict[str, str]] = []
     timed, sync_mode, duration = _timed_sentences(root, chapter, cue_data["sentences"], vcfg, sync, log,
-                                                  settings)
+                                                  settings, warnings_out=timing_warnings)
 
     segments = align_sentences(cue_data["sentences"], plist,
                                override_evidence=settings["override_evidence"])
@@ -379,7 +407,8 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
 
     result = {
         "version": 2, "chapter": chapter, "audio": {"duration": round(duration, 3)},
-        "sync_mode": sync_mode, "segments": segments, "validation": validation, "review_queue": queue,
+        "sync_mode": sync_mode, "timing_warnings": timing_warnings,
+        "segments": segments, "validation": validation, "review_queue": queue,
         "coverage": coverage,
     }
     atomic_write_text(alignment_path(root, chapter), json.dumps(result, indent=1, ensure_ascii=False))

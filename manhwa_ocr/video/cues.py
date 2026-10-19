@@ -286,9 +286,78 @@ def write_outputs(root: Path, chapter: str, narration: str, known_panels: Set[st
     return data
 
 
+def validate_cues(data: Any) -> List[str]:
+    """Line-level problems in a cues.json document (P0 safety lock).
+
+    Returns [] when the document is usable. Every problem names the
+    sentence index (1-based) and the exact field, so a reviewer can fix
+    the file without guessing. This never mutates its input.
+    """
+    problems: List[str] = []
+    if not isinstance(data, dict):
+        return ["cues.json must be a JSON object (sentence -> panels, cues, emphasis)"]
+    sentences = data.get("sentences")
+    if not isinstance(sentences, list) or not sentences:
+        return ["cues.json: \"sentences\" must be a non-empty list"]
+    for i, s in enumerate(sentences, start=1):
+        where = f"cues.json sentence {i}"
+        if not isinstance(s, dict):
+            problems.append(f"{where}: must be an object")
+            continue
+        if not isinstance(s.get("text"), str) or not s["text"].strip():
+            problems.append(f"{where}: \"text\" must be a non-empty string")
+        panels = s.get("panels")
+        if panels is None:
+            problems.append(f"{where}: missing \"panels\" (list of panel ids, may be empty)")
+        elif not isinstance(panels, list) or not all(isinstance(p, str) for p in panels):
+            problems.append(f"{where}: \"panels\" must be a list of panel-id strings")
+        elif len(set(panels)) != len(panels):
+            problems.append(f"{where}: duplicate panel ids in \"panels\": {panels}")
+        cues = s.get("cues")
+        if cues is not None and (not isinstance(cues, list)
+                                 or not all(isinstance(c, str) for c in cues)):
+            problems.append(f"{where}: \"cues\" must be a list of strings")
+        emphasis = s.get("emphasis")
+        if emphasis is not None and (not isinstance(emphasis, list)
+                                     or not all(isinstance(e, str) for e in emphasis)):
+            problems.append(f"{where}: \"emphasis\" must be a list of strings")
+    return problems
+
+
 def load_cues(root: Path, chapter: str) -> Dict[str, Any] | None:
     try:
         data = json.loads(cues_path(root, chapter).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) and data.get("sentences") else None
+
+
+def load_cues_strict(root: Path, chapter: str) -> Dict[str, Any] | None:
+    """Like load_cues, but a cues file that exists and is corrupt or invalid
+    fails loudly instead of silently looking like "no cues" (which used to
+    drop the chapter into the even-timing fallback with the wrong panels).
+
+    Missing file -> None (no cues yet). Corrupt JSON / bad shape ->
+    UserError naming the file, the problem, and the fix command.
+    """
+    from ..util import UserError
+
+    path = cues_path(root, chapter)
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise UserError(f"{path.name} cannot be read ({exc}). Fix the file, then re-run.") from None
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise UserError(
+            f"{path.name} is not valid JSON ({exc}). Fix the file, then re-run: "
+            f"video pair --chapter {chapter}") from None
+    problems = validate_cues(data)
+    if problems:
+        raise UserError(
+            f"{path.name} has problems (nothing from it was used):\n  - "
+            + "\n  - ".join(problems[:12]))
+    return data

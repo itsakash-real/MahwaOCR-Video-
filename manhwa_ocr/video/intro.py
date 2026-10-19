@@ -327,15 +327,17 @@ def build_intro(sess, cfg, *, sync: str = "auto", fmt: str | None = None, log=pr
     audio = audio_path(root, INTRO_CHAPTER)
     if audio is None:
         raise UserError(f"No narration for the intro. Save it as audio/chapter_0.mp3 (or .wav/.m4a) in {root}.")
+    intro_timing_warnings: list = []
     timed, mode, duration = align_engine._timed_sentences(
         root, INTRO_CHAPTER, [{"text": s["text"], "panels": []} for s in sentences], vcfg, sync, log,
-        sync_mod.effective_settings(vcfg, log=log))
+        sync_mod.effective_settings(vcfg, log=log), warnings_out=intro_timing_warnings)
     segments = _segments(sentences, timed)
     refs = [r for s in sentences for r in s["refs"]]
     validation = {"status": "PASS", "problems": [],
                   "checks": {"drawn_panels_only": "PASS", "each_panel_once": "PASS", "one_to_three_per_sentence": "PASS"}}
     result = {"version": 2, "chapter": INTRO_CHAPTER, "kind": "intro", "audio": {"duration": round(duration, 3)},
-              "sync_mode": mode, "segments": segments, "validation": validation, "review_queue": [],
+              "sync_mode": mode, "timing_warnings": intro_timing_warnings,
+              "segments": segments, "validation": validation, "review_queue": [],
               "coverage": {"art_panels": len(refs), "placed_by_order": [], "uncovered": []}}
     atomic_write_text(align_engine.alignment_path(root, INTRO_CHAPTER),
                       json.dumps(result, indent=1, ensure_ascii=False))

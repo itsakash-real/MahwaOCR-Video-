@@ -302,27 +302,27 @@ def autofix(root: Path, chapter: str, log=print) -> int:
     return changed
 
 
-def apply(root: Path, chapter: str, log=print) -> int:
-    """Put the tags from pairs.json into the cues. Returns how many sentences changed."""
-    cue_data, panels = _need(root, chapter)
-    path = pairs_path(root, chapter)
-    if not path.exists():
-        raise UserError(f"Nothing to apply. Run first:  video pair --chapter {chapter}")
-    pairs = read_agent_json(path, "pairs.json")
+def validate_pairs(pairs: Any, sentence_count: int, by_id: Dict[str, Any]) -> List[str]:
+    """Line-level problems in a pairs.json document (P0 safety lock).
+
+    Keys starting with "_" are notes (_suggestions, _comment) and are
+    ignored. Returns [] when every numbered entry is usable. Every
+    problem names the sentence number and the exact ids, so a reviewer
+    can fix the file without guessing.
+    """
+    errors: List[str] = []
     if not isinstance(pairs, dict):
-        raise UserError(f"{path} must be an object: sentence number -> list of panel ids.")
-    pairs = {k: v for k, v in pairs.items() if not str(k).startswith("_")}      # _suggestions, _comment: notes only
-    by_id = {p["id"]: p for p in panels["panels"]}
-    sentences = cue_data["sentences"]
-    errors, changed = [], 0
+        return ["pairs.json must be an object: sentence number -> list of panel ids"]
     for key, ids in pairs.items():
+        if str(key).startswith("_"):
+            continue
         try:
             n = int(key)
-        except ValueError:
+        except (TypeError, ValueError):
             errors.append(f'"{key}" is not a sentence number')
             continue
-        if not 1 <= n <= len(sentences):
-            errors.append(f"sentence {n} doesn't exist (there are {len(sentences)})")
+        if not 1 <= n <= sentence_count:
+            errors.append(f"sentence {n} doesn't exist (there are {sentence_count})")
             continue
         ids = [ids] if isinstance(ids, str) else ids
         if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
@@ -336,9 +336,32 @@ def apply(root: Path, chapter: str, log=print) -> int:
         if texty:
             errors.append(f"sentence {n}: {', '.join(texty)} is a text/credits panel; pick a drawn one")
             continue
-        if sentences[n - 1].get("panels") != ids:
-            sentences[n - 1]["panels"] = ids
-            changed += 1
+        if len(set(ids)) != len(ids):
+            errors.append(f"sentence {n}: duplicate panel ids in {ids}")
+    return errors
+
+
+def apply(root: Path, chapter: str, log=print) -> int:
+    """Put the tags from pairs.json into the cues. Returns how many sentences changed."""
+    cue_data, panels = _need(root, chapter)
+    path = pairs_path(root, chapter)
+    if not path.exists():
+        raise UserError(f"Nothing to apply. Run first:  video pair --chapter {chapter}")
+    pairs = read_agent_json(path, "pairs.json")
+    if not isinstance(pairs, dict):
+        raise UserError(f"{path} must be an object: sentence number -> list of panel ids.")
+    pairs = {k: v for k, v in pairs.items() if not str(k).startswith("_")}      # _suggestions, _comment: notes only
+    by_id = {p["id"]: p for p in panels["panels"]}
+    sentences = cue_data["sentences"]
+    errors = validate_pairs(pairs, len(sentences), by_id)
+    changed = 0
+    if not errors:
+        for key, ids in pairs.items():
+            n = int(key)
+            ids = [ids] if isinstance(ids, str) else ids
+            if sentences[n - 1].get("panels") != ids:
+                sentences[n - 1]["panels"] = ids
+                changed += 1
     if errors:
         raise UserError("pairs.json has problems, nothing was changed:\n  " + "\n  ".join(errors[:12]))
     tagged = sum(1 for s in sentences if s.get("panels"))

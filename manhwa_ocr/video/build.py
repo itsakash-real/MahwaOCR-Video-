@@ -179,6 +179,10 @@ def _alignment_status(root: Path, chapter: str) -> Dict[str, Any] | None:
         "sync_mode": data.get("sync_mode"),
         "validation_status": (data.get("validation") or {}).get("status"),
         "review_queue": len(data.get("review_queue") or []),
+        # P0 safety lock: estimated-timing fallbacks surface here, so
+        # `video status` shows WHY the timing is estimated, not just that
+        # it is. Empty list when timing is synced.
+        "timing_warnings": list(data.get("timing_warnings") or []),
     }
 
 
@@ -371,7 +375,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"  ! {len(report['needs_eyes'])} panel(s) with a character whose head may be cut: "
             + ", ".join(report["needs_eyes"][:12]))
     align_cov = None
-    if not cues_mod.load_cues(root, chapter):
+    if not cues_mod.load_cues_strict(root, chapter):
         units, mode_note, meta = None, "even timing (recap has no panel tags)", None
     else:
         align_path = align_engine.alignment_path(root, chapter)
@@ -528,7 +532,7 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
             log(f"  no audio yet (save it as audio/chapter_{chapter}.mp3)")
             continue
         try:
-            if cues_mod.load_cues(sess.path, chapter):
+            if cues_mod.load_cues_strict(sess.path, chapter):
                 align_engine.build_alignment(sess.path, chapter, cfg, sync=sync, log=log)
             make_plan(sess, chapter, cfg, force=force, sync=sync, fmt=fmt, log=log, storyboard=storyboard)
             out = output_path(sess.path, chapter, preview)
