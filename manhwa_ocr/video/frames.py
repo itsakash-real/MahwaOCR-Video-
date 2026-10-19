@@ -23,6 +23,7 @@ in any order and the storyboard shows exactly what the video will.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Tuple
@@ -212,6 +213,66 @@ def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
     return np.clip(big * 0.72 * _vignette(fmt), 0, 255).astype(np.uint8)
 
 
+# ------------------------------------------------------------------ P4 caches
+# Two per-shot rebuilds that P4 caches. Both hold a strong reference to
+# the source panel in the entry, so a recycled id() can never hit a stale
+# entry (the entry keeps its panel alive; eviction drops the reference).
+# Cached arrays are never mutated by callers: frame_array copies the bg
+# (Image.fromarray / PIL copy) and only reads Card.src via transform.
+_BG_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_BG_CACHE_MAX = 8
+_SRC_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_SRC_CACHE_MAX = 32
+
+
+def _cached_background(kind: str, panel: Image.Image | None, fmt: Format,
+                       bg_panel_id: str | None) -> np.ndarray:
+    """background() with a cross-shot cache. Consecutive shots usually
+    share a bg_panel (same panel across sentences); rebuilding the
+    blurred + vignetted 1080p backdrop per shot re-pays the upscale +
+    vignette multiply every time. Key includes the panel's identity so a
+    different image under the same panel id can never hit a stale entry.
+    Solid (black/white) backgrounds are cached by kind + frame size."""
+    if panel is None:
+        key = (kind, fmt.width, fmt.height, None, None)
+        hit = _BG_CACHE.get(key)
+        if hit is not None:
+            _BG_CACHE.move_to_end(key)
+            return hit[1]
+        arr = background(kind, None, fmt)
+        _BG_CACHE[key] = (None, arr)
+    else:
+        key = (kind, fmt.width, fmt.height, bg_panel_id, id(panel))
+        hit = _BG_CACHE.get(key)
+        if hit is not None and hit[0] is panel:
+            _BG_CACHE.move_to_end(key)
+            return hit[1]
+        arr = background(kind, panel, fmt)
+        _BG_CACHE[key] = (panel, arr)
+    while len(_BG_CACHE) > _BG_CACHE_MAX:
+        _BG_CACHE.popitem(last=False)
+    return arr
+
+
+def _cached_src(panel: Image.Image, region: Image.Image, crop_key: tuple,
+                iw: int, ih: int) -> Image.Image:
+    """The LANCZOS resize of a card's crop (the ~20ms part of Card init).
+    The resize is a pure function of (panel, crop, pad_y, iw, ih); sharing
+    the result across Cards that show the same panel the same way is safe
+    because transform() only reads src."""
+    key = (id(panel), crop_key, iw, ih)
+    hit = _SRC_CACHE.get(key)
+    if hit is not None and hit[0] is panel:
+        _SRC_CACHE.move_to_end(key)
+        return hit[1]
+    src = region.convert("RGB").resize((max(2, round(iw * SRC_HEADROOM)),
+                                        max(2, round(ih * SRC_HEADROOM))), Image.LANCZOS)
+    _SRC_CACHE[key] = (panel, src)
+    while len(_SRC_CACHE) > _SRC_CACHE_MAX:
+        _SRC_CACHE.popitem(last=False)
+    return src
+
+
 # ------------------------------------------------------------------ cards
 
 
@@ -272,8 +333,8 @@ class Card:
         self.margin = max(6, round(46 * u))
         iw, ih = self.cw - 2 * self.border, self.ch - 2 * self.border
         self.iw, self.ih = iw, ih
-        self.src = region.convert("RGB").resize((max(2, round(iw * SRC_HEADROOM)), max(2, round(ih * SRC_HEADROOM))),
-                                                Image.LANCZOS)
+        # P4: cache the LANCZOS resize; same panel + crop + target size reuses it.
+        self.src = _cached_src(panel, region, (x0, y0, x1, y1, pad_y), iw, ih)
 
         # Static parts of the sprite, built once: shadow + white rounded border.
         m = self.margin
@@ -424,6 +485,9 @@ def flash_alpha(t: float, times: List[float]) -> float:
 
 # ------------------------------------------------------------------ P3 overlays
 
+# P4: truetype() re-reads + parses the font file on every call; a callout
+# active for 1.2s would reload it ~36x. Fonts are read-only after load.
+@lru_cache(maxsize=16)
 def _overlay_font(size: int):
     """Bold sans-serif for callouts / chapter cards, with a plain fallback.
 
@@ -547,7 +611,13 @@ class ShotRenderer:
 
         bg_kind = shot.get("background") if shot.get("background") in BACKGROUNDS else "blur"
         bg_panel = shot.get("bg_panel") if shot.get("bg_panel") in images else (cards[0]["panel"] if cards else None)
-        self.bg = background(bg_kind, images.get(bg_panel) if bg_panel else None, fmt)
+        # P4: cross-shot bg cache; bg_panel id is the shot's panel id (None
+        # keeps the old behaviour for shots without one).
+        self.bg = _cached_background(bg_kind, images.get(bg_panel) if bg_panel else None,
+                                     fmt, bg_panel)
+        # P4: Image.fromarray(self.bg) per frame re-validates + copies the 6MB
+        # backdrop; one PIL copy per frame from a cached PIL image is cheaper.
+        self._bg_pil = Image.fromarray(self.bg)
 
         on = {"shake": True, "punch": False, "flash": False}
         on.update({k: bool(v) for k, v in (effects_on or {}).items()})
@@ -581,7 +651,7 @@ class ShotRenderer:
     def frame_array(self, t: float) -> np.ndarray:
         if self.is_static(t) and self._static is not None:
             return self._static
-        img = Image.fromarray(self.bg)
+        img = self._bg_pil.copy()
         dx_s, dy_s = shake_offset(t, self.shakes, self.fmt.unit)
         extra = punch_amount(t, self.punches)
         for card in self.cards:
