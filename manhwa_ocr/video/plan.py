@@ -36,7 +36,7 @@ from . import sync as sync_mod
 from .crops import _panel_maps, head_of, is_mask_risk, tone
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
-from .editor import (PAN_DIRECTIONS, build_chapter_cards, extract_callout, pacing_qa, plan_sfx,
+from .editor import (PAN_DIRECTIONS, _inset_crop, build_chapter_cards, extract_callout, pacing_qa, plan_sfx,
                      resolve_music, split_long_shots)
 from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
@@ -361,6 +361,61 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     return shots, stats
 
 
+def shot_frame_bounds(shots, fps, duration):
+    """Exact (f0, f1) frame bounds for each shot: contiguous, no gap, no overlap.
+
+    Joins are frame-exact by construction: each shot starts on the frame the
+    previous shot ends on, and the last shot ends on the video's final frame.
+    A shot that rounds to zero frames is an error (the renderer would have
+    no frame to draw for it). Concat is a hard cut by design -- there is
+    no crossfade, so no frame is ever blended across a cut.
+    """
+    fps = int(fps)
+    bounds = [round(float(s["start"]) * fps) for s in shots] + [round(float(duration) * fps)]
+    out = []
+    for k, s in enumerate(shots):
+        f0, f1 = bounds[k], bounds[k + 1]
+        if f1 <= f0:
+            raise UserError(f"Shot {s.get('id')} is shorter than one frame. Lengthen it in the plan.")
+        out.append((f0, f1))
+    return out
+
+
+def ensure_split_crop_change(shots):
+    """NEVER split a long sentence into multiple shots with the SAME panel and
+    the SAME crop: the entrance restarts and the cut reads as a glitch.
+
+    Walks the shot list; when a shot shows the same single panel with an
+    identical crop to the shot before it, the later shot is punched in 8%
+    (same helper split_long_shot uses) and a restarting pan becomes push_in.
+    Returns (shots, changes) with one reason-logged entry per fix. Shots that
+    already differ in crop are left alone.
+    """
+    changes = []
+    for k in range(1, len(shots)):
+        prev_cards = shots[k - 1].get("cards") or []
+        cur_cards = shots[k].get("cards") or []
+        if len(prev_cards) != 1 or len(cur_cards) != 1:
+            continue
+        if prev_cards[0].get("panel") != cur_cards[0].get("panel"):
+            continue
+        prev_crop = list(prev_cards[0].get("crop") or [0, 0, 1, 1])
+        cur_crop = list(cur_cards[0].get("crop") or [0, 0, 1, 1])
+        if any(abs(a - b) > 1e-9 for a, b in zip(prev_crop, cur_crop)):
+            continue  # already a different crop: the cut reads as a punch-in
+        new_crop = _inset_crop(cur_crop, 0.08)
+        if new_crop == cur_crop:
+            continue  # already at the minimum readable crop: nothing more to punch into
+        cur = dict(cur_cards[0], crop=new_crop)
+        if cur.get("motion") in PAN_DIRECTIONS:
+            cur["motion"] = "push_in"  # a pan would restart q -1 -> +1 on the new shot
+        shots[k] = {**shots[k], "cards": [cur]}
+        changes.append({"shot": shots[k].get("id"), "panel": cur.get("panel"),
+                        "reason": ("same panel + same crop as the previous shot: punched in 8% "
+                                   "(pan -> push_in) so the cut reads as a crop change, not a frozen restart")})
+    return shots, changes
+
+
 # ------------------------------------------------------------------ shot design
 
 
@@ -584,19 +639,23 @@ class _Designer:
         return kind
 
     def motion(self, rng: random.Random, crop: List[float]) -> str:
-        # P3: continuous motion, never `hold` (planner-emitted). Pan expands
-        # to all four directions, and the previous motion is avoided so two
-        # consecutive shots never drift the same way.
-        m = _pick(rng, MOTION_WEIGHTS, avoid=self.prev_motion)
-        if m != "pan":
-            self.prev_motion = m
-            return m
+        # P3 + CapCut bugfix: continuous motion, never `hold` (planner-emitted).
+        # Never repeat the previous motion, and never pan twice in a row: the
+        # old code avoided only the exact previous key, so a previous
+        # "pan_left" did not exclude the "pan" group and the planner could
+        # emit pan_right, pan_left, pan_right, each restarting q -1 -> +1.
+        avoid = "pan" if self.prev_motion in PAN_DIRECTIONS else self.prev_motion
+        picked = _pick(rng, MOTION_WEIGHTS, avoid=avoid)
+        if picked != "pan":
+            self.prev_motion = picked
+            return picked
         if crop[3] - crop[1] > 0.999:
             self.prev_motion = "push_in"
             return "push_in"     # the whole panel is on the card: nothing to pan over
-        m = rng.choice(list(PAN_DIRECTIONS))
-        self.prev_motion = m
-        return m
+        dirs = [d for d in PAN_DIRECTIONS if d != self.prev_motion]
+        picked = rng.choice(dirs)
+        self.prev_motion = picked
+        return picked
 
     def entrance(self, rng: random.Random, cues: List[str], layout: str) -> str:
         if "reveal" in cues:
@@ -798,6 +857,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     # then attach chapter cards + SFX. Callouts already ride on each shot.
     _pacing_before = pacing_qa(shots)
     shots, _nsplit = split_long_shots(shots)
+    # CapCut bugfix (defect 1d): a split must never leave two shots on the
+    # same panel with the same crop -- the second shot is punched in.
+    shots, _split_crop_changes = ensure_split_crop_change(shots)
     chapter_cards = build_chapter_cards(shots, duration)
     # P5: reviewer overrides from fixes.json (chapter-card titles, callout
     # text, keyed by shot id). Unknown shot_ids are warnings, never failures.
@@ -842,6 +904,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "sfx": sfx,
         "pacing": {"split_shots": _nsplit, "long_shots_flagged": _pacing_before["long_shots"],
                    "max_shot": pacing_qa(shots)["max_shot"]},
+        "split_crop_changes": _split_crop_changes,
         "override_warnings": _override_warnings,
         "reviewed": False,
         "shots": shots,

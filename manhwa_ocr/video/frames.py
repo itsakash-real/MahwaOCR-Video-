@@ -15,6 +15,11 @@ Style (see manhwa_recap_style_spec.md, measured from a real recap channel):
   * CapCut-style entrances (fade_in, slide_*, pull_down, zoom_in,
     fit_in_frame, blur_in, swing_right), all 0.6-0.8s with ease-out curves:
     deliberately unhurried.
+  * Defect fix (CapCut bugfix): a shot is NEVER returned as a frozen static
+    frame unless every card is a hand-set `hold` (see ShotRenderer.is_static).
+    Continuous-motion shots are re-drawn every frame, so a >3s panel cannot
+    read as a 0.5s cut/glitch. Joins are frame-exact (plan.shot_frame_bounds);
+    concat is a hard cut by design, never a crossfade.
 
 Every function here is a pure function of (shot, time), so frames can be drawn
 in any order and the storyboard shows exactly what the video will.
@@ -406,6 +411,10 @@ class Card:
         (ax, ay), (bx, by) = self.start_c, self.rest_c
         return ax + (bx - ax) * p, ay + (by - ay) * p
 
+    def pair_move_done(self, t: float) -> bool:
+        """True once the pair slide has finished (or there is no pair move)."""
+        return self.pair_move_at is None or t >= self.pair_move_at + PAIR_MOVE
+
     def entrance(self, t: float) -> Dict[str, float]:
         """Offsets/scale/rotation/blur/alpha for the entrance animation at time t."""
         out = {"dx": 0.0, "dy": 0.0, "scale": 1.0, "rot": 0.0, "blur": 0.0, "alpha": 1.0}
@@ -606,6 +615,11 @@ class ShotRenderer:
             # (negative) arrival time here, so the first card is already in place.
             move = shot.get("pair_move_at", cards[1].get("at"))
             pair_move_at = self.start + float(move or 0.0)
+        # Defect 2: pair_move runs at most once per pair shot. A shot that
+        # already played its pair move (re-render / clip with pair_move_done)
+        # starts with the first card already in place -- the slide never re-triggers.
+        if shot.get("pair_move_done"):
+            pair_move_at = self.start - PAIR_MOVE
         self.cards = [Card(images[c["panel"]], c, layout, i, self.start, self.end, fmt, pair_move_at)
                       for i, c in enumerate(cards)]
 
@@ -643,10 +657,17 @@ class ShotRenderer:
             for te in times:
                 settle = max(settle, te + length)
         self.static_from = settle
+        # Defect 1: only a shot whose every card is a hand-set `hold` may
+        # freeze. Continuous-motion shots must be re-drawn every frame.
+        self._can_freeze = all(c.motion == "hold" for c in self.cards)
         self._static: np.ndarray | None = None
 
     def is_static(self, t: float) -> bool:
-        return t >= self.static_from and (self.fade_from is None or t < self.fade_from)
+        return self._can_freeze and t >= self.static_from and (self.fade_from is None or t < self.fade_from)
+
+    def pair_move_done(self, t: float) -> bool:
+        """True once every card's pair slide has finished (pair_move fires once)."""
+        return all(c.pair_move_done(t) for c in self.cards)
 
     def frame_array(self, t: float) -> np.ndarray:
         if self.is_static(t) and self._static is not None:

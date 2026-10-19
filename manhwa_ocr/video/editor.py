@@ -113,6 +113,11 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
             # A later-arriving card keeps its arrival offset inside its piece.
             at = float(c.get("at") or 0)
             cc["at"] = round(max(0.0, at - k * piece), 3)
+            # CapCut bugfix: a later piece must not restart a pan (each piece's
+            # Card restarts q -1 -> +1, which reads as a left-right swap glitch).
+            # A punch-in (crop inset above) already gives the piece its own move.
+            if k > 0 and cc.get("motion") in PAN_DIRECTIONS:
+                cc["motion"] = "push_in"
             new_cards.append(cc)
         part["cards"] = new_cards
         # Effect / callout times are ABSOLUTE timeline times (like the pieces'
