@@ -2,8 +2,67 @@
 
 ## Result
 
-**Branch:** `editor/harden-all` — HEAD `41f0442`, identical tree to
-`editor/harden-p5-ux-shorts` (no diff). No merge commits were needed.
+**Branch:** `editor/harden-all` — HEAD `8422248` (merge commit; see
+"Later merge" below). It contains the original P0–P5 chain plus the
+Intro/Previously merge (`1c88bb2`) plus the CapCut-edits bugfix merge
+(`8422248`). No branch pointer was moved; `perf/remaining-audit`,
+`main`, and every phase branch are untouched.
+
+## Later merges (after the original P0–P5 + docs)
+
+### Intro + Previously — merge `1c88bb2`
+
+`video hook` / `video intro --auto` (auto-pick panels from across
+chapters for a 30-sec hook) + `video previously` (30-sec bridge from
+previous part's recaps only), memory in `video/intro_memory.json`
+(no repeat panels, `[REUSE]` override), local + deterministic.
+Tests after merge: 574 passed, 1 skipped.
+
+### CapCut edits + defect fixes + bubble-painting removal — merge `8422248`
+
+Feature branch `editor/capcut-edits-bugfix` (6 commits, `8e9b80c` …
+`8991dd3`), merged with `git merge --no-ff` as `8422248`.
+What it fixes (all three defects reported in Ch1–10 videos, built on
+old code `cbaed57`):
+
+- **Defect 1 — 0.5s glitch on panels held >3s:** old code eased Ken
+  Burns over `KB_MAX = 2.6s` then held, cached one static frame
+  (`static_from`), and joined segments with `-c:v copy` (no
+  crossfade). Fix: continuous motion for the whole shot, no static
+  freeze for long shots, frame-exact joins, and never split a long
+  sentence into multiple shots with the SAME panel without a crop
+  change.
+- **Defect 2 — left-right swap repeating >3 times in 8s:** old
+  planner picked motion independently per shot (`hold 55 / push_in
+  30 / pan 15`), so a split same-panel stretch could re-pick pan
+  and restart `_viewport` from scratch, plus `PAIR_MOVE = 0.7`
+  re-triggered on every pair. Fix: planner never repeats the
+  previous motion, never picks pan after pan unless the crop
+  changes, pair_move at most once per pair shot.
+- **Defect 3 — faces cut + colour on faces:** `clean_bubbles()`
+  painting removed **entirely** (painting code deleted, not flagged
+  off). `clean_bubbles()` is now a no-op returning the panel
+  unchanged, pixel-identical. Bubble *detection*
+  (`bubble_regions` / `bubble_boxes`) stays and still drives crop
+  scoring, drop decisions, and QA. Panels with no clean crop are
+  DROPPED and re-paired (P1 mask-risk rule, now applied to every
+  bubble that would have been painted). Cleaned-panel disk cache
+  key versioned (`v: 2`) so old painted cache entries are never
+  served again.
+
+CapCut-style edits added (tasteful, recap-appropriate): transitions
+(hard cut default, fade, slide, zoom, whip, glitch 0.2s RGB split on
+impact/reveal beats only, max 1 per 60s), continuous keyframe-style
+Ken Burns, auto-captions (ASS, 3–5 words at a time, key word yellow,
+bottom band, `video.captions` config, default ON for new builds),
+glitch effect, beat sync (cuts snap to nearest beat within ±0.15s
+when music exists), SFX additions (record-scratch, rumble, hit),
+optional gentle grade (`video.grade: subtle`, default OFF).
+Deliberately NOT added: stickers, emojis, speed-ramp spam. See
+`docs/CAPCUT_EDITS.md`.
+
+Tests after merge: **608 passed, 1 skipped, 1 deselected**
+(pre-existing root guard test).
 
 Why no merge commits: P0–P5 were built as a linear chain on top of
 `perf/remaining-audit` (`cbaed57`), which already contains yesterday's
@@ -95,6 +154,13 @@ branch → `main` once via PR. Close PR #3
 inside the chain — do NOT merge PR #3 separately. Do NOT create PRs or
 merge anything from this task; the branches are pushed, the PRs are
 for the user to open.
+
+Note: PR-H6 (`editor/harden-all` → `editor/harden-p5-ux-shorts`)
+now shows docs + the Intro/Previously merge + the CapCut-edits
+bugfix merge, since `editor/harden-all` has moved past the original
+docs commit. If a per-phase PR is wanted for the bugfix, open it as
+`editor/capcut-edits-bugfix` → `editor/harden-all` at `1c88bb2`
+(the pre-merge base) and merge it before PR-H6.
 
 ## What is in `main` vs not in `main`
 
