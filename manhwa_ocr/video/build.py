@@ -475,8 +475,17 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         mode_note = (f"{len(alignment['segments'])} sentences from the alignment engine "
                     f"({alignment.get('sync_mode', '?')} timing, {len(queue)} flagged for review)")
 
+    # Captions are timed from the alignment segments (sentence windows),
+    # never from per-shot estimates (see captions.build_captions_from_sentences).
+    _caption_sentences = None
+    try:
+        _caption_sentences = [{"text": seg.get("text"), "start": seg.get("start"),
+                               "end": seg.get("end")} for seg in alignment["segments"]]
+    except (NameError, TypeError, KeyError):
+        _caption_sentences = None
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
+                      caption_sentences=_caption_sentences,
                       image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True,
                                                       fingerprint=panels.get("fingerprint")),
                       fixes=fixes, settings=sync_settings, root=root)

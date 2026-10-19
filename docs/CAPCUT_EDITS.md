@@ -48,6 +48,15 @@ Fixes:
   a split shot's last piece can still match the next shot's motion, so
   the later shot's first-card motion is flipped, logged in
   `plan["motion_changes"]`. Hand-set `hold` is never flipped.
+- `plan.ensure_panel_diversity()`: final pass — never the same panel
+  3× consecutively with an identical crop. Coverage fillers and
+  repeated tags can leave one panel on screen for three sentences in
+  a row (Ch10 test build: P014-10 for sentences 55/56/57, P020-01 for
+  75/76/77 — correct pictures, visibly repetitive). When a shot's
+  first-card panel matches the previous two shots', the third shot's
+  crop is punched in until it differs from BOTH predecessors' crops
+  (a different crop of the same panel; the planner never re-picks a
+  panel), logged in `plan["diversity_changes"]`.
 - `pair_move` fires at most once per pair shot: `Card.pair_move_done(t)`
   / `ShotRenderer.pair_move_done(t)`; a shot with `pair_move_done`
   starts with the first card already in place, so a re-render/clip
@@ -80,6 +89,52 @@ What happens to a panel with a bubble now:
 - Stale cache: the cleaned-panel disk cache key is versioned (v2), so
   old cache entries that contain painted panels are never served again.
 
+## Test-build fixes (Ch10 new-code build, after the CapCut merge)
+
+### P2 auto-switch: never to a shape the layout cannot show
+
+`verify.find_pair_safe_shape()` now requires the switch target to be
+a shape VALID for the layout it will be used in. Pair shapes are a
+subset of single's, so single-layout switches are unaffected — but a
+WIDE shot may only show 1.333 / 1.777, never the pair layout's 1.0
+square. The Ch10 test build's `verify.json` recorded P014-07 as
+1.777 → 1.0 (a square crop in a wide shot; the panel itself was
+dropped, so the render was unaffected, but the code was wrong).
+Stale crop-cache entries holding a pre-fix switch are validated on
+read (planner + verify) and recomputed instead of reused.
+
+### System-window panels: wide shot, wide fill, never a small square
+
+A system-notification / status-window panel is a WIDE, short banner
+(aspect ≥ 1.5) whose text/scene is a system message
+(`crops.is_system_window()`: soul value, acquired title, unlock,
+…). In the Ch10 test build (~34s) P004-07's banners rendered as a
+small square in the middle of the card: the pair layout had cut the
+wide banner to the pair shape 1.0. Now: a 2-panel unit containing a
+system-window panel is split (`plan.split_system_window_units()`)
+so the banner gets its own WIDE shot, with a WIDE crop (1.777 or
+1.333) and `wide_fill` — the card fills ≥90% of the frame width
+(aspect ≥ 1.33), no equal-area shrink, never a pair shot, never a
+square crop. A tall panel that merely *contains* a system window
+(e.g. P020-03) is not a system-window panel: its shape is the
+character's.
+
+### Filler stretches (sentences 4 and 68, Ch10 test build)
+
+Pre-existing pairing gaps, not regressions: sentence 4's filler
+P002-06 (Mutakta striking at Cedric — what Minwoo must prevent) and
+sentence 68's filler P018-02 (Soul Value box counting down, Cedric
+close-up) are both story-correct for their sentences, and every
+nearby distinct panel is already tagged to its own sentence, so no
+cleaner re-pair exists. Left as-is. The sentence-aligned captions
+now cover filler stretches with on-time captions, so they no longer
+read as empty stretches.
+
+### File size +38% (45 MB vs 33 MB, Ch10)
+
+Expected cost of continuous motion + captions, NOT a defect. Do not
+lower quality / change CRF to chase size.
+
 ## CapCut-style edits added
 
 Tasteful, recap-appropriate. Everything is gated, tested, and off or
@@ -109,14 +164,42 @@ swap-repeats. See `ensure_motion_variety()` above.
 ### Auto-captions — `manhwa_ocr/video/captions.py`
 
 Generalised from the intro video's burned-in subtitles to chapter
-videos. Plan carries `captions`: each shot's sentence split into 3–5
+videos. Plan carries `captions`: each sentence split into 3–5
 word chunks (`split_sentence_to_chunks`, evenly balanced so no chunk
-is under 3 words), spread evenly across the shot. Render writes
-`video/chapter_N.captions.ass` and burns it in with ffmpeg's
-`subtitles` filter in a final pass — captions never touch the per-shot
-segment cache, so editing captions never re-renders a shot. Style:
-bottom centre (Alignment 2, bottom band, never over faces), key word
-(longest word in the chunk) yellow, rest white, black outline.
+is under 3 words), spread evenly across the sentence's ALIGNMENT
+window (`build_captions_from_sentences`, from `alignment.json`
+segments — whisper sentence timings, never per-shot estimates).
+Render writes `video/chapter_N.captions.ass` and burns it in with
+ffmpeg's `subtitles` filter in a final pass — captions never touch
+the per-shot segment cache, so editing captions never re-renders a
+shot. Style: bottom centre (Alignment 2) in a DEDICATED bottom bar
+(see below), key word (longest word in the chunk) yellow, rest
+white, black outline.
+
+Why sentence windows, not shots: a shot is not a sentence. Coverage
+fillers and pair splits cut shots *inside* a sentence's spoken
+window, so per-shot captions stopped during filler shots (3–5s gaps
+with no caption while the narration continued — Ch10 test build:
+15.65–18.94, 79.39–84.27, 123.38–126.93, 197.07–200.72) and
+compressed a sentence's tail into the shot before the filler, so its
+caption showed 3–5s BEFORE its words were spoken (Ch10 sentence 41:
+"slashes back in a streak of cyan light" captioned at 122.68–123.38
+for words spoken ~127s). Sentence-aligned captions have neither
+gap: every chunk falls inside its own sentence's aligned window
+(±0.5s), checked by `validate_caption_timing()` (also: no narration
+gap >1s without a caption).
+
+Dedicated caption bar: captions render in a black bar covering the
+bottom 8% of the frame (`CAPTION_BAR_TOP_FRACTION = 0.92`), drawn by
+`ShotRenderer` under every captioned shot (`shot["caption_bar"]`).
+Cards are capped to the top 92% of the frame (`frames.card_box` /
+`slot_centres`: cards centre on 0.46 × H) and the `.ass` MarginV puts
+the text inside the bar — so a caption can never cover a panel's own
+bottom text (Ch10 test build at 241s: the caption "Knight, the One
+Recognized" partially covered the panel's system-window text "BY
+MUTAKTA!"). Keyword callouts sit *above* the bar when one is drawn.
+The legacy per-shot builder (`build_captions`) remains only as a
+fallback for plans with no alignment file.
 
 - Config: `video.captions: true` (default ON for NEW builds).
 - Old plans have no `captions` key and render without captions unless

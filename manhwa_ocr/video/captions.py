@@ -1,26 +1,37 @@
 """Auto-captions: CapCut-style burned-in subtitles for chapter videos.
 
-One caption at a time, 3-5 words, bottom centre, key word yellow, black
-outline -- the same look the intro video's burned-in subtitles used,
-generalised to chapter videos. Captions are FULL text (every word of the
-narration), unlike callouts, which stay keyword-only: the two never double
-up, because a callout is one keyword on an impact/reveal peak and a caption
+One caption at a time, 3-5 words, key word yellow, black outline -- the
+same look the intro video's burned-in subtitles used, generalised to
+chapter videos. Captions are FULL text (every word of the narration),
+unlike callouts, which stay keyword-only: the two never double up,
+because a callout is one keyword on an impact/reveal peak and a caption
 is the sentence itself.
 
-Flow: plan.py builds plan["captions"] from the shots (captions on by
-default for NEW builds, video.captions: true). render.py writes
-video/chapter_N.captions.ass from them and burns it in with ffmpeg's
-subtitles filter in a final pass -- captions never touch the per-shot
-segment cache, so rewording captions never re-renders a shot. Old plans
-have no "captions" key and render without captions unless the user runs
-`video captions --chapter N`, which adds them to the plan + writes the
-.ass. The .ass is also a standalone artefact: any player that loads
-external subtitles shows the same captions.
+Timing: captions are built from the ALIGNMENT segments (one sentence =
+one [start, end] window from whisper / the alignment engine), never
+from per-shot estimates. A shot is not a sentence: coverage fillers and
+pair splits cut shots inside a sentence's spoken window, so captions
+built per shot stopped during filler shots (3-5s gaps with no caption
+while the narration continued) and compressed a sentence's tail into
+the shot before the filler (a caption up to 5s BEFORE its words were
+spoken). Sentence-aligned captions have neither gap: every chunk falls
+inside its own sentence's aligned window, and the chunks cover the
+whole narration span with no gap over 1s.
 
-Style: bottom band (Alignment 2, MarginV 80 at 1080p), never over faces
-(faces sit in the upper part of a card; captions sit in the bottom band
-where cards show torso / background). Key word = the longest word in the
-chunk, yellow; the rest white.
+Layout: captions render in a DEDICATED bottom bar OUTSIDE the card art
+(frames.py draws the black bar; cards are capped to the top 92% of the
+frame and centred there). The .ass MarginV puts the text inside that
+bar, so a caption can never cover a panel's own bottom text.
+
+Flow: plan.py builds plan["captions"] from the alignment sentences
+(captions on by default for NEW builds, video.captions: true).
+render.py writes video/chapter_N.captions.ass from them and burns it in
+with ffmpeg's subtitles filter in a final pass -- captions never touch
+the per-shot segment cache, so rewording captions never re-renders a
+shot. Old plans have no "captions" key and render without captions
+unless the user runs `video captions --chapter N`, which adds them to
+the plan + writes the .ass. The .ass is also a standalone artefact: any
+player that loads external subtitles shows the same captions.
 """
 
 from __future__ import annotations
@@ -35,12 +46,46 @@ from .media import video_dir
 
 CAPTION_MAX_WORDS = 5
 CAPTION_MIN_WORDS = 3
-CAPTION_MARGIN_V = 80      # bottom band, px at 1080p (scaled by frame height)
+CAPTION_MARGIN_V = 16      # text sits inside the dedicated bottom bar (px at 1080p, scaled by frame height)
 CAPTION_FONT_SIZE = 46     # px at 1080p (scaled by frame height)
 KEY_COLOUR = "&H00FFFF&"   # ASS BGR: yellow
 TEXT_COLOUR = "&HFFFFFF&"  # ASS BGR: white
 
+# The dedicated caption bar: the bottom 8% of the frame is a black bar
+# drawn by frames.py (ShotRenderer) under every captioned shot. Cards are
+# capped to the top 92% (see frames.card_box / slot_centres), so no caption
+# ever overlaps panel art.
+CAPTION_BAR_FRACTION = 0.08
+CAPTION_BAR_TOP_FRACTION = 1.0 - CAPTION_BAR_FRACTION  # 0.92: cards end at or above this
+CAPTION_EARLY_TOLERANCE = 0.5   # a caption may not appear this far before its words
+CAPTION_MAX_GAP = 1.0           # no gap over this long without a caption during narration
+
 _WORD = re.compile(r"[A-Za-z0-9']+")
+
+
+def caption_bar_geometry(fmt) -> Dict[str, float]:
+    """The dedicated caption bar for a frame format: {top, height} in px.
+
+    Cards end at or above `top`; caption text sits inside [top, height].
+    """
+    height = float(getattr(fmt, "height", 1080) or 1080)
+    top = height * CAPTION_BAR_TOP_FRACTION
+    return {"top": top, "height": height - top}
+
+
+def caption_text_bbox(fmt) -> tuple:
+    """Approximate (x0, y0, x1, y1) px box of one caption line in `fmt`.
+
+    The .ass style is bottom-centre (Alignment 2) with MarginV from the
+    frame's bottom edge; one line is ~1.25x the font size tall. Used by
+    tests / QA to prove the caption sits inside the bar, below the cards.
+    """
+    height = float(getattr(fmt, "height", 1080) or 1080)
+    width = float(getattr(fmt, "width", 1920) or 1920)
+    scale = height / 1080.0
+    margin_v = max(16, int(round(CAPTION_MARGIN_V * scale)))
+    line_h = CAPTION_FONT_SIZE * scale * 1.25
+    return (0.0, height - margin_v - line_h, width, height - margin_v)
 
 
 def _key_word(chunk: str) -> str:
@@ -73,11 +118,64 @@ def split_sentence_to_chunks(text: str) -> List[str]:
     return chunks
 
 
+def build_captions_from_sentences(sentences: List[Dict[str, Any]],
+                                  duration: float | None = None) -> List[Dict[str, Any]]:
+    """Captions aligned to sentence windows: {text, key, start, end, shot, sentence}.
+
+    `sentences`: alignment segments (or cues sentences) with "text",
+    "start" and "end". A sentence with a missing "end" ends where the
+    next sentence starts (alignment segments are contiguous: each
+    sentence's end is the next one's start); a sentence with no usable
+    start/end is skipped. Chunks spread evenly across the sentence's
+    own window, so no chunk appears before its words are spoken and no
+    filler shot inside the window leaves a caption gap. `shot` carries
+    the sentence index ("sent12") so a chunk is traceable to its
+    sentence; `sentence` carries the 1-based sentence number.
+    """
+    out: List[Dict[str, Any]] = []
+    usable: List[Dict[str, Any]] = []
+    for i, s in enumerate(sentences or []):
+        if not isinstance(s, dict):
+            continue
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = float(s["start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        try:
+            end = float(s["end"])
+        except (KeyError, TypeError, ValueError):
+            end = None
+        usable.append({"text": text, "start": start, "end": end, "index": i})
+    for k, s in enumerate(usable):
+        end = s["end"]
+        if end is None:
+            end = usable[k + 1]["start"] if k + 1 < len(usable) else duration
+        if end is None or not end > s["start"]:
+            continue
+        chunks = split_sentence_to_chunks(s["text"])
+        if not chunks:
+            continue
+        step = (end - s["start"]) / len(chunks)
+        for j, chunk in enumerate(chunks):
+            out.append({"text": chunk, "key": _key_word(chunk),
+                        "start": round(s["start"] + j * step, 3),
+                        "end": round(s["start"] + (j + 1) * step, 3),
+                        "shot": f"sent{s['index'] + 1}",
+                        "sentence": s["index"] + 1})
+    return out
+
+
 def build_captions(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Captions for a plan's shots: {text, key, start, end, shot}.
 
-    Each shot's sentence is chunked 3-5 words and the chunks spread evenly
-    across the shot, so every caption lands on the words being spoken.
+    LEGACY fallback for old plans / callers without sentence timings
+    (`video captions` on a plan with no alignment file). New builds use
+    build_captions_from_sentences() instead: a shot is not a sentence,
+    and per-shot captions leave gaps during filler shots and show a
+    sentence's tail before its words are spoken.
     """
     out: List[Dict[str, Any]] = []
     for s in shots:
@@ -126,6 +224,78 @@ def validate_captions(captions: List[Dict[str, Any]], duration: float) -> List[s
     return errs
 
 
+def validate_caption_timing(captions: List[Dict[str, Any]], sentences: List[Dict[str, Any]],
+                            duration: float | None = None) -> List[str]:
+    """Timing problems: a chunk outside its sentence's aligned window, or a
+    narration gap over CAPTION_MAX_GAP with no caption.
+
+    `sentences`: alignment segments with "text"/"start"/"end". Chunks are
+    matched to sentences by their "sentence" number (set by
+    build_captions_from_sentences); a chunk without one is matched by
+    overlap: the sentence whose window contains most of the chunk. A
+    chunk may start at most CAPTION_EARLY_TOLERANCE before its sentence
+    starts and end at most that far after it ends.
+    """
+    errs: List[str] = []
+    windows: List[tuple] = []
+    for i, s in enumerate(sentences or []):
+        if not isinstance(s, dict):
+            continue
+        try:
+            windows.append((i + 1, float(s["start"]), float(s["end"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not windows:
+        return errs
+    by_num = {n: (a, b) for n, a, b in windows}
+    for c in captions or []:
+        try:
+            cs, ce = float(c["start"]), float(c["end"])
+        except (KeyError, TypeError, ValueError):
+            errs.append(f"caption '{c.get('text')}' needs numeric start/end")
+            continue
+        num = c.get("sentence")
+        if num not in by_num:
+            # Match by WORD overlap first (a chunk's words belong to its
+            # sentence even when the chunk's time window overlaps a
+            # neighbour's -- a per-shot chunk can sit mostly inside the
+            # previous sentence's window while carrying the next
+            # sentence's words), then by time overlap as a tie-break.
+            chunk_words = {w.strip(".,!?;:'\"").lower() for w in (c.get("text") or "").split()}
+            best, best_key = None, None
+            for n, (a, b) in by_num.items():
+                sent_words = {w.strip(".,!?;:'\"").lower()
+                              for w in (sentences[n - 1].get("text") or "").split()}
+                word_ov = len(chunk_words & sent_words)
+                time_ov = max(0.0, min(ce, b) - max(cs, a))
+                key = (word_ov, time_ov)
+                if best_key is None or key > best_key:
+                    best, best_key = n, key
+            num = best
+        if num is None:
+            continue
+        a, b = by_num[num]
+        if cs < a - CAPTION_EARLY_TOLERANCE:
+            errs.append(f"caption '{c.get('text')}' starts at {cs:.2f}s, "
+                        f"{a - cs:.2f}s BEFORE its sentence's words (sentence {num} starts {a:.2f}s)")
+        if ce > b + CAPTION_EARLY_TOLERANCE:
+            errs.append(f"caption '{c.get('text')}' ends at {ce:.2f}s, "
+                        f"{ce - b:.2f}s AFTER its sentence's words (sentence {num} ends {b:.2f}s)")
+    ordered = sorted((float(c["start"]), float(c["end"])) for c in captions or []
+                     if isinstance(c, dict) and c.get("start") is not None and c.get("end") is not None)
+    span_start = min(a for _, a, _ in windows)
+    span_end = max(b for _, _, b in windows)
+    prev_end = span_start
+    for cs, ce in ordered:
+        if span_start <= cs and cs - prev_end > CAPTION_MAX_GAP + 1e-9:
+            errs.append(f"no caption for {cs - prev_end:.2f}s during narration ({prev_end:.2f}-{cs:.2f}s)")
+        prev_end = max(prev_end, ce)
+    if span_end - prev_end > CAPTION_MAX_GAP + 1e-9:
+        errs.append(f"no caption for {span_end - prev_end:.2f}s during narration "
+                    f"({prev_end:.2f}-{span_end:.2f}s)")
+    return errs
+
+
 def ass_timestamp(seconds: float) -> str:
     """H:MM:SS.cc for an .ass Dialogue line."""
     seconds = max(0.0, float(seconds))
@@ -149,7 +319,12 @@ def _ass_text(caption: Dict[str, Any]) -> str:
 
 
 def write_ass(captions: List[Dict[str, Any]], path: Path, fmt=None) -> Path:
-    """Write captions as an .ass subtitle file. Returns the path."""
+    """Write captions as an .ass subtitle file. Returns the path.
+
+    Alignment 2 (bottom centre) with MarginV inside the dedicated bottom
+    bar (see CAPTION_BAR_FRACTION): the text sits on the black bar below
+    the cards, never over panel art.
+    """
     height = int(getattr(fmt, "height", 1080) or 1080)
     width = int(getattr(fmt, "width", 1920) or 1920)
     scale = height / 1080.0

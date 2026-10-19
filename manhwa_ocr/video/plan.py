@@ -33,13 +33,13 @@ from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
 from . import sync as sync_mod
-from .crops import _panel_maps, head_of, is_mask_risk, tone
+from .crops import _panel_maps, head_of, is_mask_risk, is_system_window, tone
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
 from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_crop, build_chapter_cards, extract_callout, pacing_qa,
                      plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
 from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
-from .captions import build_captions, validate_captions
+from .captions import build_captions, build_captions_from_sentences, validate_captions
 from .frames import (BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, GLITCH_MIN_GAP, LAYOUTS, MOTIONS,
                      TRANSITION_WEIGHTS, TRANSITIONS, Format, format_from, shapes_for, transition_enter)
 from .media import video_dir
@@ -448,6 +448,94 @@ def ensure_motion_variety(shots):
     return shots, changes
 
 
+def ensure_panel_diversity(shots):
+    """Never show the same panel 3x consecutively with an identical crop.
+
+    Coverage fillers and repeated tags can leave one panel on screen for
+    three sentences in a row (Ch10 test build: P014-10 for sentences
+    55/56/57, P020-01 for 75/76/77 -- correct pictures, visibly
+    repetitive). When a shot's first-card panel matches the previous
+    two shots' first-card panel, the third shot's crop is punched in
+    until it differs from BOTH predecessors' crops (a different crop of
+    the same panel; a different panel is the alignment's call, not the
+    planner's -- the planner never re-picks a panel). A shot whose crop
+    already differs from both predecessors is left alone. Returns
+    (shots, changes) with one reason-logged entry per fix.
+    """
+    changes = []
+    for k in range(2, len(shots)):
+        cards = shots[k].get("cards") or []
+        if not cards:
+            continue
+        panel = cards[0].get("panel")
+        prev1 = (shots[k - 1].get("cards") or [{}])[0]
+        prev2 = (shots[k - 2].get("cards") or [{}])[0]
+        if panel is None or prev1.get("panel") != panel or prev2.get("panel") != panel:
+            continue
+        prev_crops = [list(prev1.get("crop") or [0, 0, 1, 1]),
+                      list(prev2.get("crop") or [0, 0, 1, 1])]
+        cur_crop = list(cards[0].get("crop") or [0, 0, 1, 1])
+
+        def _differs(crop):
+            return all(any(abs(a - b) > 1e-9 for a, b in zip(crop, pc)) for pc in prev_crops)
+
+        if _differs(cur_crop):
+            continue  # already a different crop from both predecessors
+        new_crop = None
+        for frac in (0.08, 0.16, 0.24, 0.32):
+            cand = _inset_crop(cur_crop, frac)
+            if cand != cur_crop and _differs(cand):
+                new_crop = cand
+                break
+        if new_crop is None:
+            continue  # already at the minimum readable crop: nothing more to punch into
+        cur = dict(cards[0], crop=new_crop)
+        if cur.get("motion") in PAN_DIRECTIONS:
+            cur["motion"] = "push_in"  # a pan would restart q -1 -> +1 on the new shot
+        shots[k] = {**shots[k], "cards": [cur, *cards[1:]]}
+        changes.append({"shot": shots[k].get("id"), "panel": panel,
+                        "reason": ("same panel as the previous two shots: punched in so the third "
+                                   "showing is a different crop, not the same card a third time")})
+    return shots, changes
+
+
+def split_system_window_units(units, by_id):
+    """Split a 2-panel unit that contains a system-window panel.
+
+    A system-window banner must get its own WIDE shot (see
+    crops.is_system_window): the pair layout would cut it to a small
+    square. hold_groups() / _pair_up() may still group one with a
+    neighbour (a short sentence sharing a shot), so this pass -- run
+    after pairing, before the designer -- splits such a unit into two
+    single-panel units at the second panel's arrival (unit['second_at'],
+    the same instant the pair shot would have slid it in). The first
+    piece keeps the unit's sentence/cues; the second gets sentence None
+    (its caption comes from the alignment sentences, never from shots).
+    Units without a system-window panel pass through untouched.
+    """
+    out = []
+    for u in units:
+        panels = list(u.get("panels") or [])
+        if len(panels) == 2 and any(is_system_window(by_id.get(pid) or {}) for pid in panels):
+            try:
+                cut = float(u.get("second_at") or 0)
+            except (TypeError, ValueError):
+                cut = 0.0
+            start, end = float(u["start"]), float(u["end"])
+            cut_t = start + cut if 0 < cut < (end - start) else start + (end - start) / 2
+            first = {**u, "end": cut_t, "panels": panels[:1]}
+            second = {**u, "start": cut_t, "panels": panels[1:],
+                      "sentence": None, "cues": []}
+            first["sentence_starts"] = [s for s in (u.get("sentence_starts") or []) if s <= cut_t] or [start]
+            second["sentence_starts"] = [s for s in (u.get("sentence_starts") or []) if s > cut_t] or [cut_t]
+            first.pop("second_at", None)
+            second.pop("second_at", None)
+            out.extend([first, second])
+            continue
+        out.append(u)
+    return out
+
+
 # ------------------------------------------------------------------ shot design
 
 
@@ -558,7 +646,16 @@ class _Designer:
         if layout not in ("single", "wide"):
             return None
         if entry is not None and "layout_switch" in entry:
-            return entry.get("layout_switch")
+            cached = entry.get("layout_switch")
+            if cached is None:
+                return None
+            # A cached switch recorded before the wide-layout validity
+            # fix may point at a shape this layout cannot show (wide ->
+            # 1.0): drop it and recompute below (now None for wide)
+            # instead of reusing a square crop in a wide shot.
+            _to = float(cached.get("to_shape") or 0)
+            if any(abs(math.log(_to / a)) <= 0.02 for a in shapes_for(layout, self.fmt)):
+                return cached
         if pid not in self._maps:
             self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
         layout_shapes = {name: shapes_for(name, self.fmt) for name in ("single", "pair", "wide")}
@@ -712,7 +809,11 @@ class _Designer:
         ids = [p for p in dict.fromkeys(unit["panels"]) if p in self.by_id]
         first = ids[0]
 
-        if len(ids) >= 2:
+        if len(ids) == 1 and is_system_window(self.by_id.get(first) or {}):
+            # A system-window banner gets its own WIDE shot (never a
+            # pair: the pair layout would cut it to a small square).
+            layout = "wide"
+        elif len(ids) >= 2:
             # Both panels are cards, whatever the shot's length (hold_groups() has
             # already given it the short floor). The inset layout would turn one
             # panel into a blurred background only, so it is never used here.
@@ -754,6 +855,8 @@ class _Designer:
                     motion = self.motion(rng, crop)
             enter = (self.fixes["shot"].get(pid) or {}).get("enter", enter)   # fixes.json "shot" override
             card = {"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion}
+            if len(card_ids) == 1 and is_system_window(self.by_id.get(pid) or {}):
+                card["wide_fill"] = True  # fill >=90% of the frame width, never a small square
             pad = self.pad(pid, layout)
             if pad > 0:
                 card["pad_y"] = round(pad, 4)       # a wide panel: blurred padding above and below
@@ -878,7 +981,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                fixes: Dict[str, Any] | None = None,
                alignment_meta: Dict[str, Any] | None = None,
                settings: Dict[str, float] | None = None,
-               root: Path | None = None) -> Dict[str, Any]:
+               root: Path | None = None,
+               caption_sentences: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
     this function makes no panel decisions of its own - it only lays out,
@@ -890,6 +994,12 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     `settings` are sync.effective_settings() values; the caller (make_plan)
     prints them and warns about missing config keys. Stored in the plan meta so
     a finished video can be traced back to the numbers that made it.
+
+    `caption_sentences` are the alignment segments ({text, start, end})
+    captions are timed from -- sentence windows, never per-shot estimates
+    (see captions.build_captions_from_sentences). When omitted, the
+    `sentences` argument is used if it carries timings, else captions
+    fall back to the legacy per-shot build.
     """
     panels = panels_data["panels"]
     fmt = format_from(vcfg.get("format", "16:9"), int(vcfg.get("fps", 30)))
@@ -914,6 +1024,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                                           min_hold_short=st["min_hold_short"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
+    # A system-window banner in a 2-panel unit gets its own wide shot:
+    # split such units before the designer ever sees a pair with one.
+    units = split_system_window_units(units, by_id)
     designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes,
                          root=root, fingerprint=panels_data.get("fingerprint"))
     shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
@@ -927,6 +1040,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     # CapCut bugfix (defect 2): final no-repeat pass -- a split shot's last
     # piece can still match the next shot's motion (see ensure_motion_variety).
     shots, _motion_changes = ensure_motion_variety(shots)
+    # Diversity: never the same panel 3x in a row with an identical crop
+    # (the third showing is punched in to a different crop).
+    shots, _diversity_changes = ensure_panel_diversity(shots)
     # CapCut beat sync: snap interior cuts to the nearest beat (<=0.15s),
     # from video.beats or music/beats.json. No beats = no-op.
     _beats = resolve_beats(vcfg, root)
@@ -948,8 +1064,20 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     # CapCut auto-captions: on by default for NEW builds (video.captions).
     # Old plans (no captions key) render without them unless the user runs
     # `video captions --chapter N`, which adds them to the plan.
+    # Captions are timed from the alignment sentences (caption_sentences),
+    # never from per-shot estimates: a shot is not a sentence, and
+    # per-shot captions gap during filler shots and show a sentence's
+    # tail before its words are spoken.
     _captions_on = bool(vcfg.get("captions", True))
-    _captions = build_captions(shots) if _captions_on else []
+    _captions = []
+    if _captions_on:
+        _sent = caption_sentences if caption_sentences is not None else sentences
+        if _sent:
+            _captions = build_captions_from_sentences(_sent, duration)
+        if not _captions:
+            _captions = build_captions(shots)  # legacy fallback: no sentence timings
+        for _s in shots:
+            _s["caption_bar"] = True  # dedicated bottom bar, below the cards
     sfx = plan_sfx(shots, chapter_cards)
     return {
         "version": PLAN_VERSION,
@@ -988,6 +1116,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                    "max_shot": pacing_qa(shots)["max_shot"]},
         "split_crop_changes": _split_crop_changes,
         "motion_changes": _motion_changes,
+        "diversity_changes": _diversity_changes,
         "override_warnings": _override_warnings,
         "reviewed": False,
         "shots": shots,

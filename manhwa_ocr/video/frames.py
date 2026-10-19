@@ -117,14 +117,26 @@ def ease_in_out(p: float) -> float:
 # ------------------------------------------------------------------ layout geometry
 
 
+# Dedicated caption bar: the bottom 8% of the frame is a black bar drawn
+# under captioned shots (ShotRenderer), and cards are capped to the top
+# 92% so no caption ever overlaps panel art. Must match
+# captions.CAPTION_BAR_TOP_FRACTION (kept as a literal here so frames.py
+# stays importable without the captions module).
+CAPTION_BAR_TOP_FRACTION = 0.92
+
+
 def card_box(layout: str, fmt: Format) -> Tuple[float, float]:
-    """Largest card size (w, h) for a layout; the crop's aspect decides the actual fit."""
+    """Largest card size (w, h) for a layout; the crop's aspect decides the actual fit.
+
+    Card heights are capped to the top 92% of the frame: the bottom 8%
+    is the dedicated caption bar, and a card must never extend into it.
+    """
     W, H = fmt.width, fmt.height
     if fmt.portrait:
         return {"single": (0.92 * W, 0.70 * H), "pair": (0.90 * W, 0.42 * H),
                 "inset": (0.55 * W, 0.28 * H), "wide": (0.96 * W, 0.55 * H)}.get(layout, (0.92 * W, 0.7 * H))
-    return {"single": (0.62 * W, 0.90 * H), "pair": (0.42 * W, 0.80 * H),
-            "inset": (0.34 * W, 0.60 * H), "wide": (0.94 * W, 0.86 * H)}.get(layout, (0.62 * W, 0.90 * H))
+    return {"single": (0.62 * W, 0.92 * H), "pair": (0.42 * W, 0.80 * H),
+            "inset": (0.34 * W, 0.60 * H), "wide": (0.96 * W, 0.92 * H)}.get(layout, (0.62 * W, 0.92 * H))
 
 
 # Crop shape ranges (w/h) per layout. Tall panels are cut to a focal region of
@@ -182,23 +194,27 @@ def fit(aspect: float, box: Tuple[float, float], area: float | None = None) -> T
 
 
 def slot_centres(layout: str, fmt: Format, size: Tuple[int, int], index: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """(start centre, resting centre) for card `index` in this layout."""
+    """(start centre, resting centre) for card `index` in this layout.
+
+    Cards centre on the top 92% of the frame (0.46 * H): the bottom 8%
+    is the dedicated caption bar, and no card may extend into it.
+    """
     W, H = fmt.width, fmt.height
     cw, ch = size
     if layout == "pair":
         if fmt.portrait:
-            rest = (W / 2, 0.27 * H) if index == 0 else (W / 2, 0.73 * H)
+            rest = (W / 2, 0.23 * H) if index == 0 else (W / 2, 0.67 * H)
         else:
-            rest = (0.27 * W, H / 2) if index == 0 else (0.73 * W, H / 2)
-        start = (W / 2, H / 2) if index == 0 else rest
+            rest = (0.27 * W, 0.46 * H) if index == 0 else (0.73 * W, 0.46 * H)
+        start = (W / 2, 0.46 * H) if index == 0 else rest
         return start, rest
     if layout == "inset":
         if fmt.portrait:
-            c = (W / 2, 0.93 * H - ch / 2)
+            c = (W / 2, 0.92 * H - ch / 2)
         else:
-            c = (0.05 * W + cw / 2, 0.93 * H - ch / 2)
+            c = (0.05 * W + cw / 2, 0.92 * H - ch / 2)
         return c, c
-    c = (W / 2, H / 2)
+    c = (W / 2, 0.46 * H)
     return c, c
 
 
@@ -351,7 +367,13 @@ class Card:
         if pad_y > 0:                               # a wide panel shown whole on blurred padding
             region = padded_region(panel, [x0, y0, x1, y1], pad_y)
         aspect = region.width / region.height
-        self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
+        if spec.get("wide_fill"):
+            # System-window cards fill the frame width: no equal-area
+            # shrink (a 1.777 system banner must reach >=90% of the
+            # frame width, which the equal-area rule never allows).
+            self.cw, self.ch = fit(aspect, card_box(layout, fmt), None)
+        else:
+            self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
         self.border = max(1, round(3 * u))
         self.radius = max(2, round(12 * u))
         self.margin = max(6, round(46 * u))
@@ -576,7 +598,7 @@ def _overlay_font(size: int):
         return ImageFont.load_default()
 
 
-def _draw_callout(img: Image.Image, callout: dict, fmt: "Format", t: float) -> None:
+def _draw_callout(img: Image.Image, callout: dict, fmt: "Format", t: float, caption_bar: bool = False) -> None:
     """One keyword callout: bottom banner, max 2 lines, never over faces.
 
     Faces sit in the upper part of a card; the banner sits in the bottom
@@ -603,8 +625,11 @@ def _draw_callout(img: Image.Image, callout: dict, fmt: "Format", t: float) -> N
     draw = ImageDraw.Draw(img, "RGBA")
     lh = max(10, int(58 * u))
     band_h = lh * len(lines) + int(18 * u)
-    y0 = H - band_h - int(8 * u)
-    draw.rectangle((0, y0, W, H), fill=(0, 0, 0, 140))
+    # With a caption bar, the banner sits above the bar (its bottom edge
+    # is the bar's top), never over the captions.
+    _bottom = int(H * CAPTION_BAR_TOP_FRACTION) if caption_bar else H
+    y0 = _bottom - band_h - int(8 * u)
+    draw.rectangle((0, y0, W, _bottom), fill=(0, 0, 0, 140))
     fill = (255, 214, 90) if callout.get("style") == "keyword" else (255, 255, 255)
     for i, ln in enumerate(lines):
         w = draw.textlength(ln, font=font)
@@ -660,6 +685,7 @@ class ShotRenderer:
                  end_fade: bool = False, chapter_cards: List[Dict[str, Any]] | None = None):
         # P3: shot-level callouts ride on the shot dict; plan-level chapter
         # cards are passed in (render.py) so a clip can shift them with the shot.
+        self.caption_bar = bool(shot.get("caption_bar"))
         self.callouts = [c for c in (shot.get("callouts") or []) if isinstance(c, dict)]
         self.chapter_cards = list(chapter_cards or [])
         self.fmt = fmt
@@ -740,6 +766,12 @@ class ShotRenderer:
         if self.is_static(t) and self._static is not None:
             return self._static
         img = self._bg_pil.copy()
+        if self.caption_bar:
+            # Dedicated caption bar: solid black below the cards, so
+            # captions (burned in later by ffmpeg) sit on black, never
+            # over panel art.
+            _bar_top = int(self.fmt.height * CAPTION_BAR_TOP_FRACTION)
+            ImageDraw.Draw(img).rectangle((0, _bar_top, self.fmt.width, self.fmt.height), fill=(0, 0, 0))
         dx_s, dy_s = shake_offset(t, self.shakes, self.fmt.unit)
         extra = punch_amount(t, self.punches)
         for card in self.cards:
@@ -763,7 +795,7 @@ class ShotRenderer:
             y = int(round(cy + ent["dy"] + dy_s - spr.height / 2))
             img.paste(spr.convert("RGB"), (x, y), alpha)
         for _co in self.callouts:
-            _draw_callout(img, _co, self.fmt, t)
+            _draw_callout(img, _co, self.fmt, t, caption_bar=self.caption_bar)
         for _cc in self.chapter_cards:
             _draw_chapter_card(img, _cc, self.fmt, t)
         out = np.asarray(img, dtype=np.uint8)

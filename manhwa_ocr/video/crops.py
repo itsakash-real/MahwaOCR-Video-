@@ -19,6 +19,7 @@ The result is just a default: crops are stored in the plan, where the agent
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
+import re
 
 import numpy as np
 from PIL import Image
@@ -291,6 +292,48 @@ CREDIT_WORDS = ("read at", "fastest release", "discord", "patreon", "ko-fi", "ko
 def looks_like_credits(text: str) -> bool:
     t = (text or "").lower()
     return any(w in t for w in CREDIT_WORDS)
+
+# --- System-window panels ---------------------------------------------------
+# A system notification / status window is a WIDE, short panel (a banner
+# across the page: aspect >= 1.5) whose text or scene is a system message
+# (soul value, acquired title, unlock, ...). Shown as a small square crop
+# (the pair layout's 1.0 shape) it reads as a postage stamp in the middle
+# of the card (Ch10 test build, ~34s: P004-07's banners). Such a panel
+# must get a WIDE crop (1.777 or 1.333) in a WIDE shot that fills the
+# frame width, never a pair shot and never a square crop. A tall panel
+# that merely CONTAINS a system window (e.g. P020-03) is not one: its
+# shape is the character's, and the window is part of the art.
+SYSTEM_WINDOW_MIN_ASPECT = 1.5
+SYSTEM_WINDOW_SHAPES = (1.777, 1.333)
+SYSTEM_SCENE_MARKERS = ("system notification", "system window", "system banner",
+                        "status window", "soul value")
+_SYSTEM_TEXT = re.compile(
+    r"SOUL VALUE|YOU HAVE ACQUIRED|YOU HAVE WON|IS UNLOCKED|HAS BEEN UNLOCKED|"
+    r"MENTAL FORTITUDE|TRANSCEND|PERFECT ESCAPE CONDITION|SUMMON .* UNLOCKED|"
+    r"\bSYSTEM\b", re.IGNORECASE)
+
+
+def is_system_window(panel: Dict[str, Any]) -> bool:
+    """True when `panel` (a panels.json entry) is a system-window banner.
+
+    An explicit panel tag (`system_window: true`) always wins. Otherwise
+    the panel must be wide (aspect >= 1.5) AND carry a system marker in
+    its scene description or its OCR'd text.
+    """
+    if not isinstance(panel, dict):
+        return False
+    if panel.get("system_window"):
+        return True
+    try:
+        aspect = float(panel.get("width") or 0) / max(1.0, float(panel.get("height") or 1))
+    except (TypeError, ValueError):
+        return False
+    if aspect < SYSTEM_WINDOW_MIN_ASPECT:
+        return False
+    scene = (panel.get("scene") or "").lower()
+    if any(m in scene for m in SYSTEM_SCENE_MARKERS):
+        return True
+    return bool(_SYSTEM_TEXT.search(panel.get("text") or ""))
 
 
 def tone(img: Image.Image) -> str:

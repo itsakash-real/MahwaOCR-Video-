@@ -167,6 +167,16 @@ def find_pair_safe_shape(img: Image.Image, maps: Dict[str, Any] | None,
         return None
     if abs(float(main["shape"]) - float(pair["shape"])) < 1e-9:
         return None
+    # The switch target must be a shape VALID for the layout it will be
+    # used in: the pair shape is only "safe" when this layout may actually
+    # show it. Pair shapes are a subset of single's, so single switches
+    # are unaffected -- but a WIDE shot may only show 1.333 / 1.777, never
+    # the pair layout's 1.0 square (Ch10 test build: P014-07 was recorded
+    # 1.777 -> 1.0, a square crop in a wide shot). A pair shape outside
+    # the layout's list means no switch: the layout keeps its own crop.
+    allowed = list(layout_shapes[layout])
+    if not any(abs(math.log(float(pair["shape"]) / a)) <= 0.02 for a in allowed):
+        return None
     return {"from_shape": float(main["shape"]), "to_shape": float(pair["shape"]),
             "box": list(pair["box"]), "pad_y": float(pair.get("pad_y") or 0.0),
             "reason": (f"{layout} crop {main['shape']:.3f} and pair crop {pair['shape']:.3f} "
@@ -215,6 +225,16 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
                 # missing key means "unknown", recomputed below on the
                 # fresh path only when the image is already being loaded.
                 panel_switch = cached.get("layout_switch")
+                # A cached switch recorded before the wide-layout validity
+                # fix may point at a shape this layout cannot show (e.g.
+                # 1.0 for a wide shot): drop it, so the fresh path
+                # recomputes (and now returns None) instead of reusing it.
+                if (isinstance(panel_switch, dict) and layout_shapes
+                        and "single" in layout_shapes):
+                    _to = float(panel_switch.get("to_shape") or 0)
+                    if not any(abs(math.log(_to / a)) <= 0.02
+                               for a in layout_shapes["single"]):
+                        panel_switch = None
         if card is None or cached_risk is None:
             img = image_for(p)
             maps = _panel_maps(img, options)
@@ -250,7 +270,13 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             if pair_probs is not None and not single_probs and pair_probs:
                 layout_sensitive.append(p["id"])
         if panel_switch is not None:
-            layout_switches[p["id"]] = panel_switch
+            # Label the layout this switch is for: verify computes the
+            # SINGLE-layout switch (find_pair_safe_shape's default), and
+            # a wide shot never takes it (wide switches must be 1.333 /
+            # 1.777 -- see find_pair_safe_shape's validity check). An
+            # unlabeled "1.777 -> 1.0" read as a wide-layout switch
+            # (Ch10 test build, P014-07) looks like the wide bug.
+            layout_switches[p["id"]] = {**panel_switch, "layout": "single"}
         if panel_patch > PATCH_VISIBLE:
             visible_patches.append({"panel": p["id"], "visibility": panel_patch})
         if clean:

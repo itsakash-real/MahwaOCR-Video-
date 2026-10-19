@@ -914,8 +914,24 @@ def cmd_video(args) -> int:
         for c in chapters(default_all=False):
             _panels = load_panels(sess.path, c) or {"panels": []}
             _plan = load_plan(sess.path, c, {p["id"] for p in _panels["panels"]})
-            _plan["captions"] = caps_mod.build_captions(_plan["shots"])
+            # Sentence-aligned captions when the alignment file exists
+            # (no per-shot gaps / early captions); legacy per-shot
+            # build otherwise.
+            _caps = []
+            try:
+                from .video import align_engine as _align_mod
+                import json as _json
+                _align = _json.loads(_align_mod.alignment_path(sess.path, c).read_text(encoding="utf-8"))
+                _caps = caps_mod.build_captions_from_sentences(_align.get("segments") or [],
+                                                                _plan.get("duration"))
+            except (OSError, ValueError):
+                _caps = []
+            if not _caps:
+                _caps = caps_mod.build_captions(_plan["shots"])
+            _plan["captions"] = _caps
             _plan["captions_enabled"] = True
+            for _s in _plan["shots"]:
+                _s["caption_bar"] = True
             save_plan(sess.path, c, _plan)
             _ass = caps_mod.write_captions_file(sess.path, c, _plan)
             _n = len(_plan["captions"])

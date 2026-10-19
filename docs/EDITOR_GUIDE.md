@@ -36,12 +36,16 @@ Override one shot's callout text in `fixes.json`:
 
 ## Auto-captions (CapCut)
 
-Plan `captions`: each shot's sentence split into 3–5 word chunks, spread
-evenly across the shot, burned in at render from
+Plan `captions`: each sentence split into 3–5 word chunks, spread
+evenly across the sentence's alignment window (whisper sentence
+timings — never per-shot estimates, which gap during filler shots
+and show tails early), burned in at render from
 `video/chapter_N.captions.ass` (ffmpeg subtitles filter, final pass —
-captions never touch the segment cache). Bottom centre, key word
-(longest word) yellow, black outline, never over faces. Full text;
-callouts stay keyword-only, so the two never double up.
+captions never touch the segment cache). Bottom centre in a dedicated
+black bottom bar (bottom 8% of the frame; cards capped to the top
+92%), key word (longest word) yellow, black outline, never over panel
+art. Full text; callouts stay keyword-only, so the two never double
+up.
 `video.captions: true` by default for new builds; old plans render
 without captions unless requested:
 

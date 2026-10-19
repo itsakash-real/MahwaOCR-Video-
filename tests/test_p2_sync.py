@@ -82,7 +82,10 @@ def test_pair_safe_switch_uses_narrower_shape_when_both_layouts_clean(monkeypatc
     monkeypatch.setattr(verify_mod, "pick_card",
                         _fake_pick_factory(_clean_card(1.333), _clean_card(0.75, (0, 0.1, 1, 0.9))))
     img = Image.new("RGB", (300, 400), (120, 90, 70))
-    switch = verify_mod.find_pair_safe_shape(img, {}, {"single": [1.333], "pair": [0.75]})
+    # Realistic shape lists: pair shapes are a subset of single's, so the
+    # pair-safe target is valid for the single layout it will be used in.
+    switch = verify_mod.find_pair_safe_shape(
+        img, {}, {"single": [0.5625, 0.75, 1.0, 1.333, 1.777], "pair": [0.5625, 0.75, 1.0]})
     assert switch is not None
     assert switch["from_shape"] == pytest.approx(1.333)
     assert switch["to_shape"] == pytest.approx(0.75)
@@ -134,7 +137,8 @@ def test_verify_reports_layout_switch(monkeypatch):
     panels = [{"id": "P001-01", "width": 300, "height": 400}]
     img = Image.new("RGB", (300, 400), (120, 90, 70))
     report = verify_mod.verify_chapter(panels, lambda p: img, [0.75, 1.333],
-                                       layout_shapes={"single": [1.333], "pair": [0.75]})
+                                       layout_shapes={"single": [0.5625, 0.75, 1.0, 1.333, 1.777],
+                                                      "pair": [0.5625, 0.75, 1.0]})
     assert report["layout_switches"]["P001-01"]["to_shape"] == pytest.approx(0.75)
     assert report["layout_sensitive"] == []  # both layouts clean: not "sensitive", just switched
 
