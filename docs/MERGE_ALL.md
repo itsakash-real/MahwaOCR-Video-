@@ -16,6 +16,43 @@ nothing. Full suite on merged `main`: **630 passed, 1 skipped,
 superseded by this merge — its commits are inside the chain — and
 must be closed, not merged.
 
+### Impactful-only panel selection — commit on `main` (Phase 1, 2026-10-19)
+
+Direct commit on `main` (no branch): `fix(video): impactful-only panel
+selection — min 3s shot, filler capped, coverage gate`.
+
+- **Deleted `place_coverage`** (`align_engine.py`): the "every drawn panel
+  must appear" pass is gone, not behind a flag. Replaced by
+  `place_impactful()`: one tagged panel per sentence (≤8s: tagged holds
+  the whole window); >8s splits into 2 shots (tagged ~65% + ONE
+  impactful filler ~35%), >15s at most 3 shots; fillers only from the
+  sentence's own window and only when they pass the impact test
+  (figure + scene beat, in story order, not a repeat/spoiler, max 1 per
+  sentence / 2 if >15s). Duplicate-tag sentences HOLD. Unshown panels
+  are not a failure; `panels_shown/total` is INFO ONLY in QA.
+- **Min shot 3.0s, ever:** `hold_groups()` floor is `min_hold` with no
+  `min_hold_short` (2.0s) exception — that setting is deleted
+  (`sync.py`, config, `manhwa-ocr.yaml`). `sync.min_segment` stays
+  0.25 as an anti-collapse guard only: raising it to 3.0s would
+  silently pull short sentences' panels ahead of their words.
+- **Sync gate additions** (`syncaudit.evaluate_gate`, one code path):
+  FAIL on any shot <3.0s, any sentence under its tagged-coverage
+  threshold (80% ≤8s, 60% >8s), and any filler failing the impact test
+  (failing fillers count as wrong-picture; passing fillers do not).
+- **Pair-arrival floor fix** (`plan._Designer.shot`): the second card
+  arrives exactly at `second_at` (its own words) — the old 0.6s floor
+  made boundary pairs ~0.66s late, past the 0.5s gate. No-`second_at`
+  fallback delay 0.8s → 0.5s. Beat-snapping can no longer push a
+  shot under the min_hold floor.
+- **Docs:** `EDITOR_GUIDE.md` (pacing + sync + config table),
+  `CAPCUT_EDITS.md` (filler stretches superseded, pair-arrival fix),
+  `AGENT_WAY.md` (Prompts C/H), this file, `AGENTS.md` (coverage + QA).
+
+Tests: new `tests/test_impactful_selection.py` (max-shots formula,
+min 3s, filler cap, duplicate-tag HOLD, coverage gate, impact test,
+pair-arrival regression, QA info-only); old `place_coverage` /
+coverage-filler tests replaced with impactful equivalents.
+
 ## Later merges (after the original P0–P5 + docs)
 
 ### Ch10 test-build fixes — commit `9b146d0`, merged into `main` as `f0e7d4c`

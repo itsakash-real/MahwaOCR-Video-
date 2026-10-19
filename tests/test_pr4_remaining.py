@@ -289,7 +289,13 @@ def test_gate_sweep_ignores_a_single_straddling_sample():
     rep = syncaudit.audit({"chapter": "1", "duration": 24.0, "shots": shots},
                           {"segments": segs},
                           _words("The gate opens now He draws the sword " * 6))
-    assert rep["five_second"]["over_gate"] == [] and rep["gate"]["pass"] is True
+    assert rep["five_second"]["over_gate"] == []
+    # The 0.5s straddle shot itself is illegal under the 3.0s min-shot rule,
+    # so the gate fails — but on the short shot, not on the window: the
+    # single settled-wrong sample still does not trip the window gate.
+    assert rep["gate"]["pass"] is False
+    assert not any("five-second window" in f for f in rep["gate"]["failures"])
+    assert any("minimum shot" in f for f in rep["gate"]["failures"])
 
 
 # --------------------------------------------------------------- full scene text

@@ -7,6 +7,36 @@ CapCut-style edits + the video-defect bugfixes live in `CAPCUT_EDITS.md`.
 
 ## Pacing + motion (P3)
 
+- **Impactful-only panel selection (user rules, 2026-10-19): time is
+  scarce, panels are abundant — SELECT, don't cover.** There is no
+  "every drawn panel must appear" pass: a panel no sentence picked is
+  simply not shown. `panels_shown / total` in QA is INFO ONLY, never
+  success — success is tagged coverage + min shot + impact pass.
+  - Max shots = `floor(audio_seconds / 3)`.
+  - Min shot = 3.0s, ever (except the renderer's 0.5s black tail).
+    A shot under the floor is counted, never hidden, and FAILS the
+    sync gate.
+  - One tagged panel per sentence, held for the full window if the
+    sentence is ≤8s. No filler, no split.
+  - A sentence >8s splits into 2 shots, each ≥3s: tagged (~65%) +
+    ONE impactful filler (~35%) OR a same-panel punch-in. A sentence
+    >15s: at most 3 shots, each ≥3s. Shots per sentence are capped at
+    `ceil(duration / 3)`, preferring ≤2.
+  - A filler passes the impact test ONLY if ALL hold: named character
+    + visible action/story beat (scene note), visible face (figure
+    share ≥ FIGURE_MIN; not text-only, SFX-only, body fragment,
+    back-of-head, or a spoiler for a later sentence), max 1 per
+    sentence (2 if >15s), min 3s, never a repeated panel, never
+    backwards story order. If no panel passes, the tagged panel holds.
+  - Duplicate-tag sentences (tag = previous sentence's panel) HOLD
+    the panel — no filler, no new shot.
+  - Tagged coverage: ≥80% of a ≤8s sentence's window, ≥60% of a
+    longer one's. The sync gate FAILS on any sentence under its
+    threshold, any shot <3s, or any filler that fails the impact
+    test (a failing filler counts as wrong-picture).
+  - Pair second cards arrive exactly on their own words — no arrival
+    floor (the old 0.6s floor made boundary pairs structurally late
+    past the 0.5s gate).
 - **Panel hold:** every panel shows ~3–4s (5–7s only if it carries
   readable text). No panel >8s without a crop change or chapter card.
   Shots >8s are split into (4, 8]s pieces, each with an 8%-per-piece
@@ -170,6 +200,12 @@ and render. Cached audits are reused only under the current sync
 settings. `{same}` across a story jump fails validation (name the
 skipped panel, retag). Timing warnings ride with plan + QA and the
 estimated-timing render refusal names the exact warning code + fix.
+The gate fails on: wrong-picture share / five-second windows / late cuts
+(as before) PLUS any shot under 3.0s, any sentence whose tagged panel
+covers less than its threshold (80% for ≤8s, 60% for longer), and any
+filler that fails the impact test. QA reports tagged coverage per
+sentence, filler shots/seconds, min shot, and panels shown/total
+(info only).
 
 ## Safety (P0)
 
@@ -187,8 +223,8 @@ deterministic (same inputs → identical JSON).
 | `format` | `16:9` | `16:9` YouTube, `9:16` Shorts |
 | `fps` | 30 | Frames per second |
 | `crf` / `preset` | 20 / `veryfast` | Quality / speed |
-| `min_hold` | 3.0s | No picture stays up less than this |
-| `min_shot` / `max_shot` / `target_shot` | 1.0 / 5.0 / 2.7s | Shot-length pacing |
+| `min_hold` | 3.0s | No picture stays up less than this; also the min shot (sync gate fails any shot under 3.0s) |
+| `min_shot` / `max_shot` / `target_shot` | legacy, unused by the planner | Pacing is now: max shots = floor(audio/3), min shot 3.0s, pieces (4, 8]s |
 | `pair_ratio` | 0.3 | Share of even-timed shots shown as two cards |
 | `effects` | `{shake: true, punch: false, flash: false, end_fade: true}` | Which impact effects are on |
 | `music` | `null` (= `music/bed.mp3` if present) | Music bed path |
@@ -201,7 +237,7 @@ deterministic (same inputs → identical JSON).
 | `crop.full_width` | `true` | Cards keep full width, slide vertical window |
 | `whisper_model` | `base.en` | Use `small` for Hindi narration |
 | `require_review` | `false` | If true, render refuses unless plan approved |
-| `sync.gate_wrong` / `gate_window` / `gate_grace` | 0.05 / 0.25 / 0.2 | Sync-gate thresholds |
+| `sync.gate_wrong` / `gate_window` / `gate_grace` | 0.05 / 0.25 / 0.2 | Sync-gate thresholds (plus: any shot <3s fails, any sentence under its tagged-coverage threshold fails, any filler failing the impact test counts as wrong-picture) |
 
 ## `fixes.json` overrides (all in one file, `video/chapter_N.fixes.json`)
 

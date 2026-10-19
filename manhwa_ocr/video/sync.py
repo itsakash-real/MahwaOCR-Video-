@@ -185,7 +185,15 @@ def transcribe(audio: Path, *, model: str = "small.en", language: str | None = N
     return words
 
 
-MIN_SEGMENT = 0.25   # seconds; video.sync.min_segment overrides it
+MIN_SEGMENT = 0.25   # seconds; video.sync.min_segment overrides it.
+# min_segment is ONLY an anti-collapse guard for sentence segments (it keeps
+# two sentence starts from landing on the same instant). It is NOT a shot
+# floor: raising it to the 3.0s shot floor would silently pull a short
+# sentence's panel up to ~2s EARLIER than its words (the backward pass in
+# _enforce_min_segment), i.e. real desync the audit cannot see because the
+# audit trusts segment windows. The 3.0s shot floor lives where shots are
+# made (plan.hold_groups, floor = configured video.min_hold, default 3.0)
+# and is enforced by the sync gate (syncaudit.MIN_SHOT).
 
 # Every sync/hold knob this package reads, where it lives and what it means.
 # The single place defaults are written down; config.py's DEFAULT_CONFIG ships
@@ -193,14 +201,13 @@ MIN_SEGMENT = 0.25   # seconds; video.sync.min_segment overrides it
 # config is warned about loudly (effective_settings) - never silently replaced.
 SYNC_DEFAULTS: Dict[str, float] = {
     "min_hold": 3.0,          # video.min_hold: no picture stays up for less
-    "min_segment": 0.25,      # video.sync.min_segment: shortest sentence segment
+    "min_segment": 0.25,      # video.sync.min_segment: anti-collapse guard only
+                              # (keeps two sentence starts apart); NOT a shot floor
     "max_late": 0.3,          # video.sync.max_late: a cut may start at most this much after its sentence
     "lead": 0.2,              # video.sync.lead: hard early bound - a cut may lead its sentence by at most this
-    "min_hold_short": 2.0,    # video.sync.min_hold_short: shortest hold allowed when merging is impossible
     "max_hold": 8.0,          # video.sync.max_hold: a picture held longer than this gets split
     "max_unmatched": 6.0,     # video.sync.max_unmatched: a run of unmatched (interpolated) speech longer than this stops the build
     "override_evidence": 20,  # video.sync.override_evidence: OCR-overlap score above which a tag/OCR disagreement is flagged (tag still shows)
-    "filler_full": 6.0,       # video.sync.filler_full: only sentences this long may be filled end to end
     "gate_wrong": 0.05,       # video.sync.gate_wrong: most wrong-picture time allowed overall (provisional until calibration)
     "gate_window": 0.25,      # video.sync.gate_window: most wrong-picture time allowed in any 5s window (provisional)
     "gate_grace": 0.2,        # video.sync.gate_grace: extra lateness tolerated before the gate fails

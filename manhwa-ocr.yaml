@@ -101,19 +101,21 @@ video:
   sync:
     # Narration sync. `video sync-audit` checks a finished plan against these;
     # `video build` refuses to render when the match gates fail.
-    min_segment: 0.25    # no sentence is shorter than this (seconds); stops zero-length segments
+    min_segment: 0.25    # anti-collapse guard for sentence starts only (NOT a shot floor;
+                         # the 3.0s shot floor is video.min_hold + the sync gate, see below)
     max_late: 0.3        # a cut may start at most this long after its sentence starts
     lead: 0.2            # hard early bound: a cut may lead its sentence by at most this
-    min_hold_short: 2.0  # shortest hold allowed when a sentence can't be merged into a pair
     max_hold: 8.0        # a single picture held longer than this is split by a slide-in
     max_unmatched: 6.0   # speech whisper couldn't match for this long stops the build
     override_evidence: 20  # OCR-overlap score above which a tag/OCR disagreement is flagged (the tag still shows)
-    filler_full: 6.0     # only sentences longer than this may be filled end to end
     gate_wrong: 0.05     # build gate: most wrong-picture time (another sentence's panel on
-                         # screen) allowed overall; fillers and pair second cards are excluded.
+                         # screen, or a filler that fails the impact test) allowed overall.
                          # PROVISIONAL - will be set from the calibrated after-distribution.
     gate_window: 0.25    # build gate: most wrong-picture time allowed in any five-second window
     gate_grace: 0.2      # build gate: extra lateness tolerated before a cut fails
+    # The gate ALSO fails on: any shot under 3.0s, any sentence whose tagged
+    # panel covers less than its threshold (80% for <=8s sentences, 60% for
+    # longer ones), and any filler that fails the impact test.
   whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
   whisper_language: null  # e.g. "hi"
   # true: a chapter's video must be approved (video review, or video approve) before rendering

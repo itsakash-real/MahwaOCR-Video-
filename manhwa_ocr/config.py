@@ -107,19 +107,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         #   min_hold:        no picture stays up for less than this (seconds).
         #   max_late:        a cut may start at most this long after its sentence starts.
         #   lead:            hard early bound - a cut may lead its sentence by at most this.
-        #   min_hold_short:  shortest hold allowed when a sentence can't be merged.
+        #   min_segment:     anti-collapse guard for sentence starts only (NOT a shot
+        #                    floor — raising it would pull panels ahead of their words).
         #   max_hold:        a single picture held longer than this gets split.
         #   max_unmatched:   a run of whisper-unmatched speech longer than this stops the build.
         #   override_evidence: OCR overlap above which a tag/OCR disagreement is flagged (tag still shows).
-        #   filler_full:     only sentences longer than this may be filled end to end.
-        #   gate_wrong:      most wrong-picture time (another sentence's panel on screen)
-        #                    allowed overall; fillers and pair cards are excluded.
+        #   gate_wrong:      most wrong-picture time (another sentence's panel on screen,
+        #                    or a filler that fails the impact test) allowed overall.
         #   gate_window:     most wrong-picture time allowed in any five-second window.
         #   gate_grace:      extra cut lateness tolerated before the gate fails.
         "min_hold": 3.0,
         "sync": {
-            "min_segment": 0.25, "max_late": 0.3, "lead": 0.2, "min_hold_short": 2.0,
-            "max_hold": 8.0, "max_unmatched": 6.0, "override_evidence": 20, "filler_full": 6.0,
+            "min_segment": 0.25, "max_late": 0.3, "lead": 0.2,
+            "max_hold": 8.0, "max_unmatched": 6.0, "override_evidence": 20,
             "gate_wrong": 0.05, "gate_window": 0.25, "gate_grace": 0.2,
         },
         # Recording text. spell_numbers: the NEW recaps/chapter_N.tts.txt (and the spoken text in

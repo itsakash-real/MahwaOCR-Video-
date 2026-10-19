@@ -195,13 +195,16 @@ def _shot(start, end, panel, crop=(0.0, 0.0, 1.0, 0.75)):
             "background": "blur", "cards": [{"panel": panel, "crop": list(crop)}]}
 
 
-def test_quality_report_fails_on_missing_panel_and_bad_shape():
+def test_quality_report_fails_on_bad_shape_but_not_on_a_missing_panel():
     panels = {"panels": [{"id": "P001-01", "width": 300, "height": 400},
                          {"id": "P001-02", "width": 300, "height": 400}]}
     # Only P001-01 shown -> P001-02 missing. Crop 1.0x0.1 is not an allowed shape.
     plan = _plan_with_shots([_shot(0.0, 10.0, "P001-01", crop=(0.0, 0.0, 1.0, 0.1))])
     qa = quality_report(plan, panels, None, 3.0)
-    assert any("would never appear" in f and "P001-02" in f for f in qa["failures"])
+    # Rule 9: a missing panel is INFO ONLY, never a failure.
+    assert qa["missing"] == ["P001-02"]
+    assert qa["panels_shown"] == 1 and qa["panels_total"] == 2
+    assert not any("would never appear" in f for f in qa["failures"])
     assert any("allowed shapes" in f for f in qa["failures"])
 
 

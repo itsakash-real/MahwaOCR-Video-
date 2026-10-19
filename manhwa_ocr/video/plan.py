@@ -51,6 +51,11 @@ MAX_PAIR_SHOT = 6.5      # max total duration allowed for a 2-panel pair shot
 PUNCH_GAP = 4.0
 EFFECT_GRACE = 0.35
 MIN_HOLD = 3.0           # seconds: no picture is held on screen for less than this
+MIN_SHOT = 3.0           # seconds: no SHOT is ever shorter than this (except the
+                         # renderer's 0.5s black tail). The sync gate enforces it;
+                         # hold_groups() uses the caller's min_hold as its floor
+                         # (chapter default 3.0 = MIN_SHOT; the intro trailer
+                         # deliberately uses 2.0 and is never sync-audited).
 PAD_LIMIT = 1.5          # a card's pad_y (blurred padding above and below, in panel heights) is at most this
 
 # P3 continuous motion (editor.py): the planner never emits `hold`. A reviewer
@@ -217,10 +222,10 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     for seg in segments:
         if seg.get("display_action") == "SHOW" and seg.get("selected_panel"):
             # "sequence" = every panel this sentence shows, in story order
-            # (the selected one plus any the coverage pass placed in it).
-            # A hand-edited selected_panel replaces the panel the alignment chose;
-            # the coverage extras placed in this sentence are kept, so no panel is
-            # dropped by an edit.
+            # (the selected one plus any impactful filler place_impactful()
+            # chose for a long sentence). A hand-edited selected_panel
+            # replaces the panel the alignment chose; the fillers placed in
+            # this sentence are kept, so no panel is dropped by an edit.
             sel = seg["selected_panel"]
             old = seg.get("selected_by_align")
             extras = [p for p in (seg.get("sequence") or []) if p not in (sel, old)]
@@ -233,10 +238,18 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if not seq:
             continue  # nothing has ever been shown yet; nothing to hold either
         start, end = float(seg["start"]), float(seg["end"])
-        step = (end - start) / len(seq)
+        # Split on the shares place_impactful() recorded (tagged ~65% +
+        # filler ~35% for a long sentence), NOT evenly: an even split
+        # would give the filler half the window and break tagged coverage.
+        # Segments without shares (intro, hand-built) split evenly.
+        shares = list(seg.get("sequence_shares") or [])
+        if len(shares) != len(seq) or abs(sum(shares) - 1.0) > 1e-6:
+            shares = [1.0 / len(seq)] * len(seq)
+        cursor_t = start
         for k, pid in enumerate(seq):
-            a = start + k * step
-            b = end if k == len(seq) - 1 else a + step
+            a = cursor_t
+            b = end if k == len(seq) - 1 else start + (end - start) * sum(shares[:k + 1])
+            cursor_t = b
             add({"start": a, "end": b, "panels": [pid], "cues": [], "emphasis": [],
                  "sentence": seg.get("text") if k == 0 else None,
                  "sentence_starts": [start] if k == 0 else [a]})
@@ -246,8 +259,7 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 
 def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
-                lead: float | None = None, max_late: float | None = None,
-                min_hold_short: float | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+                lead: float | None = None, max_late: float | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Pack timed single-panel units into shots with a bounded cut budget.
 
     Every cut may move only inside [sentence_start - lead, sentence_start +
@@ -255,22 +267,24 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     neighbour - the old donor pass was what made the shot drift away from the
     voice. A unit shorter than min_hold shares one shot with the next unit
     (two cards, the second arriving on its own words); a shot still shorter
-    than min_hold_short after that takes at most `lead` more from its start
+    than min_hold after that takes at most `lead` more from its start
     and `max_late` from its end. A shot that even then can't reach the floor
     is left short and counted in stats["short_shots"] - the plan QA reports
-    it; the timing never silently drifts to hide it.
+    it and the sync gate FAILS on it; the timing never silently drifts to
+    hide it.
 
-    Returns (shots, stats). `lead`, `max_late` and `min_hold_short` default to
+    Returns (shots, stats). `lead` and `max_late` default to
     the video.sync values (sync.SYNC_DEFAULTS); build_plan passes the effective
     settings from manhwa-ocr.yaml.
     """
     lead = float(sync_mod.SYNC_DEFAULTS["lead"]) if lead is None else float(lead)
     max_late = float(sync_mod.SYNC_DEFAULTS["max_late"]) if max_late is None else float(max_late)
     min_hold = float(min_hold)
-    # The floor can never be above the configured min_hold: a user who asks for
-    # 1s cuts gets 1s cuts, not a 2s floor they never set.
-    floor = min(min_hold, float(sync_mod.SYNC_DEFAULTS["min_hold_short"]) if min_hold_short is None
-                else float(min_hold_short))
+    # The floor IS min_hold: no second, lower floor exists anymore. The old
+    # min_hold_short (2.0s) exception is deleted — a shot under min_hold is
+    # a real failure (counted in short_shots, failed by the sync gate), not
+    # a "short hold" that gets a pass.
+    floor = min_hold
     if not units:
         return [], {"min_hold": min_hold, "shots": 0, "pairs": 0, "nudged": 0,
                     "moved_seconds": 0.0, "short_shots": 0}
@@ -451,7 +465,7 @@ def ensure_motion_variety(shots):
 def ensure_panel_diversity(shots):
     """Never show the same panel 3x consecutively with an identical crop.
 
-    Coverage fillers and repeated tags can leave one panel on screen for
+    Impactful fillers and repeated tags can leave one panel on screen for
     three sentences in a row (Ch10 test build: P014-10 for sentences
     55/56/57, P020-01 for 75/76/77 -- correct pictures, visibly
     repetitive). When a shot's first-card panel matches the previous
@@ -856,14 +870,22 @@ class _Designer:
         for k, pid in enumerate(card_ids):
             crop = self.crop(pid, layout)
             if layout == "pair" and k == 1:
-                # A pair shorter than a second (a one-word sentence in dense
-                # narration) has no room for a later entrance: the second card
-                # arrives with the first inside the sentence, instead of the
-                # cut drifting away from the voice.
+                # The second card arrives exactly on its own words
+                # (unit["second_at"] is its own unit's start, relative to
+                # the shot). There used to be a 0.6s floor here
+                # (max(0.6, second_at)): on a boundary pair — two sentences
+                # ~0.06s apart — that floor pushed the second card to
+                # ~0.66s late, past the gate (max_late 0.3 + grace 0.2 =
+                # 0.5s), a structurally unavoidable late cut. No floor:
+                # arrival = shot start + second_at, and the shot start
+                # itself is inside the first sentence's cut budget, so a
+                # second-card arrival can never be structurally late.
+                # The dur - 1.0 cap only pulls it EARLIER (never late) when
+                # the second piece itself is under a second.
                 if unit.get("second_at") is not None:   # arrives on its own words
-                    at = round(max(0.0, min(max(0.6, float(unit["second_at"])), dur - 1.0)), 3)
+                    at = round(max(0.0, min(float(unit["second_at"]), dur - 1.0)), 3)
                 else:
-                    at = round(max(0.0, min(max(0.8, 0.45 * dur), dur - 1.2)), 3)
+                    at = round(max(0.0, min(max(0.5, 0.45 * dur), dur - 1.2)), 3)
                 enter = "slide_up" if self.fmt.portrait else "slide_left"
                 motion = "push_in"
             else:
@@ -1029,7 +1051,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     timing = None
     if alignment_units is not None:
         shots_units, timing = hold_groups(alignment_units, st["min_hold"], lead=st["lead"],
-                                          max_late=st["max_late"], min_hold_short=st["min_hold_short"])
+                                          max_late=st["max_late"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
         # not a generic "aligned" label - video render's refusal of an
@@ -1041,8 +1063,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         mode = "synced"
     else:
         shots_units, timing = hold_groups(even_units(panels, duration, vcfg), st["min_hold"],
-                                          lead=st["lead"], max_late=st["max_late"],
-                                          min_hold_short=st["min_hold_short"])
+                                          lead=st["lead"], max_late=st["max_late"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
     # A system-window banner in a 2-panel unit gets its own wide shot:
@@ -1065,12 +1086,15 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     # (the third showing is punched in to a different crop).
     shots, _diversity_changes = ensure_panel_diversity(shots)
     # CapCut beat sync: snap interior cuts to the nearest beat (<=0.15s),
-    # from video.beats or music/beats.json. No beats = no-op.
+    # from video.beats or music/beats.json. No beats = no-op. Snapping
+    # must never push a shot under the min_hold floor, so the clamp is
+    # the plan's own min_hold (chapter 3.0s, intro 2.0s), not the 0.2s
+    # the beat helper defaults to.
     _beats = resolve_beats(vcfg, root)
     _beat_info = {"enabled": False, "moved": 0, "max_shift": 0.0,
                   "reason": "no beats (no video.beats or music/beats.json)"}
     if _beats:
-        shots, _beat_info = snap_cuts_to_beats(shots, _beats)
+        shots, _beat_info = snap_cuts_to_beats(shots, _beats, min_shot=float(st["min_hold"]))
     chapter_cards = build_chapter_cards(shots, duration)
     # P5: reviewer overrides from fixes.json (chapter-card titles, callout
     # text, keyed by shot id). Unknown shot_ids are warnings, never failures.
@@ -1134,7 +1158,11 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "captions_enabled": _captions_on,
         "beat_sync": _beat_info,
         "pacing": {"split_shots": _nsplit, "long_shots_flagged": _pacing_before["long_shots"],
-                   "max_shot": pacing_qa(shots)["max_shot"]},
+                   "max_shot": pacing_qa(shots)["max_shot"],
+                   # Rule 1: max shots = floor(audio_seconds / 3). More shots
+                   # than this means the average shot is under the 3s floor.
+                   "max_shots": max(0, int(float(duration) // MIN_SHOT)),
+                   "min_shot": MIN_SHOT},
         "split_crop_changes": _split_crop_changes,
         "motion_changes": _motion_changes,
         "diversity_changes": _diversity_changes,

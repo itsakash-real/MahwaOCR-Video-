@@ -49,7 +49,7 @@ Fixes:
   the later shot's first-card motion is flipped, logged in
   `plan["motion_changes"]`. Hand-set `hold` is never flipped.
 - `plan.ensure_panel_diversity()`: final pass — never the same panel
-  3× consecutively with an identical crop. Coverage fillers and
+  3× consecutively with an identical crop. Impactful fillers and
   repeated tags can leave one panel on screen for three sentences in
   a row (Ch10 test build: P014-10 for sentences 55/56/57, P020-01 for
   75/76/77 — correct pictures, visibly repetitive). When a shot's
@@ -129,6 +129,27 @@ nearby distinct panel is already tagged to its own sentence, so no
 cleaner re-pair exists. Left as-is. The sentence-aligned captions
 now cover filler stretches with on-time captions, so they no longer
 read as empty stretches.
+
+> SUPERSEDED (2026-10-19, impactful-only selection): the old
+> `place_coverage` pass that created these fillers is DELETED. Fillers
+> now exist only when they pass the impact test (named character +
+> action beat + visible face, in story order, not a repeat/spoiler,
+> max 1 per sentence / 2 if >15s), only on sentences >8s, and a
+> filler that fails the impact test counts as wrong-picture in the
+> sync gate. A sentence whose tagged panel covers <80% (≤8s) or
+> <60% (>8s) of its window fails the gate.
+
+### Pair-arrival floor (Ch1 test build: 1 late cut, sentence 4)
+
+The pair second card used to arrive at `max(0.6, second_at)`. On a
+boundary pair — two sentences ~0.06s apart — the 0.6s floor pushed the
+second card to ~0.66s late, past the gate (max_late 0.3 + grace 0.2 =
+0.5s): a structurally unavoidable late cut. Fixed: the second card
+arrives exactly at `second_at` (its own words, no floor); the shot
+start itself is inside the first sentence's cut budget, so a
+second-card arrival can never be structurally late. The no-`second_at`
+fallback delay dropped from 0.8s to 0.5s. Regression test:
+`tests/test_impactful_selection.py::test_pair_second_card_arrives_on_its_own_words`.
 
 ### File size +38% (45 MB vs 33 MB, Ch10)
 

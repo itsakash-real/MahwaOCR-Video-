@@ -71,7 +71,9 @@ def _jump_hint(segments: List[Dict[str, Any]], i: int, ids_by_pos: Dict[int, str
     tags = [list(s.get("tagged_panels") or []) for s in segments]
     holds = [s.get("narration_type") in {"INTERNAL", "PURE_AUDIO", "SAME"} for s in segments]
     for j in range(i - 1, -1, -1):
-        if len(set(tags[j])) >= 2 and not any(tags[j + 1:i + 1]):
+        # The jumping sentence itself may carry a tag (its tag is the jump);
+        # only the sentences BETWEEN the grouped one and it must be tag-free.
+        if len(set(tags[j])) >= 2 and not any(tags[j + 1:i]):
             move = redistribute(tags, j + 1, holds)
             if not move:
                 break
@@ -129,9 +131,8 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
 
         # P2 — the {same} trap (Ch2 sentence 60): a {same} sentence holds the
         # previous panel, so its own panel never displays; the story then
-        # jumps over panels that coverage places as gap fillers into a
-        # neighbouring sentence, where they show under the wrong words and
-        # fail the sync gate. INTERNAL/PURE_AUDIO are narrator asides and
+        # jumps over panels that never display at all (no filler pass
+        # rescues them anymore). INTERNAL/PURE_AUDIO are narrator asides and
         # may legitimately sit across a jump; {same} claims "same panel as
         # before", so a jump across it means the tag is wrong. FAIL here,
         # at align time, instead of a late sync-gate failure: remove {same}
@@ -150,9 +151,8 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
                 fail("same_no_hidden_panel", n,
                      f"{{same}} holds {prev_pid} while the story jumps to {next_pid}, "
                      f"skipping {', '.join(skipped)}: if this sentence is about a skipped panel, "
-                     f"remove {{same}} and tag it with that panel — otherwise coverage places a "
-                     f"skipped panel as filler into a neighbouring sentence and fails the sync gate "
-                     f"(Ch2 sentence 60).")
+                     f"remove {{same}} and tag it with that panel — otherwise the skipped panel "
+                     f"never displays and the jump fails the sync gate (Ch2 sentence 60).")
 
         if pid is not None and pid in panel_order:
             pos = panel_order[pid]
@@ -162,13 +162,19 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
             if pos < last_pos - JUMP_TOLERANCE and seg.get("confidence") != "tag_behind_cursor_accepted":
                 fail("no_backward_jumps", n, f"{pid} (position {pos}) is behind the running position {last_pos}")
             span = max(1, len(window)) if window else 1
-            if pos > last_pos + max(span, JUMP_TOLERANCE) and seg.get("confidence") not in {
-                    "tag_confirmed_in_window", "ocr_match", "tag_beyond_window_accepted"}:
-                before = ids_by_pos.get(last_pos)
-                fail("no_unexplained_jumps", n,
-                    f"{pid} jumps from {before + ' ' if before else ''}(position {last_pos}) to {pid} (position {pos}) "
-                    f"without strong supporting evidence (confidence={seg.get('confidence')!r})."
-                    + _jump_hint(segments, i, ids_by_pos, last_pos, pos))
+            if pos > last_pos + max(span, JUMP_TOLERANCE):
+                hint = _jump_hint(segments, i, ids_by_pos, last_pos, pos)
+                # A jump over panels an earlier sentence group-tagged is the
+                # grouped-tags mistake (those extras were never shown), even
+                # when this sentence's own tag was trusted beyond the window:
+                # the grouped cause overrides the trust exemption.
+                grouped = "Cause: sentence" in hint
+                if seg.get("confidence") not in {
+                        "tag_confirmed_in_window", "ocr_match", "tag_beyond_window_accepted"} or grouped:
+                    before = ids_by_pos.get(last_pos)
+                    fail("no_unexplained_jumps", n,
+                         f"{pid} jumps from {before + ' ' if before else ''}(position {last_pos}) to {pid} (position {pos}) "
+                         f"without strong supporting evidence (confidence={seg.get('confidence')!r})." + hint)
             last_pos = pos
 
         if i > 0:

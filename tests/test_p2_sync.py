@@ -480,10 +480,11 @@ def test_validate_passes_same_with_no_jump_and_internal_across_a_jump():
     assert result["status"] == "PASS"
 
 
-def test_coverage_filler_avoids_hosts_beside_a_hold():
-    """A filler is never parked beside a HOLD sentence when another host is
-    available — the filler is often the panel the HOLD sentence hid."""
-    panels = [{"id": f"P001-0{i}", "text_only": False} for i in range(1, 7)]
+def test_impactful_filler_never_spills_into_a_hold_neighbour():
+    """Fillers come only from a sentence's OWN window; a HOLD neighbour
+    never attracts a filler, and a filler never leaks across a hold."""
+    panels = [{"id": f"P001-0{i}", "text_only": False, "figure": 0.5,
+               "scene": f"beat {i}"} for i in range(1, 7)]
     segs = [
         {"sentence": 1, "start": 0.0, "end": 10.0, "selected_panel": "P001-01",
          "display_action": "SHOW", "tagged_extras": []},
@@ -494,9 +495,13 @@ def test_coverage_filler_avoids_hosts_beside_a_hold():
         {"sentence": 4, "start": 22.0, "end": 32.0, "selected_panel": "P001-06",
          "display_action": "SHOW", "tagged_extras": []},
     ]
-    align_engine.place_coverage(segs, panels, 32.0, 3.0)
-    # Every missing panel (P001-02/03/04) went to sentence 4 — the only host
-    # NOT beside the HOLD — even though sentences 1 and 3 are nearer.
-    assert "P001-03" in segs[3]["sequence"]
-    assert "P001-03" not in segs[0].get("sequence", [])
-    assert "P001-03" not in segs[2].get("sequence", [])
+    cov = align_engine.place_impactful(segs, panels, 32.0, 3.0)
+    # Sentence 1 (10s) gets the one impactful filler from its own window
+    # (P001-02, right after its tagged P001-01). Sentences 3 and 4 are 10s
+    # too, but their windows hold no unpicked panel after their tags, so
+    # they hold their tagged panels alone — nothing is placed beside the
+    # HOLD, and the unpicked panels (P001-03/04) simply never show.
+    assert segs[0]["sequence"] == ["P001-01", "P001-02"]
+    assert segs[2]["sequence"] == ["P001-05"]
+    assert segs[3]["sequence"] == ["P001-06"]
+    assert cov["filler_shots"] == 1

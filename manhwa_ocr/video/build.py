@@ -94,8 +94,6 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     shortest = min((float(s["end"]) - float(s["start"]) for s in shots), default=0.0)
     cs = plan.get("crop_stats") or {}
     failures = []
-    if missing:
-        failures.append(f"{len(missing)} drawn panel(s) would never appear: {', '.join(missing[:12])}")
     if shape_bad:
         failures.append(f"{len(shape_bad)} card(s) are not one of the allowed shapes: {', '.join(shape_bad[:6])}")
     if cs.get("bubble"):
@@ -107,15 +105,28 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     # all (under 0.2s) stops the build.
     if shots and shortest < 0.2 - 1e-6:
         failures.append(f"a shot lasts {shortest:.2f}s - too short to be seen (under 0.2s)")
+    cov = align_cov or {}
+    duration = float(plan.get("duration") or 0.0)
     return {
         "chapter": plan.get("chapter"),
         "failures": failures,
         "art_panels": len(art), "shown_panels": len(set(art) & shown), "missing": missing,
-        "placed_by_order": (align_cov or {}).get("placed_by_order", []),
+        # INFO ONLY: panels_shown / total is not success (and not failure).
+        # Success = tagged coverage + min shot + impact pass (sync gate).
+        "panels_shown": len(set(art) & shown), "panels_total": len(art),
+        "panels_shown_ratio": round(len(set(art) & shown) / len(art), 4) if art else 0.0,
+        "placed_by_order": cov.get("placed_by_order", []),
         "text_only_excluded": [p["id"] for p in panels["panels"] if p.get("text_only")],
         "shots": len(shots), "shortest_shot": round(shortest, 2), "timing": plan.get("timing"),
         "floor": round(float(min_hold), 3),
         "short_shots": (plan.get("timing") or {}).get("short_shots", 0),
+        # QA metrics (impactful-only selection): tagged coverage per sentence
+        # (from the alignment), filler shots/seconds, min shot, max shots.
+        "tagged_coverage": cov.get("tagged_coverage", {}),
+        "filler_shots": cov.get("filler_shots", 0),
+        "filler_seconds": cov.get("filler_seconds", 0.0),
+        "min_shot": round(shortest, 2),
+        "max_shots": max(0, int(duration // 3.0)) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
         "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
         "low_confidence_heads": cs.get("low_confidence_heads", []),
@@ -330,7 +341,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     sync_settings = sync_mod.effective_settings(vcfg, log=log)
     log(f"  chapter {chapter}: sync/hold settings: min_hold={sync_settings['min_hold']:g}s, "
         f"lead={sync_settings['lead']:g}s, max_late={sync_settings['max_late']:g}s, "
-        f"min_hold_short={sync_settings['min_hold_short']:g}s, max_hold={sync_settings['max_hold']:g}s, "
+        f"max_hold={sync_settings['max_hold']:g}s, "
         f"max_unmatched={sync_settings['max_unmatched']:g}s")
 
     if pages_from:
@@ -494,8 +505,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
-    qa = quality_report(plan, panels, align_cov,
-                        min(sync_settings["min_hold"], sync_settings["min_hold_short"]))
+    qa = quality_report(plan, panels, align_cov, sync_settings["min_hold"])
     atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
     if qa["failures"]:
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])
@@ -514,8 +524,8 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"    ! override ignored: {_w}")
     short_note = (f"; {qa['short_shots']} shot(s) under the {qa['floor']:g}s floor (dense narration, "
                   f"left honest instead of stealing time)") if qa["short_shots"] else ""
-    log(f"    all {qa['shown_panels']}/{qa['art_panels']} drawn panels shown; shortest shot "
-        f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order{short_note}")
+    log(f"    panels shown {qa['shown_panels']}/{qa['art_panels']} (info only — selection, not coverage); "
+        f"shortest shot {qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} impactful filler(s){short_note}")
     if qa["head_risk"]:
         log(f"    ! {len(qa['head_risk'])} panel(s) where a head may be cut: {', '.join(qa['head_risk'][:8])}")
     if plan.get("chapter_cards"):

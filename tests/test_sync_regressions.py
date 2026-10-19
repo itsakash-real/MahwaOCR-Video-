@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from manhwa_ocr.video.plan import hold_groups, units_from_alignment  # noqa: E402
 
-SETTINGS = {"lead": 0.2, "max_late": 0.3, "min_hold_short": 2.0}
+SETTINGS = {"lead": 0.2, "max_late": 0.3}
 
 
 CH1_S119_131 = [
@@ -224,8 +224,7 @@ def test_the_old_plan_violated_the_budget_and_the_rebuild_does_not(segments, sen
     assert old_arrival < target - SETTINGS["lead"] - 0.05 or old_arrival > target + SETTINGS["max_late"] + 0.05
 
     units = units_from_alignment([dict(s) for s in segments])
-    shots, stats = hold_groups(units, 3.0, lead=SETTINGS["lead"], max_late=SETTINGS["max_late"],
-                               min_hold_short=SETTINGS["min_hold_short"])
+    shots, stats = hold_groups(units, 3.0, lead=SETTINGS["lead"], max_late=SETTINGS["max_late"])
 
     # Every cut sits inside its own budget (the trimmed first shot starts at 0).
     for s in shots[1:]:

@@ -219,22 +219,27 @@ def test_audit_gate_reports_five_second_windows_over_the_wrong_picture_threshold
 
 
 def test_gate_windows_judge_settled_time_only():
-    # Six 1.5s sentences, every shot cut 0.25s late - inside each sentence's
+    # Six 6s sentences, every shot cut 0.25s late - inside each sentence's
     # max_late budget, by design. Five wrong-picture samples land on the
     # boundaries; the old gate counted them and failed on share alone (40% at
     # t=3). The gate now judges settled time only, so none of these on-budget
     # cuts fail a window - the honest wrong-picture count is still reported.
+    # (Shots are 6s: a 1.5s-shot fixture would itself fail the 3.0s min-shot gate.)
     segs, shots = [], []
     for k in range(1, 7):
-        a, b = 1.5 * (k - 1), 1.5 * k
+        a, b = 6.0 * (k - 1), 6.0 * k
         segs.append(_seg(k, a, b, f"sentence number {k}", [f"P{k:02d}"]))
         shots.append(_shot(k, a + 0.25, b + 0.25, [(f"P{k:02d}", 0.0)]))
     words = _words(" ".join(f"sentence number {k}" for k in range(1, 7)))
-    rep = _run_audit(shots, segs, words, 9.25)
+    rep = _run_audit(shots, segs, words, 36.25)
     assert rep["wrong_picture"]["samples"] == 5         # the honest number never hides
     assert rep["five_second"]["over_gate"] == []
     assert rep["windows"] == []
     assert not any("five-second window" in f for f in rep["gate"]["failures"])
+    # The gate still fails — on the honest overall wrong-picture share
+    # (5/72 = 6.9% > 5%), not on any window: the on-budget cuts are not drift.
+    assert rep["gate"]["failures"] == [
+        "wrong-picture time 2.5s (6.9% of judged) is over 5%"]
 
 
 def test_gate_window_needs_a_full_second_of_wrong_picture():
@@ -242,6 +247,11 @@ def test_gate_window_needs_a_full_second_of_wrong_picture():
     # lowered share bar that is 11% of the window - over the bar - but 0.5s is
     # under the full second of wrong picture a window needs to fail. A short
     # straddle must not fail the gate just because the window is sparse.
+    # Under the 3.0s min-shot rule the 0.5s flash shot itself is illegal, so
+    # the gate now fails on the short shot — but the WINDOW gate still does
+    # not trip on 0.5s of wrong picture (over_gate stays []); the failure is
+    # the short shot, not the window. (A 1.0s settled-wrong stretch tripping
+    # the window gate with legal shots is covered in test_impactful_selection.)
     segs = [_seg(1, 0.0, 20.0, "Ron draws his sword fast", ["P2"]),
             _seg(2, 20.0, 22.0, "He raises the blade", ["P1"]),
             _seg(3, 22.0, 30.0, "The demon king laughs loud", ["P3"])]
@@ -254,20 +264,32 @@ def test_gate_window_needs_a_full_second_of_wrong_picture():
     assert rep["wrong_picture"]["samples"] == 2
     assert rep["five_second"]["over_gate"] == []
     assert rep["windows"] == []
-    assert rep["gate"]["pass"] is True
+    assert not any("five-second window" in f for f in rep["gate"]["failures"])
+    assert rep["gate"]["pass"] is False
+    assert any("minimum shot" in f for f in rep["gate"]["failures"])
 
 
-def test_audit_wrong_picture_excludes_legitimate_fillers():
-    # The tagged P2 never appears; a coverage extra (owned by no sentence) is
-    # shown instead. Strict match is 0% but no OTHER sentence's panel is on
-    # screen, so wrong-picture time is 0 and the gate is not what fails.
+def test_audit_wrong_picture_excludes_impact_passing_filler():
+    # The tagged P2 never appears; an impact-PASSING filler (P9, verdict
+    # recorded by place_impactful) is shown instead. Strict match is 0%
+    # but the filler earned its seconds, so wrong-picture time is 0.
+    # The gate still FAILS — on tagged coverage (0% < 80%), not on
+    # wrong-picture. A filler that FAILS the impact test IS wrong-picture.
     segs = [_seg(1, 0.0, 6.0, "The gate opens now", ["P2"], sequence=["P2", "P9"])]
+    segs[0]["filler_impact"] = {"P9": {"pass": True, "reason": "impactful"}}
     shots = [_shot(1, 0.0, 6.0, [("P9", 0.0)])]
     rep = _run_audit(shots, segs, _words("The gate opens now"), 6.0)
     assert rep["strict_match"] == 0.0
     assert rep["wrong_picture"] == {"samples": 0, "seconds": 0.0, "ratio": 0.0}
-    assert rep["gate"]["pass"] is True
+    assert rep["gate"]["pass"] is False
+    assert any("tagged-coverage" in f for f in rep["gate"]["failures"])
     assert [w["cause"] for w in rep["windows"]] == ["filler_panel"]
+    # Same plan, filler failing the impact test -> wrong-picture.
+    segs[0]["filler_impact"] = {"P9": {"pass": False, "reason": "no scene note"}}
+    rep_fail = _run_audit(shots, segs, _words("The gate opens now"), 6.0)
+    assert rep_fail["wrong_picture"]["samples"] == 12
+    assert rep_fail["gate"]["pass"] is False
+    assert any("wrong-picture" in f for f in rep_fail["gate"]["failures"])
 
 
 def test_audit_minute_curve_splits_match_and_wrong_by_minute():
@@ -386,7 +408,9 @@ def test_effective_settings_reads_its_own_keys_and_warns_loudly_about_missing_on
     assert st["gate_window"] == sync.SYNC_DEFAULTS["gate_window"]
     text = "\n".join(logs)
     assert "video.min_hold" in text and "video.sync.max_late" not in text
-    assert "video.sync.min_hold_short" in text
+    # The deleted keys (min_hold_short, filler_full) are never required.
+    assert "video.sync.min_hold_short" not in text and "video.sync.filler_full" not in text
+    assert "min_hold_short" not in sync.SYNC_DEFAULTS and "filler_full" not in sync.SYNC_DEFAULTS
 
 
 def test_effective_settings_is_silent_when_the_config_is_complete():
@@ -556,34 +580,39 @@ def _show(sentence: int, selected: str, start: float, end: float) -> dict:
             "start": start, "end": end}
 
 
-def test_coverage_fillers_follow_the_sentence_s_own_panel():
-    """The sentence's own pick leads its time (that is what the narrator is
-    talking about); coverage fillers follow in story order, even when they come
-    before it in the story."""
+def test_impactful_filler_keeps_tagged_panel_majority():
+    """A 12s sentence splits into tagged (~65%) + ONE impactful filler
+    (~35%) — the tagged panel keeps the majority; fillers never fill a
+    sentence end to end anymore."""
     segs = [_show(1, "P001-04", 0.0, 12.0)]
-    align_engine.place_coverage(segs, _coverage_panels(6), 12.0, 3.0)
-    assert segs[0]["sequence"] == ["P001-04", "P001-01", "P001-02", "P001-03", "P001-05", "P001-06"]
+    panels = [{"id": f"P001-{i:02d}", "text_only": False, "figure": 0.5,
+               "scene": f"beat {i}"} for i in range(1, 7)]
+    align_engine.place_impactful(segs, panels, 12.0, 3.0)
+    assert segs[0]["sequence"] == ["P001-04", "P001-05"]
+    assert segs[0]["tagged_coverage"] == pytest.approx(0.65)
 
 
-def test_fillers_prefer_a_sentence_long_enough_to_share_min_hold():
-    """filler_full: a filler goes to a sentence at least that long when one is
-    near, so the sentence's own picture still holds a full min_hold beside it.
-    P001-03 sits nearer to sentence 1, but only sentence 2 (9s) can be filled
-    end to end, so that is where it goes."""
+def test_fillers_go_only_to_sentences_long_enough_to_hold_them():
+    """A filler goes only to a sentence >8s with room for it; a 3s sentence
+    holds its own panel alone, and a panel no sentence picked is simply not
+    shown (no coverage pass rescues it)."""
     segs = [_show(1, "P001-02", 0.0, 3.0), _show(2, "P001-05", 3.0, 12.0)]
-    align_engine.place_coverage(segs, _coverage_panels(6), 12.0, 3.0)
-    assert "P001-03" in segs[1]["sequence"]
-    assert "P001-03" not in segs[0]["sequence"]
+    panels = _coverage_panels(6)
+    panels[5]["figure"] = 0.5                      # P001-06: face + beat
+    panels[5]["scene"] = "A gate opens behind them"
+    align_engine.place_impactful(segs, panels, 12.0, 3.0)
+    assert segs[0]["sequence"] == ["P001-02"]
+    assert segs[1]["sequence"] == ["P001-05", "P001-06"]
 
 
-def test_a_filler_is_never_dropped_when_every_sentence_is_short():
-    """When every nearby sentence is under filler_full, the nearest ones take
-    the filler anyway - a panel the artist drew never disappears just because
-    the narration was choppy."""
+def test_an_unpicked_panel_is_never_shown_when_every_sentence_is_short():
+    """When every sentence is short, nothing is placed anywhere: a panel the
+    artist drew but no sentence picked simply never appears."""
     segs = [_show(1, "P001-02", 0.0, 3.0), _show(2, "P001-03", 3.0, 6.0)]
-    cov = align_engine.place_coverage(segs, _coverage_panels(3), 6.0, 3.0)
-    assert cov["placed_by_order"] == ["P001-01"]
-    assert "P001-01" in segs[0]["sequence"]
+    cov = align_engine.place_impactful(segs, _coverage_panels(3), 6.0, 3.0)
+    assert cov["placed_by_order"] == []
+    assert segs[0]["sequence"] == ["P001-02"]
+    assert segs[1]["sequence"] == ["P001-03"]
 
 
 # ------------------------------------------------------------------ FIX 5: the render sync gate
@@ -607,20 +636,20 @@ def _gate_workspace(tmp_path, *, shown: str):
         fh.setnchannels(1)
         fh.setsampwidth(2)
         fh.setframerate(16000)
-        fh.writeframes(b"\x00\x00" * (16000 * 4))
+        fh.writeframes(b"\x00\x00" * (16000 * 8))
     (root / "media" / "ch1" / "panels.json").write_text(json.dumps({
         "panels": [{"id": p, "width": 300, "height": 300, "text": "", "text_only": False}
                    for p in ("P001-01", "P001-02")],
         "norm_width": 900, "fingerprint": "x"}), encoding="utf-8")
     (root / "video" / "chapter_1.alignment.json").write_text(json.dumps({
-        "segments": [_seg(1, 0.0, 2.0, "Ron draws his sword fast", ["P001-01"]),
-                     _seg(2, 2.0, 4.0, "He blocks the blow", ["P001-02"])],
+        "segments": [_seg(1, 0.0, 4.0, "Ron draws his sword fast", ["P001-01"]),
+                     _seg(2, 4.0, 8.0, "He blocks the blow", ["P001-02"])],
         "sync_mode": "synced", "coverage": {}, "validation": {"status": "PASS"},
         "review_queue": []}), encoding="utf-8")
     (root / "video" / "chapter_1.plan.json").write_text(json.dumps({
-        "version": 2, "chapter": "1", "duration": 4.0, "sync": "synced",
+        "version": 2, "chapter": "1", "duration": 8.0, "sync": "synced",
         "format": "16:9", "fps": 30,
-        "shots": [_shot(1, 0.0, 2.0, [(shown, 0.0)]), _shot(2, 2.0, 4.0, [("P001-02", 0.0)])]}),
+        "shots": [_shot(1, 0.0, 4.0, [(shown, 0.0)]), _shot(2, 4.0, 8.0, [("P001-02", 0.0)])]}),
         encoding="utf-8")
     (root / "video" / "chapter_1.timeline.json").write_text(json.dumps({
         "key": {"audio": sync.file_hash(wav), "model": "base.en"},

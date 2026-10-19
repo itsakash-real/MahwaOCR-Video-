@@ -723,7 +723,10 @@ def test_align_error_for_a_jump_says_which_tag_moves_to_which_sentence():
     assert report["checks"]["no_unexplained_jumps"] == "FAIL"
     problem = next(p for p in report["problems"] if p["check"] == "no_unexplained_jumps")
     d = problem["detail"]
-    assert problem["sentence"] == 5
+    # Sentences 5-7 are untagged, so they re-show P001-05 (the grouped
+    # sentence's first tag — extras never advance the cursor anymore); the
+    # jump surfaces at sentence 8, where the grouped cause is diagnosed.
+    assert problem["sentence"] == 8
     assert "sentence 4 carries 4 tags (P001-05, P001-06, P001-08, P001-14)" in d
     assert '"4": ["P001-05"], "5": ["P001-06"], "6": ["P001-08"], "7": ["P001-14"]' in d
     assert "Fix in pairs.json" in d

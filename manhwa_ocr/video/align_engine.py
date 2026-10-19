@@ -73,6 +73,24 @@ def alignment_path(root: Path, chapter: str) -> Path:
 
 MIN_OVERRIDE_EVIDENCE = 10  # roughly two real content words, or one long distinctive one
 
+# --- Impactful-only panel selection (user rules, 2026-10-19) -----------------
+# Time is scarce, panels are abundant: SELECT, don't cover. There is no
+# "every drawn panel must appear" pass anymore (place_coverage was deleted).
+# Unshown panels are not a problem: panels_shown/total is INFO ONLY.
+MIN_SHOT = 3.0             # no shot is ever shorter than this (except the renderer's black tail)
+LONG_SENTENCE = 8.0        # a sentence longer than this may split (never shorter ones)
+LONG_SENTENCE_MAX = 15.0   # ... into at most 2 shots; above this, at most 3
+TAGGED_COVERAGE_SHORT = 0.80  # tagged panel must cover >=80% of a <=8s sentence's window
+TAGGED_COVERAGE_LONG = 0.60   # ... and >=60% of a longer sentence's window
+SPLIT_TAGGED_SHARE = 0.65  # a 2-piece split gives the tagged panel ~65% of the window
+SPLIT_TAGGED_SHARE_3 = 0.60  # a 3-piece split gives it ~60%
+IMPACT_WINDOW = 6          # how far past the tagged panel a filler may come from
+
+
+def max_shots_for_duration(duration: float) -> int:
+    """Rule 1: at most floor(audio_seconds / 3) shots in the whole video."""
+    return max(0, int(float(duration) // MIN_SHOT))
+
 
 def _lexical_overlap_sets(s_tokens: set, p_tokens: set) -> int:
     """_lexical_overlap on pre-tokenized sets (see _lexical_overlap)."""
@@ -213,90 +231,287 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
         # "selected panel is in its own window" stays a true invariant even when a
         # tag beyond the normal lookahead (or a backward tag) was used.
         stored_window = window if selected is None or selected in window else [*window, selected]
+        # Rule 6 — duplicate tag: this sentence EXPLICITLY tags the panel
+        # already on screen (the previous sentence's pick). HOLD it; do NOT
+        # trigger a filler, a re-show, or a new shot. The panel stays up
+        # across both sentences, which is exactly what "same panel again"
+        # means. An UNTAGGED sentence whose default pick lands on the same
+        # panel is not a duplicate tag — it re-shows the cursor panel, as
+        # before — so the rule keys on `tag`, never on `selected` alone:
+        # without that, untagged sentences oscillate HOLD/SHOW.
+        if (tag is not None and tag == selected and selected is not None and segments
+                and segments[-1].get("selected_panel") == selected):
+            seg.update(story_position=max(cursor, 0), candidate_window=[], candidates=[],
+                       selected_panel=None, display_action="HOLD_PREVIOUS",
+                       confidence="rule:duplicate_tag_hold", needs_review=False)
+            segments.append(seg)
+            continue
         seg.update(story_position=order.get(selected, cursor), candidate_window=stored_window,
                   candidates=candidates, selected_panel=selected,
                   display_action="SHOW" if selected else "HOLD_PREVIOUS",
                   confidence=confidence, needs_review=needs_review)
         if selected:
             cursor = order[selected]
-            # More than one tag: the sentence shows all of them (plan.py splits its time).
+            # More than one tag: only the FIRST shows (one tagged panel per
+            # sentence). The rest stay on the segment as tagged_extras so
+            # place_impactful() can use the writer's second tag as the
+            # filler of a LONG sentence (>8s) — never as a second showing
+            # of a short sentence, and never advancing the story cursor.
             if selected == tag:
-                others = [p for p in usable[1:] if p != selected and order[p] >= order[selected]]
+                others = [p for p in usable[1:] if p != selected]
                 if others:
                     seg["tagged_extras"] = others
-                    cursor = max(cursor, *(order[p] for p in others))
         segments.append(seg)
 
     return segments
 
 
-def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]], duration: float,
-                   min_hold: float, filler_full: float | None = None) -> Dict[str, Any]:
-    """Every drawn panel must appear in the video. A panel no sentence picked is
-    placed, in story order, into one of the sentences nearest to it (the one
-    with the fewest extra panels so far). Its time is shared with that
-    sentence's picks; plan.py does the timing. Text-only panels (captions,
-    blank pages, credits) are never placed.
+def _is_sfx_only(text: str) -> bool:
+    """A panel whose only OCR text is a sound effect ("BOOM", "WHEW", "SLASH"):
+    no words, no beat, never an impactful filler. Dialogue/narration has
+    lowercase letters; SFX is short and all-caps."""
+    t = (text or "").strip()
+    return bool(t) and len(t) <= 16 and not any(c.islower() for c in t)
 
-    `filler_full` (video.sync.filler_full): prefer sentences at least that long
-    as hosts, so a filler always shares the sentence with a full min_hold's
-    worth of its own picture instead of squeezing it (a sentence filled end to
-    end). When every nearby sentence is shorter than that, the nearest ones are
-    used anyway - a filler is never dropped because its neighbours were short.
 
-    A sentence's own pick leads its sequence (it is what the narrator is
-    talking about); fillers follow it in story order.
+def filler_impact(panel: Dict[str, Any], *, sentence_text: str, order: Dict[str, int],
+                  tagged_order: int, shown: set, future_tagged: set) -> tuple[bool, str]:
+    """Rule 5 — the impact test for ONE candidate filler panel. ALL must hold:
 
-    Returns {"placed_by_order": [...], "uncovered": [...]}; `uncovered` is only
-    non-empty when the narration is too short to give every panel min_hold.
+    (a) named character + visible action/story beat: the panel carries a
+        scene note from the transcript (the only action evidence the
+        aligner has without an image). No scene note -> no verified beat.
+    (b) visible face: the panel's measured figure share (panels.json
+        "figure") is at least FIGURE_MIN — a text/SFX panel, a body
+        fragment, or a back-of-head without a figure fails. Panels from
+        before figure measurement carry no "figure" key: then a scene
+        note alone is the evidence (fail closed only when both are absent).
+    (c) capped by the caller (max 1 filler per sentence, 2 if >15s).
+    (d) min 3s: enforced by the split shares in place_impactful, not here.
+    (e) never repeat a panel already shown.
+    (f) never backwards story order inside the sentence window, and never
+        a spoiler: the panel must not be a LATER sentence's tagged panel.
+
+    Returns (pass, reason). Failing closed is safe: if no panel passes,
+    the tagged panel holds the whole window.
     """
-    if filler_full is None:
-        filler_full = float(sync_mod.SYNC_DEFAULTS["filler_full"])
+    pid = panel.get("id", "")
+    if panel.get("text_only") or panel.get("credits"):
+        return False, "text-only/credits panel"
+    pos = order.get(pid)
+    if pos is None:
+        return False, "unknown panel id"
+    if pos < tagged_order:
+        return False, "backwards story order (before the tagged panel)"
+    if pid in shown:
+        return False, "panel already shown (repeat)"
+    if pid in future_tagged:
+        return False, "spoiler: tagged by a later sentence"
+    scene = (panel.get("scene") or "").strip()
+    figure = panel.get("figure")
+    if figure is not None:
+        from .crops import FIGURE_MIN
+
+        if float(figure) < FIGURE_MIN:
+            return False, "no visible figure/face (figure share below FIGURE_MIN)"
+    if not scene:
+        return False, "no scene note: no verified character/action beat"
+    text = (panel.get("text") or "").strip()
+    if text and _is_sfx_only(text):
+        return False, "SFX-only panel"
+    return True, "impactful: figure + scene beat, in story order, not a repeat/spoiler"
+
+
+def place_impactful(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]], duration: float,
+                    min_hold: float = MIN_SHOT) -> Dict[str, Any]:
+    """Impactful-only panel placement — the replacement for place_coverage.
+
+    The old pass ("every drawn panel must appear") is DELETED, not kept
+    behind a flag: it placed panels no sentence was about into nearby
+    sentences, which is exactly the wrong-picture time the sync gate now
+    fails on. Selection here:
+
+    - One tagged panel per sentence. A sentence <= LONG_SENTENCE (8s)
+      shows ONLY its tagged panel for its whole window: no filler, no split.
+    - A sentence > 8s splits into 2 shots (tagged ~65% + ONE impactful
+      filler ~35%), each >= MIN_SHOT (3s). A sentence > 15s may split
+      into 3 shots (tagged ~60% + up to TWO fillers) when two panels pass
+      the impact test and each piece stays >= 3s. Shots per sentence are
+      capped at ceil(duration / 3), preferring <= 2.
+    - A filler comes from this sentence's own window only: story order
+      after the tagged panel, before the next SHOW sentence's tagged
+      panel (or IMPACT_WINDOW past the tag when there is no next tag),
+      and must pass filler_impact(). The writer's second tag
+      (tagged_extras[0]) is tried first for a long sentence: the writer
+      chose it while looking at the panel, so it skips the figure/scene
+      content checks but still must pass the structural ones
+      (not a repeat, not backwards, not a spoiler, not text-only).
+    - A duplicate-tag sentence (its tag is the previous sentence's panel)
+      is converted to HOLD_PREVIOUS: the panel holds, no filler.
+    - If no panel passes, the tagged panel holds the whole window.
+
+    Every SHOW segment gets "sequence" (the panels it shows, in order),
+    "sequence_shares" (each piece's share of the window — the planner
+    splits on these, not evenly), "tagged_coverage" (the tagged panel's
+    share of the window), "filler_panels" and "filler_impact" (the verdict
+    per filler, read back by the sync gate).
+
+    Returns the coverage/QA dict. "uncovered" is always [] — unshown
+    panels are not a failure anymore. panels_shown/total is INFO ONLY:
+    success is tagged coverage + min shot + impact pass.
+    """
     order = {p["id"]: i for i, p in enumerate(panels)}
-    shows = [k for k, s in enumerate(segments) if s.get("selected_panel")]
-    for s in segments:
-        s["extra_panels"] = list(s.get("tagged_extras") or [])
-    shown = {segments[k]["selected_panel"] for k in shows} | {p for s in segments for p in s["extra_panels"]}
-    missing = [p["id"] for p in panels if not p.get("text_only") and p["id"] not in shown]
-    # Each shot holds at most two panels, and each needs min_hold of time.
-    room = 2 * int(duration // min_hold) - len(shown)
-    placed, uncovered = [], []
-    for pid in sorted(missing, key=lambda x: order[x]):
-        if len(placed) >= max(0, room) or not shows:
-            uncovered.append(pid)
+    by_id = {p["id"]: p for p in panels}
+    art = [p for p in panels if not p.get("text_only")]
+    art_total = len(art)
+
+    # Suffix sets of tagged panels, for the spoiler check: future_tagged[i]
+    # is every panel tagged by a SHOW segment AFTER segments[i].
+    future_tagged: List[set] = [set() for _ in segments]
+    acc: set = set()
+    for i in range(len(segments) - 1, -1, -1):
+        future_tagged[i] = set(acc)
+        seg = segments[i]
+        if seg.get("display_action") == "SHOW":
+            acc |= {p for p in (seg.get("tagged_panels") or []) if p in by_id}
+
+    shown: set = set()
+    prev_selected: str | None = None
+    placed: List[str] = []
+    filler_seconds = 0.0
+    tagged_cov: Dict[int, float] = {}
+
+    for i, seg in enumerate(segments):
+        if seg.get("display_action") != "SHOW" or not seg.get("selected_panel"):
+            # HOLD ({same} / internal / pure-audio / duplicate-tag): nothing
+            # is placed here, and nothing it hides is placed next door.
+            # A duplicate-tag HOLD's panel IS its tag, so it covers 100%;
+            # other HOLDs have no tag of their own and are not coverage-judged.
+            if seg.get("display_action") == "HOLD_PREVIOUS":
+                seg["sequence"] = []
+                seg["sequence_shares"] = []
+                seg["filler_panels"] = []
+                seg["filler_impact"] = {}
+                if seg.get("confidence") == "rule:duplicate_tag_hold":
+                    seg["tagged_coverage"] = 1.0
+                    tagged_cov[seg.get("sentence")] = 1.0
             continue
-        i = order[pid]
-        near = sorted(shows, key=lambda k: (abs(order[segments[k]["selected_panel"]] - i), k))[:3]
-        lit = [k for k in near
-               if float(segments[k]["end"]) - float(segments[k]["start"]) >= filler_full]
-        pool = lit or near
-        # P2: a filler is never parked beside a HOLD ({same}/internal/pure-audio)
-        # sentence when another host is available. The filler is often the
-        # panel the HOLD sentence hid (Ch2 sentence 60: {same} held the
-        # previous panel, coverage parked its panel next door, and it showed
-        # under the wrong words). validate()'s same_no_hidden_panel FAILs
-        # that case outright; this keeps the remaining, legitimate HOLDs
-        # from attracting fillers.
-        def _beside_hold(k: int) -> int:
-            for j in (k - 1, k + 1):
-                if 0 <= j < len(segments) and segments[j].get("display_action") == "HOLD_PREVIOUS":
-                    return 1
-            return 0
-        k = min(pool, key=lambda k: (_beside_hold(k), len(segments[k]["extra_panels"]),
-                                     abs(order[segments[k]["selected_panel"]] - i)))
-        segments[k]["extra_panels"].append(pid)
-        placed.append(pid)
-    for seg in segments:
-        if seg.get("selected_panel"):
-            seg["selected_by_align"] = seg["selected_panel"]
-            seq = [seg["selected_panel"]] + sorted(
-                (p for p in set(seg["extra_panels"]) if p != seg["selected_panel"]), key=lambda p: order[p])
-            seg["sequence"] = seq
-        if not seg["extra_panels"]:
-            del seg["extra_panels"]
-    return {"placed_by_order": placed, "uncovered": uncovered}
+        sel = seg["selected_panel"]
+        # Defensive duplicate-tag HOLD (align_sentences already converts
+        # these; a hand-built segment list may still carry one).
+        if prev_selected is not None and sel == prev_selected:
+            seg.update(selected_panel=None, display_action="HOLD_PREVIOUS",
+                       confidence="rule:duplicate_tag_hold", needs_review=False,
+                       sequence=[], sequence_shares=[], tagged_coverage=1.0,
+                       filler_panels=[], filler_impact={})
+            tagged_cov[seg.get("sentence")] = 1.0
+            continue
+        dur = float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))
+        sel_order = order.get(sel, -1)
+        # The filler's window: after the tagged panel, before the next
+        # SHOW sentence's tagged panel (exclusive). No next tag: the next
+        # IMPACT_WINDOW panels.
+        next_tag_order: int | None = None
+        for j in range(i + 1, len(segments)):
+            nxt = segments[j].get("selected_panel")
+            if segments[j].get("display_action") == "SHOW" and nxt in order:
+                next_tag_order = order[nxt]
+                break
+        window_end = next_tag_order if next_tag_order is not None else sel_order + IMPACT_WINDOW + 1
 
+        fillers: List[str] = []
+        verdicts: Dict[str, Dict[str, Any]] = {}
+        if dur > LONG_SENTENCE:
+            max_fillers = 2 if dur > LONG_SENTENCE_MAX else 1
+            # The writer's second tag goes first (structural checks only).
+            tried: List[str] = []
+            for cand in (seg.get("tagged_extras") or [])[:1]:
+                if cand not in by_id:
+                    continue
+                tried.append(cand)
+                p = by_id[cand]
+                pos = order.get(cand, -1)
+                if p.get("text_only") or p.get("credits"):
+                    verdicts[cand] = {"pass": False, "reason": "text-only/credits panel"}
+                elif pos < sel_order:
+                    verdicts[cand] = {"pass": False, "reason": "backwards story order (before the tagged panel)"}
+                elif cand in shown or cand == sel:
+                    verdicts[cand] = {"pass": False, "reason": "panel already shown (repeat)"}
+                elif cand in future_tagged[i]:
+                    verdicts[cand] = {"pass": False, "reason": "spoiler: tagged by a later sentence"}
+                else:
+                    verdicts[cand] = {"pass": True, "reason": "writer second tag"}
+                    fillers.append(cand)
+            # Then the next story-order panels inside this sentence's window.
+            for p in panels:
+                if len(fillers) >= max_fillers:
+                    break
+                pid = p["id"]
+                if pid in tried or pid == sel or pid in shown:
+                    continue
+                pos = order[pid]
+                if pos <= sel_order or pos >= window_end:
+                    continue
+                if p.get("text_only"):
+                    continue
+                ok, reason = filler_impact(p, sentence_text=seg.get("text", ""), order=order,
+                                           tagged_order=sel_order, shown=shown | {sel} | set(fillers),
+                                           future_tagged=future_tagged[i])
+                verdicts[pid] = {"pass": bool(ok), "reason": reason}
+                if ok:
+                    fillers.append(pid)
 
+        # Split shares: tagged first, each piece >= MIN_SHOT, tagged share
+        # >= its coverage threshold. Fewer pieces than the cap when the
+        # fillers (or the time) are not there — the tagged panel holds.
+        pieces = 1 + len(fillers)
+        cap = 3 if dur > LONG_SENTENCE_MAX else 2
+        cap = min(cap, max(1, int(-(-dur // MIN_SHOT)))) if dur > 0 else 1  # ceil(dur / 3)
+        if pieces > cap:
+            fillers = fillers[:cap - 1]
+            pieces = 1 + len(fillers)
+        if pieces == 3 and dur > LONG_SENTENCE_MAX:
+            tagged_dur = min(max(SPLIT_TAGGED_SHARE_3 * dur, MIN_SHOT), dur - 2 * MIN_SHOT)
+            rest = dur - tagged_dur
+            shares = [tagged_dur / dur, (rest / 2) / dur, (rest / 2) / dur]
+        elif pieces == 2:
+            tagged_dur = min(max(SPLIT_TAGGED_SHARE * dur, MIN_SHOT), dur - MIN_SHOT)
+            shares = [tagged_dur / dur, (dur - tagged_dur) / dur]
+        else:
+            fillers = []
+            shares = [1.0]
+        seq = [sel, *fillers]
+        seg["sequence"] = seq
+        seg["sequence_shares"] = shares
+        seg["tagged_coverage"] = round(shares[0], 4)
+        seg["filler_panels"] = list(fillers)
+        seg["filler_impact"] = {pid: verdicts.get(pid, {"pass": False, "reason": "not evaluated"})
+                                for pid in fillers}
+        seg["split_pieces"] = len(seq)
+        tagged_cov[seg.get("sentence")] = seg["tagged_coverage"]
+        placed.extend(fillers)
+        filler_seconds += dur * sum(shares[1:])
+        shown.update(seq)
+        prev_selected = sel
+        if "tagged_extras" in seg:
+            del seg["tagged_extras"]
+
+    shown_panels = sorted(shown)
+    return {
+        "placed": placed,
+        "placed_by_order": placed,
+        "uncovered": [],
+        "art_panels": art_total,
+        "text_only_excluded": [p["id"] for p in panels if p.get("text_only")],
+        "placed_by_order_count": len(placed),
+        "panels_shown": shown_panels,
+        "panels_total": art_total,
+        "panels_shown_ratio": round(len(shown_panels) / art_total, 4) if art_total else 0.0,
+        "tagged_coverage": tagged_cov,
+        "filler_shots": len(placed),
+        "filler_seconds": round(filler_seconds, 3),
+        "max_shots": max_shots_for_duration(duration),
+    }
 def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], vcfg: Dict[str, Any],
                      sync: str, log, settings: Dict[str, float],
                      warnings_out: List[Dict[str, str]] | None = None,
@@ -415,10 +630,9 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
         seg["timing_source"] = t.get("timing_source", "estimated")
 
     min_hold = settings["min_hold"]
-    coverage = place_coverage(segments, plist, duration, min_hold, settings["filler_full"])
-    coverage["art_panels"] = sum(1 for p in plist if not p.get("text_only"))
-    coverage["text_only_excluded"] = [p["id"] for p in plist if p.get("text_only")]
-    coverage["placed_by_order_count"] = len(coverage["placed_by_order"])
+    coverage = place_impactful(segments, plist, duration, min_hold)
+    # place_impactful already reports art_panels / text_only_excluded /
+    # placed_by_order_count; panels_shown/total there is INFO ONLY.
     validation = validate_mod.validate(segments, order, duration)
     queue = validate_mod.review_queue(segments, validation)
 

@@ -14,23 +14,27 @@ sentence, the panel shown, the panel expected and the likely cause:
                         (min_hold retiming moved a shot boundary)
   interpolated_timing   whisper never matched this sentence; its time is a
                         text-length guess between neighbours
-  filler_panel          the panel on screen was placed by the coverage pass,
-                        not chosen for this sentence
+  filler_panel          the panel on screen is a filler that failed the
+                        impact test (place_impactful), not the tagged panel
   tag_override          the alignment engine replaced the writer's tag
   long_hold             one picture held past max_hold while the voice moved on
   unknown               none of the above (needs eyes)
 
 The report goes to video/chapter_N.syncaudit.json with the calibration numbers:
 strict_match (the exact tagged panel is on screen), wrong_picture (time where a
-panel belonging to another sentence's tag is on screen; legitimate coverage
-fillers and pair second cards are excluded) and a per-minute curve of both. The
-gate `video build` enforces is on wrong-picture time and cut lateness - overall
-wrong-picture share (gate_wrong), wrong-picture inside any five-second window
-(gate_window), and cuts later than max_late + gate_grace. A window judges
-settled time only - samples inside a sentence's own cut budget (lead before its
-words, max_late after) are excluded, so a cut landing on its budget is not
-drift - and needs at least a full second of wrong picture to fail, not just a
-share of a sparse window.
+panel belonging to another sentence's tag is on screen, OR a filler that
+failed the impact test is on screen while no tagged panel is; an
+impact-PASSING filler is not wrong-picture) and a per-minute curve of both.
+The gate `video build` enforces is on wrong-picture time, cut lateness,
+tagged coverage per sentence (>=80% of a <=8s sentence's window, >=60% of a
+longer one's), and a 3.0s minimum shot - overall wrong-picture share
+(gate_wrong), wrong-picture inside any five-second window (gate_window),
+cuts later than max_late + gate_grace, any shot under 3.0s, and any sentence
+under its tagged-coverage threshold. A window judges settled time only -
+samples inside a sentence's own cut budget (lead before its words, max_late
+after) are excluded, so a cut landing on its budget is not drift - and needs
+at least a full second of wrong picture to fail, not just a share of a sparse
+window.
 """
 
 from __future__ import annotations
@@ -43,11 +47,11 @@ from typing import Any, Callable, Dict, Iterable, List, Sequence
 
 from ..util import UserError, atomic_write_text, require_chapter
 from . import sync as sync_mod
-from .align_engine import alignment_path
+from .align_engine import LONG_SENTENCE, TAGGED_COVERAGE_LONG, TAGGED_COVERAGE_SHORT, alignment_path
 from .ffmpeg import audio_timing
 from .media import audio_path, video_dir
 from .panels import load_panels
-from .plan import plan_path
+from .plan import MIN_SHOT, plan_path
 
 SAMPLE_STEP = 0.5     # the plan is sampled every half second
 WINDOW_MIN = 3.0      # mismatches shorter than this are noise, not reported windows
@@ -116,7 +120,7 @@ def _held_seconds(shots: Sequence[Dict[str, Any]], panel: str, t: float) -> floa
 def _expected_sets(segments: Sequence[Dict[str, Any]], text_only: set) -> List[List[str]]:
     """What each segment is supposed to show: the drawn panels it was tagged
     with (text-only tags can't be shown themselves). A hold keeps whatever the
-    previous sentence legitimately showed (including coverage extras), since
+    previous sentence legitimately showed (including impactful fillers), since
     holding the shot is exactly its job. An empty expectation means the
     sentence can't be judged (nothing showable was ever named for it)."""
     exp: List[List[str]] = []
@@ -165,14 +169,18 @@ def _window_record(samples: List[Dict[str, Any]], i: int, j: int, segments: List
 
 
 def evaluate_gate(wrong: Dict[str, Any], over: List[Dict[str, Any]], late: List[Dict[str, Any]],
-                    st: Dict[str, Any]) -> List[str]:
+                    st: Dict[str, Any], *, short_shots: List[Dict[str, Any]] | None = None,
+                    coverage_failures: List[Dict[str, Any]] | None = None) -> List[str]:
     """The ONE gate decision (P2). audit() computes the numbers and calls this;
     render_chapter re-evaluates a cached report through gate_from_report, which
     calls this with the same code path — the two gates cannot drift apart.
 
     `wrong` is the wrong_picture dict (ratio/seconds), `over` the five-second
     windows over gate_window in settled time, `late` the late cuts, `st` the
-    merged effective sync settings. Returns the failure strings (empty = PASS).
+    merged effective sync settings. `short_shots` are plan shots under the
+    MIN_SHOT floor (any one fails); `coverage_failures` are sentences whose
+    tagged panel covered less than its threshold (any one fails).
+    Returns the failure strings (empty = PASS).
     """
     failures: List[str] = []
     if float(wrong.get("ratio") or 0.0) > st["gate_wrong"] + 1e-9:
@@ -187,19 +195,34 @@ def evaluate_gate(wrong: Dict[str, Any], over: List[Dict[str, Any]], late: List[
         worst_late = max(late, key=lambda x: x["offset"])
         failures.append(f"{len(late)} cut(s) more than {st['max_late'] + st['gate_grace']:.1f}s after their "
                         f"sentence starts (worst {worst_late['offset']:.1f}s, sentence {worst_late['sentence']})")
+    if short_shots:
+        shortest = min(float(s.get("duration") or 0.0) for s in short_shots)
+        failures.append(f"{len(short_shots)} shot(s) under the {MIN_SHOT:.1f}s minimum shot "
+                        f"(shortest {shortest:.2f}s, shot {(min(short_shots, key=lambda s: float(s.get('duration') or 0.0)).get('shot'))})")
+    if coverage_failures:
+        worst_cov = min(coverage_failures, key=lambda c: float(c.get("coverage") or 0.0))
+        failures.append(f"{len(coverage_failures)} sentence(s) under their tagged-coverage threshold "
+                        f"(worst sentence {worst_cov.get('sentence')}: tagged panel on screen "
+                        f"{float(worst_cov.get('coverage') or 0.0):.0%} of its window, "
+                        f"needs {float(worst_cov.get('threshold') or 0.0):.0%})")
     return failures
 
 
 def gate_from_report(report: Dict[str, Any], st: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Re-evaluate the gate from a report's own numbers (wrong_picture,
-    five_second.over_gate, late_cuts) through evaluate_gate. Used by render to
-    re-check a cached audit with the CURRENT settings — a PASS stored under
-    looser settings never sneaks past a stricter config. Returns a gate dict
-    with the same shape audit() stores: {"pass", "failures"}."""
+    five_second.over_gate, late_cuts, short_shots, tagged_coverage) through
+    evaluate_gate. Used by render to re-check a cached audit with the CURRENT
+    settings — a PASS stored under looser settings never sneaks past a
+    stricter config. Returns a gate dict with the same shape audit() stores:
+    {"pass", "failures"}."""
     settings = st if st is not None else (report.get("settings") or {})
+    coverage_failures = [c for c in (report.get("tagged_coverage") or [])
+                         if isinstance(c, dict) and not c.get("pass")]
     failures = evaluate_gate(report.get("wrong_picture") or {},
                              (report.get("five_second") or {}).get("over_gate") or [],
-                             report.get("late_cuts") or [], settings)
+                             report.get("late_cuts") or [], settings,
+                             short_shots=report.get("short_shots") or [],
+                             coverage_failures=coverage_failures)
     return {"pass": not failures, "failures": failures}
 
 
@@ -234,14 +257,26 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
     interpolated = {i for i, a in enumerate(anchors) if a is None}
 
     # Wrong-picture attribution: a panel on screen that some OTHER sentence
-    # tagged. Coverage fillers (tagged by nobody) and a pair shot's second card
-    # don't count - only a foreign sentence's panel does.
+    # tagged, or a filler that FAILED the impact test (place_impactful) while
+    # no tagged panel is visible. An impact-PASSING filler is not
+    # wrong-picture (it earned its seconds); a pair shot's second card
+    # doesn't count either — it arrives on its own sentence's words and the
+    # first card stays visible. A filler with NO verdict (an alignment from
+    # before the impact test) fails closed: it counts as wrong-picture.
     owners: Dict[str, set] = {}
     for si, seg in enumerate(segments):
         for p in (seg.get("tagged_panels") or []):
             if p not in text_only:
                 owners.setdefault(p, set()).add(si)
     all_owned = set(owners)
+    selected_of = [seg.get("selected_panel") for seg in segments]
+    filler_fail: List[set] = []
+    for si, seg in enumerate(segments):
+        verdicts = seg.get("filler_impact") or {}
+        extras = [p for p in (seg.get("sequence") or []) if p != selected_of[si]]
+        filler_fail.append({p for p in extras
+                            if p not in (seg.get("tagged_panels") or [])
+                            and not (verdicts.get(p) or {}).get("pass")})
 
     duration = float(plan.get("duration") or 0.0)
     samples: List[Dict[str, Any]] = []
@@ -252,7 +287,8 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         exp = exp_sets[si]
         judged = bool(exp)
         match = judged and bool(set(vis) & set(exp))
-        wrong = (not match and any(p in all_owned and si not in owners[p] for p in vis))
+        wrong = (not match and any((p in all_owned and si not in owners[p]) or p in filler_fail[si]
+                                   for p in vis))
         samples.append({"t": t, "seg": si, "shot": sh, "shown": vis, "judged": judged,
                         "match": match, "wrong": wrong})
 
@@ -355,7 +391,30 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
 
     # P2: the gate decision lives in evaluate_gate() — audit() and the render
     # gate (gate_from_report) share it, so the two gates cannot drift apart.
-    failures = evaluate_gate(wrong, over, late, st)
+    # Rule 2: any plan shot under the MIN_SHOT floor fails the gate.
+    short_shots = [{"shot": s.get("id"), "duration": round(float(s["end"]) - float(s["start"]), 3)}
+                   for s in shots
+                   if float(s["end"]) - float(s["start"]) < MIN_SHOT - 1e-6]
+    # Rule 7: tagged coverage per sentence — the share of the sentence's
+    # judged samples where a tagged panel is on screen. <=8s sentences
+    # need >=80% (trivially 100% when the tagged panel holds the window);
+    # longer ones need >=60%. A sentence with no showable tag is not judged.
+    tagged_coverage: List[Dict[str, Any]] = []
+    for si, seg in enumerate(segments):
+        if not exp_sets[si]:
+            continue
+        win = [s for s in samples if s["seg"] == si and s["judged"]]
+        if not win:
+            continue
+        cov = round(sum(1 for s in win if s["match"]) / len(win), 4)
+        dur = float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))
+        thr = TAGGED_COVERAGE_SHORT if dur <= LONG_SENTENCE else TAGGED_COVERAGE_LONG
+        tagged_coverage.append({"sentence": seg.get("sentence"), "coverage": cov,
+                                "threshold": thr, "duration": round(dur, 3),
+                                "pass": cov + 1e-9 >= thr})
+    coverage_failures = [c for c in tagged_coverage if not c["pass"]]
+    failures = evaluate_gate(wrong, over, late, st, short_shots=short_shots,
+                             coverage_failures=coverage_failures)
 
     # Interpolated sentences, grouped into runs.
     runs: List[Dict[str, Any]] = []
@@ -412,6 +471,8 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         "judged_samples": len(judged), "total_samples": len(samples),
         "windows": windows, "worst_windows": worst_windows,
         "late_cuts": late,
+        "short_shots": short_shots,
+        "tagged_coverage": tagged_coverage,
         "five_second": {"over_gate": over, "worst": worst_window},
         "minute_curve": minute_curve,
         "interpolated": {"sentences": [segments[i].get("sentence") for i in sorted(interpolated)],
@@ -437,10 +498,22 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
     wp = report["wrong_picture"]
     out.append(f"  strict match (the tagged panel itself): {report['strict_match']:.1%} "
                f"of {judged} judged samples ({total} total)")
-    out.append("  wrong-picture time (another sentence's panel; fillers and pair second cards "
-               f"excluded): {wp['seconds']:.1f}s ({wp['ratio']:.1%} of judged time)")
+    out.append("  wrong-picture time (another sentence's panel, or a filler that "
+               f"failed the impact test): {wp['seconds']:.1f}s ({wp['ratio']:.1%} of judged time)")
     if judged < total:
         out.append(f"  ({total - judged} samples had no showable tag on their sentence and were not judged)")
+    if report.get("short_shots"):
+        ss = report["short_shots"]
+        shortest = min(s["duration"] for s in ss)
+        out.append(f"  shots under the {MIN_SHOT:.1f}s minimum shot: {len(ss)} (shortest {shortest:.2f}s)")
+    cov_fail = [c for c in (report.get("tagged_coverage") or []) if not c.get("pass")]
+    if cov_fail:
+        shown_cov = ", ".join(f"{c['sentence']} ({c['coverage']:.0%} vs {c['threshold']:.0%})"
+                              for c in cov_fail[:8])
+        out.append(f"  sentences under their tagged-coverage threshold: {len(cov_fail)} → {shown_cov}")
+    if report.get("tagged_coverage"):
+        out.append(f"  tagged coverage: {len(report['tagged_coverage'])} sentence(s) judged, "
+                   f"{sum(1 for c in report['tagged_coverage'] if c.get('pass'))} pass")
 
     wins = report["windows"]
     if wins:

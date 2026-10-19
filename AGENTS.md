@@ -256,18 +256,26 @@ Check a chapter's state with `video status --session "<name>"`.
    several tags followed by an untagged one is reported by `video pair` (and by align's
    `no_unexplained_jumps` message) with the exact tag to move to which sentence; the suggestion is
    in `pairs.json` under `_suggestions` and is never applied for you.
-2. **Coverage**: every drawn panel must appear. A panel no sentence picked is placed in story
-   order, into a nearby sentence, and listed under `placed_by_order` in the QA file. Text-only
-   panels (captions, blank or white pages, credits) are the only ones left out.
+2. **Coverage**: there is NO "every drawn panel must appear" pass.
+   Time is scarce, panels are abundant — SELECT, don't cover. One
+   tagged panel per sentence (≤8s: tagged holds the whole window);
+   a sentence >8s may split (tagged ~65% + ONE impactful filler
+   ~35%, only if the filler passes the impact test: named character
+   + action beat + visible face, in story order, not a repeat/spoiler);
+   a sentence >15s max 3 shots. Min shot 3.0s, ever; max shots =
+   floor(audio_seconds / 3). A panel no sentence picked is simply not
+   shown. `panels_shown / total` is INFO ONLY, never success.
 3. **Plan** (`video plan`): turns the alignment into shots. Every card has one of the allowed
    shapes (landscape: 3:4, 1:1, 4:3, 16:9; portrait: 9:16, 3:4, 1:1), full width with no white
    gutters; a panel too wide for any shape is shown whole on a blurred backdrop. Every shot holds
    at least `min_hold` seconds (`manhwa-ocr.yaml`); a short sentence shares its shot with the next
    one. Crops avoid speech bubbles and never cut a detected head.
 4. **QA** (`video/chapter_N.qa.json`): objective checks. The build stops only on hard failures: a
-   drawn panel that would never appear, a card that isn't an allowed shape, or a shot too short to
-   be seen at all (under 0.2s). A shot under the 2s floor that dense narration forces is counted
-   (`short_shots` in the QA file) and left honest — never fixed by stealing time from neighbours.
+   card that isn't an allowed shape, a bubble in a card, or a shot too short to be seen at all
+   (under 0.2s). A shot under the 3s floor is counted (`short_shots` in the QA file) and
+   FAILS the sync gate — never fixed by stealing time from neighbours. Unshown panels are
+   NOT a failure. QA reports tagged coverage per sentence, filler shots/seconds, min shot,
+   and panels shown/total (info only).
 5. **Render** (`video render`): 1080p MP4.
 
 ### Where each kind of fix goes (this decides whether it survives a rebuild)

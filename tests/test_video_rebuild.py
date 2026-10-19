@@ -90,12 +90,16 @@ def test_hold_groups_reaches_the_short_floor_and_keeps_every_panel():
              {"start": 2.0, "end": 9.0, "panels": ["C"], "cues": [], "emphasis": [], "sentence": "c",
               "sentence_starts": [2.0]}]
     shots, stats = hold_groups(units, MIN_HOLD)
-    # A and B pair into one 2.0s shot (the short floor); C keeps its 7s.
-    assert all(s["end"] - s["start"] >= 2.0 - 1e-6 for s in shots)
+    # A and B pair into one 2.3s shot (nudged to the cut budget, still under
+    # the 3.0s floor: there is no shorter floor anymore, so it is counted as
+    # a short shot and the sync gate fails on it); C keeps its 6.7s.
+    assert shots[0]["panels"] == ["A", "B"]
+    assert shots[0]["end"] - shots[0]["start"] == pytest.approx(2.3)
+    assert shots[1]["end"] - shots[1]["start"] == pytest.approx(6.7)
     assert {p for s in shots for p in s["panels"]} == {"A", "B", "C"}
     assert shots[0]["start"] == 0.0 and shots[-1]["end"] == pytest.approx(9.0)
     assert all(len(s["panels"]) <= 2 for s in shots)
-    assert stats["short_shots"] == 0
+    assert stats["short_shots"] == 1
     # Every cut sits within its budget of the unit it belongs to.
     for s in shots[1:]:
         s0 = s["sentence_starts"][0]
@@ -113,7 +117,11 @@ def test_hold_groups_never_drifts_a_cut_outside_its_budget():
         s0 = s["sentence_starts"][0]
         assert s0 - 0.2 - 1e-6 <= s["start"] <= s0 + 0.3 + 1e-6
     assert stats["short_shots"] >= 1          # honestly reported, not hidden by drift
-    assert stats["moved_seconds"] <= 0.5 + 1e-6
+    # Two nudged boundaries, each moving at most lead + max_late (0.5s):
+    # with the 3.0s floor the shortfalls are bigger than under the old
+    # 2.0s short floor, so the total can reach 1.0s. Every cut still sits
+    # inside its own budget (asserted above).
+    assert stats["moved_seconds"] <= 1.0 + 1e-6
 
 
 def test_even_timing_shows_every_drawn_panel_and_skips_only_text():
@@ -132,38 +140,47 @@ def _segments(n_shows, panels_order):
              "start": 3.0 * i, "end": 3.0 * (i + 1)} for i in range(n_shows)]
 
 
-def test_coverage_places_every_unshown_art_panel_in_story_order():
+def test_impactful_selection_shows_only_tagged_panels_for_short_sentences():
+    # SELECT, don't cover: a <=8s sentence shows ONLY its tagged panel.
+    # The unpicked panels are not placed anywhere (no coverage pass).
     panels = [{"id": f"P001-{i:02d}", "text_only": False} for i in range(1, 7)]
     segs = _segments(2, ["P001-01", "P001-05"])
-    cov = align_engine.place_coverage(segs, panels, 12.0, 3.0)
+    cov = align_engine.place_impactful(segs, panels, 12.0, 3.0)
     assert cov["uncovered"] == []
-    assert sorted(cov["placed_by_order"]) == ["P001-02", "P001-03", "P001-04", "P001-06"]
+    assert cov["placed_by_order"] == []
     for s in segs:
-        # The sentence's own pick leads its time; coverage fillers follow in story order.
-        assert s["sequence"][0] == s["selected_panel"]
-        assert s["sequence"][1:] == sorted(s["sequence"][1:])
+        assert s["sequence"] == [s["selected_panel"]]
+        assert s["tagged_coverage"] == 1.0
     shown = {p for s in segs for p in s["sequence"]}
-    assert shown == {p["id"] for p in panels}
+    assert shown == {"P001-01", "P001-05"}
+    # panels_shown/total is INFO ONLY: 2/6 shown is not a failure.
+    assert cov["panels_shown"] == ["P001-01", "P001-05"]
+    assert cov["panels_total"] == 6
 
 
-def test_coverage_never_places_text_only_panels():
+def test_impactful_selection_never_places_text_only_panels():
     panels = [{"id": "P001-01", "text_only": False}, {"id": "P001-02", "text_only": True},
               {"id": "P001-03", "text_only": False}]
     segs = _segments(1, ["P001-01"])
-    cov = align_engine.place_coverage(segs, panels, 6.0, 3.0)
+    cov = align_engine.place_impactful(segs, panels, 6.0, 3.0)
     assert "P001-02" not in segs[0]["sequence"]
-    assert cov["placed_by_order"] == ["P001-03"]
+    assert cov["placed_by_order"] == []
 
 
-def test_coverage_reports_panels_the_narration_has_no_time_for():
+def test_impactful_selection_reports_unshown_panels_as_info_only():
+    # Unshown panels are not "uncovered" failures anymore: uncovered is
+    # always empty, and the QA ratio just reports what was selected.
     panels = [{"id": f"P001-{i:02d}", "text_only": False} for i in range(1, 12)]
     segs = _segments(1, ["P001-01"])
-    cov = align_engine.place_coverage(segs, panels, 6.0, 3.0)   # 6 s holds at most 4 panels
-    assert len(cov["uncovered"]) > 0
-    assert len(cov["placed_by_order"]) + 1 + len(cov["uncovered"]) == 11
+    cov = align_engine.place_impactful(segs, panels, 6.0, 3.0)
+    assert cov["uncovered"] == []
+    assert cov["panels_shown"] == ["P001-01"]
+    assert cov["panels_shown_ratio"] == pytest.approx(1 / 11, abs=1e-4)  # rounded to 4dp
 
 
-def test_quality_gate_stops_a_build_that_would_skip_a_panel():
+def test_quality_gate_no_longer_fails_on_a_skipped_panel():
+    # Rule 9: panels_shown/total is INFO ONLY. A drawn panel no sentence
+    # picked is not a failure; a bad card shape still is.
     fmt = format_from("16:9", 30)
     panels = {"panels": [{"id": "A", "width": 300, "height": 300, "text_only": False},
                          {"id": "B", "width": 300, "height": 300, "text_only": False}]}
@@ -172,7 +189,10 @@ def test_quality_gate_stops_a_build_that_would_skip_a_panel():
          "cards": [{"panel": "A", "crop": [0, 0, 1, 1]}]}]}
     qa = quality_report(plan, panels, None, 3.0)
     assert qa["missing"] == ["B"]
-    assert any("would never appear" in f for f in qa["failures"])
+    assert qa["panels_shown"] == 1 and qa["panels_total"] == 2
+    assert qa["panels_shown_ratio"] == 0.5
+    assert not any("would never appear" in f for f in qa["failures"])
+    assert qa["failures"] == []
 
 
 def test_quality_gate_flags_a_too_short_shot_and_a_wrong_shape():
