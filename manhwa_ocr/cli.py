@@ -734,12 +734,49 @@ def cmd_video(args) -> int:
             _log("  next: write intro/intro.json, record audio/chapter_0.mp3, then:  "
                  f"python -m manhwa_ocr video intro{_pin(sess)}")
             return 0
+        if args.auto:
+            from .video import hook as hook_mod
+
+            out = hook_mod.build_hook(
+                sess, cfg, chapters=expand_chapters(args.chapters) if args.chapters else None,
+                audio=args.audio, script=args.script, cues=args.cues,
+                target_seconds=args.duration, sync="off" if args.no_sync else "auto",
+                fmt=args.format, plan_only=args.dry_run, workers=args.workers,
+                allow_reuse=args.allow_reuse, log=_log)[1]
+            if out is not None:
+                _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+            return 0
         out = intro_mod.run(sess, cfg, sync="off" if args.no_sync else "auto", fmt=args.format,
                             preview=args.preview, workers=args.workers, plan_only=args.dry_run, log=_log)
         if out is not None:
             _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
         return 0
 
+    if action == "hook":
+        from .video import hook as hook_mod
+
+        out = hook_mod.build_hook(
+            sess, cfg, chapters=expand_chapters(args.chapters) if args.chapters else None,
+            audio=args.audio, script=args.script, cues=args.cues,
+            target_seconds=args.duration, sync="off" if args.no_sync else "auto",
+            fmt=args.format, plan_only=args.dry_run, workers=args.workers,
+            allow_reuse=args.allow_reuse, log=_log)[1]
+        if out is not None:
+            _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+        return 0
+
+    if action == "previously":
+        from .video import hook as hook_mod
+
+        out = hook_mod.build_previously(
+            sess, cfg, chapters=chapters(default_all=False),
+            audio=args.audio, script=args.script, target_seconds=args.duration,
+            sync="off" if args.no_sync else "auto", fmt=args.format,
+            plan_only=args.dry_run, workers=args.workers,
+            allow_reuse=args.allow_reuse, log=_log)[1]
+        if out is not None:
+            _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+        return 0
     if action == "sync-audit":
         from .video import syncaudit
 
@@ -1031,7 +1068,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
     p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "sync-audit", "storyboard", "render",
-                                      "build", "clip", "compile", "verify", "review", "approve", "intro",
+                                      "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
@@ -1056,6 +1093,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="plan/build: skip writing the storyboard + review task")
     p.add_argument("--prepare", action="store_true",
                    help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
+    p.add_argument("--audio", help="hook/previously: narration audio file, e.g. audio/chapter_0.mp3")
+    p.add_argument("--script", help="hook/previously: narration script, one sentence per line")
+    p.add_argument("--cues", help="hook: cues.json file with the narration sentences (alternative to --script)")
+    p.add_argument("--auto", action="store_true",
+                   help="intro: auto-pick panels from the script instead of reading intro.json")
+    p.add_argument("--allow-reuse", dest="allow_reuse", action="store_true",
+                   help="hook/previously: allow reusing panels already used in intro/previously")
     p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing; intro: plan only, no render")
     p.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
                    help="review: how many review-and-fix rounds to allow (default 3)")

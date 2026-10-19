@@ -130,6 +130,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # two at a time. darken: darker grade (0-0.6). backdrop: always the blurred panel, never black bars.
         "intro": {"min_hold": 2.0, "pair_ratio": 0.5, "darken": 0.15, "backdrop": "blur",
                   "beat_effects": ["shake", "flash", "fade_out"]},
+        # `video hook` / `video previously`: 30-second auto-picked videos.
+        # target_seconds is clamped into [min_seconds, max_seconds]; audio
+        # longer than the cap (or shorter than the floor) logs a warning.
+        # seed makes the auto-pick's near-tie jitter reproducible.
+        "hook": {"target_seconds": 30.0, "min_seconds": 20.0, "max_seconds": 45.0, "seed": 7},
         "whisper_model": "small.en",
         "whisper_language": None,   # e.g. "hi" for Hindi narration (use a multilingual model)
     },

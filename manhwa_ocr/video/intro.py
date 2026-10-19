@@ -161,20 +161,12 @@ def _chapter_key(label: str):
 # ------------------------------------------------------------------ reading intro.json
 
 
-def load_intro(root: Path, chapters: Dict[str, Dict[str, Any]],
-               dropped: Dict[str, set] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Validated sentences [{"text", "refs", "beat"}] and the synthetic chapter-0 panels_data.
-    Every problem is collected, so the writer fixes the file once."""
-    path = intro_json_path(root)
-    if not path.exists():
-        raise UserError(f"No {path.relative_to(root).as_posix()} yet. Start one with:  video intro --prepare")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise UserError(f"intro/intro.json is not valid JSON ({exc}).") from None
-    raw = data.get("sentences") if isinstance(data, dict) else None
-    if not isinstance(raw, list) or not raw:
-        raise UserError("intro/intro.json needs a non-empty \"sentences\" list.")
+def sentences_from_raw(root: Path, chapters: Dict[str, Dict[str, Any]], raw: List[Any],
+                       dropped: Dict[str, set] | None = None,
+                       source: str = "intro/intro.json") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Validate a raw sentences list (manual intro.json, or an auto-pick) into
+    sentences + synthetic panels_data. Shared by the manual and auto paths so
+    both get the same text-only / reuse / unknown-panel checks."""
     dropped = dropped or {}
     problems: List[str] = []
     used: Dict[str, int] = {}
@@ -221,12 +213,29 @@ def load_intro(root: Path, chapters: Dict[str, Dict[str, Any]],
                            "src_fingerprint": chapters[c].get("fingerprint"), "text_only": False})
         out.append({"text": text, "refs": refs, "beat": bool(entry.get("beat"))})
     if problems:
-        raise UserError("intro/intro.json has problems (nothing was built):\n  - " + "\n  - ".join(problems))
+        raise UserError(f"{source} has problems (nothing was built):\n  - " + "\n  - ".join(problems))
     fp = hashlib.sha256(json.dumps([[p["id"], p.get("src_fingerprint")] for p in panels]).encode()).hexdigest()[:16]
     first_chapter = panels[0]["src_chapter"]
     synthetic = {"version": 1, "chapter": INTRO_CHAPTER, "fingerprint": fp,
                  "norm_width": chapters[first_chapter].get("norm_width") or 1, "panels": panels}
     return out, synthetic
+
+
+def load_intro(root: Path, chapters: Dict[str, Dict[str, Any]],
+               dropped: Dict[str, set] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Validated sentences [{"text", "refs", "beat"}] and the synthetic chapter-0 panels_data.
+    Every problem is collected, so the writer fixes the file once."""
+    path = intro_json_path(root)
+    if not path.exists():
+        raise UserError(f"No {path.relative_to(root).as_posix()} yet. Start one with:  video intro --prepare")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UserError(f"intro/intro.json is not valid JSON ({exc}).") from None
+    raw = data.get("sentences") if isinstance(data, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raise UserError("intro/intro.json needs a non-empty \"sentences\" list.")
+    return sentences_from_raw(root, chapters, raw, dropped=dropped)
 
 
 def _dropped_by_fixes(root: Path, chapters: Dict[str, Dict[str, Any]]) -> Dict[str, set]:
@@ -314,48 +323,67 @@ def style_plan(plan: Dict[str, Any], segments: List[Dict[str, Any]], icfg: Dict[
     return plan
 
 
-def build_intro(sess, cfg, *, sync: str = "auto", fmt: str | None = None, log=print
+def build_intro(sess, cfg, *, sync: str = "auto", fmt: str | None = None, log=print,
+                sentences: List[Dict[str, Any]] | None = None, out_chapter: str | None = None,
+                audio: Path | None = None, kind: str = "intro"
                 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Alignment + plan for the intro. Returns (plan, panels_data). Always rebuilt from intro.json,
-    the audio and video/chapter_0.fixes.json (the plan itself is never edited by hand)."""
+    the audio and video/chapter_0.fixes.json (the plan itself is never edited by hand).
+
+    The auto paths (`video hook`, `video intro --auto`, `video previously`) pass
+    `sentences` (already picked panels, [{"text", "panels": [refs], "beat"}]),
+    `out_chapter` (chapter "0" for hook, "prevN" for previously) and `audio`
+    (the explicit --audio file) instead of reading intro.json / chapter_0.mp3.
+    Manual `video intro` passes none of those and behaves exactly as before.
+    """
     root = sess.path
     vcfg = dict(cfg.video)
     icfg = settings(vcfg)
     fmt = fmt or vcfg.get("format", "16:9")
+    chapter = out_chapter or INTRO_CHAPTER
     chapters = _chapters_with_panels(sess)
-    sentences, panels_data = load_intro(root, chapters, _dropped_by_fixes(root, chapters))
-    audio = audio_path(root, INTRO_CHAPTER)
+    if sentences is None:
+        sentences, panels_data = load_intro(root, chapters, _dropped_by_fixes(root, chapters))
+    else:
+        sentences, panels_data = sentences_from_raw(
+            root, chapters, sentences, dropped=_dropped_by_fixes(root, chapters), source="auto-pick")
     if audio is None:
-        raise UserError(f"No narration for the intro. Save it as audio/chapter_0.mp3 (or .wav/.m4a) in {root}.")
+        audio = audio_path(root, chapter)
+    if audio is None:
+        raise UserError(f"No narration for the intro. Save it as audio/chapter_{chapter}.mp3 (or .wav/.m4a) in {root}.")
     intro_timing_warnings: list = []
     timed, mode, duration = align_engine._timed_sentences(
-        root, INTRO_CHAPTER, [{"text": s["text"], "panels": []} for s in sentences], vcfg, sync, log,
-        sync_mod.effective_settings(vcfg, log=log), warnings_out=intro_timing_warnings)
+        root, chapter, [{"text": s["text"], "panels": []} for s in sentences], vcfg, sync, log,
+        sync_mod.effective_settings(vcfg, log=log), warnings_out=intro_timing_warnings,
+        audio=audio)
     segments = _segments(sentences, timed)
     refs = [r for s in sentences for r in s["refs"]]
     validation = {"status": "PASS", "problems": [],
                   "checks": {"drawn_panels_only": "PASS", "each_panel_once": "PASS", "one_to_three_per_sentence": "PASS"}}
-    result = {"version": 2, "chapter": INTRO_CHAPTER, "kind": "intro", "audio": {"duration": round(duration, 3)},
+    result = {"version": 2, "chapter": chapter, "kind": kind, "audio": {"duration": round(duration, 3)},
               "sync_mode": mode, "timing_warnings": intro_timing_warnings,
               "segments": segments, "validation": validation, "review_queue": [],
               "coverage": {"art_panels": len(refs), "placed_by_order": [], "uncovered": []}}
-    atomic_write_text(align_engine.alignment_path(root, INTRO_CHAPTER),
+    atomic_write_text(align_engine.alignment_path(root, chapter),
                       json.dumps(result, indent=1, ensure_ascii=False))
 
     dims = {p["id"]: (float(p.get("width") or 1), float(p.get("height") or 1)) for p in panels_data["panels"]}
-    fixes = fixes_mod.load(root, INTRO_CHAPTER, dims)
+    fixes = fixes_mod.load(root, chapter, dims)
     drop = fixes["drop"]
     if drop:
-        raise UserError("video/chapter_0.fixes.json drops " + ", ".join(sorted(drop))
-                        + ", but every intro panel must show. Remove the drop, or take the panel out of intro.json.")
+        raise UserError(f"video/chapter_{chapter}.fixes.json drops " + ", ".join(sorted(drop))
+                        + ", but every intro panel must show. Remove the drop, or take the panel out of the picks.")
     from .plan import units_from_alignment
 
     units = units_from_alignment(segments)
     fmt_vcfg = {**vcfg, "format": fmt, "min_hold": float(icfg["min_hold"]), "pair_ratio": float(icfg["pair_ratio"]),
                 "effects": {"shake": True, "punch": False, "flash": "flash" in icfg["beat_effects"],
                             "end_fade": True}}
-    rel_audio = audio.relative_to(root).as_posix()
-    plan = build_plan(chapter=INTRO_CHAPTER, panels_data=panels_data, duration=duration, audio=rel_audio,
+    try:
+        rel_audio = audio.relative_to(root).as_posix()
+    except ValueError:
+        rel_audio = audio.as_posix()
+    plan = build_plan(chapter=chapter, panels_data=panels_data, duration=duration, audio=rel_audio,
                       vcfg=fmt_vcfg, alignment_units=units,
                       alignment_meta={"sync_mode": mode, "review_queue": []},
                       image_for=lambda p: panel_image(root, p["src_chapter"], p, p["src_norm_w"], clean=True),
@@ -371,9 +399,9 @@ def build_intro(sess, cfg, *, sync: str = "auto", fmt: str | None = None, log=pr
     if errs:
         raise UserError("Internal error: the intro plan is invalid:\n  " + "\n  ".join(errs[:5]))
     plan["generated_hash"] = hashlib.sha256(json.dumps(plan["shots"], sort_keys=True).encode()).hexdigest()[:16]
-    save_plan(root, INTRO_CHAPTER, plan)
-    log(f"  intro: {len(plan['shots'])} shots, {len(refs)} panels, {mode} timing, {duration:.1f}s")
-    log(f"  wrote {plan_path(root, INTRO_CHAPTER).relative_to(root).as_posix()}")
+    save_plan(root, chapter, plan)
+    log(f"  {kind}: {len(plan['shots'])} shots, {len(refs)} panels, {mode} timing, {duration:.1f}s")
+    log(f"  wrote {plan_path(root, chapter).relative_to(root).as_posix()}")
     return plan, panels_data
 
 

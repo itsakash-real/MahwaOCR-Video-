@@ -299,7 +299,8 @@ def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]],
 
 def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], vcfg: Dict[str, Any],
                      sync: str, log, settings: Dict[str, float],
-                     warnings_out: List[Dict[str, str]] | None = None) -> tuple[List[Dict[str, Any]], str, float]:
+                     warnings_out: List[Dict[str, str]] | None = None,
+                     audio: Path | None = None) -> tuple[List[Dict[str, Any]], str, float]:
     """Adds "start"/"end" to each sentence using whisper (cached if available),
     falling back to even spacing. This is the only I/O-dependent part.
     sync="off" skips whisper entirely (fast, deterministic estimated timing).
@@ -313,8 +314,11 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
 
     With real timing, a run of consecutive sentences whisper never matched,
     longer than video.sync.max_unmatched, stops the build: timing that stretch
-    would be pure interpolation, and interpolation is how drift starts."""
-    audio = audio_path(root, chapter)
+    would be pure interpolation, and interpolation is how drift starts.
+
+    `audio` overrides the chapter audio file (hook / previously pass their
+    explicit --audio file, e.g. audio/previously_7.mp3)."""
+    audio = audio or audio_path(root, chapter)
     if audio is None:
         raise UserError(f"No narration audio for chapter {chapter} yet.")
     from .build import END_TAIL

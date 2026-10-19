@@ -111,6 +111,30 @@ Never hand-edit `video/chapter_N.plan.json` — `plan --force` rebuilds it
 and re-applies `fixes.json`. `fixes.json` is validated as a whole: one
 bad entry refuses the file.
 
+## 4b. Intro hook + previously (30s each, before a part)
+
+```bash
+# Hook: write intro/intro.txt (one sentence per line, [HOOK] / [LOOP: ...]
+# markers), record it as audio/chapter_0.mp3 (30s), then:
+python -m manhwa_ocr video hook --chapters 1-6 --audio audio/chapter_0.mp3 \
+    --script intro/intro.txt --session "Your Series Name"
+# -> video/chapter_0.mp4, picks reviewed in intro/intro.auto.json
+# Manual instead: video intro --prepare, fill intro/intro.json, video intro.
+
+# Previously (between parts): write previously/previously_7.txt, record it
+# as audio/previously_7.mp3 (30s), then:
+python -m manhwa_ocr video previously --chapters 1-6 --audio audio/previously_7.mp3 \
+    --script previously/previously_7.txt --session "Your Series Name"
+# -> video/chapter_prev7.mp4. Panels ONLY from chapters 1-6, never the next part.
+```
+
+Full rules: `INTRO_HOOK_GUIDE.md` + `PREVIOUSLY_GUIDE.md`. Picks are
+auto (lexical overlap + face/impact heuristics, no repeats, no
+text-only/credits, payoff guard). Used panels/beats are recorded in
+`video/intro_memory.json` and avoided next time unless a sentence is
+marked `[REUSE]`. The 30-second rule: target 30s, 20–45s configurable
+(`video.hook` in config or `--duration`); audio is never trimmed.
+
 ## 5. Shorts + end-screen
 
 ```bash
