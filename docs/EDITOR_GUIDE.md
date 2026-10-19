@@ -127,11 +127,14 @@ no-op, cuts stay exactly on their sentences.
 
 ## Crop / face safety (P1 + P2)
 
-- A face is never masked. Mask-risk bubbles (dominant bubble overlapping
-  the head) are never painted — and neither is ANY bubble overlapping
-  the face box, any size. Crops steer around unpainted bubbles;
-  if no clean crop exists, verify DROPs the panel with a re-pair
-  reason. See `CAPCUT_EDITS.md` (defect 3).
+- A face is never masked. Bubble painting was removed ENTIRELY:
+  `clean_bubbles()` returns the panel unchanged (pixel-identical) --
+  there is no flag to re-enable painting. Bubbles stay visible, so
+  crops steer around them (bubble scoring); a panel whose best crop
+  still shows a bubble is DROPPED and re-paired (the P1 mask-risk
+  rule, now applied to every bubble). Mask-risk bubbles (dominant
+  bubble overlapping the head) are dropped the same way. See
+  `CAPCUT_EDITS.md` (defect 3).
 - Crop QA checks every layout (single / pair / wide). A crop clean in
   single but not in pair is `layout_sensitive`; the planner auto-switches
   to the pair-safe shape (e.g. 4:3 → 3:4) and logs the switch in

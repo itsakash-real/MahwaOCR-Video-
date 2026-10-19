@@ -362,7 +362,8 @@ def _panel_maps(img: Image.Image, options: Dict[str, Any] | None = None) -> Dict
     m["edge_rows"] = edge_rows(m["gray_hi"], int(opts.get("white_threshold", 242)), int(opts.get("black_threshold", 13)))
     m["bubble_regions"] = bubble_regions(m)
     m["bubbles"] = [r["box"] for r in m["bubble_regions"]]
-    # Where clean_bubbles() painted: flat patches the crop should avoid if it can.
+    # Bubble painting was removed entirely (clean_bubbles() is a no-op),
+    # so this is always empty. Kept so the scoring shape stays stable.
     m["painted"] = list(getattr(img, "painted_boxes", []))
     return m
 
@@ -684,7 +685,7 @@ def _full_width_boxes(aspect: float, pa: float, fe, fb, minw: float, allow_pad: 
         vertical(1.0, 1.0 / r, [0.0], 0.0)
         ah, bh = 1.0 - et - eb, 1.0 / r
         if allow_pad and et + eb >= 0.02 and ah >= 0.2 and ah < bh <= PAD_MAX:
-            # White rows (a gutter, or a painted-out bubble) sit on the panel's edge: show only the
+            # White rows (a gutter, or a bubble the crop must exclude) sit on the panel's edge: show only the
             # art, full width, and pad the rest of the shape with the blurred panel instead of white.
             out.append((0.0, et, 1.0, 1.0 - eb, ART_PAD_COST * (bh - ah), (bh - ah) / 2))
         for bw in sorted({0.95, minw}, reverse=True):
@@ -839,9 +840,10 @@ def choose_shape(img: Image.Image, shapes: List[float],
 
 # --- P1: shouting-face + dominant-bubble mask risk -------------------------
 # Observed in real chapters (Ch2 P018-04 / P020-04): when a DOMINANT speech
-# bubble overlaps a shouting face, painting the bubble out leaves a flat
+# bubble overlaps a shouting face, painting the bubble out would leave a flat
 # grey oval sitting on the face in the final render. The fix is never to
-# paint over a face: crops must steer around such bubbles, and when no
+# paint over a face (painting is removed entirely: nothing is ever painted).
+# Crops must steer around such bubbles, and when no
 # clean crop exists the panel is DROPPED (verify.py) and its time is
 # re-paired to a neighbour, instead of masking the face in render.
 DOMINANT_BUBBLE_AREA = 0.12    # bubble box >= 12% of the panel: dominant
@@ -861,7 +863,7 @@ def bubble_overlaps_face(box: Box, face: Tuple[float, float] | None) -> bool:
     """True when a bubble box overlaps the face's vertical range (any size).
 
     The face box is (top, bottom) panel fractions from head_vertical_range.
-    Any vertical overlap counts: painting even a small bubble that touches
+    Any vertical overlap counts: even a small bubble that touches
     the head range leaves a flat patch on/near the face.
     """
     if face is None:
@@ -874,7 +876,8 @@ def face_bubble_boxes(maps: Dict[str, Any]) -> List[Box]:
     """Bubble boxes overlapping the detected head's vertical range.
 
     Dominant ones are the mask-risk set (see mask_risk_bubbles); smaller
-    ones are still never painted -- the crop must exclude them, or the
+    ones are the mask-risk set (see mask_risk_bubbles). Nothing is ever
+    painted now: the crop must exclude them, or the
     panel is dropped (verify.py).
     """
     face = head_vertical_range(maps)
@@ -885,13 +888,14 @@ def face_bubble_boxes(maps: Dict[str, Any]) -> List[Box]:
 
 
 def mask_risk_bubbles(maps: Dict[str, Any]) -> List[Box]:
-    """Bubble boxes that would mask a face if painted out.
+    """Bubble boxes that would have masked a face if painted out.
 
     A bubble is mask-risk when it is DOMINANT and its box overlaps the
     detected head's vertical range. Dominant = large in area or width.
     Shouting (open mouth) cannot be detected reliably from pixels, so the
     rule is deliberately conservative: any dominant bubble overlapping
-    the head range counts. Painting it would put a flat patch on the face.
+    the head range counts. Painting is removed entirely (see clean_bubbles),
+    so these panels are dropped instead of shown (verify.py).
     """
     out: List[Box] = []
     for box in face_bubble_boxes(maps):
@@ -904,13 +908,16 @@ def mask_risk_bubbles(maps: Dict[str, Any]) -> List[Box]:
 
 
 def is_mask_risk(maps: Dict[str, Any]) -> bool:
-    """True when painting this panel's bubbles would mask a face."""
+    """True when this panel's bubbles would have masked a face if painted (painting removed)."""
     return bool(mask_risk_bubbles(maps))
 
 
 def patch_visibility(img: Image.Image, painted_boxes: List[Box]) -> float:
-    """How visible the painted-bubble patches are in a cleaned panel, 0..1.
+    """How visible painted-bubble patches are in a panel, 0..1.
 
+    Kept as the measurement for any legacy painted input. Nothing paints
+    any more (clean_bubbles() is a no-op), so in practice this always sees
+    an empty list and returns 0.0.
     A painted patch is a FLAT fill (one median colour) sitting in art that
     usually has texture. For each painted box, compares texture (grey
     standard deviation) inside the box with texture in the ring just
@@ -945,58 +952,21 @@ def patch_visibility(img: Image.Image, painted_boxes: List[Box]) -> float:
 
 
 def clean_bubbles(img: Image.Image, maps: Dict[str, Any] | None = None) -> Image.Image:
-    """The panel with its speech bubbles and caption boxes painted out.
+    """Return the panel UNCHANGED -- bubble painting was removed entirely.
 
-    The recap's narration carries the story (manhwa_recap_style_spec.md), so no
-    dialogue is left on screen. Each detected bubble is covered by an ellipse
-    (a rectangle for a caption box) slightly larger than the bubble, filled
-    with the median colour of the art just around it and feathered into the
-    picture. A bubble's own outline, text and most of its tail are inside it.
-    Works only on the area around each bubble, so it stays fast.
+    Painting bubbles out harmed more than it helped: the median-colour
+    fill could land on a character face (a grey / peach / white patch),
+    and no feathering fixed that reliably. So nothing is painted any
+    more: bubbles stay visible in the panel, crops steer around them
+    (bubble scoring in shape_candidates), and a panel with no clean
+    crop -- its best window still shows a bubble -- is DROPPED by
+    verify.py and re-paired instead of being painted. That is the P1
+    mask-risk rule, now applied to every bubble that would have been
+    painted.
 
-    P1 + CapCut bugfix: a bubble overlapping the face box (face_bubble_boxes) is
-    NEVER painted -- not just dominant mask-risk ones. It stays as a bubble
-    the crop must steer around; when no clean crop exists, verify.py drops
-    the panel instead of masking it. The feather is wide (blur 6) so painted
-    patches blend instead of reading as visible discs (see patch_visibility).
+    Kept as a no-op for call-site compatibility (panels.panel_image
+    still calls it with clean=True): it returns the same image object,
+    pixel-identical, with no painted_boxes set. `maps` is accepted and
+    ignored. There is no flag to re-enable painting -- do not add one.
     """
-    from PIL import ImageDraw, ImageFilter
-
-    m = maps or _panel_maps(img)
-    if not m["bubble_regions"]:
-        return img
-    # P1 + CapCut bugfix (defect 3): NEVER paint a bubble that overlaps the
-    # face box -- not just dominant (mask-risk) ones. Painting even a small
-    # bubble over the head range leaves a flat patch on/near the face.
-    # Unpainted bubbles stay as bubbles the crop must steer around; when no
-    # clean crop exists, verify.py drops the panel instead of masking it.
-    # `painted` lists only the bubbles actually painted, so crops steer around
-    # the unpainted face-overlapping bubbles as bubbles, not as painted patches.
-    unpaintable = set(face_bubble_boxes(m))
-    paint_regions = [r for r in m["bubble_regions"] if r["box"] not in unpaintable]
-    painted = [r["box"] for r in paint_regions]
-    out = img.convert("RGB")
-    W, H = out.size
-    for r in paint_regions:
-        x0, y0, x1, y1 = r["box"]
-        bx0, by0, bx1, by1 = x0 * W, y0 * H, x1 * W, y1 * H
-        grow = 0.04 * max(bx1 - bx0, by1 - by0)
-        ring_w = 14
-        pad = int(grow + ring_w + 6)
-        cx0, cy0 = max(0, int(bx0) - pad), max(0, int(by0) - pad)
-        cx1, cy1 = min(W, int(bx1) + pad), min(H, int(by1) + pad)
-        local = out.crop((cx0, cy0, cx1, cy1))
-        mask = Image.new("L", local.size, 0)
-        shape = (bx0 - grow - cx0, by0 - grow - cy0, bx1 + grow - cx0, by1 + grow - cy0)
-        d = ImageDraw.Draw(mask)
-        d.rectangle(shape, fill=255) if r["fill"] >= 0.82 else d.ellipse(shape, fill=255)
-        grown = mask.filter(ImageFilter.MaxFilter(ring_w + 1 if ring_w % 2 == 0 else ring_w))
-        ring = np.asarray(grown, dtype=bool) & ~np.asarray(mask, dtype=bool)
-        if not ring.any():
-            continue
-        fill = np.median(np.asarray(local, dtype=np.float32)[ring], axis=0)
-        alpha = mask.filter(ImageFilter.GaussianBlur(6))  # P1: wide feather, no hard disc edge
-        patched = Image.composite(Image.new("RGB", local.size, tuple(int(v) for v in fill)), local, alpha)
-        out.paste(patched, (cx0, cy0))
-    out.painted_boxes = painted         # read by _panel_maps so crops can steer clear
-    return out
+    return img

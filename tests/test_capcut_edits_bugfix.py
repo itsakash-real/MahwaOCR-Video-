@@ -2,8 +2,8 @@
 
 Covers: long shots never freeze, no same-panel split without a crop
 change, frame-exact joins, no motion repeat / pan swap-repeat, pair_move
-once per pair, no painted patch over a face, mask-risk panels dropped
-not painted, transitions frame-exact with no flicker, captions (3-5
+once per pair, bubble painting removed (panel returned unchanged),
+bubble panels with no clean crop dropped, transitions frame-exact
 words, key word yellow, bottom band), beat sync (cut moved <= 0.15s),
 SFX/music missing-dir fallback.
 """
@@ -219,24 +219,37 @@ def _face_maps(face_bubble, other_bubble):
     return {"bubble_regions": regions, "face_override": (0.15, 0.45)}
 
 
-def test_clean_bubbles_never_paints_face_bubble():
+def test_clean_bubbles_returns_panel_unchanged_even_with_face_bubble():
+    # Bubble painting removed entirely: even a bubble overlapping the
+    # face box is returned pixel-identical -- no painted patch can ever
+    # land on a face again. The crop/drop path deals with it instead.
+    import numpy as np
+
     img = Image.new("RGB", (300, 400), (120, 90, 70))
     # Small (non-dominant) bubble overlapping the face range + one clear of it.
     maps = _face_maps((0.1, 0.2, 0.3, 0.4), (0.1, 0.6, 0.4, 0.9))
     assert not is_mask_risk(maps)  # small bubble: not mask-risk, but still on the face
     assert face_bubble_boxes(maps) == [(0.1, 0.2, 0.3, 0.4)]
+    before = np.asarray(img.convert("RGB"), dtype=int).copy()
     out = clean_bubbles(img, maps)
+    assert out is img
+    assert (np.asarray(out, dtype=int) == before).all()  # pixel-identical
     painted = list(getattr(out, "painted_boxes", []))
-    assert painted == [(0.1, 0.6, 0.4, 0.9)]  # only the non-face bubble painted
+    assert painted == []  # no painted patch anywhere, let alone on a face
     for box in painted:
-        assert not bubble_overlaps_face(box, (0.15, 0.45))  # no painted patch on a face
+        assert not bubble_overlaps_face(box, (0.15, 0.45))
 
 
 def test_mask_risk_bubble_never_painted():
+    import numpy as np
+
     img = Image.new("RGB", (300, 400), (120, 90, 70))
     maps = _face_maps((0.05, 0.1, 0.6, 0.5), None)  # dominant bubble over the face
     assert is_mask_risk(maps)
+    before = np.asarray(img.convert("RGB"), dtype=int).copy()
     out = clean_bubbles(img, maps)
+    assert out is img
+    assert (np.asarray(out, dtype=int) == before).all()  # pixel-identical
     assert list(getattr(out, "painted_boxes", [])) == []
 
 
@@ -260,6 +273,30 @@ def test_mask_risk_panel_dropped_not_painted(monkeypatch):
     assert report["panels"]["P001-01"]["action"] == "dropped"
     assert report["dropped"][0]["panel"] == "P001-01"
     assert "mask" in report["dropped"][0]["reason"]
+
+
+def test_bubble_panel_with_no_clean_crop_dropped_not_painted(monkeypatch):
+    # Painting removed: a panel whose best crop still shows an ordinary
+    # (non-mask-risk) bubble is dropped and re-paired, not painted.
+    def fake_maps(img, options=None):
+        return {"_head": {"top": 0.1, "bottom": 0.4, "source": "skin", "confident": True,
+                          "figure": True, "keep_top": None},
+                "bubble_regions": [{"box": (0.2, 0.1, 0.8, 0.4), "fill": 0.9}],
+                "painted": [], "edge_rows": (0.0, 0.0)}
+
+    def fake_pick(img, shapes, m=None):
+        return {"shape": 0.75, "box": (0.0, 0.0, 1.0, 1.0), "pad_y": 0.0,
+                "problems": ["lettering"], "clean": False}
+
+    monkeypatch.setattr(verify_mod, "_panel_maps", fake_maps)
+    monkeypatch.setattr(verify_mod, "is_mask_risk", lambda maps: False)
+    monkeypatch.setattr(verify_mod, "pick_card", fake_pick)
+    panels = [{"id": "P001-01", "width": 300, "height": 400, "text": ""}]
+    report = verify_mod.verify_chapter(panels, lambda p: Image.new("RGB", (300, 400)),
+                                       [0.75], root=None, chapter=None, log=lambda *a: None)
+    assert report["panels"]["P001-01"]["action"] == "dropped"
+    assert report["dropped"][0]["panel"] == "P001-01"
+    assert "re-pair" in report["dropped"][0]["reason"]
 
 
 # ------------------------------------------------------------------ transitions

@@ -347,21 +347,26 @@ def _clean_cache_dir(root: Path, chapter: str) -> Path:
 def _clean_cache_key(fingerprint: str, panel: Panel, norm_w: int) -> str:
     geo = {"id": panel.id, "x0": panel.x0, "x1": panel.x1, "y0": panel.y0, "y1": panel.y1,
            "segments": [dict(s) for s in panel.segments]}
-    raw = json.dumps({"fp": fingerprint, "nw": norm_w, "panel": geo}, sort_keys=True, default=str)
+    # v2: bubble painting was removed entirely. v1 cache entries contain
+    # PAINTED panels and must never be served again; the version in the
+    # key makes old entries unreachable (they stay on disk, unused).
+    raw = json.dumps({"v": 2, "fp": fingerprint, "nw": norm_w, "panel": geo}, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
 def panel_image(root: Path, chapter: str, panel: Dict[str, Any] | Panel, norm_w: int | None = None,
                 clean: bool = False, fingerprint: str | None = None) -> Image.Image:
-    """Crop one panel from the kept pages, side margins trimmed. clean=True also
-    paints out its speech bubbles: that is the picture the video shows."""
+    """Crop one panel from the kept pages, side margins trimmed. clean=True
+    shows the panel unpainted: bubble painting was removed entirely,
+    so clean=True is a no-op kept for call-site compatibility (bubbles
+    are avoided by crops, or the panel is dropped)."""
     if isinstance(panel, dict):
         panel = Panel(**{k: panel[k] for k in ("id", "index", "y0", "y1", "x0", "x1", "segments")})
-    # Cleaned-panel disk cache: stitching + bubble-cleaning (which itself runs
-    # _panel_maps) is paid once per panel per fingerprint, not once per caller
-    # (verify, designer, storyboard, render workers). The sidecar preserves
-    # `painted_boxes`, the attribute _panel_maps reads to steer crops away
-    # from painted patches -- a bare PNG would lose it.
+    # Cleaned-panel disk cache: stitching is paid once per panel per
+    # fingerprint, not once per caller (verify, designer, storyboard,
+    # render workers). Bubble painting was removed, so "cleaned" now
+    # means the unpainted panel; the sidecar preserves `painted_boxes`
+    # (always empty) for shape compatibility.
     cache_key = cache_png = cache_sidecar = None
     if clean and fingerprint and norm_w is not None:
         cache_key = _clean_cache_key(fingerprint, panel, norm_w)

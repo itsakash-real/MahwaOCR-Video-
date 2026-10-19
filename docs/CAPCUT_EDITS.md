@@ -56,22 +56,29 @@ Fixes:
 ### 3. Cuts faces + paints colour on faces
 
 Root causes: crops could cut faces at edges; `clean_bubbles()` painted
-every bubble except dominant mask-risk ones, so a smaller bubble
-overlapping the head range still became a flat patch on/near the face.
+ellipses/rectangles over bubbles, and the median-colour fill could land
+on a character face as a flat grey / peach / white patch.
 
-Fixes (P1 rule now applies to chapter videos, in the chapter
-verify/build path — it already did; this closes the remaining gap):
-- `crops.bubble_overlaps_face()` + `crops.face_bubble_boxes()`: a bubble
-  is face-overlapping when it overlaps the head's vertical range.
-- `clean_bubbles()` paints ONLY bubbles that do NOT overlap the face
-  box — any size, not just dominant ones. Face-overlapping bubbles stay
-  as bubbles the crop must steer around; when no clean crop exists,
-  `verify.py` DROPs the panel and its time is re-paired, instead of
-  masking the face.
-- `verify.pick_card()` adds the `face_bubble` problem, so crop choice
-  prefers windows with `head_ok` that avoid face-overlapping bubbles,
-  alongside the existing layout-sensitive QA
+Fix: bubble painting was REMOVED ENTIRELY. `clean_bubbles()` is now a
+no-op that returns the panel unchanged (pixel-identical) -- there is no
+flag to re-enable painting, and no painted patch can ever land on a
+face again. Bubble DETECTION stays (`bubble_regions` / `bubble_boxes`),
+because crop scoring, drop decisions and QA still need it.
+
+What happens to a panel with a bubble now:
+- Crop to exclude the bubble, if a clean crop exists. `verify.pick_card()`
+  adds the `face_bubble` problem and crop choice prefers windows with
+  `head_ok` that avoid face-overlapping bubbles (`bubble_overlaps_face()`
+  / `face_bubble_boxes()`), alongside the existing layout-sensitive QA
   (`layout_crop_problems`, pair-safe auto-switch).
+- Else DROP the panel and re-pair its time to a neighbour. That is the
+  P1 mask-risk rule, now applied to EVERY bubble that would have been
+  painted -- not just dominant ones over a head. `verify.py` drops a
+  panel whose best crop still shows a bubble (`lettering` /
+  `face_bubble` problem); head-cut-only panels still go to
+  "needs eyes", not to dropped.
+- Stale cache: the cleaned-panel disk cache key is versioned (v2), so
+  old cache entries that contain painted panels are never served again.
 
 ## CapCut-style edits added
 
@@ -191,14 +198,16 @@ art. The blurred + darkened + vignetted background is unchanged.
   real beats would move cuts for no reason.
 - **Face beautification / skin smoothing / colour pops on faces.**
   Anything that repaints pixels on a face risks the grey-oval defect
-  all over again. Grade is global and subtle; faces are never painted.
+  all over again -- which is why bubble painting was removed entirely.
+  Grade is global and subtle; faces are never painted.
 
 ## Tests
 
 `tests/test_capcut_edits_bugfix.py` covers: defect 1 (long shot no
 static freeze, no same-panel split without crop change, join frame
 counts exact), defect 2 (no motion repeat, no consecutive pans,
-pair_move once per pair), defect 3 (no painted patch overlaps face
-box, mask-risk panel dropped not painted), transitions (frame-exact,
+pair_move once per pair), defect 3 (bubble painting removed: panel
+returned pixel-identical, bubble panel with no clean crop dropped,
+no painted patch anywhere), transitions (frame-exact,
 no flicker), captions (3–5 words, key word yellow, bottom band),
 beat sync (cut moved ≤0.15s), SFX/music missing-dir fallback.

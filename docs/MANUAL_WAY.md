@@ -89,9 +89,10 @@ python -m manhwa_ocr video status --session "Your Series Name"
   Read its `fix` (e.g. install pywhispercpp) and fix it — never render on
   estimated timing. Render refuses estimated timing by design.
 - **Mask-risk:** a panel flagged `mask_risk` (shouting face + dominant
-  bubble) is DROPPED and re-paired, never masked with a grey oval. The
-  same holds for ANY bubble overlapping the face box: it is never
-  painted, the crop steers around it, or the panel is dropped.
+  bubble) is DROPPED and re-paired, never masked with a grey oval.
+  Bubble painting was removed entirely: no bubble is ever painted, the
+  crop steers around bubbles, and a panel with no bubble-free crop is
+  dropped and re-paired.
 - **Layout switches:** a `layout_switches` entry means the planner
   auto-switched a crop to the pair-safe shape (e.g. 4:3 → 3:4). No action
   needed; the switch is logged in the plan + QA.
