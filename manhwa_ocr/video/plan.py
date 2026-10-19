@@ -35,7 +35,7 @@ from ..util import UserError, atomic_write_text, read_agent_json, require_chapte
 from . import sync as sync_mod
 from .crops import _panel_maps, head_of, is_mask_risk, tone
 from .cropcache import crop_key, load_crop, store_crop
-from .verify import pick_card
+from .verify import find_pair_safe_shape, pick_card
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
 from .media import video_dir
 
@@ -387,14 +387,18 @@ class _Designer:
         self._crops: Dict[tuple, List[float]] = {}
         self._pads: Dict[tuple, float] = {}
         self._maps: Dict[str, Any] = {}
-        self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": [], "bubble": [],
+        self.crop_stats: Dict[str, List[Any]] = {"head_risk": [], "side_cut": [], "bubble": [],
                                                  "padded": [], "white_edge": [],
                                                  "low_confidence_heads": [],
                                                  # P1: panels with a dominant bubble overlapping
                                                  # the head range (mask risk). Informational:
                                                  # dropping happens in verify.py; here the
                                                  # clean crop (if one exists) already avoids it.
-                                                 "mask_risk": []}
+                                                 "mask_risk": [],
+                                                 # P2: crops the planner auto-switched to the
+                                                 # pair-safe shape (see crop()). Each entry:
+                                                 # {"panel", "from_shape", "to_shape", "reason"}.
+                                                 "layout_switches": []}
         self.map_options = map_options(vcfg)
         self._tone: Dict[str, str] = {}
         self.uses: Dict[str, int] = {}
@@ -422,12 +426,61 @@ class _Designer:
         self.crop(pid, layout)
         return self._pads.get((pid, layout), 0.0)
 
+    def _fixes_crop_for_layout(self, pid: str, layout: str, box: List[float]) -> List[float]:
+        """A reviewer's fixes.json crop is layout-blind: the same box is reused
+        in every layout. If its aspect is not an allowed shape for THIS layout
+        (Ch4: a 4:3 crop failing QA once the panel landed in a pair), P2
+        auto-switches to a clean crop in this layout's shapes when one exists
+        and records the switch. If no clean crop exists the reviewer's crop
+        stands (a human chose it) and QA keeps flagging the shape."""
+        _p = self.by_id[pid]
+        pw, ph = float(_p.get("width") or 1), float(_p.get("height") or 1)
+        w = (box[2] - box[0]) * pw
+        h = (box[3] - box[1]) * ph
+        if h <= 0:
+            return list(box)
+        aspect = w / h
+        allowed = shapes_for(layout, self.fmt)
+        if any(abs(math.log(aspect / a)) <= 0.02 for a in allowed):
+            return list(box)
+        if pid not in self._maps:
+            self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
+        card = pick_card(self.img(pid), list(allowed), self._maps[pid])
+        if not card["clean"]:
+            return list(box)
+        self.crop_stats["layout_switches"].append(
+            {"panel": pid, "layout": layout, "from_shape": "fixes.json",
+             "to_shape": float(card["shape"]), "box": list(card["box"]),
+             "reason": (f"fixes.json crop aspect {aspect:.3f} is not an allowed shape for {layout}; "
+                        f"auto-switched to the clean {card['shape']:.3f} crop")})
+        return list(card["box"])
+
+    def _pair_safe_switch(self, pid: str, layout: str, entry: Dict[str, Any] | None,
+                          ckey: str | None) -> Dict[str, Any] | None:
+        """P2 auto-switch for single/wide layouts (see verify.find_pair_safe_shape).
+        Cache-aware: a stored "layout_switch" is reused without loading the image;
+        a pre-P2 entry without the key is upgraded once."""
+        if layout not in ("single", "wide"):
+            return None
+        if entry is not None and "layout_switch" in entry:
+            return entry.get("layout_switch")
+        if pid not in self._maps:
+            self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
+        layout_shapes = {name: shapes_for(name, self.fmt) for name in ("single", "pair", "wide")}
+        switch = find_pair_safe_shape(self.img(pid), self._maps[pid], layout_shapes, layout)
+        if entry is not None and ckey is not None:
+            store_crop(self._root, self.chapter, ckey, {**entry, "layout_switch": switch})
+        return switch
+
     def crop(self, pid: str, layout: str) -> List[float]:
         """The card's crop: one exact shape from the layout's list (crops.py)."""
         key = (pid, layout)
         if key not in self._crops:
             if pid in self.fixes["crop"]:                  # a reviewer's exact crop (fixes.json)
                 shape, box = self.fixes["crop"][pid]
+                # P2: a fixes.json crop is layout-blind; switch it when its
+                # aspect is not allowed in this layout and a clean crop exists.
+                box = self._fixes_crop_for_layout(pid, layout, box)
                 self._crops[key] = list(box)
                 if box[2] - box[0] < 0.999 and pid not in self.crop_stats["side_cut"]:
                     self.crop_stats["side_cut"].append(pid)
@@ -473,6 +526,23 @@ class _Designer:
                     and pid not in self.crop_stats["low_confidence_heads"]:
                 self.crop_stats["low_confidence_heads"].append(pid)
             shape, box, probs = card["shape"], card["box"], card["problems"]
+            # P2 auto-switch: when single/wide and pair crops are both clean
+            # but different shapes, use the pair-safe (narrower) shape here
+            # too, so one crop passes QA in every layout. Recorded in
+            # crop_stats["layout_switches"] (surfaced in plan + QA, never silent).
+            switch = self._pair_safe_switch(pid, layout, entry, ckey)
+            if switch is not None and abs(float(switch["to_shape"]) - float(shape)) > 1e-9:
+                box = list(switch["box"])
+                probs = []
+                shape = float(switch["to_shape"])
+                card = {**card, "shape": shape, "box": box,
+                        "pad_y": float(switch.get("pad_y") or 0.0), "problems": []}
+                if not any(s.get("panel") == pid and s.get("layout") == layout
+                           for s in self.crop_stats["layout_switches"]):
+                    self.crop_stats["layout_switches"].append(
+                        {"panel": pid, "layout": layout,
+                         "from_shape": float(switch["from_shape"]), "to_shape": shape,
+                         "reason": switch.get("reason", "")})
             if ("mask_risk" in probs or (entry is not None and hit_risk)) \
                     and pid not in self.crop_stats["mask_risk"]:
                 self.crop_stats["mask_risk"].append(pid)
@@ -715,6 +785,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "sync_report": sync_report,
         "sync_settings": st,
         "alignment_review_queue": (alignment_meta or {}).get("review_queue"),
+        # P2: the P0 timing warnings ride with the plan, so status/QA/render
+        # all see the same whisper outcome — no silent estimated render.
+        "timing_warnings": list((alignment_meta or {}).get("timing_warnings") or []),
         "music": vcfg.get("music"),
         "music_volume": float(vcfg.get("music_volume", 0.22)),
         "effects_enabled": dict(vcfg.get("effects") or {}),

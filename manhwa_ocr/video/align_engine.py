@@ -270,7 +270,20 @@ def place_coverage(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]],
         lit = [k for k in near
                if float(segments[k]["end"]) - float(segments[k]["start"]) >= filler_full]
         pool = lit or near
-        k = min(pool, key=lambda k: (len(segments[k]["extra_panels"]), abs(order[segments[k]["selected_panel"]] - i)))
+        # P2: a filler is never parked beside a HOLD ({same}/internal/pure-audio)
+        # sentence when another host is available. The filler is often the
+        # panel the HOLD sentence hid (Ch2 sentence 60: {same} held the
+        # previous panel, coverage parked its panel next door, and it showed
+        # under the wrong words). validate()'s same_no_hidden_panel FAILs
+        # that case outright; this keeps the remaining, legitimate HOLDs
+        # from attracting fillers.
+        def _beside_hold(k: int) -> int:
+            for j in (k - 1, k + 1):
+                if 0 <= j < len(segments) and segments[j].get("display_action") == "HOLD_PREVIOUS":
+                    return 1
+            return 0
+        k = min(pool, key=lambda k: (_beside_hold(k), len(segments[k]["extra_panels"]),
+                                     abs(order[segments[k]["selected_panel"]] - i)))
         segments[k]["extra_panels"].append(pid)
         placed.append(pid)
     for seg in segments:

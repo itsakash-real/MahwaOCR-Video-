@@ -122,6 +122,11 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         # P1: mask-risk panels whose clean crop avoids the bubble (the
         # no-clean-crop ones were already dropped by verify.py).
         "mask_risk": cs.get("mask_risk", []),
+        # P2: auto-switched crops (from_shape -> to_shape) and the timing
+        # warnings that produced this plan — both surfaced in QA so a
+        # reviewer sees what the planner changed and why timing is estimated.
+        "layout_switches": cs.get("layout_switches", []),
+        "timing_warnings": list(plan.get("timing_warnings") or []),
         "review_queue": plan.get("alignment_review_queue") or [],
         "sync": plan.get("sync"),
     }
@@ -382,6 +387,10 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if report.get("mask_risk"):
         log(f"  ! {len(report['mask_risk'])} panel(s) with a dominant bubble over the head range "
             f"(mask risk): {', '.join(report['mask_risk'][:12])}")
+    if report.get("layout_switches"):
+        log(f"  chapter {chapter}: {len(report['layout_switches'])} crop(s) will auto-switch to the pair-safe shape: "
+            + ", ".join(f"{pid} {sw.get('from_shape'):g}->{sw.get('to_shape'):g}"
+                        for pid, sw in sorted(report["layout_switches"].items())[:12]))
     if report.get("layout_sensitive"):
         log(f"  ! {len(report['layout_sensitive'])} panel(s) clean in a single shot but not in a pair "
             f"(layout-sensitive crop): {', '.join(report['layout_sensitive'][:12])}")
@@ -415,7 +424,10 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         units = _replace_dropped(units_from_alignment(alignment["segments"]), drop)
         align_cov = alignment.get("coverage")
         queue = alignment.get("review_queue") or []
-        meta = {"sync_mode": alignment.get("sync_mode"), "review_queue": queue}
+        # P2: timing warnings ride with the plan (see build_plan), so status/QA/render
+        # all report the same whisper outcome.
+        meta = {"sync_mode": alignment.get("sync_mode"), "review_queue": queue,
+                "timing_warnings": list(alignment.get("timing_warnings") or [])}
         mode_note = (f"{len(alignment['segments'])} sentences from the alignment engine "
                     f"({alignment.get('sync_mode', '?')} timing, {len(queue)} flagged for review)")
 
@@ -446,6 +458,14 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if qa["review_queue"]:
         log(f"    ! {len(qa['review_queue'])} sentence(s) flagged for review (non-blocking; "
             f"see video/chapter_{chapter}.qa.json)")
+    # P2: no silent change — every auto-switch and every timing warning is
+    # logged with its fix, and both ride in the QA file for the reviewer.
+    if qa.get("layout_switches"):
+        log("    layout auto-switches (pair-safe shape): " + "; ".join(
+            f"{sw.get('panel')} {sw.get('from_shape'):g}->{sw.get('to_shape'):g}"
+            for sw in qa["layout_switches"][:12]))
+    for w in qa.get("timing_warnings") or []:
+        log(f"    ! timing: {w.get('code')}: {w.get('message')} Fix: {w.get('fix')}")
     if storyboard:
         write_storyboard(root, chapter, plan, log=log)
         write_review_task(root, chapter, plan, sess.slug)
@@ -468,12 +488,24 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
                 f"Chapter {chapter} video has not been reviewed yet (require_review is on in manhwa-ocr.yaml).\n"
                 f'Review it first:  video review --chapter {chapter} --session "{sess.slug}"\n'
                 f"or check the storyboard yourself and run:  video approve --chapter {chapter}")
+    # P2: the estimated-timing refusal names the exact whisper failure and
+    # its fix (from the P0 timing warnings), not just "whisper couldn't".
+    timing_warnings = list(plan.get("timing_warnings") or [])
+    if not timing_warnings:
+        try:
+            _align_data = json.loads(align_engine.alignment_path(root, chapter).read_text(encoding="utf-8"))
+            timing_warnings = list(_align_data.get("timing_warnings") or [])
+        except (OSError, ValueError):
+            timing_warnings = []
+    timing_detail = "".join(
+        f"\n  - {w.get('code')}: {w.get('message')} Fix: {w.get('fix')}" for w in timing_warnings)
     if plan.get("sync") == "estimated" and not allow_estimated:
         raise UserError(
             f"Chapter {chapter}'s timing was only estimated from text length, not synced to the real "
             f"narration (whisper couldn't transcribe it) — the pictures will drift out of sync with the voice.\n"
             f"Fix the sync first: lower `whisper_model` in manhwa-ocr.yaml (e.g. to base.en or tiny.en if your "
             f"machine is low on RAM), then rebuild the plan:  video plan --chapter {chapter} --force\n"
+            f"Why the timing is estimated:{timing_detail or '  (no detail recorded — re-run video align to capture it)'}\n"
             f"To render with the estimated timing anyway, pass --force to render.")
     if plan.get("sync") == "synced":
         # The sync gate: the audit samples the plan against the narration and
@@ -494,8 +526,20 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
             if (isinstance(cached, dict) and isinstance(cached.get("gate"), dict)
                     and isinstance(cached.get("wrong_picture"), dict)
                     and "ratio" in cached["wrong_picture"]):
-                report = cached
-                log("  sync gate: using the existing audit (plan unchanged since it ran)")
+                # P2: a cached audit is only reused when it was computed
+                # under the CURRENT sync settings, and its gate is
+                # re-evaluated from its own numbers through the same code
+                # path as audit() (syncaudit.gate_from_report) — a cached
+                # PASS under looser settings never sneaks past a stricter
+                # config, and the two gate paths cannot drift apart.
+                _st = sync_mod.effective_settings(cfg.video, log=lambda _m: None)
+                if cached.get("settings") != _st:
+                    report = None
+                else:
+                    cached["gate"] = syncaudit.gate_from_report(cached, _st)
+                    report = cached
+                if report is not None:
+                    log("  sync gate: using the existing audit (plan unchanged since it ran)")
         if report is None:
             report = syncaudit.make_report(root, chapter, cfg, log=log)
         gate = report["gate"]
@@ -547,7 +591,12 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
             continue
         try:
             if cues_mod.load_cues_strict(sess.path, chapter):
-                align_engine.build_alignment(sess.path, chapter, cfg, sync=sync, log=log)
+                _align_result = align_engine.build_alignment(sess.path, chapter, cfg, sync=sync, log=log)
+                # P2: timing warnings are action, not trivia — log each with
+                # its fix here (align), in the plan/QA (make_plan), and in
+                # the render refusal, so estimated timing is never silent.
+                for _w in (_align_result or {}).get("timing_warnings") or []:
+                    log(f"  ! timing: {_w.get('code')}: {_w.get('message')} Fix: {_w.get('fix')}")
             make_plan(sess, chapter, cfg, force=force, sync=sync, fmt=fmt, log=log, storyboard=storyboard)
             out = output_path(sess.path, chapter, preview)
             pf = plan_path(sess.path, chapter)

@@ -95,6 +95,7 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
         "no_outside_interval_display": "PASS",
         "no_gaps_or_overlaps": "PASS",
         "non_visual_no_panel_change": "PASS",
+        "same_no_hidden_panel": "PASS",
         "duration_matches_narration": "PASS",
     }
     problems: List[Dict[str, Any]] = []
@@ -125,6 +126,33 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
                 fail("non_visual_no_panel_change", n,
                     f"{seg.get('narration_type')} segment must hold the previous panel, "
                     f"got display_action={seg.get('display_action')!r} selected_panel={pid!r}")
+
+        # P2 — the {same} trap (Ch2 sentence 60): a {same} sentence holds the
+        # previous panel, so its own panel never displays; the story then
+        # jumps over panels that coverage places as gap fillers into a
+        # neighbouring sentence, where they show under the wrong words and
+        # fail the sync gate. INTERNAL/PURE_AUDIO are narrator asides and
+        # may legitimately sit across a jump; {same} claims "same panel as
+        # before", so a jump across it means the tag is wrong. FAIL here,
+        # at align time, instead of a late sync-gate failure: remove {same}
+        # and tag the sentence with the panel it is really about.
+        if seg.get("narration_type") == "SAME" and is_hold and last_pos >= 0:
+            next_pos = None
+            next_pid = None
+            for j in range(i + 1, len(segments)):
+                cand = segments[j].get("selected_panel")
+                if cand is not None and cand in panel_order:
+                    next_pos, next_pid = panel_order[cand], cand
+                    break
+            if next_pos is not None and next_pos - last_pos > 1:
+                skipped = [ids_by_pos[p] for p in range(last_pos + 1, next_pos) if p in ids_by_pos][:4]
+                prev_pid = ids_by_pos.get(last_pos)
+                fail("same_no_hidden_panel", n,
+                     f"{{same}} holds {prev_pid} while the story jumps to {next_pid}, "
+                     f"skipping {', '.join(skipped)}: if this sentence is about a skipped panel, "
+                     f"remove {{same}} and tag it with that panel — otherwise coverage places a "
+                     f"skipped panel as filler into a neighbouring sentence and fails the sync gate "
+                     f"(Ch2 sentence 60).")
 
         if pid is not None and pid in panel_order:
             pos = panel_order[pid]

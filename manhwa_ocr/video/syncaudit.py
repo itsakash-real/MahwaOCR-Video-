@@ -164,6 +164,45 @@ def _window_record(samples: List[Dict[str, Any]], i: int, j: int, segments: List
             "cut_offset": None if offset is None else round(offset, 3), "cause": cause}
 
 
+def evaluate_gate(wrong: Dict[str, Any], over: List[Dict[str, Any]], late: List[Dict[str, Any]],
+                    st: Dict[str, Any]) -> List[str]:
+    """The ONE gate decision (P2). audit() computes the numbers and calls this;
+    render_chapter re-evaluates a cached report through gate_from_report, which
+    calls this with the same code path — the two gates cannot drift apart.
+
+    `wrong` is the wrong_picture dict (ratio/seconds), `over` the five-second
+    windows over gate_window in settled time, `late` the late cuts, `st` the
+    merged effective sync settings. Returns the failure strings (empty = PASS).
+    """
+    failures: List[str] = []
+    if float(wrong.get("ratio") or 0.0) > st["gate_wrong"] + 1e-9:
+        failures.append(f"wrong-picture time {float(wrong.get('seconds') or 0.0):.1f}s "
+                        f"({float(wrong.get('ratio') or 0.0):.1%} of judged) "
+                        f"is over {st['gate_wrong']:.0%}")
+    if over:
+        worst_window = max(over, key=lambda w: w["wrong"])
+        failures.append(f"{len(over)} five-second window(s) over {st['gate_window']:.0%} wrong-picture "
+                        f"in settled time (worst {worst_window['wrong']:.0%} at {_mmss(worst_window['start'])})")
+    if late:
+        worst_late = max(late, key=lambda x: x["offset"])
+        failures.append(f"{len(late)} cut(s) more than {st['max_late'] + st['gate_grace']:.1f}s after their "
+                        f"sentence starts (worst {worst_late['offset']:.1f}s, sentence {worst_late['sentence']})")
+    return failures
+
+
+def gate_from_report(report: Dict[str, Any], st: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Re-evaluate the gate from a report's own numbers (wrong_picture,
+    five_second.over_gate, late_cuts) through evaluate_gate. Used by render to
+    re-check a cached audit with the CURRENT settings — a PASS stored under
+    looser settings never sneaks past a stricter config. Returns a gate dict
+    with the same shape audit() stores: {"pass", "failures"}."""
+    settings = st if st is not None else (report.get("settings") or {})
+    failures = evaluate_gate(report.get("wrong_picture") or {},
+                             (report.get("five_second") or {}).get("over_gate") or [],
+                             report.get("late_cuts") or [], settings)
+    return {"pass": not failures, "failures": failures}
+
+
 def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str, Any]], *,
           audio: Dict[str, Any] | None = None, timeline: Dict[str, Any] | None = None,
           settings: Dict[str, float] | None = None, text_only: Iterable[str] = ()) -> Dict[str, Any]:
@@ -314,17 +353,9 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         t += SAMPLE_STEP
     worst_window = max(over, key=lambda w: w["wrong"]) if over else None
 
-    failures: List[str] = []
-    if wrong["ratio"] > st["gate_wrong"] + 1e-9:
-        failures.append(f"wrong-picture time {wrong['seconds']:.1f}s ({wrong['ratio']:.1%} of judged) "
-                        f"is over {st['gate_wrong']:.0%}")
-    if over and worst_window:
-        failures.append(f"{len(over)} five-second window(s) over {st['gate_window']:.0%} wrong-picture "
-                        f"in settled time (worst {worst_window['wrong']:.0%} at {_mmss(worst_window['start'])})")
-    if late:
-        worst_late = max(late, key=lambda x: x["offset"])
-        failures.append(f"{len(late)} cut(s) more than {st['max_late'] + st['gate_grace']:.1f}s after their "
-                        f"sentence starts (worst {worst_late['offset']:.1f}s, sentence {worst_late['sentence']})")
+    # P2: the gate decision lives in evaluate_gate() — audit() and the render
+    # gate (gate_from_report) share it, so the two gates cannot drift apart.
+    failures = evaluate_gate(wrong, over, late, st)
 
     # Interpolated sentences, grouped into runs.
     runs: List[Dict[str, Any]] = []

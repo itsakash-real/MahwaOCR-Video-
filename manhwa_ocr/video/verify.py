@@ -116,6 +116,42 @@ def layout_crop_problems(img: Image.Image, maps: Dict[str, Any] | None,
     return out
 
 
+def find_pair_safe_shape(img: Image.Image, maps: Dict[str, Any] | None,
+                           layout_shapes: Dict[str, List[float]] | None,
+                           layout: str = "single") -> Dict[str, Any] | None:
+    """The auto-switch for a panel whose single/wide crop and pair crop are both
+    clean but different shapes (P2).
+
+    P1 only flagged layout-sensitive crops (clean in single, problems in pair).
+    The remaining gap was consistency: the planner picked one crop per layout,
+    so the same panel could show a 4:3 crop in a single shot and a 3:4 crop in
+    a pair shot, and verify/QA judged a different crop than the one rendered
+    (Ch4: a 4:3 crop passing in a single shot failed once the panel landed in
+    a pair — fixed by hand by switching to 3:4). When BOTH layouts have a
+    clean crop but disagree on shape, the planner now uses the pair-safe
+    (narrower) shape everywhere, so one crop passes QA in every layout.
+
+    Returns {"from_shape", "to_shape", "box", "pad_y", "reason"} or None when
+    no switch applies (either layout has no clean crop — that stays a
+    reviewer decision, never a silent switch to a problematic crop — or the
+    shapes already agree). `maps` may be None (computed here).
+    """
+    if not layout_shapes or layout not in layout_shapes or "pair" not in layout_shapes:
+        return None
+    m = maps or _panel_maps(img)
+    main = pick_card(img, list(layout_shapes[layout]), m)
+    pair = pick_card(img, list(layout_shapes["pair"]), m)
+    if not main["clean"] or not pair["clean"]:
+        return None
+    if abs(float(main["shape"]) - float(pair["shape"])) < 1e-9:
+        return None
+    return {"from_shape": float(main["shape"]), "to_shape": float(pair["shape"]),
+            "box": list(pair["box"]), "pad_y": float(pair.get("pad_y") or 0.0),
+            "reason": (f"{layout} crop {main['shape']:.3f} and pair crop {pair['shape']:.3f} "
+                       f"are both clean; using the pair-safe {pair['shape']:.3f} everywhere "
+                       f"so one crop passes QA in every layout (Ch4: 4:3 failing in a pair -> 3:4)")}
+
+
 def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, Any]], Image.Image],
                    shapes: List[float], root: Path | None = None, chapter: str | None = None,
                    log: Callable = print, options: Dict[str, Any] | None = None,
@@ -131,6 +167,7 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
     mask_risk: List[str] = []
     layout_sensitive: List[str] = []
     layout_problems: Dict[str, Dict[str, List[str]]] = {}
+    layout_switches: Dict[str, Dict[str, Any]] = {}
     visible_patches: List[Dict[str, Any]] = []
     for p in panels:
         if p.get("text_only"):
@@ -141,6 +178,7 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
         cached_risk = None
         panel_layout_problems: Dict[str, List[str]] = {}
         panel_patch = 0.0
+        panel_switch: Dict[str, Any] | None = None
         if root is not None and chapter is not None and fingerprint:
             ckey = crop_key(fingerprint, p, shapes, options, None)
             cached = load_crop(root, chapter, ckey)
@@ -151,6 +189,10 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
                 # then re-stored with the flag) so drop decisions stay
                 # stable across cached runs.
                 cached_risk = cached.get("mask_risk")
+                # P2: cache entries written before P2 lack "layout_switch";
+                # missing key means "unknown", recomputed below on the
+                # fresh path only when the image is already being loaded.
+                panel_switch = cached.get("layout_switch")
         if card is None or cached_risk is None:
             img = image_for(p)
             maps = _panel_maps(img, options)
@@ -160,11 +202,14 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             cached_risk = bool(is_mask_risk(maps))
             if layout_shapes is not None:
                 panel_layout_problems = layout_crop_problems(img, maps, layout_shapes)
+                # P2: the planner applies this switch (pair-safe shape);
+                # verify reports it so the reviewer sees what will change.
+                panel_switch = find_pair_safe_shape(img, maps, layout_shapes)
             panel_patch = patch_visibility(img, list(maps.get("painted") or []))
             if ckey is not None:
                 store_crop(root, chapter, ckey,
                            {"pick": card, "head": head, "edge_rows": list(maps["edge_rows"]),
-                            "mask_risk": cached_risk})
+                            "mask_risk": cached_risk, "layout_switch": panel_switch})
         shape, box, probs, clean = card["shape"], card["box"], card["problems"], card["clean"]
         figure = bool(head["figure"])           # skin colour, or a pale/gray head blob
         if not head["confident"] and (head["source"] == "pale" or head["keep_top"]):
@@ -182,6 +227,8 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             pair_probs = panel_layout_problems.get("pair")
             if pair_probs is not None and not single_probs and pair_probs:
                 layout_sensitive.append(p["id"])
+        if panel_switch is not None:
+            layout_switches[p["id"]] = panel_switch
         if panel_patch > PATCH_VISIBLE:
             visible_patches.append({"panel": p["id"], "visibility": panel_patch})
         if clean:
@@ -215,7 +262,8 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
               # layout-sensitive crops (clean in single, not in pair), and
               # visible painted patches (reviewer warning, not a drop).
               "mask_risk": mask_risk, "layout_sensitive": layout_sensitive,
-              "layout_problems": layout_problems, "visible_patches": visible_patches,
+              "layout_problems": layout_problems, "layout_switches": layout_switches,
+              "visible_patches": visible_patches,
               # Heads the heuristic is not sure of (it cannot be): where a reviewer should look first.
               "low_confidence_heads": low_confidence}
     if root is not None and chapter is not None:
