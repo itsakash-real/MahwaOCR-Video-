@@ -702,7 +702,12 @@ def test_status_surfaces_alignment_review_queue(tmp_path):
     build_panels(sess.path, "1", log=lambda *_: None)
     align_engine.build_alignment(sess.path, "1", cfg, sync="off", log=lambda *_: None)
     clean = vb.chapter_status(sess.path, "1")["alignment"]
-    assert clean == {"broken": False, "sync_mode": "estimated", "validation_status": "PASS", "review_queue": 0}
+    # P0: status also surfaces WHY timing is estimated (timing_warnings),
+    # so a terminal-only user sees the fallback reason, not just the mode.
+    assert clean == {"broken": False, "sync_mode": "estimated", "validation_status": "PASS", "review_queue": 0,
+                     "timing_warnings": [{"code": "sync_off",
+                                          "message": "sync=off was passed, so timing is estimated from text length.",
+                                          "fix": "Re-run without --off for real sync: video align --chapter 1"}]}
 
     path = align_engine.alignment_path(sess.path, "1")
     data = json.loads(path.read_text(encoding="utf-8"))
