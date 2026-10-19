@@ -58,7 +58,19 @@ video:
   music_volume: 0.22      # 15-25% under narration; sidechain lets it rise toward 60-80% when no narration
   music_fade: 0.5         # music fade in/out, seconds (>= 0.3s)
   sfx_dir: null           # P3: folder (relative to series folder) with whoosh.mp3, impact.mp3,
-                          # ding.mp3, sting.mp3. null = no SFX; missing files render silent, never fail.
+  # ding.mp3, sting.mp3, scratch.mp3, rumble.mp3, hit.mp3. null = no SFX; missing files render
+  # silent, never fail.
+  # CapCut-style auto-captions: 3-5 words at a time, key word yellow, bottom band.
+  # Burned in at render from video/chapter_N.captions.ass. true by default for NEW
+  # builds; old plans (no captions key) render without them -- run
+  # `video captions --chapter N` to add captions to an existing plan.
+  captions: true
+  # Gentle grade: null = off; "subtle" = contrast +5%, saturation +5%. Off by default.
+  grade: null
+  # Beat sync: optional beat times (seconds) to snap interior cuts to, within +/-0.15s.
+  # null = no beat sync (cuts stay exactly on their sentences); or drop
+  # {"beats": [...]} as music/beats.json (from any beat-detection tool).
+  beats: null
   # Panel detection edges. Rows at a panel's top/bottom that are all white (gray above
   # white_threshold) or all near-black (below black_threshold) are gutter and are trimmed off.
   # Existing panels.json files are not re-detected on their own: run `video panels --force`.

@@ -223,20 +223,22 @@ def test_bubble_with_lettering_is_found_and_kept_out_of_the_card():
         assert max(_overlap_share(box, b) for b in maps["bubbles"]) <= 0.02
 
 
-def test_clean_bubbles_paints_out_the_lettering_and_leaves_the_art_alone():
+def test_clean_bubbles_returns_a_panel_with_bubbles_unchanged():
+    # Bubble painting was removed entirely: the panel comes back
+    # pixel-identical, bubbles and all. Detection still works -- the
+    # crop/drop path (not painting) deals with bubbles now.
     import numpy as np
 
-    from manhwa_ocr.video.crops import clean_bubbles
+    from manhwa_ocr.video.crops import _panel_maps, bubble_boxes, clean_bubbles
 
     img = _bubble_panel()
+    maps = _panel_maps(img)
+    assert maps["bubbles"], "the speech bubble should still be detected"
+    assert bubble_boxes(maps), "bubble_boxes still lists the bubble"
     cleaned = clean_bubbles(img)
+    assert cleaned is img
     a, b = np.asarray(img.convert("RGB"), dtype=int), np.asarray(cleaned, dtype=int)
-    h, w = a.shape[:2]
-    inside = (slice(int(0.12 * h), int(0.28 * h)), slice(int(0.56 * w), int(0.88 * w)))   # where the lettering was
-    assert (a[inside].min(axis=2) < 60).mean() > 0.05          # the original has dark lettering there
-    assert (b[inside].min(axis=2) < 60).mean() < 0.005         # the cleaned picture does not
-    far = (slice(int(0.6 * h), h), slice(0, w))
-    assert np.abs(a[far] - b[far]).max() == 0                  # art away from the bubble is untouched
+    assert (a == b).all()  # pixel-identical, lettering and all
 
 
 def test_clean_bubbles_returns_a_panel_without_bubbles_unchanged():

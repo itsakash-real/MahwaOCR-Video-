@@ -2,7 +2,9 @@
 visibility, head safety.
 
 The mask rule is: a DOMINANT bubble overlapping the head range must never
-be painted over (that leaves a flat grey oval on the face). Crops steer
+be painted over (that leaves a flat grey oval on the face). Bubble
+painting was then removed ENTIRELY -- painting harmed more than it
+helped, so no bubble is ever painted now. Crops steer
 around it; when no clean crop exists the panel is DROPPED and its time is
 re-paired, instead of masking the face in render (Ch2 P018-04 / P020-04
 were fixed exactly this way by hand).
@@ -67,15 +69,22 @@ def test_clean_bubbles_never_paints_a_mask_risk_bubble():
     assert out.getpixel((100, 55)) == (255, 255, 255)  # bubble left white, face unmasked
 
 
-def test_clean_bubbles_still_paints_a_non_risk_bubble():
+def test_clean_bubbles_returns_panel_unchanged_even_with_bubbles():
+    # Bubble painting was removed entirely: clean_bubbles() is a no-op.
+    # Even a non-risk bubble is left exactly as drawn -- pixel-identical,
+    # no painted_boxes -- and the crop/drop path deals with it instead.
+    import numpy as np
+
     img = _two_tone_panel()
     d = ImageDraw.Draw(img)
-    d.rectangle((40, 20, 160, 90), fill=(255, 255, 255))
+    d.rectangle((40, 20, 160, 90), fill=(255, 255, 255))  # the bubble
     maps = _maps((0.70, 0.90), [(0.20, 0.10, 0.80, 0.45)])
     assert is_mask_risk(maps) is False
     out = clean_bubbles(img, maps)
-    assert list(getattr(out, "painted_boxes", [])) == [(0.20, 0.10, 0.80, 0.45)]
-    assert out.getpixel((100, 55)) != (255, 255, 255)  # bubble painted out
+    assert out is img
+    assert list(getattr(out, "painted_boxes", [])) == []
+    assert (np.asarray(out) == np.asarray(img)).all()  # pixel-identical
+    assert out.getpixel((100, 55)) == (255, 255, 255)  # bubble left as drawn
 
 
 # ------------------------------------------------------------------ patch visibility
@@ -188,6 +197,20 @@ def test_verify_marks_head_cut_panel_needs_eyes_not_dropped(monkeypatch):
     assert report["panels"]["P001-01"]["action"] == "needs eyes"
     assert report["needs_eyes"] == ["P001-01"]
     assert report["dropped"] == []
+
+
+def test_verify_drops_panel_whose_best_crop_still_shows_a_bubble(monkeypatch):
+    # Bubble painting removed: a figure panel with no clean crop (best
+    # window still shows a bubble) is DROPPED and re-paired -- the P1
+    # mask-risk rule, now applied to every bubble. Head-cut-only panels
+    # still go to needs-eyes (see the test above), not to dropped.
+    report = _verify_with(monkeypatch,
+                          {"shape": 0.75, "box": (0, 0, 1, 0.5), "pad_y": 0.0,
+                           "problems": ["lettering"], "clean": False},
+                          risk=False)
+    assert report["panels"]["P001-01"]["action"] == "dropped"
+    assert report["dropped"][0]["panel"] == "P001-01"
+    assert "re-pair" in report["dropped"][0]["reason"]
 
 
 def test_verify_flags_layout_sensitive_crop(monkeypatch):

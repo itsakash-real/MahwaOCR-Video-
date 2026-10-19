@@ -4,15 +4,22 @@ For each panel the crop search (crops.shape_candidates) gives ranked windows
 for each allowed card shape. A window is clean when it shows none of:
 
   lettering  speech-bubble or caption lettering inside the card
-  painted    a patch left where a bubble was painted out
+  painted    (legacy, never occurs now: bubble painting was removed entirely)
   blank      mostly flat white/empty (a white screen)
   head_cut   a detected head would be cut (top or chin outside the card)
 
 The first clean window wins. If a panel has no clean window:
-  - a panel with a character is never dropped: the best window is kept and
-    marked "needs eyes" for the reviewer;
-  - a panel with no character (lettering-only, blank, logo) is dropped and
-    listed with its page and panel id, so nothing silently goes missing.
+  - a panel whose best window still shows a bubble (lettering /
+    face_bubble) is DROPPED and listed with its page and panel id, so
+    nothing silently goes missing. Bubble painting was removed
+    entirely -- a bubble can no longer be painted clean, so a panel
+    with no bubble-free crop is dropped and its time re-paired (the
+    P1 mask-risk rule, now applied to every bubble).
+  - a panel with a character whose only problem is a cut head
+    (head_cut, no bubble) is never dropped: the best window is kept
+    and marked "needs eyes" for the reviewer;
+  - a panel with no character (lettering-only, blank, logo) is dropped
+    and listed with its page and panel id, so nothing silently goes missing.
 
 The designer (plan.py) uses pick_crop() for the same decision, so the report
 and the video agree.
@@ -28,7 +35,7 @@ from typing import Any, Callable, Dict, List, Tuple
 from PIL import Image
 
 from .crops import (BUBBLE_OK, FIGURE_MIN, PATCH_VISIBLE, _panel_maps,
-                    head_of, is_mask_risk, patch_visibility, shape_candidates)
+                    face_bubble_boxes, head_of, is_mask_risk, patch_visibility, shape_candidates)
 from .cropcache import crop_key, load_crop, store_crop
 from ..util import atomic_write_text, require_chapter
 from .media import video_dir
@@ -62,15 +69,30 @@ def pick_card(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None
     m = maps or _panel_maps(img)
     panel_aspect = img.width / max(1, img.height)
     risk = is_mask_risk(m)
+    face_bubbles = face_bubble_boxes(m)
     best = None
     for fallback in (False, True):       # a shape that would cost the panel its sides only if none else works
         for a in shapes:
             for c in shape_candidates(img, a, m, fallback=fallback, allow_pad=True)[:40]:
                 probs = problems_of(c)
                 # P1: a mask-risk panel whose best window still overlaps a
-                # bubble would mask a face if painted -> flag it so the
+                # bubble would have masked a face if painted (painting
+                # removed) -> flag it so the
                 # caller drops the panel instead of masking it. A clean
                 # window (avoids the bubble) has no mask problem.
+                # CapCut bugfix (defect 3): a window showing a bubble that
+                # overlaps the face range would have put a patch on/near the
+                # face -- flag it, so the planner drops the panel instead of
+                # masking it. (Such a window already has the lettering
+                # problem; face_bubble names the face reason.)
+                if face_bubbles and "face_bubble" not in probs:
+                    _bx0, _by0, _bx1, _by1 = c["box"]
+                    for _fb in face_bubbles:
+                        _ix = max(0.0, min(_bx1, _fb[2]) - max(_bx0, _fb[0]))
+                        _iy = max(0.0, min(_by1, _fb[3]) - max(_by0, _fb[1]))
+                        if _ix > 0 and _iy > 0:
+                            probs = [*probs, "face_bubble"]
+                            break
                 if risk and not c["bubble_ok"] and "mask_risk" not in probs:
                     probs = [*probs, "mask_risk"]
                 cost = (c["score"] + 0.4 * max(0.0, math.log(panel_aspect / a))
@@ -242,6 +264,17 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             dropped.append({"panel": p["id"],
                             "reason": "shouting face + dominant bubble would mask the face "
                                       "(no clean crop); drop and re-pair"})
+        elif "lettering" in probs or "face_bubble" in probs:
+            # Bubble painting is removed: a panel whose best crop still
+            # shows a bubble can no longer be painted clean. Crops already
+            # tried to exclude it (pick_card prefers clean windows); with
+            # no clean crop, drop the panel and let build.py re-pair its
+            # time to a neighbour -- the P1 mask-risk rule, now applied to
+            # every bubble that would have been painted.
+            action = "dropped"
+            dropped.append({"panel": p["id"],
+                            "reason": "best crop still shows a speech bubble or caption and bubble painting "
+                                      "is removed; drop and re-pair"})
         elif figure:
             action = "needs eyes" if "head_cut" in probs else "kept (check)"
             if "head_cut" in probs:
@@ -260,7 +293,8 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
               "needs_eyes": needs_eyes, "recropped": recropped,
               # P1: mask-risk panels (dropped when no clean crop exists),
               # layout-sensitive crops (clean in single, not in pair), and
-              # visible painted patches (reviewer warning, not a drop).
+              # visible painted patches (always empty now: bubble painting
+              # was removed; kept for report shape).
               "mask_risk": mask_risk, "layout_sensitive": layout_sensitive,
               "layout_problems": layout_problems, "layout_switches": layout_switches,
               "visible_patches": visible_patches,

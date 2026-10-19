@@ -3,6 +3,7 @@
 What the editor does to every video, and the knobs that change it. This
 doc is a reference, not a tutorial — the workflows are in `MANUAL_WAY.md`
 (by hand), `AGENT_WAY.md` (prompts A–G), `HYBRID_WAY.md` (split).
+CapCut-style edits + the video-defect bugfixes live in `CAPCUT_EDITS.md`.
 
 ## Pacing + motion (P3)
 
@@ -13,10 +14,14 @@ doc is a reference, not a tutorial — the workflows are in `MANUAL_WAY.md`
 - **Motion:** continuous Ken Burns on every shot — never a frozen frame.
   Planner never emits `hold`. Motions are push_in (100→115%), pull_out
   (118→100%), and 4-way pans, varied so the same motion never repeats.
-  Hand-set `hold` survives only for deliberate payoff beats.
-- **Transitions:** hard cuts by default. Fade/dissolve only for time
-  skips, flashbacks, scene changes, chapter boundaries. Whip/flash only
-  for impact moments (≤1 per 3–4 min).
+  Hand-set `hold` survives only for deliberate payoff beats. Never pan
+  twice in a row, never repeat the previous motion; split pieces
+  alternate motion and only the first piece arrives with the shot's
+  transition. See `CAPCUT_EDITS.md` (defects 1–2).
+- **Transitions:** hard cuts by default (90%), fade 10%. `slide` / `zoom`
+  / `whip` / `glitch` only on impact/reveal beats; glitch (0.2s RGB split)
+  at most once per 60s. Joins are frame-exact, concat is a hard cut by
+  design — no crossfade. See `CAPCUT_EDITS.md`.
 
 ## Callouts (P3)
 
@@ -28,6 +33,25 @@ Override one shot's callout text in `fixes.json`:
 ```json
 {"version": 1, "callouts": [{"shot_id": "S007", "text": "SS-RANK"}]}
 ```
+
+## Auto-captions (CapCut)
+
+Plan `captions`: each shot's sentence split into 3–5 word chunks, spread
+evenly across the shot, burned in at render from
+`video/chapter_N.captions.ass` (ffmpeg subtitles filter, final pass —
+captions never touch the segment cache). Bottom centre, key word
+(longest word) yellow, black outline, never over faces. Full text;
+callouts stay keyword-only, so the two never double up.
+`video.captions: true` by default for new builds; old plans render
+without captions unless requested:
+
+```bash
+python -m manhwa_ocr video captions --chapter N --session "Your Series Name"
+# -> adds captions to the plan + writes video/chapter_N.captions.ass
+```
+
+A subtitles-filter failure keeps the un-captioned video and logs a
+warning, never fails the render.
 
 ## Chapter cards (P3 + P5)
 
@@ -43,9 +67,12 @@ full-screen dark overlay, auto title from the boundary sentence
 ## SFX (P3)
 
 Plan `sfx` events: whoosh on chapter cards, impact on shake, sting on
-flash, ding on system/status-window sentences. Render mixes them from
+  flash, ding on system/status-window sentences. CapCut extras: scratch
+  on twist reveals, rumble on long (>5s) reveals, hit on impact
+  sentences with no shake of their own. Render mixes them from
 `video.sfx_dir`. Files needed in that folder: `whoosh.mp3`,
-`impact.mp3`, `ding.mp3`, `sting.mp3`. Missing dir/files → one warning,
+`impact.mp3`, `ding.mp3`, `sting.mp3`, `scratch.mp3`, `rumble.mp3`,
+`hit.mp3`. Missing dir/files → one warning,
 renders without SFX, never fails. No SFX ships with the program.
 
 ## Music (P3)
@@ -54,6 +81,11 @@ renders without SFX, never fails. No SFX ships with the program.
 series folder when present, else music-free. Default volume 0.22
 (15–25% under narration); sidechain ducking lets it rise toward 60–80%
 when no narration speaks. Fade in/out 0.5s (≥0.3s).
+
+**Beat sync:** `video.beats` (list of seconds) or `music/beats.json`
+(`{"beats": [...]}`) snaps interior cuts to the nearest beat within
+±0.15s — first/last cuts never move, no shot under 0.2s. No beats =
+no-op, cuts stay exactly on their sentences.
 
 ## Hook + open loops (P3)
 
@@ -95,9 +127,14 @@ when no narration speaks. Fade in/out 0.5s (≥0.3s).
 
 ## Crop / face safety (P1 + P2)
 
-- A face is never masked. Mask-risk bubbles (dominant bubble overlapping
-  the head) are never painted; crops steer around them. If no clean crop
-  exists, verify DROPs the panel with a re-pair reason.
+- A face is never masked. Bubble painting was removed ENTIRELY:
+  `clean_bubbles()` returns the panel unchanged (pixel-identical) --
+  there is no flag to re-enable painting. Bubbles stay visible, so
+  crops steer around them (bubble scoring); a panel whose best crop
+  still shows a bubble is DROPPED and re-paired (the P1 mask-risk
+  rule, now applied to every bubble). Mask-risk bubbles (dominant
+  bubble overlapping the head) are dropped the same way. See
+  `CAPCUT_EDITS.md` (defect 3).
 - Crop QA checks every layout (single / pair / wide). A crop clean in
   single but not in pair is `layout_sensitive`; the planner auto-switches
   to the pair-safe shape (e.g. 4:3 → 3:4) and logs the switch in
@@ -137,7 +174,10 @@ deterministic (same inputs → identical JSON).
 | `music` | `null` (= `music/bed.mp3` if present) | Music bed path |
 | `music_volume` | 0.22 | 15–25% under narration |
 | `music_fade` | 0.5s | Fade in/out (≥0.3s) |
-| `sfx_dir` | `null` (= no SFX) | Folder with whoosh/impact/ding/sting.mp3 |
+| `sfx_dir` | `null` (= no SFX) | Folder with whoosh/impact/ding/sting/scratch/rumble/hit.mp3 |
+| `captions` | `true` | Auto-captions on new builds (3–5 words, key word yellow) |
+| `grade` | `null` (off) | `"subtle"` = contrast +5%, saturation +5% |
+| `beats` | `null` (off) | Beat times (seconds) to snap cuts to, ±0.15s; or `music/beats.json` |
 | `crop.full_width` | `true` | Cards keep full width, slide vertical window |
 | `whisper_model` | `base.en` | Use `small` for Hindi narration |
 | `require_review` | `false` | If true, render refuses unless plan approved |

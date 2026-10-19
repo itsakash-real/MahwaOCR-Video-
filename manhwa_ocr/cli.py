@@ -904,6 +904,24 @@ def cmd_video(args) -> int:
             _log(f"  chapter {c}: approved; render with  video render --chapter {c}")
         return 0
 
+    if action == "captions":
+        # Add CapCut-style auto-captions to an existing plan (old plans have
+        # none) and write video/chapter_N.captions.ass. The next render
+        # burns them in; nothing else in the plan is touched.
+        from .video import captions as caps_mod
+        from .video.panels import load_panels
+        from .video.plan import load_plan, save_plan
+        for c in chapters(default_all=False):
+            _panels = load_panels(sess.path, c) or {"panels": []}
+            _plan = load_plan(sess.path, c, {p["id"] for p in _panels["panels"]})
+            _plan["captions"] = caps_mod.build_captions(_plan["shots"])
+            _plan["captions_enabled"] = True
+            save_plan(sess.path, c, _plan)
+            _ass = caps_mod.write_captions_file(sess.path, c, _plan)
+            _n = len(_plan["captions"])
+            _log(f"  chapter {c}: {_n} caption chunk(s) -> {_ass.relative_to(sess.path).as_posix()}")
+        return 0
+
     if action == "render":
         for c in chapters(default_all=False):
             _log(f"=== Chapter {c} ===")
@@ -1069,7 +1087,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
     p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
-                                      "shorts", "endscreen"])
+                                      "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
     p.add_argument("--force", action="store_true", help="rebuild even if up to date (discards plan edits)")
