@@ -736,11 +736,15 @@ Do not build the intro by hand-copying images, and do not write alignment or pla
 
 ```bash
 python -m manhwa_ocr video compile --chapters 1-7          # one video, title cards between chapters
-python -m manhwa_ocr video clip --chapter 3 --from 45 --to 105 --format 9:16   # a YouTube Short
+python -m manhwa_ocr video clip --chapter 3 --from 45 --to 105 --format 9:16   # a hand-cut YouTube Short
+python -m manhwa_ocr video shorts --chapter 3               # 3 auto-cut Shorts + shorts.json manifest
+python -m manhwa_ocr video endscreen --chapter 3            # endscreen.json + watch_next.txt
 python -m manhwa_ocr compile --chapters 1-7                # one long script, with a runtime table
 ```
 
-These write `video\compiled_1-7.mp4`, `video\chapter_3.clip_45-105_9x16.mp4`, and
+These write `video\compiled_1-7.mp4`, `video\chapter_3.clip_45-105_9x16.mp4`,
+`video\chapter_3.shorts_1..3.mp4`, `video\chapter_3.shorts.json`,
+`video\chapter_3.endscreen.json`, `video\chapter_3.watch_next.txt`, and
 `recaps\compiled_1-7.md`.
 
 **Background music:** set `music: "music/bed.mp3"` under `video:` in
