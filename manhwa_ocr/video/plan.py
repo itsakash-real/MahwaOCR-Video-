@@ -33,7 +33,7 @@ from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
 from . import sync as sync_mod
-from .crops import _panel_maps, head_of, tone
+from .crops import _panel_maps, head_of, is_mask_risk, tone
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import pick_card
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
@@ -389,7 +389,12 @@ class _Designer:
         self._maps: Dict[str, Any] = {}
         self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": [], "bubble": [],
                                                  "padded": [], "white_edge": [],
-                                                 "low_confidence_heads": []}
+                                                 "low_confidence_heads": [],
+                                                 # P1: panels with a dominant bubble overlapping
+                                                 # the head range (mask risk). Informational:
+                                                 # dropping happens in verify.py; here the
+                                                 # clean crop (if one exists) already avoids it.
+                                                 "mask_risk": []}
         self.map_options = map_options(vcfg)
         self._tone: Dict[str, str] = {}
         self.uses: Dict[str, int] = {}
@@ -439,6 +444,10 @@ class _Designer:
                 card = entry["pick"]
                 head = entry["head"]
                 top, bottom = entry["edge_rows"]
+                # P1: mask risk rides in the cache entry (or, for pre-P1
+                # entries, in the pick's problems). Recorded in crop_stats
+                # below, next to head_risk / bubble.
+                hit_risk = entry.get("mask_risk", "mask_risk" in card.get("problems", []))
                 if (top + bottom) >= 0.01 and pid not in self.crop_stats["white_edge"]:
                     # Gutter rows still sit on this panel's edge (panels.json predates edge
                     # tightening). `video panels --force` re-detects it flush to the art.
@@ -458,11 +467,15 @@ class _Designer:
                 card = pick_card(self.img(pid), shapes, maps)
                 if ckey is not None:
                     store_crop(self._root, self.chapter, ckey,
-                               {"pick": card, "head": head, "edge_rows": list(self._maps[pid]["edge_rows"])})
+                               {"pick": card, "head": head, "edge_rows": list(self._maps[pid]["edge_rows"]),
+                                "mask_risk": bool(is_mask_risk(self._maps[pid]))})
             if not head["confident"] and (head["source"] == "pale" or head["keep_top"]) \
                     and pid not in self.crop_stats["low_confidence_heads"]:
                 self.crop_stats["low_confidence_heads"].append(pid)
             shape, box, probs = card["shape"], card["box"], card["problems"]
+            if ("mask_risk" in probs or (entry is not None and hit_risk)) \
+                    and pid not in self.crop_stats["mask_risk"]:
+                self.crop_stats["mask_risk"].append(pid)
             if card["pad_y"] > 0:
                 self._pads[key] = float(card["pad_y"])
             if "head_cut" in probs and pid not in self.crop_stats["head_risk"]:

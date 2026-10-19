@@ -119,6 +119,9 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
         "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
         "low_confidence_heads": cs.get("low_confidence_heads", []),
+        # P1: mask-risk panels whose clean crop avoids the bubble (the
+        # no-clean-crop ones were already dropped by verify.py).
+        "mask_risk": cs.get("mask_risk", []),
         "review_queue": plan.get("alignment_review_queue") or [],
         "sync": plan.get("sync"),
     }
@@ -358,11 +361,13 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     fixes = fixes_mod.load(root, chapter, dims)
     fmt_obj = format_from(fmt, int(vcfg.get("fps", 30)))
     shapes = sorted({a for k in ("single", "pair", "wide") for a in shapes_for(k, fmt_obj)})
+    layout_shapes = {layout: shapes_for(layout, fmt_obj) for layout in ("single", "pair", "wide")}
     report = verify_chapter(panels["panels"],
                             lambda p: panel_image(root, chapter, p, norm_w, clean=True,
                                                   fingerprint=panels.get("fingerprint")),
                             shapes, root, chapter, log=log, options=map_options(vcfg),
-                            fingerprint=panels.get("fingerprint"))
+                            fingerprint=panels.get("fingerprint"),
+                            layout_shapes=layout_shapes)
     drop = {d["panel"]: d["reason"] for d in report["dropped"]}
     drop.update(fixes["drop"])
     for p in panels["panels"]:
@@ -374,6 +379,15 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if report["needs_eyes"]:
         log(f"  ! {len(report['needs_eyes'])} panel(s) with a character whose head may be cut: "
             + ", ".join(report["needs_eyes"][:12]))
+    if report.get("mask_risk"):
+        log(f"  ! {len(report['mask_risk'])} panel(s) with a dominant bubble over the head range "
+            f"(mask risk): {', '.join(report['mask_risk'][:12])}")
+    if report.get("layout_sensitive"):
+        log(f"  ! {len(report['layout_sensitive'])} panel(s) clean in a single shot but not in a pair "
+            f"(layout-sensitive crop): {', '.join(report['layout_sensitive'][:12])}")
+    if report.get("visible_patches"):
+        log(f"  ! {len(report['visible_patches'])} panel(s) with a visible painted patch: "
+            + ", ".join(d['panel'] for d in report['visible_patches'][:12]))
     align_cov = None
     if not cues_mod.load_cues_strict(root, chapter):
         units, mode_note, meta = None, "even timing (recap has no panel tags)", None
