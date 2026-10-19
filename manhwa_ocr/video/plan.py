@@ -799,6 +799,16 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     _pacing_before = pacing_qa(shots)
     shots, _nsplit = split_long_shots(shots)
     chapter_cards = build_chapter_cards(shots, duration)
+    # P5: reviewer overrides from fixes.json (chapter-card titles, callout
+    # text, keyed by shot id). Unknown shot_ids are warnings, never failures.
+    from .shorts import apply_callout_overrides as _apply_callouts
+    from .shorts import apply_card_overrides as _apply_cards
+    _over = fixes or {}
+    chapter_cards, _card_warn = _apply_cards(chapter_cards, _over.get("chapter_cards") or {}, shots)
+    shots, _call_warn = _apply_callouts(shots, _over.get("callouts") or {})
+    _override_warnings = list(_card_warn) + list(_call_warn)
+    from .shorts import build_end_screen as _build_end_screen
+    _end_screen = _build_end_screen(duration, chapter)
     sfx = plan_sfx(shots, chapter_cards)
     return {
         "version": PLAN_VERSION,
@@ -826,9 +836,13 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "crop_stats": designer.crop_stats,
         # P3 editor layer (see editor.py).
         "chapter_cards": chapter_cards,
+        # P5: end-screen spec (window + slots + WATCH NEXT). Native
+        # YouTube end-screen cards only; never burned into pixels.
+        "end_screen": _end_screen,
         "sfx": sfx,
         "pacing": {"split_shots": _nsplit, "long_shots_flagged": _pacing_before["long_shots"],
                    "max_shot": pacing_qa(shots)["max_shot"]},
+        "override_warnings": _override_warnings,
         "reviewed": False,
         "shots": shots,
     }
@@ -923,6 +937,8 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
     for _cc in plan.get("chapter_cards") or []:
         if not isinstance(_cc, dict) or not isinstance(_cc.get("title"), str) or not _cc["title"].strip():
             errs.append("chapter_cards entries need a non-empty string \"title\"")
+        elif len(_cc["title"]) > 40:
+            errs.append(f"chapter card '{_cc['title'][:20]}...' title must be at most 40 chars")
         else:
             try:
                 _t = float(_cc.get("t", -1))

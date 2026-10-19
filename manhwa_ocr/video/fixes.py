@@ -7,7 +7,9 @@ video/chapter_N.fixes.json, and nothing else. The plan reads it:
      "drop": [{"panel": "P016-06", "reason": "sound-effect lettering only"}],
      "face": [{"panel": "P017-02", "top": 0.12, "bottom": 0.46}],
      "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}],
-     "shot": [{"panel": "P019-01", "background": "black", "enter": "fade_in"}]}
+     "shot": [{"panel": "P019-01", "background": "black", "enter": "fade_in"}],
+     "chapter_cards": [{"shot_id": "S012", "title": "The Exam That Kills"}],
+     "callouts": [{"shot_id": "S007", "text": "SS-RANK"}]}
 
 "shot" overrides how a panel is presented: "background" (blur or black) applies to the shot whose
 first card is that panel, "enter" (how the card arrives) to that panel's card. Both are optional.
@@ -42,7 +44,10 @@ def fixes_path(root: Path, chapter: str) -> Path:
 
 
 def empty() -> Dict[str, Any]:
-    return {"version": VERSION, "drop": [], "face": [], "crop": [], "shot": []}
+    return {"version": VERSION, "drop": [], "face": [], "crop": [], "shot": [],
+            # P5: reviewer overrides for chapter-card titles and callout text,
+            # keyed by shot id (e.g. "S012"). See shorts.validate_override_entry.
+            "chapter_cards": [], "callouts": []}
 
 
 def _shape(value: Any) -> float | None:
@@ -65,7 +70,8 @@ def validate(data: Any, panel_dims: Dict[str, Tuple[float, float]]) -> Tuple[Dic
     {"drop": {pid: reason}, "face": {pid: (top, bottom)}, "crop": {pid: (shape, box)},
      "shot": {pid: {"background": ..., "enter": ...}}}."""
     problems: List[str] = []
-    clean: Dict[str, Any] = {"drop": {}, "face": {}, "crop": {}, "shot": {}}
+    clean: Dict[str, Any] = {"drop": {}, "face": {}, "crop": {}, "shot": {},
+                             "chapter_cards": {}, "callouts": {}}
     if not isinstance(data, dict):
         return clean, ["the file must be a JSON object"]
     if data.get("version", VERSION) != VERSION:
@@ -140,6 +146,26 @@ def validate(data: Any, panel_dims: Dict[str, Tuple[float, float]]) -> Tuple[Dic
         if enter is not None:
             entry["enter"] = enter
         clean["shot"][pid] = entry
+
+    # P5: chapter-card title and callout text overrides, keyed by shot id.
+    # A duplicate shot_id is ambiguous (which title wins?) so it is a
+    # problem, like every other bad fixes.json entry: nothing is applied.
+    from .shorts import validate_override_entry
+
+    for kind, field in (("chapter_cards", "title"), ("callouts", "text")):
+        seen: set = set()
+        for i, e in enumerate(data.get(kind) or []):
+            errs = validate_override_entry(kind, e)
+            for err in errs:
+                problems.append(f"{kind}[{i}]: {err}")
+            if errs:
+                continue
+            sid = e.get("shot_id")
+            if sid in seen:
+                problems.append(f"{kind}[{i}]: duplicate shot_id {sid!r} (one override per shot)")
+                continue
+            seen.add(sid)
+            clean[kind][sid] = e.get(field)
     return clean, problems
 
 
