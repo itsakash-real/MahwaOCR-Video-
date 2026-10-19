@@ -2,13 +2,65 @@
 
 ## Result
 
-**Branch:** `editor/harden-all` — HEAD `8422248` (merge commit; see
-"Later merge" below). It contains the original P0–P5 chain plus the
+**Branch:** `editor/harden-all` — HEAD `9b146d0` (see "Later merge"
+below). It contains the original P0–P5 chain plus the
 Intro/Previously merge (`1c88bb2`) plus the CapCut-edits bugfix merge
-(`8422248`). No branch pointer was moved; `perf/remaining-audit`,
-`main`, and every phase branch are untouched.
+(`8422248`) plus the Ch10 test-build fixes (`9b146d0`).
+
+**Merged into `main`:** merge commit `f0e7d4c`
+(`git merge --no-ff editor/harden-all`). `main` had zero commits
+outside `editor/harden-all` (merge-base = old `main` HEAD
+`95403d8`), so the merge was clean with no conflicts and dropped
+nothing. Full suite on merged `main`: **630 passed, 1 skipped,
+1 deselected**. PR #3 (`perf/video-p0-double-work` → `main`) is
+superseded by this merge — its commits are inside the chain — and
+must be closed, not merged.
 
 ## Later merges (after the original P0–P5 + docs)
+
+### Ch10 test-build fixes — commit `9b146d0`, merged into `main` as `f0e7d4c`
+
+Fixes for issues found in the Ch10 new-code test build
+(`test-ch10-newcode`, 255.67s, 65 shots, 83 sentences), all directly
+on `editor/harden-all`:
+
+- **Caption timing:** captions were chunked per-shot, leaving 1–5s
+  gaps during narration and captioning sentence 41's tail ~5s early.
+  Captions are now built from alignment segments (sentence windows)
+  and validated (chunk inside its sentence window ±0.5s, no
+  narration gap >1s). Test rebuild: zero caption gaps >1s, sent-41
+  tail chunk at 127.29–128.71 (on time), sync gate PASS, wrong-picture
+  0.8%.
+- **Caption bar:** captions sat on the card and covered panel text
+  (241s: "BY MUTAKTA!"). Captions now render in a dedicated black
+  bottom bar (bottom 8%); cards are capped to the top 92%.
+  Spot-check: 241s caption in the bar, panel text fully visible.
+- **Panel diversity:** same panel 3x consecutively with an identical
+  crop (55–57 P014-10, 75–77 P020-01). The third showing is now
+  punched in until its crop differs from both predecessors
+  (`diversity_changes` in the plan). Spot-check: 174s third showing
+  is a distinct tighter crop.
+- **P2 wide-switch guard:** `find_pair_safe_shape` only switches to
+  shapes valid for the target layout (wide: never 1.0); stale cache
+  entries are validated on read; `verify.json` labels its switches
+  as single-layout so a `1.777 -> 1.0` entry is never misread as a
+  wide-layout switch. Test rebuild: planner recorded zero layout
+  switches.
+- **System-window wide fill:** the ~34s system-notification panel
+  (P004-07) rendered as a small square. System-window banners are
+  split out of pair units and get their own wide shot with
+  `wide_fill` (≥90% frame width). Spot-check: 34s banner fills the
+  frame, "INEXPLICABLE MENTAL FORTITUDE!" legible.
+- **Filler stretches (sent 4, sent 68) left as-is:** both fillers
+  are story-correct; no cleaner distinct panel exists (sync-audit
+  flags them `[filler_panel]`, gate still PASS).
+- **File size:** test rebuild 47 MB vs original 33 MB (+38%) —
+  expected cost of continuous motion + captions, not a defect.
+  Do not lower quality / change CRF to chase size.
+
+Tests: new `tests/test_caption_and_layout_fixes.py` (23 tests).
+Full suite on `editor/harden-all` before merge: **630 passed,
+1 skipped, 1 deselected**.
 
 ### Intro + Previously — merge `1c88bb2`
 
@@ -164,8 +216,11 @@ docs commit. If a per-phase PR is wanted for the bugfix, open it as
 
 ## What is in `main` vs not in `main`
 
-- **In `main` (`95403d8`):** the older alignment/tag-wins + README work.
-  It does NOT contain PR1–PR4, P0–P5, or these docs.
-- **NOT in `main` (on `editor/harden-all`):** everything above — all
-  perf work, all hardening, all docs. Nothing in this task merged
-  anything into `main`.
+- **In `main` (merge `f0e7d4c`):** everything below — the older
+  alignment/tag-wins + README work (old HEAD `95403d8`), PR1–PR4,
+  P0–P5, Intro/Previously, CapCut edits + bugfixes, and the Ch10
+  test-build fixes (`9b146d0`). `main` is now the integration
+  branch; `editor/harden-all` remains as the feature branch pointer
+  at `9b146d0`.
+- **NOT in `main`:** nothing from this chain. `perf/remaining-audit`
+  and the phase branches are untouched.
