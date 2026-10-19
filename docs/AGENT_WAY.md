@@ -91,6 +91,22 @@ What it does: `video intro --prepare`, you fill `intro/intro.json`, then
 it aligns / plans / renders `video/chapter_0.mp4`. You record
 `audio/chapter_0.mp3` first.
 
+**Auto hook (no `intro.json` needed):** you write `intro/intro.txt`
+(one sentence per line, `[HOOK]` / `[LOOP: ...]` markers), record it as
+`audio/chapter_0.mp3` (30s), and the agent runs
+`video hook --chapters 1-6 --audio audio/chapter_0.mp3 --script intro/intro.txt`
+(or `video intro --auto` with the same flags). It reports the picks from
+`intro/intro.auto.json` (sentence → panel + reason) and the hook-structure
+warnings. Full rules: `INTRO_HOOK_GUIDE.md`.
+
+**Previously (between parts):** you write
+`previously/previously_7.txt`, record it as `audio/previously_7.mp3`
+(30s), and the agent runs
+`video previously --chapters 1-6 --audio audio/previously_7.mp3 --script previously/previously_7.txt`.
+Panels come ONLY from chapters 1–6 (never the next part). Full rules:
+`PREVIOUSLY_GUIDE.md`. The agent never generates or trims audio, and
+never passes a next-part chapter to `previously`.
+
 ## Prompt F — Fix one chapter
 
 ```

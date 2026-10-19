@@ -18,6 +18,10 @@ Neither side re-does the other's job.
 | Fixes (`fixes.json`) | Agent writes, you approve | You confirm any drop of a panel you care about |
 | Approve + render | You approve, agent renders | Approval is a human gate |
 | Shorts + end-screen | Agent | Mechanical cut + manifest |
+| Hook script (`intro/intro.txt`) + record `audio/chapter_0.mp3` | You | Your voice; 30s, proof + stakes + roadmap + loop |
+| Hook auto-pick + build (`video hook`) | Agent | Deterministic picks, reviewed in `intro/intro.auto.json` |
+| Previously script (`previously/previously_7.txt`) + record `audio/previously_7.mp3` | You | Your voice; 30s, 5–8 beats, no next-part spoilers |
+| Previously build (`video previously`) | Agent | Panels only from the previous part's chapters |
 | Music / SFX files | You | You pick + drop royalty-free files into the series folder |
 | Publish on YouTube | You | Titles, description, thumbnail, Shorts upload |
 
@@ -46,6 +50,12 @@ Neither side re-does the other's job.
 6. **Shorts + end-screen → you publish.** Agent reports: manifest +
    WATCH NEXT block. You paste them on YouTube. You never let the agent
    upload.
+7. **Hook / previously → you spot-check.** Agent reports: picks from
+   the `.auto.json` file, hook-structure warnings, memory file. You
+   watch the 30s video once. If a pick shows the wrong picture or a
+   payoff too early, say the sentence + what it should show; the agent
+   fixes it through manual `intro.json` (hook) — it never hand-edits a
+   plan or the `.auto.json` as an input.
 
 ## What the agent must never do (even in hybrid mode)
 

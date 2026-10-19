@@ -66,6 +66,33 @@ when no narration speaks. Fade in/out 0.5s (≥0.3s).
   `tts.txt`. `plan["hook"]` carries explicit-hook + open-loop count +
   a warning when missing (never blocks).
 
+## Hook video + previously (30s each)
+
+- `video hook --chapters 1-6 --audio audio/chapter_0.mp3 --script intro/intro.txt`
+  → `video/chapter_0.mp4`. `video intro --auto` is the same build.
+  `video previously --chapters 1-6 --audio audio/previously_7.mp3
+  --script previously/previously_7.txt` → `video/chapter_prev7.mp4`.
+- Hook structure is the same rule as above, compressed: 0–10s proof
+  (`[HOOK]`), 10–20s stakes, 20–30s roadmap + `[LOOP: ...]`. Missing
+  markers warn, never block. No chapter cards, at most one callout.
+- Auto-pick: lexical overlap with panel OCR text first, face/impact
+  pixel heuristics on top (portrait ≈ close-up, wide ≈ establishing,
+  low-dialogue ≈ clean impact). Never text-only/credits, never a repeat,
+  story order never backwards, tease ceiling keeps payoff panels out
+  until the narration names the beat. Picks + reasons land in
+  `intro/intro.auto.json` / `previously/previously_prev7.auto.json`.
+- Previously: beats from the previous part's **recaps** (never
+  transcripts), panels ONLY from the given chapters (no next-part leak
+  by construction), preference for panels already shown in those
+  chapters' videos. Threads used for beat selection are cut off at the
+  previous part — later-chapter threads never steer it.
+- Memory: `video/intro_memory.json` records used panels / beats / open
+  loops / last previously run. Later picks avoid them unless the
+  sentence is marked `[REUSE]` (or `--allow-reuse`). `series_memory.json`
+  is read-only here.
+- 30-second rule: target 30s, 20–45s via `video.hook` config or
+  `--duration`. Over/under logs a warning; audio is never trimmed.
+
 ## Crop / face safety (P1 + P2)
 
 - A face is never masked. Mask-risk bubbles (dominant bubble overlapping
