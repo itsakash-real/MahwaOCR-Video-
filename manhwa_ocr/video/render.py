@@ -7,7 +7,12 @@ shot's crossfade). Editing one shot in the plan therefore re-renders that shot
 and the one after it, nothing else.
 
 Segments share identical encoder settings, so joining them is a stream copy;
-the narration (and optional ducked music) is muxed in the same pass.
+the narration (and optional ducked music) is muxed in the same pass. Joins
+are hard cuts by design (frame-exact bounds from plan.shot_frame_bounds),
+never crossfades. When the plan has captions enabled, a final ffmpeg pass
+burns video/chapter_N.captions.ass in with the subtitles filter -- captions
+never touch the per-shot segment cache, and a subtitles-filter failure
+keeps the un-captioned video instead of failing the render.
 """
 
 from __future__ import annotations
@@ -86,7 +91,8 @@ def render_segment(job: Dict[str, Any]) -> str:
     try:
         for f in range(job["f0"], job["f1"]):
             # Once a shot settles, frame_array returns the same cached frame:
-            # holds (about half of every shot) cost nothing to draw.
+            # A hand-set hold shot returns a cached frame once settled;
+            # continuous-motion shots are re-drawn every frame (defect 1).
             arr = shot.frame_array(f / fmt.fps)
             enc.stdin.write(memoryview(np.ascontiguousarray(arr)))
     except BrokenPipeError:
@@ -105,7 +111,8 @@ def _jobs(root: Path, chapter: str, plan: Dict[str, Any], panels_data: Dict[str,
     panels = {p["id"]: p for p in panels_data["panels"]}
     shots = plan["shots"]
     duration = float(plan["duration"])
-    bounds = [round(float(s["start"]) * fmt.fps) for s in shots] + [round(duration * fmt.fps)]
+    from .plan import shot_frame_bounds
+    bounds = shot_frame_bounds(shots, fmt.fps, duration)
     effects_on = {k: bool(v) for k, v in (plan.get("effects_enabled") or vcfg.get("effects") or {}).items()}
     end_fade = effects_on.get("end_fade", True)
     crf = int(vcfg.get("crf", 20)) + (6 if preview else 0)
@@ -114,7 +121,7 @@ def _jobs(root: Path, chapter: str, plan: Dict[str, Any], panels_data: Dict[str,
 
     jobs = []
     for i, shot in enumerate(shots):
-        f0, f1 = bounds[i], bounds[i + 1]
+        (f0, f1) = bounds[i]
         if f1 <= f0:
             raise UserError(f"Shot {shot.get('id')} is shorter than one frame. Lengthen it in the plan.")
         last = i == len(shots) - 1
@@ -275,7 +282,29 @@ def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any],
         args += ["-map", "0:v"]
     args += ["-c:v", "copy", "-t", f"{duration:.3f}", "-movflags", "+faststart", str(tmp)]
     run(args, timeout=1800)
-    os.replace(tmp, out)
+    assembled = tmp
+    # CapCut auto-captions: burn the plan's .ass in with the subtitles
+    # filter. Captions are a final re-encode pass, not part of the shot
+    # segments, so editing captions never re-renders a shot. Old plans
+    # (no captions key) skip this; `video captions` adds captions to one.
+    _caps = plan.get("captions") or []
+    if plan.get("captions_enabled") and _caps:
+        from .captions import captions_path, write_ass
+        _ass = captions_path(root, chapter)
+        write_ass(_caps, _ass, fmt=fmt)
+        _escaped = str(_ass).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        _captioned = tmp.with_name(tmp.stem + ".captioned.mp4")
+        _preset = "ultrafast" if preview else str(vcfg.get("preset", "veryfast"))
+        _crf = int(vcfg.get("crf", 20)) + (6 if preview else 0)
+        try:
+            run(["-i", str(tmp), "-vf", f"subtitles={_escaped}", "-map", "0",
+                 "-c:v", "libx264", "-preset", _preset, "-crf", str(_crf),
+                 "-c:a", "copy", "-movflags", "+faststart", str(_captioned)], timeout=1800)
+            assembled = _captioned
+            log(f"  captions burned in ({len(_caps)} chunks)")
+        except UserError:
+            log("  ! captions could not be burned (subtitles filter failed); keeping the video without captions")
+    os.replace(assembled, out)
 
     # Drop segments no longer referenced by this plan, so the cache can't grow forever.
     keep = {Path(j["out"]).name for j in jobs}

@@ -17,6 +17,7 @@ Research-backed rules implemented here (see the P3 plan):
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List
@@ -263,6 +264,12 @@ def chapter_cards_to_timestamps(cards: List[Dict[str, Any]]) -> List[str]:
 # ------------------------------------------------------------------ SFX + music
 
 SFX_FILES = {"whoosh": "whoosh.mp3", "impact": "impact.mp3", "ding": "ding.mp3", "sting": "sting.mp3"}
+# CapCut-style extras (from the intro SFX plan). Kept separate so the
+# original four keep their exact resolve_sfx_files() behaviour (tests
+# assert the missing set for the core four); SFX_ALL is the full set the
+# planner, validator and renderer use.
+SFX_EXTRA_FILES = {"scratch": "scratch.mp3", "rumble": "rumble.mp3", "hit": "hit.mp3"}
+SFX_ALL = {**SFX_FILES, **SFX_EXTRA_FILES}
 SFX_VOLUME = 0.5          # SFX sit below narration, never over a sentence
 MUSIC_DUCKED_VOLUME = 0.22  # 15-25% under narration (sidechain ducks further under speech)
 MUSIC_SOLO_VOLUME = 0.7   # target when no narration (sidechain release; see render._audio_graph)
@@ -274,7 +281,7 @@ def plan_sfx(shots: List[Dict[str, Any]], chapter_cards: List[Dict[str, Any]]) -
 
     whoosh on every chapter card; impact on every shake (hit); sting on every
     flash (reveal); ding when a shot's sentence mentions a system/status window.
-    Types are keys of SFX_FILES; the renderer skips any type with no file.
+    Types are keys of SFX_ALL; the renderer skips any type with no file.
     """
     events: List[Dict[str, Any]] = []
     for c in chapter_cards:
@@ -292,11 +299,24 @@ def plan_sfx(shots: List[Dict[str, Any]], chapter_cards: List[Dict[str, Any]]) -
         text = (s.get("sentence") or "").lower()
         if "system window" in text or "status window" in text:
             events.append({"t": round(start + 0.3, 3), "type": "ding"})
+        # CapCut extras, all gated so they never spam: scratch on a twist
+        # reveal ("but / however / suddenly" + a flash), rumble on a long
+        # reveal (>5s, a big moment), hit on an impact sentence with no
+        # shake effect of its own (a shake already gets "impact").
+        _has_shake = any(x.get("type") == "shake" for x in s.get("effects") or [])
+        _has_flash = any(x.get("type") == "flash" for x in s.get("effects") or [])
+        _dur = float(s.get("end", start)) - start
+        if _has_flash and any(w in text for w in (" but ", " however ", " except ", " suddenly ")):
+            events.append({"t": round(start + 0.3, 3), "type": "scratch"})
+        if _has_flash and _dur > 5.0:
+            events.append({"t": round(start + 0.3, 3), "type": "rumble"})
+        if not _has_shake and any(w in text for w in ("slams", "crashes", "explodes", "strikes", "smashes", "blasts")):
+            events.append({"t": round(start + 0.3, 3), "type": "hit"})
     events.sort(key=lambda e: (e["t"], e["type"]))
     return events
 
 
-def resolve_sfx_files(root: Path, sfx_dir: str | None) -> tuple[Dict[str, Path], List[str]]:
+def resolve_sfx_files(root: Path, sfx_dir: str | None, kinds=None) -> tuple[Dict[str, Path], List[str]]:
     """Map SFX type -> existing file. Missing dir / files are a warning, never
     an error: the plan still renders, minus that SFX. Returns (found, missing)."""
     if not sfx_dir:
@@ -304,7 +324,8 @@ def resolve_sfx_files(root: Path, sfx_dir: str | None) -> tuple[Dict[str, Path],
     base = Path(root) / sfx_dir
     found: Dict[str, Path] = {}
     missing: List[str] = []
-    for kind, name in SFX_FILES.items():
+    _files = SFX_FILES if kinds is None else {k: SFX_ALL[k] for k in kinds if k in SFX_ALL}
+    for kind, name in _files.items():
         p = base / name
         if p.is_file():
             found[kind] = p
@@ -350,3 +371,68 @@ def hook_status(cues_sentences: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"explicit_hook": explicit, "first_payoff_at": None,
             "open_loops": len(flat), "loops": flat[:8],
             "warning": warning}
+
+# ------------------------------------------------------------------ beat sync
+
+BEAT_MAX_SHIFT = 0.15   # a cut never moves more than this to land on a beat
+BEAT_MIN_SHOT = 0.2     # a snapped cut never makes a shot shorter than this
+
+
+def snap_cuts_to_beats(shots, beats, max_shift=BEAT_MAX_SHIFT, min_shot=BEAT_MIN_SHOT):
+    """Snap interior cuts to the nearest beat, within +/-max_shift seconds.
+
+    - The first shot still starts at 0 and the last still ends on the
+      video duration: only interior boundaries move.
+    - No cut moves more than max_shift off its sentence, and no shot gets
+      shorter than min_shot: a snapped cut is clamped into its neighbours.
+    - No beats (None / empty) is a no-op: the shots come back unchanged.
+    Returns (shots, info) with moved count + max shift actually applied.
+    """
+    if not shots or not beats:
+        return shots, {"enabled": False, "moved": 0, "max_shift": 0.0,
+                       "reason": "no beats (no video.beats or music/beats.json)"}
+    beats = sorted(float(b) for b in beats)
+    bounds = [float(s["start"]) for s in shots] + [float(shots[-1]["end"])]
+    new_bounds = [bounds[0]]
+    moved = 0
+    max_moved = 0.0
+    for k in range(1, len(bounds) - 1):
+        c = bounds[k]
+        nearest = min(beats, key=lambda b: abs(b - c))
+        cand = nearest if abs(nearest - c) <= max_shift else c
+        lo = new_bounds[-1] + min_shot
+        hi = bounds[k + 1] - min_shot
+        cand = min(max(cand, lo), hi) if hi >= lo else c
+        if abs(cand - c) > 1e-9:
+            moved += 1
+            max_moved = max(max_moved, abs(cand - c))
+        new_bounds.append(cand)
+    new_bounds.append(bounds[-1])
+    out = []
+    for k, s in enumerate(shots):
+        out.append({**s, "start": round(new_bounds[k], 3), "end": round(new_bounds[k + 1], 3)})
+    return out, {"enabled": True, "moved": moved, "max_shift": round(max_moved, 3),
+                   "reason": None}
+
+
+def resolve_beats(vcfg, root):
+    """Beat times (seconds) for snap_cuts_to_beats, or None.
+
+    Explicit `video.beats` (a list of seconds) wins; else music/beats.json
+    in the series folder ({"beats": [...]}, from any beat-detection tool).
+    None means no beat sync: cuts stay exactly on their sentences.
+    """
+    beats = (vcfg or {}).get("beats")
+    if beats:
+        return sorted(float(b) for b in beats)
+    if root is not None:
+        p = Path(root) / "music" / "beats.json"
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            raw = data.get("beats") if isinstance(data, dict) else data
+            if isinstance(raw, list):
+                return sorted(float(b) for b in raw)
+    return None

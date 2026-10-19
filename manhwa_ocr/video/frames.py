@@ -40,13 +40,32 @@ LAYOUTS = ("single", "pair", "inset", "wide")
 BACKGROUNDS = ("blur", "black", "white")
 MOTIONS = ("push_in", "pull_out", "pan_left", "pan_right", "pan_up", "pan_down", "hold")
 ENTRANCES = ("cut", "fade_in", "slide_left", "slide_right", "slide_up", "slide_down", "pull_down",
-             "zoom_in", "fit_in_frame", "blur_in", "swing_right")
+             "zoom_in", "fit_in_frame", "blur_in", "swing_right", "whip_in")
 EXITS = ("cut", "fade_out")
-EFFECTS = ("shake", "punch", "flash")
+EFFECTS = ("shake", "punch", "flash", "glitch")
+# CapCut-style shot transitions (how a shot ARRIVES; see transition_enter).
+# cut is the default (90%); fade 10%; slide / zoom / whip / glitch only on
+# impact / reveal beats, and glitch at most once per 60s. Every transition
+# is a pure function of (shot, time): frame-exact, no flicker by design.
+TRANSITIONS = ("cut", "fade", "slide", "zoom", "whip", "glitch")
+TRANSITION_WEIGHTS = [("cut", 90), ("fade", 10)]
+TRANSITION_ENTERS = {"cut": "cut", "fade": "fade_in", "slide": "slide_left",
+                     "zoom": "zoom_in", "whip": "whip_in", "glitch": "cut"}
+GLITCH_LEN = 0.2          # RGB-split glitch length, seconds (CapCut-style, impact beats only)
+GLITCH_MIN_GAP = 60.0     # at most one glitch per 60s of video
 
 ENTER_DUR = {"cut": 0.0, "fade_in": 0.6, "slide_left": 0.7, "slide_right": 0.7, "slide_up": 0.7,
              "slide_down": 0.7, "pull_down": 0.75, "zoom_in": 0.7, "fit_in_frame": 0.75, "blur_in": 0.8,
-             "swing_right": 0.8}
+             "swing_right": 0.8, "whip_in": 0.25}
+def transition_enter(transition: str) -> str:
+    """The card entrance a shot transition arrives with (TRANSITIONS).
+    "cut" and "fade" keep their own entrances; slide / zoom / whip map to
+    the matching entrance; glitch cuts in hard and the RGB split carries it.
+    Unknown transitions fall back to a hard cut, never to an animation.
+    """
+    return TRANSITION_ENTERS.get(transition, "cut")
+
+
 KB_MAX = 2.6          # P3: only `hold` still settles after this long; other motions run the whole shot
 PAIR_MOVE = 0.7       # first card's slide to the left when the second arrives
 EXIT_FADE = 0.6
@@ -445,6 +464,8 @@ class Card:
             out["blur"], out["alpha"] = (1 - p) * 22 * self.fmt.unit, fade
         elif e == "swing_right":
             out["rot"], out["dx"], out["alpha"] = -11 * (1 - p), -(1 - p) * 0.06 * W, ease_in_out(u / d)
+        elif e == "whip_in":       # fast push: sweeps in from the right, settles in 0.25s
+            out["dx"], out["scale"], out["alpha"] = (1 - p) * 0.22 * W, 1.22 - 0.22 * p, fade
         return out
 
     def sprite(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
@@ -492,6 +513,47 @@ def flash_alpha(t: float, times: List[float]) -> float:
     return best
 
 
+
+def glitch_offset(t: float, times: List[float], unit: float) -> int:
+    """RGB-split offset in pixels at time t (0 when no glitch is active).
+
+    A glitch lasts GLITCH_LEN (0.2s) and decays linearly: the split is
+    widest on the beat, then settles. It shifts colour channels, never
+    covers a face: no pixels are hidden, only separated by a few px.
+    """
+    best = 0.0
+    for te in times:
+        dt = t - te
+        if 0 <= dt < GLITCH_LEN:
+            best = max(best, 1.0 - dt / GLITCH_LEN)
+    return max(0, int(round(8 * unit * best)))
+
+
+def glitch_split(arr: np.ndarray, px: int) -> np.ndarray:
+    """RGB split: R shifts left, B shifts right by px; G stays. Edges repeat
+    (no wrap-around, no black bars). Returns a copy; input untouched.
+    """
+    if px <= 0:
+        return arr
+    h, w = arr.shape[:2]
+    px = min(px, max(1, w // 8))
+    out = arr.copy()
+    out[:, :w - px, 0] = arr[:, px:, 0]
+    out[:, w - px:, 0] = arr[:, -1:, 0]
+    out[:, px:, 2] = arr[:, :w - px, 2]
+    out[:, :px, 2] = arr[:, :1, 2]
+    return out
+
+
+def grade_subtle(arr: np.ndarray) -> np.ndarray:
+    """Gentle grade: contrast +5%, saturation +5%. Subtle by design --
+    the art still looks like the art, just a touch more present.
+    """
+    f = arr.astype(np.float32)
+    f = (f - 128.0) * 1.05 + 128.0
+    gray = f.mean(axis=2, keepdims=True)
+    f = gray + (f - gray) * 1.05
+    return np.clip(f, 0, 255).astype(np.uint8)
 # ------------------------------------------------------------------ P3 overlays
 
 # P4: truetype() re-reads + parses the font file on every call; a callout
@@ -639,6 +701,10 @@ class ShotRenderer:
         self.shakes = [float(e["t"]) for e in fx if e["type"] == "shake"]
         self.punches = [float(e["t"]) for e in fx if e["type"] == "punch"]
         self.flashes = [float(e["t"]) for e in fx if e["type"] == "flash"]
+        self.glitches = [float(e["t"]) for e in fx if e["type"] == "glitch"]
+        # CapCut grade: "subtle" only, off by default (planner sets it from
+        # video.grade). Anything else is ignored, never a surprise grade.
+        self.grade = shot.get("grade") if shot.get("grade") == "subtle" else None
 
         try:     # a darker grade for the whole shot (the intro preset sets it)
             self.darken = max(0.0, min(0.6, float(shot.get("darken") or 0.0)))
@@ -653,7 +719,8 @@ class ShotRenderer:
 
         # From this moment until any exit fade, every frame is identical.
         settle = max([c.settled_at() for c in self.cards] + [self.start])
-        for times, length in ((self.shakes, SHAKE_LEN), (self.punches, PUNCH_LEN), (self.flashes, FLASH_LEN)):
+        for times, length in ((self.shakes, SHAKE_LEN), (self.punches, PUNCH_LEN),
+                                (self.flashes, FLASH_LEN), (self.glitches, GLITCH_LEN)):
             for te in times:
                 settle = max(settle, te + length)
         self.static_from = settle
@@ -702,6 +769,11 @@ class ShotRenderer:
         out = np.asarray(img, dtype=np.uint8)
         if self.darken > 0:
             out = (out.astype(np.float32) * (1.0 - self.darken)).astype(np.uint8)
+        if self.grade == "subtle":
+            out = grade_subtle(out)
+        _glitch = glitch_offset(t, self.glitches, self.fmt.unit)
+        if _glitch > 0:
+            out = glitch_split(out, _glitch)
         fa = flash_alpha(t, self.flashes)
         if fa > 0.001:
             out = _mix(out, np.full_like(out, 255), fa)

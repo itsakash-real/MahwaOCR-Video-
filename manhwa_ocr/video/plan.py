@@ -36,10 +36,12 @@ from . import sync as sync_mod
 from .crops import _panel_maps, head_of, is_mask_risk, tone
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
-from .editor import (PAN_DIRECTIONS, _inset_crop, build_chapter_cards, extract_callout, pacing_qa, plan_sfx,
-                     resolve_music, split_long_shots)
+from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_crop, build_chapter_cards, extract_callout, pacing_qa,
+                     plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
 from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
-from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
+from .captions import build_captions, validate_captions
+from .frames import (BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, GLITCH_MIN_GAP, LAYOUTS, MOTIONS,
+                     TRANSITION_WEIGHTS, TRANSITIONS, Format, format_from, shapes_for, transition_enter)
 from .media import video_dir
 
 PLAN_VERSION = 2
@@ -464,6 +466,8 @@ class _Designer:
         self.uses: Dict[str, int] = {}
         self.prev_enter: str | None = None
         self.prev_motion: str | None = None
+        self._prev_shot: Dict[str, Any] | None = None   # CapCut transitions: the shot before this one
+        self.last_glitch = -1e9                          # CapCut: at most one glitch per 60s
         self.prev_bg = "blur"
         self.last_punch = -1e9
 
@@ -745,15 +749,41 @@ class _Designer:
         if _call is not None:
             callouts.append({"t": round(start + 0.4, 3), "text": _call["text"],
                              "style": _call["style"], "dur": 1.2})
+        # CapCut transitions: how this shot ARRIVES (frames.TRANSITIONS).
+        # Hard cut default (90%), fade 10%; slide / zoom / whip / glitch
+        # only on impact / reveal beats, glitch at most once per 60s.
+        # A fade also fades the PREVIOUS shot out; a glitch adds a 0.2s
+        # RGB-split effect at the cut. The first shot always hard-cuts in.
+        transition = "cut"
+        if self._prev_shot is not None:
+            if "impact" in unit["cues"] or "reveal" in unit["cues"]:
+                _pool = ["slide", "zoom", "whip"]
+                if start - self.last_glitch >= GLITCH_MIN_GAP:
+                    _pool.append("glitch")
+                transition = rng.choice(_pool)
+            else:
+                transition = _pick(rng, TRANSITION_WEIGHTS)
+            if transition == "fade":
+                self._prev_shot["exit"] = "fade_out"
+                cards[0]["enter"] = "fade_in"
+            elif transition != "cut":
+                cards[0]["enter"] = transition_enter(transition)
+            if transition == "glitch":
+                effects.append({"type": "glitch", "t": round(start, 3)})
+                self.last_glitch = start
         background = self.background(rng, (bg_panel or first), layout)
         background = (self.fixes["shot"].get(first) or {}).get("background", background)
         shot = {
             "id": f"S{i + 1:03d}", "start": round(start, 3), "end": round(end, 3),
             "layout": layout, "background": background,
             "cards": cards, "exit": "fade_out" if last else "cut", "effects": effects,
+            "transition": transition,
             "callouts": callouts,
             "sentence": (unit.get("sentence") or "")[:300] or None,
         }
+        if self.vcfg.get("grade") == "subtle":
+            shot["grade"] = "subtle"  # CapCut grade, off by default (video.grade)
+        self._prev_shot = shot
         if bg_panel:
             shot["bg_panel"] = bg_panel
         return shot
@@ -860,6 +890,13 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     # CapCut bugfix (defect 1d): a split must never leave two shots on the
     # same panel with the same crop -- the second shot is punched in.
     shots, _split_crop_changes = ensure_split_crop_change(shots)
+    # CapCut beat sync: snap interior cuts to the nearest beat (<=0.15s),
+    # from video.beats or music/beats.json. No beats = no-op.
+    _beats = resolve_beats(vcfg, root)
+    _beat_info = {"enabled": False, "moved": 0, "max_shift": 0.0,
+                  "reason": "no beats (no video.beats or music/beats.json)"}
+    if _beats:
+        shots, _beat_info = snap_cuts_to_beats(shots, _beats)
     chapter_cards = build_chapter_cards(shots, duration)
     # P5: reviewer overrides from fixes.json (chapter-card titles, callout
     # text, keyed by shot id). Unknown shot_ids are warnings, never failures.
@@ -871,6 +908,11 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     _override_warnings = list(_card_warn) + list(_call_warn)
     from .shorts import build_end_screen as _build_end_screen
     _end_screen = _build_end_screen(duration, chapter)
+    # CapCut auto-captions: on by default for NEW builds (video.captions).
+    # Old plans (no captions key) render without them unless the user runs
+    # `video captions --chapter N`, which adds them to the plan.
+    _captions_on = bool(vcfg.get("captions", True))
+    _captions = build_captions(shots) if _captions_on else []
     sfx = plan_sfx(shots, chapter_cards)
     return {
         "version": PLAN_VERSION,
@@ -902,6 +944,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         # YouTube end-screen cards only; never burned into pixels.
         "end_screen": _end_screen,
         "sfx": sfx,
+        "captions": _captions,
+        "captions_enabled": _captions_on,
+        "beat_sync": _beat_info,
         "pacing": {"split_shots": _nsplit, "long_shots_flagged": _pacing_before["long_shots"],
                    "max_shot": pacing_qa(shots)["max_shot"]},
         "split_crop_changes": _split_crop_changes,
@@ -946,6 +991,10 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
             errs.append(f"{where}: background must be one of {', '.join(BACKGROUNDS)}")
         if s.get("exit", "cut") not in EXITS:
             errs.append(f"{where}: exit must be one of {', '.join(EXITS)}")
+        if s.get("transition", "cut") not in TRANSITIONS:
+            errs.append(f"{where}: transition must be one of {', '.join(TRANSITIONS)}")
+        if s.get("grade") not in (None, "subtle"):
+            errs.append(f"{where}: grade must be \"subtle\" or absent (off)")
         if s.get("bg_panel") is not None and s["bg_panel"] not in panel_ids:
             errs.append(f"{where}: bg_panel '{s['bg_panel']}' doesn't exist")
         cards = s.get("cards")
@@ -1010,14 +1059,16 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
             except (TypeError, ValueError):
                 errs.append(f"chapter card '{_cc.get('title')}' needs a numeric \"t\"")
     for _sfx in plan.get("sfx") or []:
-        if not isinstance(_sfx, dict) or _sfx.get("type") not in ("whoosh", "impact", "ding", "sting"):
-            errs.append("sfx entries need type whoosh | impact | ding | sting")
+        if not isinstance(_sfx, dict) or _sfx.get("type") not in tuple(SFX_ALL):
+            errs.append(f"sfx entries need one of {', '.join(sorted(SFX_ALL))}")
         else:
             try:
                 if not 0 <= float(_sfx.get("t", -1)) <= max(duration, 0):
                     errs.append(f"sfx '{_sfx.get('type')}' at {_sfx.get('t')}s is outside the video")
             except (TypeError, ValueError):
                 errs.append(f"sfx '{_sfx.get('type')}' needs a numeric \"t\"")
+    for _cerr in validate_captions(plan.get("captions") or [], duration):
+        errs.append(f"captions: {_cerr}")
     if duration > 0 and abs(prev_end - duration) > 0.05:
         errs.append(f"the last shot ends at {round(prev_end, 3)}s but the audio is {duration}s long")
     return errs

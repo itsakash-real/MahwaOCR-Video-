@@ -517,6 +517,11 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"    {_ncall} keyword callout(s) (impact/reveal peaks only)")
     if plan.get("sfx"):
         log(f"    {len(plan['sfx'])} SFX event(s) (missing files render silent, never fail)")
+    if plan.get("captions_enabled"):
+        log(f"    {len(plan.get('captions') or [])} caption chunk(s) (auto-captions on; key word yellow)")
+    _bs = plan.get("beat_sync") or {}
+    if _bs.get("enabled"):
+        log(f"    beat sync: {_bs.get('moved')} cut(s) snapped to beats (max shift {_bs.get('max_shift')}s)")
     if (plan.get("hook") or {}).get("warning"):
         log(f"    ! hook: {plan['hook']['warning']}")
     if qa["review_queue"]:
