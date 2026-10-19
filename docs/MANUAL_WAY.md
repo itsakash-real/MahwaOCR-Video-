@@ -89,7 +89,9 @@ python -m manhwa_ocr video status --session "Your Series Name"
   Read its `fix` (e.g. install pywhispercpp) and fix it — never render on
   estimated timing. Render refuses estimated timing by design.
 - **Mask-risk:** a panel flagged `mask_risk` (shouting face + dominant
-  bubble) is DROPPED and re-paired, never masked with a grey oval.
+  bubble) is DROPPED and re-paired, never masked with a grey oval. The
+  same holds for ANY bubble overlapping the face box: it is never
+  painted, the crop steers around it, or the panel is dropped.
 - **Layout switches:** a `layout_switches` entry means the planner
   auto-switched a crop to the pair-safe shape (e.g. 4:3 → 3:4). No action
   needed; the switch is logged in the plan + QA.
@@ -98,6 +100,12 @@ python -m manhwa_ocr video status --session "Your Series Name"
 - **Chapter cards / callouts / SFX / music:** the `editor` dict in
   `video status` shows counts plus which SFX/music files are present or
   missing. Missing files render silent on that layer, never fail.
+- **Captions:** new plans carry `captions` (3–5 words at a time, key word
+  yellow, bottom band), burned in at render. Old plans have none — run
+  `video captions --chapter N` to add them, then render again.
+- **Beat sync / grade:** only if you set `video.beats` (or drop
+  `music/beats.json`) do cuts snap to beats (±0.15s max); `video.grade:
+  "subtle"` is the only grade. Both default off.
 
 ### Storyboard fixes (the only hand-edit routes)
 
