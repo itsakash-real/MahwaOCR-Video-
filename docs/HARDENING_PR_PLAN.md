@@ -77,7 +77,7 @@ gh pr create --base editor/harden-p2-sync --head editor/harden-p3-editor \
 
 gh pr create --base editor/harden-p3-editor --head editor/harden-p4-perf \
   --title "Harden P4: perf — frame-path caches, PR plan" \
-  --body "Bg/src/font caches (pixel-identical), PR1-PR4 cache regression locks, PR strategy doc. See docs/HARDENING_PR_PLAN.md. Tests: <fill in final run>."
+  --body "Bg/src/font caches (pixel-identical), PR1-PR4 cache regression locks, PR strategy doc. See docs/HARDENING_PR_PLAN.md. Tests: 526 passed, 1 skipped."
 ```
 
 Merge order: PR-H1 → PR-H2 → PR-H3 → PR-H4, normal (non-force)
