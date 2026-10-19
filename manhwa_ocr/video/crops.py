@@ -857,6 +857,33 @@ def head_vertical_range(maps: Dict[str, Any]) -> Tuple[float, float] | None:
     return (float(head["top"]), float(head["bottom"]))
 
 
+def bubble_overlaps_face(box: Box, face: Tuple[float, float] | None) -> bool:
+    """True when a bubble box overlaps the face's vertical range (any size).
+
+    The face box is (top, bottom) panel fractions from head_vertical_range.
+    Any vertical overlap counts: painting even a small bubble that touches
+    the head range leaves a flat patch on/near the face.
+    """
+    if face is None:
+        return False
+    top, bottom = face
+    return box[1] < bottom and box[3] > top
+
+
+def face_bubble_boxes(maps: Dict[str, Any]) -> List[Box]:
+    """Bubble boxes overlapping the detected head's vertical range.
+
+    Dominant ones are the mask-risk set (see mask_risk_bubbles); smaller
+    ones are still never painted -- the crop must exclude them, or the
+    panel is dropped (verify.py).
+    """
+    face = head_vertical_range(maps)
+    if face is None:
+        return []
+    return [r["box"] for r in maps.get("bubble_regions") or []
+            if bubble_overlaps_face(r["box"], face)]
+
+
 def mask_risk_bubbles(maps: Dict[str, Any]) -> List[Box]:
     """Bubble boxes that would mask a face if painted out.
 
@@ -866,17 +893,12 @@ def mask_risk_bubbles(maps: Dict[str, Any]) -> List[Box]:
     rule is deliberately conservative: any dominant bubble overlapping
     the head range counts. Painting it would put a flat patch on the face.
     """
-    head = head_vertical_range(maps)
-    if head is None:
-        return []
-    top, bottom = head
     out: List[Box] = []
-    for box in [r["box"] for r in maps.get("bubble_regions") or []]:
+    for box in face_bubble_boxes(maps):
         x0, y0, x1, y1 = box
-        overlaps_head = y0 < bottom and y1 > top
         area = (x1 - x0) * (y1 - y0)
         dominant = area >= DOMINANT_BUBBLE_AREA or (x1 - x0) >= DOMINANT_BUBBLE_WIDTH
-        if overlaps_head and dominant:
+        if dominant:
             out.append(box)
     return out
 
@@ -932,8 +954,8 @@ def clean_bubbles(img: Image.Image, maps: Dict[str, Any] | None = None) -> Image
     picture. A bubble's own outline, text and most of its tail are inside it.
     Works only on the area around each bubble, so it stays fast.
 
-    P1: a bubble that would mask a face (mask_risk_bubbles) is NEVER painted:
-    painting it leaves a flat grey oval on the face. It stays as a bubble
+    P1 + CapCut bugfix: a bubble overlapping the face box (face_bubble_boxes) is
+    NEVER painted -- not just dominant mask-risk ones. It stays as a bubble
     the crop must steer around; when no clean crop exists, verify.py drops
     the panel instead of masking it. The feather is wide (blur 6) so painted
     patches blend instead of reading as visible discs (see patch_visibility).
@@ -943,11 +965,15 @@ def clean_bubbles(img: Image.Image, maps: Dict[str, Any] | None = None) -> Image
     m = maps or _panel_maps(img)
     if not m["bubble_regions"]:
         return img
-    # P1: never paint a bubble that overlaps a head (mask risk). `painted`
-    # lists only the bubbles actually painted, so crops steer around the
-    # unpainted mask-risk bubbles as bubbles, not as painted patches.
-    risky = set(mask_risk_bubbles(m))
-    paint_regions = [r for r in m["bubble_regions"] if r["box"] not in risky]
+    # P1 + CapCut bugfix (defect 3): NEVER paint a bubble that overlaps the
+    # face box -- not just dominant (mask-risk) ones. Painting even a small
+    # bubble over the head range leaves a flat patch on/near the face.
+    # Unpainted bubbles stay as bubbles the crop must steer around; when no
+    # clean crop exists, verify.py drops the panel instead of masking it.
+    # `painted` lists only the bubbles actually painted, so crops steer around
+    # the unpainted face-overlapping bubbles as bubbles, not as painted patches.
+    unpaintable = set(face_bubble_boxes(m))
+    paint_regions = [r for r in m["bubble_regions"] if r["box"] not in unpaintable]
     painted = [r["box"] for r in paint_regions]
     out = img.convert("RGB")
     W, H = out.size

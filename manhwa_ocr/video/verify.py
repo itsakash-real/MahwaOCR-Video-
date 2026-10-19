@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, List, Tuple
 from PIL import Image
 
 from .crops import (BUBBLE_OK, FIGURE_MIN, PATCH_VISIBLE, _panel_maps,
-                    head_of, is_mask_risk, patch_visibility, shape_candidates)
+                    face_bubble_boxes, head_of, is_mask_risk, patch_visibility, shape_candidates)
 from .cropcache import crop_key, load_crop, store_crop
 from ..util import atomic_write_text, require_chapter
 from .media import video_dir
@@ -62,6 +62,7 @@ def pick_card(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None
     m = maps or _panel_maps(img)
     panel_aspect = img.width / max(1, img.height)
     risk = is_mask_risk(m)
+    face_bubbles = face_bubble_boxes(m)
     best = None
     for fallback in (False, True):       # a shape that would cost the panel its sides only if none else works
         for a in shapes:
@@ -71,6 +72,19 @@ def pick_card(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None
                 # bubble would mask a face if painted -> flag it so the
                 # caller drops the panel instead of masking it. A clean
                 # window (avoids the bubble) has no mask problem.
+                # CapCut bugfix (defect 3): a window showing a bubble that
+                # overlaps the face range would paint a patch on/near the
+                # face -- flag it, so the planner drops the panel instead of
+                # masking it. (Such a window already has the lettering
+                # problem; face_bubble names the face reason.)
+                if face_bubbles and "face_bubble" not in probs:
+                    _bx0, _by0, _bx1, _by1 = c["box"]
+                    for _fb in face_bubbles:
+                        _ix = max(0.0, min(_bx1, _fb[2]) - max(_bx0, _fb[0]))
+                        _iy = max(0.0, min(_by1, _fb[3]) - max(_by0, _fb[1]))
+                        if _ix > 0 and _iy > 0:
+                            probs = [*probs, "face_bubble"]
+                            break
                 if risk and not c["bubble_ok"] and "mask_risk" not in probs:
                     probs = [*probs, "mask_risk"]
                 cost = (c["score"] + 0.4 * max(0.0, math.log(panel_aspect / a))
