@@ -305,7 +305,8 @@ def cmd_prepare(args) -> int:
 
     _log(f"=== Preparing chapter {chapter} ===")
     try:
-        task = flow.prepare(chapter=chapter, url=url, folder=Path(args.folder) if args.folder else None)
+        task = flow.prepare(chapter=chapter, url=url, folder=Path(args.folder) if args.folder else None,
+                            shards=args.shards)
     except UserError as exc:
         # Recorded so `next` can offer the --folder workaround instead of
         # telling the agent to retry the same failing download forever.
@@ -641,7 +642,7 @@ def cmd_video(args) -> int:
         if not rows:
             _log("No transcribed chapters yet.")
             return 0
-        _log(f"{'ch':<6}{'recap':<8}{'tags':<7}{'audio':<10}{'panels':<8}{'align':<12}{'plan':<26}video")
+        _log(f"{'ch':<6}{'recap':<8}{'tags':<7}{'audio':<10}{'panels':<8}{'align':<12}{'plan':<26}{'sync':<10}video")
         for r in rows:
             plan = r["plan"]
             align = r["alignment"]
@@ -650,14 +651,50 @@ def cmd_video(args) -> int:
                       else f"{align['review_queue']} review" if align["review_queue"] else "ok")
             plan_s = "-" if not plan else ("BROKEN" if plan["broken"] else "old style: rebuild" if plan["outdated"] else
                                            f"{plan['sync']}{' reviewed' if plan['reviewed'] else ''}{' edited' if plan['edited'] else ''}")
+            audit = r.get("sync_audit")
+            if not audit:
+                sync_s = "-"
+            elif audit.get("broken"):
+                sync_s = "BROKEN"
+            elif not audit.get("fresh"):
+                sync_s = "stale"
+            elif audit.get("pass"):
+                sync_s = "ok"
+            else:
+                wrong = audit.get("wrong_ratio")
+                sync_s = f"FAIL{f' {wrong:.0%}' if wrong is not None else ''}"
             audio_s = f"{r['duration']:.0f}s" if r["duration"] else ("yes" if r["audio"] else "-")
             video_s = "-" if not r["video"] else ("ok" if r["video_up_to_date"] else "outdated")
             tags = f"{r['tagged']:.0%}" if r["tagged"] is not None else "-"
             _log(f"{r['chapter']:<6}{'yes' if r['recap'] else '-':<8}{tags:<7}{audio_s:<10}{r['panels'] or '-':<8}"
-                 f"{align_s:<12}{plan_s:<25} {video_s}")
+                 f"{align_s:<12}{plan_s:<25} {sync_s:<9}{video_s}")
+            # P5: one-glance editor signals (P0-P3) under each chapter row.
+            ed = r.get("editor") or {}
+            if r["plan"] and not r["plan"].get("broken"):
+                hook = ed.get("hook") or {}
+                hook_s = ("hook: explicit" if hook.get("explicit_hook") else "hook: MISSING (add [HOOK])")
+                hook_s += f", {hook.get('open_loops', 0)} open loop(s)"
+                tw = ed.get("timing_warnings") or []
+                tw_s = ("timing: ok" if not tw else
+                        "timing: " + "; ".join(f"{w.get('code')} (fix: {w.get('fix')})" for w in tw[:2]))
+                sfx = ed.get("sfx") or {}
+                sfx_s = (f"SFX: {sfx.get('events', 0)} event(s)"
+                         + (f", missing files: {', '.join(sfx.get('files_missing') or [])}"
+                            if sfx.get("files_missing") else ", all files present"
+                            if (sfx.get("events") or 0) and not sfx.get("files_missing") else ""))
+                mus = ed.get("music") or {}
+                mus_s = ("music: none" if mus.get("file") is None else
+                         f"music: {mus.get('file')} ({'present' if mus.get('present') else 'MISSING'})")
+                _log(f"      editor: {tw_s} | mask_risk: {ed.get('mask_risk', 0)} | "
+                     f"layout_switches: {ed.get('layout_switches', 0)} | {hook_s} | "
+                     f"cards: {ed.get('chapter_cards', 0)} | callouts: {ed.get('callouts', 0)} | {sfx_s} | {mus_s}")
+                for _w in ed.get("override_warnings") or []:
+                    _log(f"      editor: override ignored: {_w}")
         _log("\n'align' is video align's own check: a sentence it couldn't resolve with full "
             "confidence (never confirmed by you) shows as \"N review\" - open its pairing sheet "
-            "or PROMPTS.md before trusting the video for that stretch.")
+            "(video pair) before trusting the video for that stretch.")
+        _log("'sync' is the last sync-audit gate result for the current plan (ok / FAIL / stale; "
+            "run  video sync-audit --chapter N  for the details).")
         _log(f"\nAudio goes in: {sess.path / 'audio'}  (chapter_N.mp3 / .wav / .m4a)")
         return 0
 
@@ -680,15 +717,82 @@ def cmd_video(args) -> int:
         for c in chapters(default_all=False):
             vb.make_plan(sess, c, cfg, force=args.force or action == "sync",
                          sync="off" if args.no_sync else "auto", fmt=args.format, duration=args.duration,
-                         pages_from=Path(args.pages) if args.pages else None, log=_log)
-            _log(f"  review: .work/video/ch{c}/REVIEW.md   then:  python -m manhwa_ocr video render "
-                 f"--chapter {c}{_pin(sess)}")
+                         pages_from=Path(args.pages) if args.pages else None, log=_log,
+                         storyboard=not args.no_storyboard)
+            if not args.no_storyboard:
+                _log(f"  review: .work/video/ch{c}/REVIEW.md   then:  python -m manhwa_ocr video render "
+                     f"--chapter {c}{_pin(sess)}")
+            else:
+                _log(f"  next:  python -m manhwa_ocr video render --chapter {c}{_pin(sess)}")
+        return 0
+
+    if action == "intro":
+        from .video import intro as intro_mod
+
+        if args.prepare:
+            intro_mod.prepare(sess, log=_log)
+            _log("  next: write intro/intro.json, record audio/chapter_0.mp3, then:  "
+                 f"python -m manhwa_ocr video intro{_pin(sess)}")
+            return 0
+        if args.auto:
+            from .video import hook as hook_mod
+
+            out = hook_mod.build_hook(
+                sess, cfg, chapters=expand_chapters(args.chapters) if args.chapters else None,
+                audio=args.audio, script=args.script, cues=args.cues,
+                target_seconds=args.duration, sync="off" if args.no_sync else "auto",
+                fmt=args.format, plan_only=args.dry_run, workers=args.workers,
+                allow_reuse=args.allow_reuse, log=_log)[1]
+            if out is not None:
+                _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+            return 0
+        out = intro_mod.run(sess, cfg, sync="off" if args.no_sync else "auto", fmt=args.format,
+                            preview=args.preview, workers=args.workers, plan_only=args.dry_run, log=_log)
+        if out is not None:
+            _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+        return 0
+
+    if action == "hook":
+        from .video import hook as hook_mod
+
+        out = hook_mod.build_hook(
+            sess, cfg, chapters=expand_chapters(args.chapters) if args.chapters else None,
+            audio=args.audio, script=args.script, cues=args.cues,
+            target_seconds=args.duration, sync="off" if args.no_sync else "auto",
+            fmt=args.format, plan_only=args.dry_run, workers=args.workers,
+            allow_reuse=args.allow_reuse, log=_log)[1]
+        if out is not None:
+            _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+        return 0
+
+    if action == "previously":
+        from .video import hook as hook_mod
+
+        out = hook_mod.build_previously(
+            sess, cfg, chapters=chapters(default_all=False),
+            audio=args.audio, script=args.script, target_seconds=args.duration,
+            sync="off" if args.no_sync else "auto", fmt=args.format,
+            plan_only=args.dry_run, workers=args.workers,
+            allow_reuse=args.allow_reuse, log=_log)[1]
+        if out is not None:
+            _log(f"Wrote {out.relative_to(sess.path).as_posix()}")
+        return 0
+    if action == "sync-audit":
+        from .video import syncaudit
+
+        for c in chapters(default_all=False):
+            _log(f"=== Chapter {c} ===")
+            syncaudit.run(sess.path, c, cfg, log=_log)
         return 0
 
     if action == "pair":
         from .video import pairing
 
         for c in chapters(default_all=False):
+            if args.autofix:
+                pairing.autofix(sess.path, c, log=_log)
+                _log(f"  next:  python -m manhwa_ocr video align --chapter {c} --session \"{sess.slug}\"")
+                continue
             if args.apply:
                 pairing.apply(sess.path, c, log=_log)
                 _log(f"  next:  python -m manhwa_ocr video plan --chapter {c} --force --session \"{sess.slug}\"")
@@ -763,11 +867,16 @@ def cmd_video(args) -> int:
         from .video import verify as vf
 
         for c in chapters(default_all=False):
-            vb.make_plan(sess, c, cfg, force=True, sync="off" if args.no_sync else "auto",
-                         fmt=args.format, log=_log)
             from .video.media import video_dir
 
-            rep = json.loads((video_dir(sess.path) / f"chapter_{c}.verify.json").read_text(encoding="utf-8"))
+            # make_plan writes chapter_N.verify.json as part of planning, and
+            # rebuilds whenever its inputs changed -- so a second full plan
+            # buys nothing. Only force a rebuild when no verify report exists
+            # yet (e.g. it was deleted while the plan survived).
+            vpath = video_dir(sess.path) / f"chapter_{c}.verify.json"
+            vb.make_plan(sess, c, cfg, force=not vpath.exists(), sync="off" if args.no_sync else "auto",
+                         fmt=args.format, log=_log)
+            rep = json.loads(vpath.read_text(encoding="utf-8"))
             _log(f"=== Chapter {c}: checked {len(rep['panels'])} drawn panels ===")
             for pid, r in rep["panels"].items():
                 if r["action"] != "ok":
@@ -795,21 +904,71 @@ def cmd_video(args) -> int:
             _log(f"  chapter {c}: approved; render with  video render --chapter {c}")
         return 0
 
+    if action == "captions":
+        # Add CapCut-style auto-captions to an existing plan (old plans have
+        # none) and write video/chapter_N.captions.ass. The next render
+        # burns them in; nothing else in the plan is touched.
+        from .video import captions as caps_mod
+        from .video.panels import load_panels
+        from .video.plan import load_plan, save_plan
+        for c in chapters(default_all=False):
+            _panels = load_panels(sess.path, c) or {"panels": []}
+            _plan = load_plan(sess.path, c, {p["id"] for p in _panels["panels"]})
+            # Sentence-aligned captions when the alignment file exists
+            # (no per-shot gaps / early captions); legacy per-shot
+            # build otherwise.
+            _caps = []
+            try:
+                from .video import align_engine as _align_mod
+                import json as _json
+                _align = _json.loads(_align_mod.alignment_path(sess.path, c).read_text(encoding="utf-8"))
+                _caps = caps_mod.build_captions_from_sentences(_align.get("segments") or [],
+                                                                _plan.get("duration"))
+            except (OSError, ValueError):
+                _caps = []
+            if not _caps:
+                _caps = caps_mod.build_captions(_plan["shots"])
+            _plan["captions"] = _caps
+            _plan["captions_enabled"] = True
+            for _s in _plan["shots"]:
+                _s["caption_bar"] = True
+            save_plan(sess.path, c, _plan)
+            _ass = caps_mod.write_captions_file(sess.path, c, _plan)
+            _n = len(_plan["captions"])
+            _log(f"  chapter {c}: {_n} caption chunk(s) -> {_ass.relative_to(sess.path).as_posix()}")
+        return 0
+
     if action == "render":
         for c in chapters(default_all=False):
             _log(f"=== Chapter {c} ===")
             vb.render_chapter(sess, c, cfg, preview=args.preview, workers=args.workers,
                               allow_estimated=args.force, allow_unreviewed=args.force,
-                              strict=args.strict, log=_log)
+                              allow_sync_fail=args.force, strict=args.strict, log=_log)
         return 0
 
     if action == "build":
         results = vb.build(sess, chapters(), cfg, force=args.force, sync="off" if args.no_sync else "auto",
-                           fmt=args.format, preview=args.preview, workers=args.workers, log=_log)
+                           fmt=args.format, preview=args.preview, workers=args.workers, log=_log,
+                           storyboard=not args.no_storyboard)
         _log("")
         for c, r in results.items():
             _log(f"  ch {c:<6} {r}")
         return 1 if any(r.startswith("failed") for r in results.values()) else 0
+
+    if action == "shorts":
+        for c in chapters(default_all=False):
+            manifest = vb.make_shorts(sess, c, cfg, count=args.count or 3, preview=args.preview,
+                                      workers=args.workers, log=_log)
+            _log(f"  next:  upload video/chapter_{c}.shorts_*.mp4 as Shorts; "
+                 f"titles + hooks in video/chapter_{c}.shorts.json")
+        return 0
+
+    if action == "endscreen":
+        for c in chapters(default_all=False):
+            vb.make_end_screen(sess, c, cfg, log=_log)
+            _log(f"  next:  add the slots as native end-screen cards in YouTube Studio, "
+                 f"and paste video/chapter_{c}.watch_next.txt into the description.")
+        return 0
 
     if action == "clip":
         if args.start is None or args.end is None:
@@ -899,6 +1058,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--folder", help="use local images instead of downloading")
     p.add_argument("--chapter")
     p.add_argument("--next", action="store_true", help="next pending chapter from the link list")
+    p.add_argument("--shards", type=int, default=1,
+                   help="split the tile list into N shard tasks (TASK_1.md ... TASK_N.md) so several "
+                        "agents can read in parallel; assemble merges the tile_results_shard_N.json files")
     ws(p)
     p.set_defaults(func=cmd_prepare)
 
@@ -939,8 +1101,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "storyboard", "render",
-                                      "build", "clip", "compile", "verify", "review", "approve"])
+    p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+                                      "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
+                                      "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
     p.add_argument("--force", action="store_true", help="rebuild even if up to date (discards plan edits)")
@@ -954,10 +1117,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="start", type=float, help="clip start, seconds")
     p.add_argument("--to", dest="end", type=float, help="clip end, seconds")
     p.add_argument("--workers", type=int, default=0, help="parallel renders (default: half your CPU cores)")
+    p.add_argument("--count", type=int, default=3, help="shorts: how many Shorts to cut (default 3)")
     p.add_argument("--no-titles", dest="no_titles", action="store_true", help="compile without title cards")
     p.add_argument("--name", help="compiled output name")
     p.add_argument("--apply", action="store_true", help="pair: save the fixed tags from pairs.json")
-    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing")
+    p.add_argument("--autofix", action="store_true",
+                   help="pair: replace text-only/credits tags with the nearest drawn panel")
+    p.add_argument("--no-storyboard", dest="no_storyboard", action="store_true",
+                   help="plan/build: skip writing the storyboard + review task")
+    p.add_argument("--prepare", action="store_true",
+                   help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
+    p.add_argument("--audio", help="hook/previously: narration audio file, e.g. audio/chapter_0.mp3")
+    p.add_argument("--script", help="hook/previously: narration script, one sentence per line")
+    p.add_argument("--cues", help="hook: cues.json file with the narration sentences (alternative to --script)")
+    p.add_argument("--auto", action="store_true",
+                   help="intro: auto-pick panels from the script instead of reading intro.json")
+    p.add_argument("--allow-reuse", dest="allow_reuse", action="store_true",
+                   help="hook/previously: allow reusing panels already used in intro/previously")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="review: ask the reviewer, apply nothing; intro: plan only, no render")
     p.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
                    help="review: how many review-and-fix rounds to allow (default 3)")
     ws(p)

@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .agent_prompts import RECAP_RULES
 from .config import Config
 from .memory import SeriesMemory
 from .util import (
@@ -88,6 +89,9 @@ emotional logic: why a character does a thing, why a moment lands.
 - Call out the one or two beats that genuinely matter -- a reveal, a reversal, a \
 line that recontextualizes something. Say why it matters.
 - End on the cliffhanger or the open question that pulls into the next chapter.
+- Mark the hook with a [HOOK] line on its own line before it, and open a loop
+  every 2-3 minutes with a [LOOP: question] line on its own line before the
+  sentence. These bracketed lines are editing cues, never spoken.
 
 Include editing cues in square brackets on their own lines, for example \
 `[Panel: the rooftop reveal]` or `[Beat -- hold here]`. These are directions for \
@@ -145,14 +149,24 @@ narrator, so never mention them in the narration itself.
 
 
 def _panel_listing(panels: List[Dict[str, Any]]) -> str:
+    from .video.cues import nearest_drawn_panel
+
     lines = []
     for p in panels:
         if p.get("credits"):
             continue  # scanlator credits: never part of the story
-        bits = [p["id"] + (" [tall]" if p.get("tall") else "")
-                + (" [TEXT ONLY - don't tag; tag the drawn panel next to it]" if p.get("text_only") else "")]
+        if p.get("text_only"):
+            # Name the panel to tag instead of leaving the writer to hunt for
+            # it: a text-only tag is rejected by the checker, and the nearest
+            # drawn panel is almost always the right replacement.
+            near = nearest_drawn_panel(panels, p["id"])
+            hint = f" [TEXT ONLY - don't tag; tag {{{near}}} instead]" if near \
+                else " [TEXT ONLY - don't tag; tag the drawn panel next to it]"
+        else:
+            hint = ""
+        bits = [p["id"] + (" [tall]" if p.get("tall") else "") + hint]
         if p.get("scene"):
-            bits.append(f"shows: {p['scene'][:150]}")
+            bits.append(f"shows: {p['scene']}")
         if p.get("text"):
             bits.append(f"text: {p['text'][:120]}")
         lines.append("- " + " — ".join(bits))
@@ -339,11 +353,40 @@ class RecapBuilder:
         m = META_RE.search(text)
         return text[m.end():].strip() if m else text.strip()
 
-    def _write_recap(self, chapter: str, narration: str, hook: str, minutes: float) -> Path:
+    def _spell_numbers(self) -> bool:
+        """video.tts.spell_numbers: write digits out as words in the NEW tts.txt (default on)."""
+        tts = (self.cfg.video or {}).get("tts")
+        return bool(tts.get("spell_numbers", True)) if isinstance(tts, dict) else True
+
+    def _check(self, chapter: str, narration: str) -> Dict[str, List[str]]:
         from .video import cues
 
+        vcfg = self.cfg.video or {}
+        return cues.check(narration, self.panels(chapter), min_hold=float(vcfg.get("min_hold", cues.MIN_HOLD)),
+                          wpm=WORDS_PER_MINUTE, spell=self._spell_numbers())
+
+    def _has_audio(self, chapter: str) -> Path | None:
+        """The chapter's recorded audio, when its recap or tts file already exists: the recording
+        matches those files, so they are never rewritten."""
+        from .video import cues
+        from .video.media import audio_path
+
+        audio = audio_path(self.workdir, chapter)
+        if audio is not None and (self.recap_path(chapter).exists() or cues.tts_path(self.workdir, chapter).exists()):
+            return audio
+        return None
+
+    def _write_recap(self, chapter: str, narration: str, hook: str, minutes: float) -> Path | None:
+        from .video import cues
+
+        audio = self._has_audio(chapter)
+        if audio is not None:
+            self.log(f"    ! chapter {chapter} already has audio ({audio.name}); its recap and tts file were NOT "
+                     "rewritten, because the recording matches them. Move the audio away first if you really "
+                     "mean to re-record this chapter.")
+            return None
         known = {p["id"] for p in self.panels(chapter)} or None
-        parsed = cues.write_outputs(self.workdir, chapter, narration, known)
+        parsed = cues.write_outputs(self.workdir, chapter, narration, known, self._spell_numbers())
         clean = cues.strip_tags(narration)
         words = _count_words(clean)
         meta = {
@@ -402,7 +445,11 @@ class RecapBuilder:
             if _count_words(strip_tags(narration)) < MIN_NARRATION_WORDS:
                 self.log(f"    ! model returned too little narration; chapter {chapter} not saved")
                 continue
+            for msg in self._check(chapter, narration)["warnings"]:
+                self.log(f"    ! chapter {chapter}: {msg}")
             path = self._write_recap(chapter, narration, hook, minutes)
+            if path is None:
+                continue
             self.log(f"    {_count_words(narration)} words -> {path.name}")
             written.append(path)
         return written
@@ -517,6 +564,12 @@ series context as of that chapter. Work through them in order.
 
 ---
 
+## Rules finalize checks
+
+{RECAP_RULES}
+
+---
+
 ## Output
 
 Write `{rel(self.task_dir / 'parts.json')}`:
@@ -567,23 +620,41 @@ covering exactly chapters {', '.join(todo)}.
 
         from .video.cues import strip_tags
 
-        written, still_owed = [], []
+        written, still_owed, rejected = [], [], {}
         for chapter in expected:
             narration, hook = _parse_part(parts.get(chapter))
             if _count_words(strip_tags(narration)) < MIN_NARRATION_WORDS:
                 still_owed.append(chapter)
                 continue
-            written.append(self._write_recap(chapter, narration, hook, minutes))
+            report = self._check(chapter, narration)
+            if report["errors"]:
+                rejected[chapter] = report["errors"]      # not saved: the writer must retag
+                continue
+            for msg in report["warnings"]:
+                self.log(f"    ! chapter {chapter}: {msg}")
+            path = self._write_recap(chapter, narration, hook, minutes)
+            if path is not None:
+                written.append(path)
 
         intro, outro = str(raw.get("_intro") or ""), str(raw.get("_outro") or "")
         if intro or outro:
             self._write_bookends(expected, intro, outro)
 
-        if still_owed:
-            self.log(f"  still missing narration for chapter(s) {', '.join(still_owed)}; task kept open")
-            atomic_write_json(self.task_dir / "plan.json", {"chapters": still_owed, "minutes": minutes})
+        if still_owed or rejected:
+            owed = [c for c in expected if c in still_owed or c in rejected]
+            if still_owed:
+                self.log(f"  still missing narration for chapter(s) {', '.join(still_owed)}; task kept open")
+            atomic_write_json(self.task_dir / "plan.json", {"chapters": owed, "minutes": minutes})
         else:
             self.cancel()
+        if rejected:
+            lines = []
+            for chapter, errs in rejected.items():
+                lines.append(f"Chapter {chapter} was NOT saved:")
+                lines.extend(f"  - {e}" for e in errs)
+            raise UserError(
+                "\n".join(lines) + f"\nFix the tags in parts.json, then run again:  {self._cmd('recap --finalize')}"
+                + (f"\n(Chapter(s) {', '.join(w.stem.split('_')[-1] for w in written)} were saved.)" if written else ""))
         return written
 
     # ---------------- compile ----------------

@@ -25,10 +25,13 @@ from PIL import Image
 from ..util import UserError, atomic_save_image, atomic_write_text, require_chapter, sort_chapters
 from . import align_engine
 from . import cues as cues_mod
+from . import sync as sync_mod
+from . import syncaudit
 from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, run, video_info
 from .frames import background, format_from, shapes_for
 from . import fixes as fixes_mod
 from .verify import verify_chapter
+from .plan import map_options
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
 from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, units_from_alignment, validate
@@ -84,7 +87,8 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         for c in s.get("cards") or []:
             pw, ph = dims.get(c["panel"], (1.0, 1.0))
             x0, y0, x1, y1 = (float(v) for v in c["crop"])
-            aspect = ((x1 - x0) * pw) / max(1e-9, (y1 - y0) * ph)
+            pad = float(c.get("pad_y") or 0.0)          # blurred padding above and below the crop
+            aspect = ((x1 - x0) * pw) / max(1e-9, ((y1 - y0) + 2 * pad) * ph)
             if min(abs(math.log(aspect / a)) for a in allowed) > 0.02:
                 shape_bad.append(f"{s.get('id')} {c['panel']} ({aspect:.2f})")
     shortest = min((float(s["end"]) - float(s["start"]) for s in shots), default=0.0)
@@ -97,8 +101,12 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     if cs.get("bubble"):
         failures.append(f"{len(cs['bubble'])} panel(s) would show a speech bubble or caption in their card: "
                         f"{', '.join(cs['bubble'][:8])}")
-    if shots and shortest < min_hold - 0.01:
-        failures.append(f"a shot lasts {shortest:.2f}s, under the {min_hold:g}s minimum")
+    # A shot under the floor is the honest price of dense narration (one-word
+    # sentences): it is counted in timing.short_shots and never fixed by
+    # stealing time from neighbours, so only a shot too short to be seen at
+    # all (under 0.2s) stops the build.
+    if shots and shortest < 0.2 - 1e-6:
+        failures.append(f"a shot lasts {shortest:.2f}s - too short to be seen (under 0.2s)")
     return {
         "chapter": plan.get("chapter"),
         "failures": failures,
@@ -106,7 +114,19 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "placed_by_order": (align_cov or {}).get("placed_by_order", []),
         "text_only_excluded": [p["id"] for p in panels["panels"] if p.get("text_only")],
         "shots": len(shots), "shortest_shot": round(shortest, 2), "timing": plan.get("timing"),
+        "floor": round(float(min_hold), 3),
+        "short_shots": (plan.get("timing") or {}).get("short_shots", 0),
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
+        "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
+        "low_confidence_heads": cs.get("low_confidence_heads", []),
+        # P1: mask-risk panels whose clean crop avoids the bubble (the
+        # no-clean-crop ones were already dropped by verify.py).
+        "mask_risk": cs.get("mask_risk", []),
+        # P2: auto-switched crops (from_shape -> to_shape) and the timing
+        # warnings that produced this plan — both surfaced in QA so a
+        # reviewer sees what the planner changed and why timing is estimated.
+        "layout_switches": cs.get("layout_switches", []),
+        "timing_warnings": list(plan.get("timing_warnings") or []),
         "review_queue": plan.get("alignment_review_queue") or [],
         "sync": plan.get("sync"),
     }
@@ -129,7 +149,14 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
     ap = align_engine.alignment_path(root, chapter)
     st = audio.stat() if audio else None
     knobs = {k: vcfg.get(k) for k in ("min_shot", "max_shot", "target_shot", "lead", "pair_ratio", "fps",
-                                      "music", "music_volume", "effects")}
+                                      "min_hold", "sync", "music", "music_volume", "effects")}
+    # Framing options join the hash only when changed from their defaults, so plans built
+    # before they existed stay current (a rebuild would re-frame every card).
+    crop_opts = {k: v for k, v in map_options(vcfg).items()
+                 if v != {"full_width": True, "min_width_kept": 0.9, "white_threshold": 242,
+                          "black_threshold": 13, "pale_heads": True, "keep_top": 0.25}[k]}
+    if crop_opts:
+        knobs["crop"] = crop_opts
     return {
         "panels": panels_fp,
         "audio": [audio.name, st.st_size, int(st.st_mtime)] if st else None,
@@ -160,6 +187,34 @@ def _alignment_status(root: Path, chapter: str) -> Dict[str, Any] | None:
         "sync_mode": data.get("sync_mode"),
         "validation_status": (data.get("validation") or {}).get("status"),
         "review_queue": len(data.get("review_queue") or []),
+        # P0 safety lock: estimated-timing fallbacks surface here, so
+        # `video status` shows WHY the timing is estimated, not just that
+        # it is. Empty list when timing is synced.
+        "timing_warnings": list(data.get("timing_warnings") or []),
+    }
+
+
+def _sync_audit_status(root: Path, chapter: str, plan_file: Path) -> Dict[str, Any] | None:
+    """Read-only peek at chapter_N.syncaudit.json for `video status`: the sync
+    gate result of the last audit, and whether that audit still belongs to the
+    current plan (a rebuilt plan invalidates it)."""
+    path = syncaudit.audit_path(root, chapter)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"broken": True}
+    if not isinstance(data, dict):
+        return {"broken": True}
+    fresh = plan_file.exists() and path.stat().st_mtime >= plan_file.stat().st_mtime
+    gate = data.get("gate") or {}
+    return {
+        "broken": False,
+        "fresh": fresh,
+        "pass": bool(gate.get("pass")),
+        "failures": [str(f) for f in (gate.get("failures") or [])],
+        "wrong_ratio": (data.get("wrong_picture") or {}).get("ratio"),
     }
 
 
@@ -218,7 +273,45 @@ def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str
         "video": video.name if video.exists() else None,
         "video_up_to_date": up_to_date,
         "preview": preview.name if preview.exists() else None,
+        "sync_audit": _sync_audit_status(root, chapter, plan_file),
         "storyboards": [p.name for p in storyboard_paths(root, chapter)],
+        # P5: one-glance editor signals (P0-P3) for `video status` / `next`.
+        "editor": _editor_status(root, plan, alignment),
+    }
+
+
+def _editor_status(root: Path, plan: Dict[str, Any] | None, alignment: Dict[str, Any] | None) -> Dict[str, Any]:
+    """One-glance P0-P3 signals for `video status` / `next` / dashboard.
+
+    Never raises: a missing/broken plan reports empty signals, not an error.
+    SFX file presence is checked against the conventional `sfx/` folder
+    (config `video.sfx_dir` may point elsewhere; the plan/build logs name
+    the configured dir when it renders).
+    """
+    from .editor import resolve_sfx_files
+
+    if not isinstance(plan, dict) or plan.get("broken"):
+        return {"timing_warnings": [], "mask_risk": 0, "layout_switches": 0,
+                "hook": None, "chapter_cards": 0, "callouts": 0,
+                "sfx": {"events": 0, "files_present": [], "files_missing": []},
+                "music": {"file": None, "present": None}, "override_warnings": []}
+    cs = plan.get("crop_stats") or {}
+    timing = list((alignment or {}).get("timing_warnings") or []) or list(plan.get("timing_warnings") or [])
+    music_file = plan.get("music")
+    found, missing = resolve_sfx_files(root, "sfx")
+    return {
+        "timing_warnings": [{"code": w.get("code"), "fix": w.get("fix")}
+                            for w in timing if isinstance(w, dict)],
+        "mask_risk": len(cs.get("mask_risk") or []),
+        "layout_switches": len(cs.get("layout_switches") or []),
+        "hook": plan.get("hook"),
+        "chapter_cards": len(plan.get("chapter_cards") or []),
+        "callouts": sum(len(s.get("callouts") or []) for s in plan.get("shots") or []),
+        "sfx": {"events": len(plan.get("sfx") or []),
+                "files_present": sorted(found), "files_missing": sorted(missing)},
+        "music": {"file": music_file,
+                  "present": (root / music_file).is_file() if music_file else None},
+        "override_warnings": list(plan.get("override_warnings") or []),
     }
 
 
@@ -226,11 +319,19 @@ def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str
 
 
 def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto", fmt: str | None = None,
-              duration: float | None = None, pages_from: Path | None = None, log: Callable = print) -> Dict[str, Any]:
+              duration: float | None = None, pages_from: Path | None = None, log: Callable = print,
+              storyboard: bool = True) -> Dict[str, Any]:
     root, chapter = sess.path, require_chapter(chapter)
     vcfg = dict(cfg.video)
     fmt = fmt or vcfg.get("format", "16:9")
     ensure_gitignore(root)
+    # The numbers that decide timing, printed before any work so the plan's
+    # meta can always be traced back to what the config said.
+    sync_settings = sync_mod.effective_settings(vcfg, log=log)
+    log(f"  chapter {chapter}: sync/hold settings: min_hold={sync_settings['min_hold']:g}s, "
+        f"lead={sync_settings['lead']:g}s, max_late={sync_settings['max_late']:g}s, "
+        f"min_hold_short={sync_settings['min_hold_short']:g}s, max_hold={sync_settings['max_hold']:g}s, "
+        f"max_unmatched={sync_settings['max_unmatched']:g}s")
 
     if pages_from:
         from ..images import import_pages, list_images
@@ -302,8 +403,13 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     fixes = fixes_mod.load(root, chapter, dims)
     fmt_obj = format_from(fmt, int(vcfg.get("fps", 30)))
     shapes = sorted({a for k in ("single", "pair", "wide") for a in shapes_for(k, fmt_obj)})
-    report = verify_chapter(panels["panels"], lambda p: panel_image(root, chapter, p, norm_w, clean=True),
-                            shapes, root, chapter, log=log)
+    layout_shapes = {layout: shapes_for(layout, fmt_obj) for layout in ("single", "pair", "wide")}
+    report = verify_chapter(panels["panels"],
+                            lambda p: panel_image(root, chapter, p, norm_w, clean=True,
+                                                  fingerprint=panels.get("fingerprint")),
+                            shapes, root, chapter, log=log, options=map_options(vcfg),
+                            fingerprint=panels.get("fingerprint"),
+                            layout_shapes=layout_shapes)
     drop = {d["panel"]: d["reason"] for d in report["dropped"]}
     drop.update(fixes["drop"])
     for p in panels["panels"]:
@@ -315,8 +421,27 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if report["needs_eyes"]:
         log(f"  ! {len(report['needs_eyes'])} panel(s) with a character whose head may be cut: "
             + ", ".join(report["needs_eyes"][:12]))
+    if report.get("mask_risk"):
+        log(f"  ! {len(report['mask_risk'])} panel(s) with a dominant bubble over the head range "
+            f"(mask risk): {', '.join(report['mask_risk'][:12])}")
+    if report.get("layout_switches"):
+        log(f"  chapter {chapter}: {len(report['layout_switches'])} crop(s) will auto-switch to the pair-safe shape: "
+            + ", ".join(f"{pid} {sw.get('from_shape'):g}->{sw.get('to_shape'):g}"
+                        for pid, sw in sorted(report["layout_switches"].items())[:12]))
+    if report.get("layout_sensitive"):
+        log(f"  ! {len(report['layout_sensitive'])} panel(s) clean in a single shot but not in a pair "
+            f"(layout-sensitive crop): {', '.join(report['layout_sensitive'][:12])}")
+    if report.get("visible_patches"):
+        log(f"  ! {len(report['visible_patches'])} panel(s) with a visible painted patch: "
+            + ", ".join(d['panel'] for d in report['visible_patches'][:12]))
     align_cov = None
-    if not cues_mod.load_cues(root, chapter):
+    # P3: hook / open-loop status comes from the same cues.json the plan uses.
+    cues_data = cues_mod.load_cues_strict(root, chapter)
+    hook_info = None
+    if cues_data is not None:
+        from .editor import hook_status as _hook_status
+        hook_info = _hook_status(list((cues_data or {}).get("sentences") or []))
+    if not cues_data:
         units, mode_note, meta = None, "even timing (recap has no panel tags)", None
     else:
         align_path = align_engine.alignment_path(root, chapter)
@@ -342,40 +467,92 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         units = _replace_dropped(units_from_alignment(alignment["segments"]), drop)
         align_cov = alignment.get("coverage")
         queue = alignment.get("review_queue") or []
-        meta = {"sync_mode": alignment.get("sync_mode"), "review_queue": queue}
+        # P2: timing warnings ride with the plan (see build_plan), so status/QA/render
+        # all report the same whisper outcome.
+        meta = {"sync_mode": alignment.get("sync_mode"), "review_queue": queue,
+                "timing_warnings": list(alignment.get("timing_warnings") or []),
+                "hook": hook_info}
         mode_note = (f"{len(alignment['segments'])} sentences from the alignment engine "
                     f"({alignment.get('sync_mode', '?')} timing, {len(queue)} flagged for review)")
 
+    # Captions are timed from the alignment segments (sentence windows),
+    # never from per-shot estimates (see captions.build_captions_from_sentences).
+    _caption_sentences = None
+    try:
+        _caption_sentences = [{"text": seg.get("text"), "start": seg.get("start"),
+                               "end": seg.get("end")} for seg in alignment["segments"]]
+    except (NameError, TypeError, KeyError):
+        _caption_sentences = None
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
-                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True), fixes=fixes)
+                      caption_sentences=_caption_sentences,
+                      image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True,
+                                                      fingerprint=panels.get("fingerprint")),
+                      fixes=fixes, settings=sync_settings, root=root)
     plan["inputs"] = inputs
     plan["generated_hash"] = _shots_hash(plan)
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
-    qa = quality_report(plan, panels, align_cov, float(vcfg.get("min_hold", 3.0)))
+    qa = quality_report(plan, panels, align_cov,
+                        min(sync_settings["min_hold"], sync_settings["min_hold_short"]))
     atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
     if qa["failures"]:
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])
                         + f"\nDetails: video/chapter_{chapter}.qa.json")
     save_plan(root, chapter, plan)
+    # P5: end-screen spec + WATCH NEXT block ride with every plan (native
+    # YouTube cards only; never burned into pixels). Override warnings are
+    # logged here too, next to the other plan-time warnings.
+    from .shorts import build_end_screen as _build_end_screen
+    _es = _build_end_screen(float(plan["duration"]), chapter,
+                            series_name=getattr(sess, "name", None) or sess.slug)
+    atomic_write_text(endscreen_path(root, chapter), json.dumps(_es, indent=1, ensure_ascii=False))
+    atomic_write_text(watch_next_path(root, chapter), _es["watch_next"] + "\n")
     log(f"  chapter {chapter}: {len(plan['shots'])} shots, {mode_note}")
+    for _w in plan.get("override_warnings") or []:
+        log(f"    ! override ignored: {_w}")
+    short_note = (f"; {qa['short_shots']} shot(s) under the {qa['floor']:g}s floor (dense narration, "
+                  f"left honest instead of stealing time)") if qa["short_shots"] else ""
     log(f"    all {qa['shown_panels']}/{qa['art_panels']} drawn panels shown; shortest shot "
-        f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order")
+        f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order{short_note}")
     if qa["head_risk"]:
         log(f"    ! {len(qa['head_risk'])} panel(s) where a head may be cut: {', '.join(qa['head_risk'][:8])}")
+    if plan.get("chapter_cards"):
+        from .editor import chapter_cards_to_timestamps as _ts
+        log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))
+    _ncall = sum(len(sh.get("callouts") or []) for sh in plan.get("shots") or [])
+    if _ncall:
+        log(f"    {_ncall} keyword callout(s) (impact/reveal peaks only)")
+    if plan.get("sfx"):
+        log(f"    {len(plan['sfx'])} SFX event(s) (missing files render silent, never fail)")
+    if plan.get("captions_enabled"):
+        log(f"    {len(plan.get('captions') or [])} caption chunk(s) (auto-captions on; key word yellow)")
+    _bs = plan.get("beat_sync") or {}
+    if _bs.get("enabled"):
+        log(f"    beat sync: {_bs.get('moved')} cut(s) snapped to beats (max shift {_bs.get('max_shift')}s)")
+    if (plan.get("hook") or {}).get("warning"):
+        log(f"    ! hook: {plan['hook']['warning']}")
     if qa["review_queue"]:
         log(f"    ! {len(qa['review_queue'])} sentence(s) flagged for review (non-blocking; "
             f"see video/chapter_{chapter}.qa.json)")
-    write_storyboard(root, chapter, plan, log=log)
-    write_review_task(root, chapter, plan, sess.slug)
+    # P2: no silent change — every auto-switch and every timing warning is
+    # logged with its fix, and both ride in the QA file for the reviewer.
+    if qa.get("layout_switches"):
+        log("    layout auto-switches (pair-safe shape): " + "; ".join(
+            f"{sw.get('panel')} {sw.get('from_shape'):g}->{sw.get('to_shape'):g}"
+            for sw in qa["layout_switches"][:12]))
+    for w in qa.get("timing_warnings") or []:
+        log(f"    ! timing: {w.get('code')}: {w.get('message')} Fix: {w.get('fix')}")
+    if storyboard:
+        write_storyboard(root, chapter, plan, log=log)
+        write_review_task(root, chapter, plan, sess.slug)
     return plan
 
 
 def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: int = 0,
                    allow_estimated: bool = False, allow_unreviewed: bool = False, strict: bool = False,
-                   log: Callable = print) -> Path:
+                   allow_sync_fail: bool = False, log: Callable = print) -> Path:
     root, chapter = sess.path, require_chapter(chapter)
     panels = load_panels(root, chapter)
     if not panels:
@@ -389,13 +566,77 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
                 f"Chapter {chapter} video has not been reviewed yet (require_review is on in manhwa-ocr.yaml).\n"
                 f'Review it first:  video review --chapter {chapter} --session "{sess.slug}"\n'
                 f"or check the storyboard yourself and run:  video approve --chapter {chapter}")
+    # P2: the estimated-timing refusal names the exact whisper failure and
+    # its fix (from the P0 timing warnings), not just "whisper couldn't".
+    timing_warnings = list(plan.get("timing_warnings") or [])
+    if not timing_warnings:
+        try:
+            _align_data = json.loads(align_engine.alignment_path(root, chapter).read_text(encoding="utf-8"))
+            timing_warnings = list(_align_data.get("timing_warnings") or [])
+        except (OSError, ValueError):
+            timing_warnings = []
+    timing_detail = "".join(
+        f"\n  - {w.get('code')}: {w.get('message')} Fix: {w.get('fix')}" for w in timing_warnings)
     if plan.get("sync") == "estimated" and not allow_estimated:
         raise UserError(
             f"Chapter {chapter}'s timing was only estimated from text length, not synced to the real "
             f"narration (whisper couldn't transcribe it) — the pictures will drift out of sync with the voice.\n"
             f"Fix the sync first: lower `whisper_model` in manhwa-ocr.yaml (e.g. to base.en or tiny.en if your "
             f"machine is low on RAM), then rebuild the plan:  video plan --chapter {chapter} --force\n"
+            f"Why the timing is estimated:{timing_detail or '  (no detail recorded — re-run video align to capture it)'}\n"
             f"To render with the estimated timing anyway, pass --force to render.")
+    if plan.get("sync") == "synced":
+        # The sync gate: the audit samples the plan against the narration and
+        # fails on wrong-picture time and late cuts. It runs here, on the plan
+        # about to be rendered, and its report stays beside it for status.
+        # Reuse a fresh audit instead of recomputing it: the agent workflow
+        # already runs `video sync-audit` before render, and an audit is only
+        # valid for the plan it was computed from (mtime check).
+        report = None
+        audit_file = syncaudit.audit_path(root, chapter)
+        plan_file = plan_path(root, chapter)
+        if (audit_file.exists() and plan_file.exists()
+                and audit_file.stat().st_mtime >= plan_file.stat().st_mtime):
+            try:
+                cached = json.loads(audit_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cached = None
+            if (isinstance(cached, dict) and isinstance(cached.get("gate"), dict)
+                    and isinstance(cached.get("wrong_picture"), dict)
+                    and "ratio" in cached["wrong_picture"]):
+                # P2: a cached audit is only reused when it was computed
+                # under the CURRENT sync settings, and its gate is
+                # re-evaluated from its own numbers through the same code
+                # path as audit() (syncaudit.gate_from_report) — a cached
+                # PASS under looser settings never sneaks past a stricter
+                # config, and the two gate paths cannot drift apart.
+                _st = sync_mod.effective_settings(cfg.video, log=lambda _m: None)
+                if cached.get("settings") != _st:
+                    report = None
+                else:
+                    cached["gate"] = syncaudit.gate_from_report(cached, _st)
+                    report = cached
+                if report is not None:
+                    log("  sync gate: using the existing audit (plan unchanged since it ran)")
+        if report is None:
+            report = syncaudit.make_report(root, chapter, cfg, log=log)
+        gate = report["gate"]
+        if gate["failures"]:
+            detail = "; ".join(gate["failures"])
+            if not allow_sync_fail:
+                raise UserError(
+                    f"Chapter {chapter}'s pictures don't match the narration closely enough to render "
+                    f"(sync gate): {detail}.\n"
+                    f"See the worst stretches:  video sync-audit --chapter {chapter}\n"
+                    f"If these thresholds are wrong for this series, adjust video.sync.gate_wrong, "
+                    f"gate_window or gate_grace in manhwa-ocr.yaml.\n"
+                    f"To render anyway, pass --force to render.")
+            log(f"  ! sync gate failed ({detail}); rendering anyway (--force)")
+        else:
+            worst = ((report.get("five_second") or {}).get("worst") or {}).get("wrong")
+            worst_s = "none" if worst is None else f"{worst:.0%}"
+            log(f"  sync gate: PASS (wrong-picture {report['wrong_picture']['ratio']:.1%} of judged time, "
+                f"worst 5s window {worst_s})")
     queue = plan.get("alignment_review_queue") or []
     if queue and not strict:
         log(f"  ! {len(queue)} sentence(s) flagged for review; rendering anyway "
@@ -407,7 +648,7 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
             f"confidence, never reviewed (sentence numbers: {shown}) — one of these may be the wrong "
             f"picture for its sentence.\n"
             f"Look at them first: open .work/video/ch{chapter}/pairing_NN.png for those sentence numbers, "
-            f"or use the checkpointed review template in PROMPTS.md. Fix pairs.json if anything's wrong, "
+            f"or run `video pair --chapter {chapter}`. Fix pairs.json if anything's wrong, "
             f"then `video align --chapter {chapter}` and `video plan --chapter {chapter} --force` again.\n"
             f"To render anyway, pass --force to render.")
     if plan.get("panels_fingerprint") and plan["panels_fingerprint"] != panels.get("fingerprint"):
@@ -416,7 +657,8 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
 
 
 def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "auto", fmt: str | None = None,
-          preview: bool = False, workers: int = 0, log: Callable = print) -> Dict[str, str]:
+          preview: bool = False, workers: int = 0, log: Callable = print,
+          storyboard: bool = True) -> Dict[str, str]:
     """Plan + storyboard + render for each chapter, skipping what's already current."""
     results: Dict[str, str] = {}
     for chapter in sort_chapters(chapters):
@@ -426,9 +668,14 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
             log(f"  no audio yet (save it as audio/chapter_{chapter}.mp3)")
             continue
         try:
-            if cues_mod.load_cues(sess.path, chapter):
-                align_engine.build_alignment(sess.path, chapter, cfg, sync=sync, log=log)
-            make_plan(sess, chapter, cfg, force=force, sync=sync, fmt=fmt, log=log)
+            if cues_mod.load_cues_strict(sess.path, chapter):
+                _align_result = align_engine.build_alignment(sess.path, chapter, cfg, sync=sync, log=log)
+                # P2: timing warnings are action, not trivia — log each with
+                # its fix here (align), in the plan/QA (make_plan), and in
+                # the render refusal, so estimated timing is never silent.
+                for _w in (_align_result or {}).get("timing_warnings") or []:
+                    log(f"  ! timing: {_w.get('code')}: {_w.get('message')} Fix: {_w.get('fix')}")
+            make_plan(sess, chapter, cfg, force=force, sync=sync, fmt=fmt, log=log, storyboard=storyboard)
             out = output_path(sess.path, chapter, preview)
             pf = plan_path(sess.path, chapter)
             if out.exists() and out.stat().st_mtime >= pf.stat().st_mtime and not force:
@@ -436,7 +683,8 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
                 log(f"  {out.name} is up to date")
                 continue
             path = render_chapter(sess, chapter, cfg, preview=preview, workers=workers,
-                                  allow_estimated=force, allow_unreviewed=force, log=log)
+                                  allow_estimated=force, allow_unreviewed=force,
+                                  allow_sync_fail=force, log=log)
             results[chapter] = f"rendered: {path.name}"
         except UserError as exc:
             results[chapter] = f"failed: {exc}"
@@ -447,20 +695,20 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
 # ------------------------------------------------------------------ clips (Shorts)
 
 
-def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | None = None,
-              preview: bool = False, workers: int = 0, log: Callable = print) -> Path:
-    """Cut a highlight from a chapter's plan, optionally re-framed as 9:16."""
-    root, chapter = sess.path, require_chapter(chapter)
-    panels = load_panels(root, chapter)
-    if not panels:
-        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
-    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+def _clip_plan(plan: Dict[str, Any], start: float, end: float, fmt: str) -> Dict[str, Any]:
+    """Slice a finished plan to [start, end) and re-frame it as `fmt`.
+
+    Pure plan surgery (no I/O): shots are cut to the window, card entrances
+    that already happened become plain cuts, callouts / chapter cards / SFX
+    shift into clip time, events outside drop out. The narration audio is
+    sliced by the renderer via `audio_offset` — the recording is never
+    re-recorded or regenerated.
+    """
     duration = float(plan["duration"])
     if not 0 <= start < end <= duration + 0.01:
         raise UserError(f"Clip range {start}-{end}s must be inside the chapter (0-{duration:.1f}s).")
-    fmt = fmt or plan.get("format", "16:9")
     if fmt in {"9:16", "shorts"} and end - start > 180:
-        log("  ! YouTube Shorts are limited to 3 minutes; this clip is longer.")
+        pass  # the caller logs the 3-minute Shorts warning; this stays pure
     shots = []
     for s in plan["shots"]:
         a, b = max(float(s["start"]), start), min(float(s["end"]), end)
@@ -473,7 +721,13 @@ def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | N
             # A card that already arrived before the clip starts is simply there:
             # replaying its entrance would look like a glitch.
             cards.append({**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"})
-        extra: Dict[str, Any] = {}
+        # P3: callouts ride on shots with absolute times — shift them into
+        # the clip timeline and drop ones outside the clip.
+        clip_callouts = [{"t": round(float(c["t"]) - start, 3), "text": c.get("text"),
+                          "style": c.get("style"), "dur": c.get("dur", 1.2)}
+                         for c in (s.get("callouts") or [])
+                         if isinstance(c, dict) and a <= float(c.get("t") or -1) <= b]
+        extra: Dict[str, Any] = {"callouts": clip_callouts}
         if len(cards) >= 2:
             # Where the pair's slide really happens, relative to the clipped shot
             # (negative = already happened, so the first card starts in place).
@@ -491,9 +745,110 @@ def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | N
     shots[-1]["end"] = round(end - start, 3)
     for prev, cur in zip(shots, shots[1:]):
         cur["start"] = prev["end"]
-    clip = {**plan, "format": fmt, "shots": shots, "duration": round(end - start, 3), "audio_offset": start}
+    # P3: chapter cards + SFX shift with the clip; events outside it drop out.
+    clip_cards = [{**c, "t": round(float(c["t"]) - start, 3)}
+                  for c in (plan.get("chapter_cards") or [])
+                  if isinstance(c, dict) and start <= float(c.get("t") or -1) < end]
+    clip_sfx = [{**e, "t": round(float(e["t"]) - start, 3)}
+                for e in (plan.get("sfx") or [])
+                if isinstance(e, dict) and start <= float(e.get("t") or -1) < end]
+    clip = {**plan, "format": fmt, "shots": shots, "duration": round(end - start, 3), "audio_offset": start,
+            "chapter_cards": clip_cards, "sfx": clip_sfx}
+    return clip
+
+
+def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | None = None,
+              preview: bool = False, workers: int = 0, log: Callable = print) -> Path:
+    """Cut a highlight from a chapter's plan, optionally re-framed as 9:16."""
+    root, chapter = sess.path, require_chapter(chapter)
+    panels = load_panels(root, chapter)
+    if not panels:
+        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
+    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    fmt = fmt or plan.get("format", "16:9")
+    if fmt in {"9:16", "shorts"} and end - start > 180:
+        log("  ! YouTube Shorts are limited to 3 minutes; this clip is longer.")
+    clip = _clip_plan(plan, start, end, fmt)
     tag = f"clip_{start:g}-{end:g}".replace(".", "_") + ("_9x16" if fmt in {"9:16", "shorts"} else "")
     return render(root, chapter, clip, cfg.video, preview=preview, workers=workers, log=log, name=tag)
+
+
+# ------------------------------------------------------------------ P5: Shorts + end screen
+
+def shorts_manifest_path(root: Path, chapter: str) -> Path:
+    return video_dir(root) / f"chapter_{require_chapter(chapter)}.shorts.json"
+
+
+def endscreen_path(root: Path, chapter: str) -> Path:
+    return video_dir(root) / f"chapter_{require_chapter(chapter)}.endscreen.json"
+
+
+def watch_next_path(root: Path, chapter: str) -> Path:
+    return video_dir(root) / f"chapter_{require_chapter(chapter)}.watch_next.txt"
+
+
+def make_end_screen(sess, chapter: str, cfg=None, *, log: Callable = print) -> Dict[str, Any]:
+    """Write `video/chapter_N.endscreen.json` + `video/chapter_N.watch_next.txt`
+    from the finished plan. The plan's `end_screen` is the window/slots spec
+    (P5); this resolves the series name for the playlist slot and the WATCH
+    NEXT block. Never burns cards into pixels — YouTube Studio adds them."""
+    from .shorts import build_end_screen
+
+    root, chapter = sess.path, require_chapter(chapter)
+    panels = load_panels(root, chapter)
+    if not panels:
+        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
+    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    spec = build_end_screen(float(plan["duration"]), chapter, series_name=getattr(sess, "name", None) or sess.slug)
+    atomic_write_text(endscreen_path(root, chapter), json.dumps(spec, indent=1, ensure_ascii=False))
+    atomic_write_text(watch_next_path(root, chapter), spec["watch_next"] + "\n")
+    log(f"  wrote video/chapter_{chapter}.endscreen.json + video/chapter_{chapter}.watch_next.txt")
+    return spec
+
+
+def make_shorts(sess, chapter: str, cfg, *, count: int = 3, preview: bool = False, workers: int = 0,
+                log: Callable = print) -> Dict[str, Any]:
+    """Build up to `count` vertical 9:16 Shorts from a finished chapter plan.
+
+    Picks the highest-impact moments (hook + payoffs), slices the chapter's
+    own narration audio to each window (never re-recorded / generated),
+    re-frames panels vertically (face-centred crops, no black bars — the
+    plan's crop rules run in 9:16), keeps keyword callouts, and ends each
+    Short on a "Full story on channel" card. Writes the manifest
+    `video/chapter_N.shorts.json` plus `video/chapter_N.shorts_1.mp4` etc.
+    """
+    from .shorts import END_CARD_DUR, END_CARD_TEXT, pick_shorts_windows, shorts_manifest, validate_shorts_manifest
+
+    root, chapter = sess.path, require_chapter(chapter)
+    panels = load_panels(root, chapter)
+    if not panels:
+        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
+    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    windows = pick_shorts_windows(plan, count=count)
+    if not windows:
+        raise UserError(f"Chapter {chapter} has no shots to cut Shorts from.")
+    manifest = shorts_manifest(plan, windows)
+    problems = validate_shorts_manifest(manifest)
+    if problems:
+        raise UserError("Internal error: generated Shorts manifest is invalid:\n  - " + "\n  - ".join(problems))
+    outputs: List[str] = []
+    for entry in manifest["shorts"]:
+        start, end = float(entry["start"]), float(entry["end"])
+        clip = _clip_plan(plan, start, end, "9:16")
+        # End card: a chapter-card-style overlay on the Short's last shot,
+        # rendered by the existing chapter-card machinery (frames.py) —
+        # text only, no new audio, no burned YouTube end-screen cards.
+        clip["chapter_cards"] = [{**c} for c in clip.get("chapter_cards") or []] + [
+            {"t": round(max(0.0, clip["duration"] - END_CARD_DUR), 3),
+             "title": END_CARD_TEXT, "dur": END_CARD_DUR}]
+        out = render(root, chapter, clip, cfg.video, preview=preview, workers=workers, log=log,
+                     name=f"shorts_{entry['index']}")
+        outputs.append(out.name)
+        log(f"  short {entry['index']}: {start:.1f}s-{end:.1f}s -> {out.name} ({entry['title_suggestion']})")
+    manifest["files"] = outputs
+    atomic_write_text(shorts_manifest_path(root, chapter), json.dumps(manifest, indent=1, ensure_ascii=False))
+    log(f"  wrote video/chapter_{chapter}.shorts.json ({len(outputs)} Shorts)")
+    return manifest
 
 
 # ------------------------------------------------------------------ compilations

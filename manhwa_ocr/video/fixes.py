@@ -6,7 +6,16 @@ video/chapter_N.fixes.json, and nothing else. The plan reads it:
     {"version": 1,
      "drop": [{"panel": "P016-06", "reason": "sound-effect lettering only"}],
      "face": [{"panel": "P017-02", "top": 0.12, "bottom": 0.46}],
-     "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}]}
+     "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}],
+     "shot": [{"panel": "P019-01", "background": "black", "enter": "fade_in"}],
+     "chapter_cards": [{"shot_id": "S012", "title": "The Exam That Kills"}],
+     "callouts": [{"shot_id": "S007", "text": "SS-RANK"}]}
+
+"shot" overrides how a panel is presented: "background" (blur or black) applies to the shot whose
+first card is that panel, "enter" (how the card arrives) to that panel's card. Both are optional.
+Everything a person or agent could once only change by hand-editing chapter_N.plan.json (a drop,
+a head position, a crop, a background, an entrance) belongs here, because `video plan --force`
+rebuilds the plan and re-applies this file every time. The plan itself is presentation only.
 
 Rules: every entry is checked against the chapter's real panels and the
 allowed card shapes. A file with any bad entry is rejected as a whole with a
@@ -22,7 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from ..util import UserError, atomic_write_text, require_chapter
-from .frames import LAYOUT_SHAPES
+from .frames import BACKGROUNDS, ENTRANCES, LAYOUT_SHAPES
 from .media import video_dir
 
 VERSION = 1
@@ -35,7 +44,10 @@ def fixes_path(root: Path, chapter: str) -> Path:
 
 
 def empty() -> Dict[str, Any]:
-    return {"version": VERSION, "drop": [], "face": [], "crop": []}
+    return {"version": VERSION, "drop": [], "face": [], "crop": [], "shot": [],
+            # P5: reviewer overrides for chapter-card titles and callout text,
+            # keyed by shot id (e.g. "S012"). See shorts.validate_override_entry.
+            "chapter_cards": [], "callouts": []}
 
 
 def _shape(value: Any) -> float | None:
@@ -55,9 +67,11 @@ def _shape(value: Any) -> float | None:
 
 def validate(data: Any, panel_dims: Dict[str, Tuple[float, float]]) -> Tuple[Dict[str, Any], List[str]]:
     """Returns (clean, problems). `clean` holds plain lookups the plan can use:
-    {"drop": {pid: reason}, "face": {pid: (top, bottom)}, "crop": {pid: (shape, box)}}."""
+    {"drop": {pid: reason}, "face": {pid: (top, bottom)}, "crop": {pid: (shape, box)},
+     "shot": {pid: {"background": ..., "enter": ...}}}."""
     problems: List[str] = []
-    clean: Dict[str, Any] = {"drop": {}, "face": {}, "crop": {}}
+    clean: Dict[str, Any] = {"drop": {}, "face": {}, "crop": {}, "shot": {},
+                             "chapter_cards": {}, "callouts": {}}
     if not isinstance(data, dict):
         return clean, ["the file must be a JSON object"]
     if data.get("version", VERSION) != VERSION:
@@ -110,6 +124,48 @@ def validate(data: Any, panel_dims: Dict[str, Tuple[float, float]]) -> Tuple[Dic
                             "adjust the box so it keeps that shape")
             continue
         clean["crop"][pid] = (shape, (x0, y0, x1, y1))
+
+    for i, e in enumerate(data.get("shot") or []):
+        pid = e.get("panel") if isinstance(e, dict) else None
+        if pid not in panel_dims:
+            problems.append(f"shot[{i}]: unknown panel {pid!r}")
+            continue
+        entry: Dict[str, str] = {}
+        bg, enter = e.get("background"), e.get("enter")
+        if bg is not None and bg not in BACKGROUNDS:
+            problems.append(f"shot[{i}] ({pid}): background must be one of {', '.join(BACKGROUNDS)}")
+            continue
+        if enter is not None and enter not in ENTRANCES:
+            problems.append(f"shot[{i}] ({pid}): enter must be one of {', '.join(ENTRANCES)}")
+            continue
+        if bg is None and enter is None:
+            problems.append(f"shot[{i}] ({pid}): give a \"background\" or an \"enter\" (or both)")
+            continue
+        if bg is not None:
+            entry["background"] = bg
+        if enter is not None:
+            entry["enter"] = enter
+        clean["shot"][pid] = entry
+
+    # P5: chapter-card title and callout text overrides, keyed by shot id.
+    # A duplicate shot_id is ambiguous (which title wins?) so it is a
+    # problem, like every other bad fixes.json entry: nothing is applied.
+    from .shorts import validate_override_entry
+
+    for kind, field in (("chapter_cards", "title"), ("callouts", "text")):
+        seen: set = set()
+        for i, e in enumerate(data.get(kind) or []):
+            errs = validate_override_entry(kind, e)
+            for err in errs:
+                problems.append(f"{kind}[{i}]: {err}")
+            if errs:
+                continue
+            sid = e.get("shot_id")
+            if sid in seen:
+                problems.append(f"{kind}[{i}]: duplicate shot_id {sid!r} (one override per shot)")
+                continue
+            seen.add(sid)
+            clean[kind][sid] = e.get(field)
     return clean, problems
 
 

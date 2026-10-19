@@ -10,6 +10,7 @@ segments relate, not of either one alone.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Set
 
 JUMP_TOLERANCE = 2      # a panel can be this far "behind" the running position
@@ -17,6 +18,71 @@ JUMP_TOLERANCE = 2      # a panel can be this far "behind" the running position
                         # sometimes glance back a panel or two on purpose)
 GAP_TOLERANCE = 0.25    # seconds of slack allowed between consecutive segments
 MIN_SEGMENT_DUR = 0.05  # a segment shorter than this is almost certainly a bug
+
+
+GROUPED_MIN_TAGS = 3     # a sentence with this many tags (or a long reach, see GROUPED_SPAN) is "grouped"
+GROUPED_SPAN = 6         # ... or whose tags span this many panels of the story
+
+
+def redistribute(tags: List[List[str]], n: int, holds: List[bool] | None = None) -> Dict[int, List[str]]:
+    """How to spread sentence `n`'s tags (1-based) over the untagged sentences right after it.
+
+    `tags[i]` is sentence i+1's tag list; `holds[i]` marks a sentence that can't carry a tag because
+    the video keeps the previous picture for it ({same}, inner thoughts, pure sound). The first tag
+    stays on sentence n; each later tag moves to the next free sentence, in order, stopping at the
+    first sentence that already has tags of its own. Tags left over (not enough free sentences)
+    stay together on the last sentence used. Returns {sentence: [tags]} for the sentences that change
+    or keep a tag; {} when there is nothing to move (fewer than two tags, or no free sentence next)."""
+    mine = list(dict.fromkeys(tags[n - 1])) if 0 < n <= len(tags) else []
+    if len(mine) < 2:
+        return {}
+    out: Dict[int, List[str]] = {n: mine[:1]}
+    rest = mine[1:]
+    k, last = n, n                      # k is the 0-based index of the sentence after n
+    while rest and k < len(tags) and not tags[k]:
+        if holds and holds[k]:
+            k += 1
+            continue
+        out[k + 1] = [rest.pop(0)]
+        last = k + 1
+        k += 1
+    if rest and last == n:
+        return {}                       # no free sentence after it: nothing can move
+    if rest:
+        out[last] = out[last] + rest
+    return out
+
+
+def is_grouped(tag_list: List[str], position: Dict[str, int] | None = None) -> bool:
+    """Several tags on one sentence: three or more, or tags that reach across more than GROUPED_SPAN panels."""
+    uniq = list(dict.fromkeys(tag_list))
+    if len(uniq) >= GROUPED_MIN_TAGS:
+        return True
+    if position and len(uniq) >= 2:
+        spots = [position[t] for t in uniq if t in position]
+        return bool(spots) and max(spots) - min(spots) > GROUPED_SPAN
+    return False
+
+
+def _jump_hint(segments: List[Dict[str, Any]], i: int, ids_by_pos: Dict[int, str], last_pos: int, pos: int) -> str:
+    """Plain words for a no_unexplained_jumps failure at segments[i]: the cause when a grouped
+    sentence just before it carried the tags that were jumped over, and exactly which tag to move to
+    which sentence in pairs.json."""
+    tags = [list(s.get("tagged_panels") or []) for s in segments]
+    holds = [s.get("narration_type") in {"INTERNAL", "PURE_AUDIO", "SAME"} for s in segments]
+    for j in range(i - 1, -1, -1):
+        if len(set(tags[j])) >= 2 and not any(tags[j + 1:i + 1]):
+            move = redistribute(tags, j + 1, holds)
+            if not move:
+                break
+            sentence = segments[j].get("sentence", j + 1)
+            fix = ", ".join(f'"{s}": {json.dumps(t)}' for s, t in sorted(move.items()))
+            return (f" Cause: sentence {sentence} carries {len(set(tags[j]))} tags ({', '.join(dict.fromkeys(tags[j]))}) "
+                    f"and the sentence(s) after it have none, so the picture runs ahead of the words. "
+                    f"Fix in pairs.json: {fix}")
+    skipped = [ids_by_pos[p] for p in range(last_pos + 1, pos) if p in ids_by_pos][:4]
+    near = f" The panels in between are {', '.join(skipped)}: tag this sentence with {skipped[0]} (or the one it is really about)." if skipped else ""
+    return near
 
 
 def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], duration: float) -> Dict[str, Any]:
@@ -29,6 +95,7 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
         "no_outside_interval_display": "PASS",
         "no_gaps_or_overlaps": "PASS",
         "non_visual_no_panel_change": "PASS",
+        "same_no_hidden_panel": "PASS",
         "duration_matches_narration": "PASS",
     }
     problems: List[Dict[str, Any]] = []
@@ -37,6 +104,7 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
         checks[check] = "FAIL"
         problems.append({"sentence": sentence, "check": check, "detail": detail})
 
+    ids_by_pos = {pos: pid for pid, pos in panel_order.items()}
     last_pos = -1
     last_end = 0.0
     for i, seg in enumerate(segments):
@@ -59,19 +127,48 @@ def validate(segments: List[Dict[str, Any]], panel_order: Dict[str, int], durati
                     f"{seg.get('narration_type')} segment must hold the previous panel, "
                     f"got display_action={seg.get('display_action')!r} selected_panel={pid!r}")
 
+        # P2 — the {same} trap (Ch2 sentence 60): a {same} sentence holds the
+        # previous panel, so its own panel never displays; the story then
+        # jumps over panels that coverage places as gap fillers into a
+        # neighbouring sentence, where they show under the wrong words and
+        # fail the sync gate. INTERNAL/PURE_AUDIO are narrator asides and
+        # may legitimately sit across a jump; {same} claims "same panel as
+        # before", so a jump across it means the tag is wrong. FAIL here,
+        # at align time, instead of a late sync-gate failure: remove {same}
+        # and tag the sentence with the panel it is really about.
+        if seg.get("narration_type") == "SAME" and is_hold and last_pos >= 0:
+            next_pos = None
+            next_pid = None
+            for j in range(i + 1, len(segments)):
+                cand = segments[j].get("selected_panel")
+                if cand is not None and cand in panel_order:
+                    next_pos, next_pid = panel_order[cand], cand
+                    break
+            if next_pos is not None and next_pos - last_pos > 1:
+                skipped = [ids_by_pos[p] for p in range(last_pos + 1, next_pos) if p in ids_by_pos][:4]
+                prev_pid = ids_by_pos.get(last_pos)
+                fail("same_no_hidden_panel", n,
+                     f"{{same}} holds {prev_pid} while the story jumps to {next_pid}, "
+                     f"skipping {', '.join(skipped)}: if this sentence is about a skipped panel, "
+                     f"remove {{same}} and tag it with that panel — otherwise coverage places a "
+                     f"skipped panel as filler into a neighbouring sentence and fails the sync gate "
+                     f"(Ch2 sentence 60).")
+
         if pid is not None and pid in panel_order:
             pos = panel_order[pid]
             window = seg.get("candidate_window") or []
             if window and pid not in window:
                 fail("no_outside_interval_display", n, f"{pid} was selected but isn't in its own candidate_window")
-            if pos < last_pos - JUMP_TOLERANCE:
+            if pos < last_pos - JUMP_TOLERANCE and seg.get("confidence") != "tag_behind_cursor_accepted":
                 fail("no_backward_jumps", n, f"{pid} (position {pos}) is behind the running position {last_pos}")
             span = max(1, len(window)) if window else 1
             if pos > last_pos + max(span, JUMP_TOLERANCE) and seg.get("confidence") not in {
                     "tag_confirmed_in_window", "ocr_match", "tag_beyond_window_accepted"}:
+                before = ids_by_pos.get(last_pos)
                 fail("no_unexplained_jumps", n,
-                    f"{pid} jumps from position {last_pos} to {pos} without strong supporting evidence "
-                    f"(confidence={seg.get('confidence')!r})")
+                    f"{pid} jumps from {before + ' ' if before else ''}(position {last_pos}) to {pid} (position {pos}) "
+                    f"without strong supporting evidence (confidence={seg.get('confidence')!r})."
+                    + _jump_hint(segments, i, ids_by_pos, last_pos, pos))
             last_pos = pos
 
         if i > 0:

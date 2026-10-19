@@ -288,7 +288,11 @@ def test_even_plan_covers_audio_exactly():
     shots = plan["shots"]
     assert shots[0]["start"] == 0 and shots[-1]["end"] == 20.0
     assert all(b["start"] == pytest.approx(a["end"], abs=0.002) for a, b in zip(shots, shots[1:]))
-    assert shots[-1]["exit"] == "fade_out" and all(s["exit"] == "cut" for s in shots[:-1])
+    assert shots[-1]["exit"] == "fade_out"
+    # A fade_out is also allowed right before a shot with a fade transition
+    # (fade-through-black: previous shot fades out, next fades in).
+    assert all(s["exit"] == "cut" or (s["exit"] == "fade_out" and nxt["transition"] == "fade")
+               for s, nxt in zip(shots, shots[1:]))
     assert validate(plan, _ids()) == []
 
 
@@ -358,9 +362,14 @@ def test_no_panel_is_shown_twice_in_a_row():
     sentences = [{"start": float(t), "text": str(t), "panels": [pid], "cues": [], "emphasis": []}
                  for t, pid in ((0, "P001-01"), (4, "P001-01"), (8, "P001-03"), (12, "P001-03"), (16, "P001-05"))]
     shots = _plan(30.0, sentences)["shots"]
-    seq = [c["panel"] for s in shots for c in s["cards"]]
-    assert all(x != y for x, y in zip(seq, seq[1:]))
-    assert sorted(seq) == sorted(set(seq)) == ["P001-01", "P001-03", "P001-05"]   # each panel once
+    seq = [(c["panel"], tuple(c.get("crop") or [])) for s in shots for c in s["cards"]]
+    # P3: a >8s shot is split into punch-in pieces of the SAME panel. Adjacent
+    # equal panels are allowed only as split continuations (a different crop);
+    # the same framing twice in a row is still a bug.
+    for (p1, crop1), (p2, crop2) in zip(seq, seq[1:]):
+        assert p1 != p2 or crop1 != crop2
+    panels = [p for p, _ in seq]
+    assert sorted(set(panels)) == ["P001-01", "P001-03", "P001-05"]   # tagged panels only, in order
 
 
 def test_crops_are_vertical_pans_and_always_an_allowed_shape():
@@ -489,9 +498,20 @@ def test_frames_are_deterministic_and_effects_change_pixels():
     assert end.mean() < 10
 
 
-def test_motion_eases_out_then_holds():
+def test_push_in_moves_through_whole_shot():
+    # P3: continuous motion — push_in no longer settles and holds mid-shot.
     fmt = Format(320, 180, 30)
     r = ShotRenderer(_shot(end=5), {"A": _card_panel()}, fmt)
+    assert r.static_from == pytest.approx(5.0)
+    f3, f4 = (r.frame_array(t).astype(int) for t in (3.0, 4.5))
+    assert abs(f4 - f3).mean() > 0  # still moving late in the shot
+
+
+def test_hold_settles_then_holds():
+    # Hand-set `hold` (payoff beats only) keeps the old ease-out-then-hold.
+    fmt = Format(320, 180, 30)
+    shot = _shot(end=5, cards=[{"panel": "A", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0, "motion": "hold"}])
+    r = ShotRenderer(shot, {"A": _card_panel()}, fmt)
     assert r.static_from <= 3.0                       # settles within ~2.6s, then holds
     f0, f1, f2 = (r.frame_array(t).astype(int) for t in (0.0, 1.0, 2.0))
     assert (r.frame_array(4.5) == r.frame_array(4.0)).all()
@@ -702,7 +722,12 @@ def test_status_surfaces_alignment_review_queue(tmp_path):
     build_panels(sess.path, "1", log=lambda *_: None)
     align_engine.build_alignment(sess.path, "1", cfg, sync="off", log=lambda *_: None)
     clean = vb.chapter_status(sess.path, "1")["alignment"]
-    assert clean == {"broken": False, "sync_mode": "estimated", "validation_status": "PASS", "review_queue": 0}
+    # P0: status also surfaces WHY timing is estimated (timing_warnings),
+    # so a terminal-only user sees the fallback reason, not just the mode.
+    assert clean == {"broken": False, "sync_mode": "estimated", "validation_status": "PASS", "review_queue": 0,
+                     "timing_warnings": [{"code": "sync_off",
+                                          "message": "sync=off was passed, so timing is estimated from text length.",
+                                          "fix": "Re-run without --off for real sync: video align --chapter 1"}]}
 
     path = align_engine.alignment_path(sess.path, "1")
     data = json.loads(path.read_text(encoding="utf-8"))

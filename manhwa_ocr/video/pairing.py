@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -27,7 +28,9 @@ from PIL import Image, ImageDraw
 from ..util import UserError, atomic_save_image, atomic_write_text, read_agent_json, require_chapter
 from ..workspace import work_root
 from . import cues as cues_mod
+from . import classify as classify_mod
 from . import sync as sync_mod
+from .validate import is_grouped, redistribute
 from .panels import _font, load_panels, panel_image
 
 ROWS_PER_SHEET = 6
@@ -96,7 +99,39 @@ def check(root: Path, chapter: str) -> List[str]:
         here = [order[p] for p in tags if p in order]
         if here:
             last = max(here)     # compare with the previous sentence only (an opening hook may jump ahead)
+    problems.extend(_grouped_lines(grouped_tags(root, chapter)))
     return problems
+
+
+def grouped_tags(root: Path, chapter: str) -> List[Dict[str, Any]]:
+    """Sentences that carry several tags with the next sentence untagged: the pattern that makes
+    `video align` fail no_unexplained_jumps (the picture runs ahead of the words). Each:
+    {"sentence", "tags", "move": {sentence: [tags]}, "text"}. `move` is a suggestion only."""
+    cue_data, panels = _need(root, chapter)
+    position = {p["id"]: i for i, p in enumerate(panels["panels"])}
+    sentences = cue_data["sentences"]
+    tags = [list(s.get("panels") or []) for s in sentences]
+    holds = [bool(s.get("same")) or classify_mod.classify(s.get("text") or "")[0] in {"INTERNAL", "PURE_AUDIO"}
+             for s in sentences]
+    found = []
+    for n, tag_list in enumerate(tags, start=1):
+        nxt_free = n < len(tags) and not tags[n] and not sentences[n].get("same")
+        if not nxt_free or not is_grouped(tag_list, position):
+            continue
+        move = redistribute(tags, n, holds)
+        if move:
+            found.append({"sentence": n, "tags": list(dict.fromkeys(tag_list)), "move": move,
+                          "text": sentences[n - 1].get("text") or ""})
+    return found
+
+
+def _grouped_lines(found: List[Dict[str, Any]]) -> List[str]:
+    out = []
+    for g in found:
+        fix = ", ".join(f'"{s}": {json.dumps(t)}' for s, t in sorted(g["move"].items()))
+        out.append(f"sentence {g['sentence']} carries {len(g['tags'])} tags ({', '.join(g['tags'])}) and the next "
+                   f"sentence has none; `video align` fails no_unexplained_jumps on this. Suggested fix in pairs.json: {fix}")
+    return out
 
 
 def write_sheets(root: Path, chapter: str, log=print) -> List[Path]:
@@ -111,12 +146,16 @@ def write_sheets(root: Path, chapter: str, log=print) -> List[Path]:
     cols = 2 + NEXT_SHOWN
     width = text_w + cols * (cell_w + pad) + pad
     row_h = THUMB_H + 2 * pad + 26
-    cache: Dict[str, Image.Image] = {}
+    cache: "OrderedDict[str, Image.Image]" = OrderedDict()
 
     def thumb(pid: str) -> Image.Image:
-        if pid not in cache:
-            if len(cache) > 40:
-                cache.clear()
+        if pid in cache:
+            cache.move_to_end(pid)
+        else:
+            # LRU: evict one entry, never wipe the whole cache (the old
+            # clear() made every sheet re-decode panels it had just loaded).
+            if len(cache) >= 40:
+                cache.popitem(last=False)
             img = panel_image(root, chapter, by_id[pid], panels["norm_width"])
             img.thumbnail((cell_w, THUMB_H), Image.LANCZOS)
             cache[pid] = img
@@ -166,7 +205,13 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
     """Sheets + pairs.json (current tags) + PAIRING.md, the instructions."""
     cue_data, _ = _need(root, chapter)
     sheets = write_sheets(root, chapter, log=log)
-    pairs = {str(n): s.get("panels") or [] for n, s in enumerate(cue_data["sentences"], start=1)}
+    pairs: Dict[str, Any] = {str(n): s.get("panels") or [] for n, s in enumerate(cue_data["sentences"], start=1)}
+    grouped = grouped_tags(root, chapter)
+    if grouped:
+        # Suggestions only: apply ignores keys starting with "_". Copy a "move" into the numbered entries to use it.
+        pairs["_suggestions"] = {str(g["sentence"]): {
+            "why": "several tags on one sentence with the next sentence untagged (align fails no_unexplained_jumps)",
+            "move": {str(s): t for s, t in sorted(g["move"].items())}} for g in grouped}
     atomic_write_text(pairs_path(root, chapter), json.dumps(pairs, indent=1))
     problems = check(root, chapter)
     sess = f' --session "{session}"' if session else ""
@@ -193,39 +238,91 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
         '`"12": ["P006-02"]` or `"13": ["P006-03", "P006-04"]`. Leave sentences that are right as they are.',
         "",
         f"Then:  python -m manhwa_ocr video pair --chapter {chapter} --apply{sess}",
+        f"then:  python -m manhwa_ocr video align --chapter {chapter}{sess}",
         f"then:  python -m manhwa_ocr video plan --chapter {chapter} --force{sess}",
+        f"then:  python -m manhwa_ocr video verify --chapter {chapter}{sess}",
+        "then check the storyboard and approve it (the build prompt in USER_GUIDE.md has the full routine):",
+        f"       python -m manhwa_ocr video approve --chapter {chapter}{sess}",
         f"and:   python -m manhwa_ocr video render --chapter {chapter}{sess}",
         "",
         "## Found automatically",
         "",
         *([f"- {p}" for p in problems] or ["- nothing"]),
         "",
+        *(["## Grouped tags: fix these before `video align`", "",
+           "A sentence with several tags shows them all, so the picture races ahead of the words and the next",
+           "sentence (which has no tag) looks like a jump. Spread the tags over the sentences that follow.",
+           f"pairs.json has a `_suggestions` entry for each; nothing is applied until you copy a suggestion into the",
+           "numbered entries.", "",
+           *[f"- {line}" for line in _grouped_lines(grouped)], ""] if grouped else []),
     ]
     path = task_dir(root, chapter) / "PAIRING.md"
     atomic_write_text(path, "\n".join(lines))
     return path
 
 
-def apply(root: Path, chapter: str, log=print) -> int:
-    """Put the tags from pairs.json into the cues. Returns how many sentences changed."""
+def autofix(root: Path, chapter: str, log=print) -> int:
+    """Replace text-only/credits tags with the nearest drawn panel.
+
+    The mechanical fix for the problem `check()` flags: a text-only tag is
+    never shown, and the nearest drawn panel is almost always the right
+    replacement. Writes straight to the cues (like apply() does) and logs
+    every change; run `check()` afterwards for anything left over.
+    Returns how many sentences changed.
+    """
     cue_data, panels = _need(root, chapter)
-    path = pairs_path(root, chapter)
-    if not path.exists():
-        raise UserError(f"Nothing to apply. Run first:  video pair --chapter {chapter}")
-    pairs = read_agent_json(path, "pairs.json")
-    if not isinstance(pairs, dict):
-        raise UserError(f"{path} must be an object: sentence number -> list of panel ids.")
-    by_id = {p["id"]: p for p in panels["panels"]}
+    plist = panels["panels"]
+    by_id = {p["id"]: p for p in plist}
     sentences = cue_data["sentences"]
-    errors, changed = [], 0
+    changed = 0
+    for n, s in enumerate(sentences, start=1):
+        new_tags = []
+        dirty = False
+        for pid in s.get("panels") or []:
+            p = by_id.get(pid)
+            if p is not None and (p.get("text_only") or p.get("credits")):
+                near = cues_mod.nearest_drawn_panel(plist, pid)
+                if near and near != pid:
+                    log(f"  sentence {n}: {pid} is text-only/credits -> {near}")
+                    new_tags.append(near)
+                    dirty = True
+                else:
+                    new_tags.append(pid)  # no drawn panel to retag to; leave it
+            else:
+                new_tags.append(pid)
+        new_tags = list(dict.fromkeys(new_tags))
+        if dirty:
+            s["panels"] = new_tags
+            changed += 1
+    if changed:
+        atomic_write_text(cues_mod.cues_path(root, chapter), json.dumps(cue_data, indent=1, ensure_ascii=False))
+        log(f"  chapter {chapter}: {changed} sentence(s) re-tagged to the nearest drawn panel")
+    else:
+        log(f"  chapter {chapter}: no text-only/credits tags to fix")
+    return changed
+
+
+def validate_pairs(pairs: Any, sentence_count: int, by_id: Dict[str, Any]) -> List[str]:
+    """Line-level problems in a pairs.json document (P0 safety lock).
+
+    Keys starting with "_" are notes (_suggestions, _comment) and are
+    ignored. Returns [] when every numbered entry is usable. Every
+    problem names the sentence number and the exact ids, so a reviewer
+    can fix the file without guessing.
+    """
+    errors: List[str] = []
+    if not isinstance(pairs, dict):
+        return ["pairs.json must be an object: sentence number -> list of panel ids"]
     for key, ids in pairs.items():
+        if str(key).startswith("_"):
+            continue
         try:
             n = int(key)
-        except ValueError:
+        except (TypeError, ValueError):
             errors.append(f'"{key}" is not a sentence number')
             continue
-        if not 1 <= n <= len(sentences):
-            errors.append(f"sentence {n} doesn't exist (there are {len(sentences)})")
+        if not 1 <= n <= sentence_count:
+            errors.append(f"sentence {n} doesn't exist (there are {sentence_count})")
             continue
         ids = [ids] if isinstance(ids, str) else ids
         if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
@@ -239,9 +336,32 @@ def apply(root: Path, chapter: str, log=print) -> int:
         if texty:
             errors.append(f"sentence {n}: {', '.join(texty)} is a text/credits panel; pick a drawn one")
             continue
-        if sentences[n - 1].get("panels") != ids:
-            sentences[n - 1]["panels"] = ids
-            changed += 1
+        if len(set(ids)) != len(ids):
+            errors.append(f"sentence {n}: duplicate panel ids in {ids}")
+    return errors
+
+
+def apply(root: Path, chapter: str, log=print) -> int:
+    """Put the tags from pairs.json into the cues. Returns how many sentences changed."""
+    cue_data, panels = _need(root, chapter)
+    path = pairs_path(root, chapter)
+    if not path.exists():
+        raise UserError(f"Nothing to apply. Run first:  video pair --chapter {chapter}")
+    pairs = read_agent_json(path, "pairs.json")
+    if not isinstance(pairs, dict):
+        raise UserError(f"{path} must be an object: sentence number -> list of panel ids.")
+    pairs = {k: v for k, v in pairs.items() if not str(k).startswith("_")}      # _suggestions, _comment: notes only
+    by_id = {p["id"]: p for p in panels["panels"]}
+    sentences = cue_data["sentences"]
+    errors = validate_pairs(pairs, len(sentences), by_id)
+    changed = 0
+    if not errors:
+        for key, ids in pairs.items():
+            n = int(key)
+            ids = [ids] if isinstance(ids, str) else ids
+            if sentences[n - 1].get("panels") != ids:
+                sentences[n - 1]["panels"] = ids
+                changed += 1
     if errors:
         raise UserError("pairs.json has problems, nothing was changed:\n  " + "\n  ".join(errors[:12]))
     tagged = sum(1 for s in sentences if s.get("panels"))

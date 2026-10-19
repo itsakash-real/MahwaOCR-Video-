@@ -1,8 +1,10 @@
 """Drawing video frames in the recap-channel style.
 
 Style (see manhwa_recap_style_spec.md, measured from a real recap channel):
-  * Hard cuts between shots. Motion starts on the cut and *eases out*: a
-    Ken Burns move over ~2.6s, then the shot holds still until the next cut.
+  * Hard cuts between shots. P3: continuous Ken Burns motion across the
+    whole shot (push_in 100->115%, pull_out 118->100%, pans traverse the
+    crop) with ease_in_out, so the frame is never frozen. `hold` keeps the
+    old ease-out-then-hold, for hand-set payoff beats only.
   * Panels are shown as cards: a focal crop of the panel, thin white border,
     rounded corners and a strong black drop shadow.
   * Layouts: single (centred card), pair (first card centred, then slides
@@ -13,6 +15,11 @@ Style (see manhwa_recap_style_spec.md, measured from a real recap channel):
   * CapCut-style entrances (fade_in, slide_*, pull_down, zoom_in,
     fit_in_frame, blur_in, swing_right), all 0.6-0.8s with ease-out curves:
     deliberately unhurried.
+  * Defect fix (CapCut bugfix): a shot is NEVER returned as a frozen static
+    frame unless every card is a hand-set `hold` (see ShotRenderer.is_static).
+    Continuous-motion shots are re-drawn every frame, so a >3s panel cannot
+    read as a 0.5s cut/glitch. Joins are frame-exact (plan.shot_frame_bounds);
+    concat is a hard cut by design, never a crossfade.
 
 Every function here is a pure function of (shot, time), so frames can be drawn
 in any order and the storyboard shows exactly what the video will.
@@ -21,24 +28,45 @@ in any order and the storyboard shows exactly what the video will.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 LAYOUTS = ("single", "pair", "inset", "wide")
 BACKGROUNDS = ("blur", "black", "white")
 MOTIONS = ("push_in", "pull_out", "pan_left", "pan_right", "pan_up", "pan_down", "hold")
 ENTRANCES = ("cut", "fade_in", "slide_left", "slide_right", "slide_up", "slide_down", "pull_down",
-             "zoom_in", "fit_in_frame", "blur_in", "swing_right")
+             "zoom_in", "fit_in_frame", "blur_in", "swing_right", "whip_in")
 EXITS = ("cut", "fade_out")
-EFFECTS = ("shake", "punch", "flash")
+EFFECTS = ("shake", "punch", "flash", "glitch")
+# CapCut-style shot transitions (how a shot ARRIVES; see transition_enter).
+# cut is the default (90%); fade 10%; slide / zoom / whip / glitch only on
+# impact / reveal beats, and glitch at most once per 60s. Every transition
+# is a pure function of (shot, time): frame-exact, no flicker by design.
+TRANSITIONS = ("cut", "fade", "slide", "zoom", "whip", "glitch")
+TRANSITION_WEIGHTS = [("cut", 90), ("fade", 10)]
+TRANSITION_ENTERS = {"cut": "cut", "fade": "fade_in", "slide": "slide_left",
+                     "zoom": "zoom_in", "whip": "whip_in", "glitch": "cut"}
+GLITCH_LEN = 0.2          # RGB-split glitch length, seconds (CapCut-style, impact beats only)
+GLITCH_MIN_GAP = 60.0     # at most one glitch per 60s of video
 
 ENTER_DUR = {"cut": 0.0, "fade_in": 0.6, "slide_left": 0.7, "slide_right": 0.7, "slide_up": 0.7,
              "slide_down": 0.7, "pull_down": 0.75, "zoom_in": 0.7, "fit_in_frame": 0.75, "blur_in": 0.8,
-             "swing_right": 0.8}
-KB_MAX = 2.6          # Ken Burns eases out over at most this long, then holds
+             "swing_right": 0.8, "whip_in": 0.25}
+def transition_enter(transition: str) -> str:
+    """The card entrance a shot transition arrives with (TRANSITIONS).
+    "cut" and "fade" keep their own entrances; slide / zoom / whip map to
+    the matching entrance; glitch cuts in hard and the RGB split carries it.
+    Unknown transitions fall back to a hard cut, never to an animation.
+    """
+    return TRANSITION_ENTERS.get(transition, "cut")
+
+
+KB_MAX = 2.6          # P3: only `hold` still settles after this long; other motions run the whole shot
 PAIR_MOVE = 0.7       # first card's slide to the left when the second arrives
 EXIT_FADE = 0.6
 SHAKE_LEN, PUNCH_LEN, FLASH_LEN = 0.5, 0.85, 0.6
@@ -89,14 +117,26 @@ def ease_in_out(p: float) -> float:
 # ------------------------------------------------------------------ layout geometry
 
 
+# Dedicated caption bar: the bottom 8% of the frame is a black bar drawn
+# under captioned shots (ShotRenderer), and cards are capped to the top
+# 92% so no caption ever overlaps panel art. Must match
+# captions.CAPTION_BAR_TOP_FRACTION (kept as a literal here so frames.py
+# stays importable without the captions module).
+CAPTION_BAR_TOP_FRACTION = 0.92
+
+
 def card_box(layout: str, fmt: Format) -> Tuple[float, float]:
-    """Largest card size (w, h) for a layout; the crop's aspect decides the actual fit."""
+    """Largest card size (w, h) for a layout; the crop's aspect decides the actual fit.
+
+    Card heights are capped to the top 92% of the frame: the bottom 8%
+    is the dedicated caption bar, and a card must never extend into it.
+    """
     W, H = fmt.width, fmt.height
     if fmt.portrait:
         return {"single": (0.92 * W, 0.70 * H), "pair": (0.90 * W, 0.42 * H),
                 "inset": (0.55 * W, 0.28 * H), "wide": (0.96 * W, 0.55 * H)}.get(layout, (0.92 * W, 0.7 * H))
-    return {"single": (0.62 * W, 0.90 * H), "pair": (0.42 * W, 0.80 * H),
-            "inset": (0.34 * W, 0.60 * H), "wide": (0.94 * W, 0.86 * H)}.get(layout, (0.62 * W, 0.90 * H))
+    return {"single": (0.62 * W, 0.92 * H), "pair": (0.42 * W, 0.80 * H),
+            "inset": (0.34 * W, 0.60 * H), "wide": (0.96 * W, 0.92 * H)}.get(layout, (0.62 * W, 0.92 * H))
 
 
 # Crop shape ranges (w/h) per layout. Tall panels are cut to a focal region of
@@ -154,35 +194,47 @@ def fit(aspect: float, box: Tuple[float, float], area: float | None = None) -> T
 
 
 def slot_centres(layout: str, fmt: Format, size: Tuple[int, int], index: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """(start centre, resting centre) for card `index` in this layout."""
+    """(start centre, resting centre) for card `index` in this layout.
+
+    Cards centre on the top 92% of the frame (0.46 * H): the bottom 8%
+    is the dedicated caption bar, and no card may extend into it.
+    """
     W, H = fmt.width, fmt.height
     cw, ch = size
     if layout == "pair":
         if fmt.portrait:
-            rest = (W / 2, 0.27 * H) if index == 0 else (W / 2, 0.73 * H)
+            rest = (W / 2, 0.23 * H) if index == 0 else (W / 2, 0.67 * H)
         else:
-            rest = (0.27 * W, H / 2) if index == 0 else (0.73 * W, H / 2)
-        start = (W / 2, H / 2) if index == 0 else rest
+            rest = (0.27 * W, 0.46 * H) if index == 0 else (0.73 * W, 0.46 * H)
+        start = (W / 2, 0.46 * H) if index == 0 else rest
         return start, rest
     if layout == "inset":
         if fmt.portrait:
-            c = (W / 2, 0.93 * H - ch / 2)
+            c = (W / 2, 0.92 * H - ch / 2)
         else:
-            c = (0.05 * W + cw / 2, 0.93 * H - ch / 2)
+            c = (0.05 * W + cw / 2, 0.92 * H - ch / 2)
         return c, c
-    c = (W / 2, H / 2)
+    c = (W / 2, 0.46 * H)
     return c, c
 
 
 # ------------------------------------------------------------------ backgrounds
 
 
-def _vignette(fmt: Format) -> np.ndarray:
-    ys, xs = np.ogrid[0:fmt.height, 0:fmt.width]
-    nx = (xs - fmt.width / 2) / (fmt.width / 2)
-    ny = (ys - fmt.height / 2) / (fmt.height / 2)
+@lru_cache(maxsize=8)
+def _vignette_grid(width: int, height: int) -> np.ndarray:
+    ys, xs = np.ogrid[0:height, 0:width]
+    nx = (xs - width / 2) / (width / 2)
+    ny = (ys - height / 2) / (height / 2)
     d = np.sqrt(nx ** 2 + ny ** 2) / math.sqrt(2)
     return (1.0 - 0.45 * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
+
+
+def _vignette(fmt: Format) -> np.ndarray:
+    # The vignette depends only on the frame size: identical for every shot
+    # in a chapter, so build it once. Callers must not mutate the result
+    # (background() only multiplies by it).
+    return _vignette_grid(fmt.width, fmt.height)
 
 
 def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
@@ -201,7 +253,99 @@ def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
     return np.clip(big * 0.72 * _vignette(fmt), 0, 255).astype(np.uint8)
 
 
+# ------------------------------------------------------------------ P4 caches
+# Two per-shot rebuilds that P4 caches. Both hold a strong reference to
+# the source panel in the entry, so a recycled id() can never hit a stale
+# entry (the entry keeps its panel alive; eviction drops the reference).
+# Cached arrays are never mutated by callers: frame_array copies the bg
+# (Image.fromarray / PIL copy) and only reads Card.src via transform.
+_BG_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_BG_CACHE_MAX = 8
+_SRC_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_SRC_CACHE_MAX = 32
+
+
+def _cached_background(kind: str, panel: Image.Image | None, fmt: Format,
+                       bg_panel_id: str | None) -> np.ndarray:
+    """background() with a cross-shot cache. Consecutive shots usually
+    share a bg_panel (same panel across sentences); rebuilding the
+    blurred + vignetted 1080p backdrop per shot re-pays the upscale +
+    vignette multiply every time. Key includes the panel's identity so a
+    different image under the same panel id can never hit a stale entry.
+    Solid (black/white) backgrounds are cached by kind + frame size."""
+    if panel is None:
+        key = (kind, fmt.width, fmt.height, None, None)
+        hit = _BG_CACHE.get(key)
+        if hit is not None:
+            _BG_CACHE.move_to_end(key)
+            return hit[1]
+        arr = background(kind, None, fmt)
+        _BG_CACHE[key] = (None, arr)
+    else:
+        key = (kind, fmt.width, fmt.height, bg_panel_id, id(panel))
+        hit = _BG_CACHE.get(key)
+        if hit is not None and hit[0] is panel:
+            _BG_CACHE.move_to_end(key)
+            return hit[1]
+        arr = background(kind, panel, fmt)
+        _BG_CACHE[key] = (panel, arr)
+    while len(_BG_CACHE) > _BG_CACHE_MAX:
+        _BG_CACHE.popitem(last=False)
+    return arr
+
+
+def _cached_src(panel: Image.Image, region: Image.Image, crop_key: tuple,
+                iw: int, ih: int) -> Image.Image:
+    """The LANCZOS resize of a card's crop (the ~20ms part of Card init).
+    The resize is a pure function of (panel, crop, pad_y, iw, ih); sharing
+    the result across Cards that show the same panel the same way is safe
+    because transform() only reads src."""
+    key = (id(panel), crop_key, iw, ih)
+    hit = _SRC_CACHE.get(key)
+    if hit is not None and hit[0] is panel:
+        _SRC_CACHE.move_to_end(key)
+        return hit[1]
+    src = region.convert("RGB").resize((max(2, round(iw * SRC_HEADROOM)),
+                                        max(2, round(ih * SRC_HEADROOM))), Image.LANCZOS)
+    _SRC_CACHE[key] = (panel, src)
+    while len(_SRC_CACHE) > _SRC_CACHE_MAX:
+        _SRC_CACHE.popitem(last=False)
+    return src
+
+
 # ------------------------------------------------------------------ cards
+
+
+def padded_region(panel: Image.Image, box: List[float], pad_y: float) -> Image.Image:
+    """The card's picture when it is taller than its crop: the crop in full width, centred,
+    with `pad_y` panel-heights above and below filled by a blurred, darkened copy of the
+    panel itself (a wide panel is shown whole rather than losing its sides)."""
+    x0, y0, x1, y1 = (max(0.0, min(1.0, float(v))) for v in box)
+    pw, ph = panel.size
+    inner = panel.convert("RGB").crop((int(x0 * pw), int(y0 * ph), max(int(x0 * pw) + 2, int(x1 * pw)),
+                                       max(int(y0 * ph) + 2, int(y1 * ph))))
+    pad = max(0, round(float(pad_y) * ph))
+    cw, ch = inner.width, inner.height + 2 * pad
+    k = max(cw / inner.width, ch / inner.height)
+    cover = inner.resize((max(cw, round(inner.width * k)), max(ch, round(inner.height * k))), Image.BILINEAR)
+    left, top = (cover.width - cw) // 2, (cover.height - ch) // 2
+    canvas = cover.crop((left, top, left + cw, top + ch)).filter(ImageFilter.GaussianBlur(max(4, ch * 0.03)))
+    canvas = Image.eval(canvas, lambda v: int(v * 0.7))
+    canvas.paste(inner, (0, pad))
+    return canvas
+
+
+@lru_cache(maxsize=32)
+def _shadow_mask(sw: int, sh: int, m: int, off: int, cw: int, ch: int, radius: int, u: float) -> Image.Image:
+    # The blurred drop shadow depends only on the card geometry, and cards
+    # share a handful of sizes: build it once per size instead of blurring
+    # a ~1300x1900 mask for every card. The returned image is shared
+    # (putalpha reads from it without mutating it); callers must not draw on it.
+    shadow = Image.new("L", (sw, sh), 0)
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (m - round(4 * u), m + off - round(2 * u), m + cw + round(4 * u),
+         m + ch + off + round(6 * u)), radius + 4, fill=235)
+    return shadow.filter(ImageFilter.GaussianBlur(20 * u))
 
 
 class Card:
@@ -219,24 +363,30 @@ class Card:
         pw, ph = panel.size
         region = panel.crop((int(x0 * pw), int(y0 * ph), max(int(x0 * pw) + 2, int(x1 * pw)),
                              max(int(y0 * ph) + 2, int(y1 * ph))))
+        pad_y = float(spec.get("pad_y") or 0.0)
+        if pad_y > 0:                               # a wide panel shown whole on blurred padding
+            region = padded_region(panel, [x0, y0, x1, y1], pad_y)
         aspect = region.width / region.height
-        self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
+        if spec.get("wide_fill"):
+            # System-window cards fill the frame width: no equal-area
+            # shrink (a 1.777 system banner must reach >=90% of the
+            # frame width, which the equal-area rule never allows).
+            self.cw, self.ch = fit(aspect, card_box(layout, fmt), None)
+        else:
+            self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
         self.border = max(1, round(3 * u))
         self.radius = max(2, round(12 * u))
         self.margin = max(6, round(46 * u))
         iw, ih = self.cw - 2 * self.border, self.ch - 2 * self.border
         self.iw, self.ih = iw, ih
-        self.src = region.convert("RGB").resize((max(2, round(iw * SRC_HEADROOM)), max(2, round(ih * SRC_HEADROOM))),
-                                                Image.LANCZOS)
+        # P4: cache the LANCZOS resize; same panel + crop + target size reuses it.
+        self.src = _cached_src(panel, region, (x0, y0, x1, y1, pad_y), iw, ih)
 
         # Static parts of the sprite, built once: shadow + white rounded border.
         m = self.margin
         sw, sh = self.cw + 2 * m, self.ch + 2 * m
-        shadow = Image.new("L", (sw, sh), 0)
         off = round(10 * u)
-        ImageDraw.Draw(shadow).rounded_rectangle((m - round(4 * u), m + off - round(2 * u), m + self.cw + round(4 * u),
-                                                  m + self.ch + off + round(6 * u)), self.radius + 4, fill=235)
-        shadow = shadow.filter(ImageFilter.GaussianBlur(20 * u))
+        shadow = _shadow_mask(sw, sh, m, off, self.cw, self.ch, self.radius, u)
         base = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
         base.putalpha(shadow)
         card_mask = Image.new("L", (sw, sh), 0)
@@ -251,7 +401,12 @@ class Card:
         self.enter = spec.get("enter") if spec.get("enter") in ENTRANCES else "cut"
         self.enter_dur = ENTER_DUR[self.enter]
         self.motion = spec.get("motion") if spec.get("motion") in MOTIONS else "push_in"
-        self.kb_dur = max(0.01, min(shot_end - self.appear, KB_MAX))
+        # P3: non-hold motions run the whole visible shot (continuous Ken
+        # Burns); `hold` keeps the old settle-then-hold (payoff beats only).
+        if self.motion == "hold":
+            self.kb_dur = max(0.01, min(shot_end - self.appear, KB_MAX))
+        else:
+            self.kb_dur = max(0.01, shot_end - self.appear)
         self.start_c, self.rest_c = slot_centres(layout, fmt, (self.cw, self.ch), index)
         self.pair_move_at = pair_move_at if (layout == "pair" and index == 0) else None
 
@@ -268,9 +423,11 @@ class Card:
 
     def _viewport(self, t: float, extra_zoom: float) -> Tuple[float, float, float, float]:
         sw, sh = self.src.size
-        p = ease_out((t - self.appear) / self.kb_dur)
         m = self.motion
-        zoom = {"push_in": 1.0 + 0.07 * p, "pull_out": 1.10 - 0.10 * p, "hold": 1.01 + 0.02 * p}.get(m, 1.08)
+        # P3: non-hold motions ease in-out across the whole shot (continuous
+        # motion); `hold` keeps ease-out-then-hold.
+        p = ease_out((t - self.appear) / self.kb_dur) if m == "hold" else ease_in_out((t - self.appear) / self.kb_dur)
+        zoom = {"push_in": 1.0 + 0.15 * p, "pull_out": 1.18 - 0.18 * p, "hold": 1.01 + 0.02 * p}.get(m, 1.08)
         zoom *= 1 + extra_zoom
         # The source is the whole crop (at extra resolution, so zoomed views stay
         # sharp); zoom 1 shows all of it, zoom 1.1 shows the middle 1/1.1.
@@ -294,6 +451,10 @@ class Card:
         p = ease_out((t - self.pair_move_at) / PAIR_MOVE)
         (ax, ay), (bx, by) = self.start_c, self.rest_c
         return ax + (bx - ax) * p, ay + (by - ay) * p
+
+    def pair_move_done(self, t: float) -> bool:
+        """True once the pair slide has finished (or there is no pair move)."""
+        return self.pair_move_at is None or t >= self.pair_move_at + PAIR_MOVE
 
     def entrance(self, t: float) -> Dict[str, float]:
         """Offsets/scale/rotation/blur/alpha for the entrance animation at time t."""
@@ -325,6 +486,8 @@ class Card:
             out["blur"], out["alpha"] = (1 - p) * 22 * self.fmt.unit, fade
         elif e == "swing_right":
             out["rot"], out["dx"], out["alpha"] = -11 * (1 - p), -(1 - p) * 0.06 * W, ease_in_out(u / d)
+        elif e == "whip_in":       # fast push: sweeps in from the right, settles in 0.25s
+            out["dx"], out["scale"], out["alpha"] = (1 - p) * 0.22 * W, 1.22 - 0.22 * p, fade
         return out
 
     def sprite(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
@@ -372,6 +535,139 @@ def flash_alpha(t: float, times: List[float]) -> float:
     return best
 
 
+
+def glitch_offset(t: float, times: List[float], unit: float) -> int:
+    """RGB-split offset in pixels at time t (0 when no glitch is active).
+
+    A glitch lasts GLITCH_LEN (0.2s) and decays linearly: the split is
+    widest on the beat, then settles. It shifts colour channels, never
+    covers a face: no pixels are hidden, only separated by a few px.
+    """
+    best = 0.0
+    for te in times:
+        dt = t - te
+        if 0 <= dt < GLITCH_LEN:
+            best = max(best, 1.0 - dt / GLITCH_LEN)
+    return max(0, int(round(8 * unit * best)))
+
+
+def glitch_split(arr: np.ndarray, px: int) -> np.ndarray:
+    """RGB split: R shifts left, B shifts right by px; G stays. Edges repeat
+    (no wrap-around, no black bars). Returns a copy; input untouched.
+    """
+    if px <= 0:
+        return arr
+    h, w = arr.shape[:2]
+    px = min(px, max(1, w // 8))
+    out = arr.copy()
+    out[:, :w - px, 0] = arr[:, px:, 0]
+    out[:, w - px:, 0] = arr[:, -1:, 0]
+    out[:, px:, 2] = arr[:, :w - px, 2]
+    out[:, :px, 2] = arr[:, :1, 2]
+    return out
+
+
+def grade_subtle(arr: np.ndarray) -> np.ndarray:
+    """Gentle grade: contrast +5%, saturation +5%. Subtle by design --
+    the art still looks like the art, just a touch more present.
+    """
+    f = arr.astype(np.float32)
+    f = (f - 128.0) * 1.05 + 128.0
+    gray = f.mean(axis=2, keepdims=True)
+    f = gray + (f - gray) * 1.05
+    return np.clip(f, 0, 255).astype(np.uint8)
+# ------------------------------------------------------------------ P3 overlays
+
+# P4: truetype() re-reads + parses the font file on every call; a callout
+# active for 1.2s would reload it ~36x. Fonts are read-only after load.
+@lru_cache(maxsize=16)
+def _overlay_font(size: int):
+    """Bold sans-serif for callouts / chapter cards, with a plain fallback.
+
+    DejaVuSans-Bold ships with most Pillow installs; when it is absent the
+    default bitmap font still renders (smaller, but never crashes a render).
+    """
+    for name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # Pillow < 10.1
+        return ImageFont.load_default()
+
+
+def _draw_callout(img: Image.Image, callout: dict, fmt: "Format", t: float, caption_bar: bool = False) -> None:
+    """One keyword callout: bottom banner, max 2 lines, never over faces.
+
+    Faces sit in the upper part of a card; the banner sits in the bottom
+    14% of the frame (lower-third), where cards show torso / background.
+    `keyword` style is yellow; other styles are white. No-op outside the
+    callout's [t, t+dur) window or when the text is empty.
+    """
+    try:
+        start = float(callout.get("t") or 0)
+        dur = float(callout.get("dur") or 1.2)
+    except (TypeError, ValueError):
+        return
+    if not start <= t < start + dur:
+        return
+    text = str(callout.get("text") or "").strip()
+    if not text:
+        return
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()][:2]
+    if not lines:
+        return
+    W, H = fmt.width, fmt.height
+    u = fmt.unit
+    font = _overlay_font(max(10, int(44 * u)))
+    draw = ImageDraw.Draw(img, "RGBA")
+    lh = max(10, int(58 * u))
+    band_h = lh * len(lines) + int(18 * u)
+    # With a caption bar, the banner sits above the bar (its bottom edge
+    # is the bar's top), never over the captions.
+    _bottom = int(H * CAPTION_BAR_TOP_FRACTION) if caption_bar else H
+    y0 = _bottom - band_h - int(8 * u)
+    draw.rectangle((0, y0, W, _bottom), fill=(0, 0, 0, 140))
+    fill = (255, 214, 90) if callout.get("style") == "keyword" else (255, 255, 255)
+    for i, ln in enumerate(lines):
+        w = draw.textlength(ln, font=font)
+        draw.text(((W - w) / 2, y0 + int(9 * u) + i * lh), ln, font=font, fill=fill,
+                  stroke_width=max(1, int(3 * u)), stroke_fill=(0, 0, 0))
+
+
+def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) -> bool:
+    """A chapter card: full-screen dark overlay + centred stakes title.
+
+    Returns True when a card was active at t (the overlay covers the panels
+    for its 1.5-2s window — a deliberate pattern interrupt, not a glitch).
+    """
+    try:
+        start = float(card.get("t") or 0)
+        dur = float(card.get("dur") or 1.75)
+    except (TypeError, ValueError):
+        return False
+    if not start <= t < start + dur:
+        return False
+    title = str(card.get("title") or "").strip()
+    if not title:
+        return False
+    W, H = fmt.width, fmt.height
+    u = fmt.unit
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 150))
+    img.paste(Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB"), (0, 0))
+    draw = ImageDraw.Draw(img)
+    font = _overlay_font(max(12, int(72 * u)))
+    w = draw.textlength(title, font=font)
+    draw.text(((W - w) / 2, H / 2 - int(36 * u)), title, font=font, fill=(255, 255, 255),
+              stroke_width=max(1, int(4 * u)), stroke_fill=(0, 0, 0))
+    rule = max(2, int(4 * u))
+    draw.rectangle(((W - w) / 2, H / 2 + int(40 * u), (W + w) / 2, H / 2 + int(40 * u) + rule),
+                   fill=(255, 214, 90))
+    return True
+
+
 # ------------------------------------------------------------------ shot
 
 
@@ -386,7 +682,12 @@ class ShotRenderer:
 
     def __init__(self, shot: Dict[str, Any], images: Dict[str, Image.Image], fmt: Format,
                  effects_on: Dict[str, bool] | None = None, video_end: float | None = None,
-                 end_fade: bool = False):
+                 end_fade: bool = False, chapter_cards: List[Dict[str, Any]] | None = None):
+        # P3: shot-level callouts ride on the shot dict; plan-level chapter
+        # cards are passed in (render.py) so a clip can shift them with the shot.
+        self.caption_bar = bool(shot.get("caption_bar"))
+        self.callouts = [c for c in (shot.get("callouts") or []) if isinstance(c, dict)]
+        self.chapter_cards = list(chapter_cards or [])
         self.fmt = fmt
         self.shot = shot
         self.start, self.end = float(shot["start"]), float(shot["end"])
@@ -402,12 +703,23 @@ class ShotRenderer:
             # (negative) arrival time here, so the first card is already in place.
             move = shot.get("pair_move_at", cards[1].get("at"))
             pair_move_at = self.start + float(move or 0.0)
+        # Defect 2: pair_move runs at most once per pair shot. A shot that
+        # already played its pair move (re-render / clip with pair_move_done)
+        # starts with the first card already in place -- the slide never re-triggers.
+        if shot.get("pair_move_done"):
+            pair_move_at = self.start - PAIR_MOVE
         self.cards = [Card(images[c["panel"]], c, layout, i, self.start, self.end, fmt, pair_move_at)
                       for i, c in enumerate(cards)]
 
         bg_kind = shot.get("background") if shot.get("background") in BACKGROUNDS else "blur"
         bg_panel = shot.get("bg_panel") if shot.get("bg_panel") in images else (cards[0]["panel"] if cards else None)
-        self.bg = background(bg_kind, images.get(bg_panel) if bg_panel else None, fmt)
+        # P4: cross-shot bg cache; bg_panel id is the shot's panel id (None
+        # keeps the old behaviour for shots without one).
+        self.bg = _cached_background(bg_kind, images.get(bg_panel) if bg_panel else None,
+                                     fmt, bg_panel)
+        # P4: Image.fromarray(self.bg) per frame re-validates + copies the 6MB
+        # backdrop; one PIL copy per frame from a cached PIL image is cheaper.
+        self._bg_pil = Image.fromarray(self.bg)
 
         on = {"shake": True, "punch": False, "flash": False}
         on.update({k: bool(v) for k, v in (effects_on or {}).items()})
@@ -415,7 +727,15 @@ class ShotRenderer:
         self.shakes = [float(e["t"]) for e in fx if e["type"] == "shake"]
         self.punches = [float(e["t"]) for e in fx if e["type"] == "punch"]
         self.flashes = [float(e["t"]) for e in fx if e["type"] == "flash"]
+        self.glitches = [float(e["t"]) for e in fx if e["type"] == "glitch"]
+        # CapCut grade: "subtle" only, off by default (planner sets it from
+        # video.grade). Anything else is ignored, never a surprise grade.
+        self.grade = shot.get("grade") if shot.get("grade") == "subtle" else None
 
+        try:     # a darker grade for the whole shot (the intro preset sets it)
+            self.darken = max(0.0, min(0.6, float(shot.get("darken") or 0.0)))
+        except (TypeError, ValueError):
+            self.darken = 0.0
         self.exit = shot.get("exit") if shot.get("exit") in EXITS else "cut"
         self.fade_from = self.end - EXIT_FADE if self.exit == "fade_out" else None
         if end_fade and video_end is not None and abs(video_end - self.end) < 0.05:
@@ -425,19 +745,33 @@ class ShotRenderer:
 
         # From this moment until any exit fade, every frame is identical.
         settle = max([c.settled_at() for c in self.cards] + [self.start])
-        for times, length in ((self.shakes, SHAKE_LEN), (self.punches, PUNCH_LEN), (self.flashes, FLASH_LEN)):
+        for times, length in ((self.shakes, SHAKE_LEN), (self.punches, PUNCH_LEN),
+                                (self.flashes, FLASH_LEN), (self.glitches, GLITCH_LEN)):
             for te in times:
                 settle = max(settle, te + length)
         self.static_from = settle
+        # Defect 1: only a shot whose every card is a hand-set `hold` may
+        # freeze. Continuous-motion shots must be re-drawn every frame.
+        self._can_freeze = all(c.motion == "hold" for c in self.cards)
         self._static: np.ndarray | None = None
 
     def is_static(self, t: float) -> bool:
-        return t >= self.static_from and (self.fade_from is None or t < self.fade_from)
+        return self._can_freeze and t >= self.static_from and (self.fade_from is None or t < self.fade_from)
+
+    def pair_move_done(self, t: float) -> bool:
+        """True once every card's pair slide has finished (pair_move fires once)."""
+        return all(c.pair_move_done(t) for c in self.cards)
 
     def frame_array(self, t: float) -> np.ndarray:
         if self.is_static(t) and self._static is not None:
             return self._static
-        img = Image.fromarray(self.bg)
+        img = self._bg_pil.copy()
+        if self.caption_bar:
+            # Dedicated caption bar: solid black below the cards, so
+            # captions (burned in later by ffmpeg) sit on black, never
+            # over panel art.
+            _bar_top = int(self.fmt.height * CAPTION_BAR_TOP_FRACTION)
+            ImageDraw.Draw(img).rectangle((0, _bar_top, self.fmt.width, self.fmt.height), fill=(0, 0, 0))
         dx_s, dy_s = shake_offset(t, self.shakes, self.fmt.unit)
         extra = punch_amount(t, self.punches)
         for card in self.cards:
@@ -460,7 +794,18 @@ class ShotRenderer:
             x = int(round(cx + ent["dx"] + dx_s - spr.width / 2))
             y = int(round(cy + ent["dy"] + dy_s - spr.height / 2))
             img.paste(spr.convert("RGB"), (x, y), alpha)
+        for _co in self.callouts:
+            _draw_callout(img, _co, self.fmt, t, caption_bar=self.caption_bar)
+        for _cc in self.chapter_cards:
+            _draw_chapter_card(img, _cc, self.fmt, t)
         out = np.asarray(img, dtype=np.uint8)
+        if self.darken > 0:
+            out = (out.astype(np.float32) * (1.0 - self.darken)).astype(np.uint8)
+        if self.grade == "subtle":
+            out = grade_subtle(out)
+        _glitch = glitch_offset(t, self.glitches, self.fmt.unit)
+        if _glitch > 0:
+            out = glitch_split(out, _glitch)
         fa = flash_alpha(t, self.flashes)
         if fa > 0.001:
             out = _mix(out, np.full_like(out, 255), fa)

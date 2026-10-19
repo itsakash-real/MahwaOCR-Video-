@@ -78,17 +78,72 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "drop_below": 80,       # px; smaller fragments are dropped
             "merge_below": 220,     # px; small fragments merge into a neighbour
             "skip_landscape": True, # skip wide pages (scanlation credit banners)
+            "tighten_edges": True,  # trim white/black gutter rows off a panel's top and bottom
+            "white_threshold": 242, # gray above this across a row = white gutter
+            "black_threshold": 13,  # gray below this across a row = near-black gutter
+        },
+        # Card framing. Cards keep the panel's full width and pick a vertical window.
+        # Head detection beyond skin colour, for white/silver hair and gray skin.
+        "heads": {
+            "pale": True,           # try the pale/gray head detector when skin colour finds none
+            "keep_top": 0.25,       # figure but no head: a card never starts this far down (0 = off)
+        },
+        "crop": {
+            "full_width": True,     # false = the old behavior (zoomed, side-cropped windows)
+            "min_width_kept": 0.9,  # last-resort bubble avoidance may narrow a card, never below this
         },
         # Recap style is calm: only a gentle shake on {impact} lines by default.
         "effects": {"shake": True, "punch": False, "flash": False, "end_fade": True},
-        "music": None,              # path to a music file, relative to the series folder
-        "music_volume": 0.22,
+        "music": None,              # path to a music file, relative to the series folder.
+                                 # None still means: use music/bed.mp3 in the series folder when
+                                 # it exists (P3 safe default), else render music-free.
+        "music_volume": 0.22,     # 15-25% under narration (sidechain ducks further under speech)
+        "music_fade": 0.5,        # music fade in/out, seconds (>= 0.3s)
+        "sfx_dir": None,          # folder (relative to the series folder) with whoosh.mp3,
+                                 # impact.mp3, ding.mp3, sting.mp3. None = no SFX, never fails.
+        # Narration sync and hold limits. These are the numbers `video plan` and
+        # `video sync-audit` actually use; sync.effective_settings() reads them
+        # from here (video.min_hold and video.sync.*) or warns by name.
+        #   min_hold:        no picture stays up for less than this (seconds).
+        #   max_late:        a cut may start at most this long after its sentence starts.
+        #   lead:            hard early bound - a cut may lead its sentence by at most this.
+        #   min_hold_short:  shortest hold allowed when a sentence can't be merged.
+        #   max_hold:        a single picture held longer than this gets split.
+        #   max_unmatched:   a run of whisper-unmatched speech longer than this stops the build.
+        #   override_evidence: OCR overlap above which a tag/OCR disagreement is flagged (tag still shows).
+        #   filler_full:     only sentences longer than this may be filled end to end.
+        #   gate_wrong:      most wrong-picture time (another sentence's panel on screen)
+        #                    allowed overall; fillers and pair cards are excluded.
+        #   gate_window:     most wrong-picture time allowed in any five-second window.
+        #   gate_grace:      extra cut lateness tolerated before the gate fails.
+        "min_hold": 3.0,
+        "sync": {
+            "min_segment": 0.25, "max_late": 0.3, "lead": 0.2, "min_hold_short": 2.0,
+            "max_hold": 8.0, "max_unmatched": 6.0, "override_evidence": 20, "filler_full": 6.0,
+            "gate_wrong": 0.05, "gate_window": 0.25, "gate_grace": 0.2,
+        },
+        # Recording text. spell_numbers: the NEW recaps/chapter_N.tts.txt (and the spoken text in
+        # cues.json) write digits as words (99 -> ninety nine). Existing files with audio are never touched.
+        "tts": {"spell_numbers": True},
+        # `video intro`: the chapter-0 trailer built from panels of several chapters.
+        # min_hold: shortest time a picture stays up. pair_ratio: share of neighbouring panels shown
+        # two at a time. darken: darker grade (0-0.6). backdrop: always the blurred panel, never black bars.
+        "intro": {"min_hold": 2.0, "pair_ratio": 0.5, "darken": 0.15, "backdrop": "blur",
+                  "beat_effects": ["shake", "flash", "fade_out"]},
+        # `video hook` / `video previously`: 30-second auto-picked videos.
+        # target_seconds is clamped into [min_seconds, max_seconds]; audio
+        # longer than the cap (or shorter than the floor) logs a warning.
+        # seed makes the auto-pick's near-tie jitter reproducible.
+        "hook": {"target_seconds": 30.0, "min_seconds": 20.0, "max_seconds": 45.0, "seed": 7},
         "whisper_model": "small.en",
         "whisper_language": None,   # e.g. "hi" for Hindi narration (use a multilingual model)
     },
     "pipeline": {
         # Parallel vision calls. Keep modest to respect provider rate limits.
         "concurrency": 4,
+        # Tiles per vision() call. 1 = one call per tile (the old behaviour).
+        # Higher values cut round-trips; each tile is still cached separately.
+        "vision_batch": 1,
         "cache": True,
         # Near-duplicate threshold for de-duplicating text across tile overlaps.
         "dedupe_threshold": 0.86,

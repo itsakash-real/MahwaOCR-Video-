@@ -4,15 +4,22 @@ For each panel the crop search (crops.shape_candidates) gives ranked windows
 for each allowed card shape. A window is clean when it shows none of:
 
   lettering  speech-bubble or caption lettering inside the card
-  painted    a patch left where a bubble was painted out
+  painted    (legacy, never occurs now: bubble painting was removed entirely)
   blank      mostly flat white/empty (a white screen)
   head_cut   a detected head would be cut (top or chin outside the card)
 
 The first clean window wins. If a panel has no clean window:
-  - a panel with a character is never dropped: the best window is kept and
-    marked "needs eyes" for the reviewer;
-  - a panel with no character (lettering-only, blank, logo) is dropped and
-    listed with its page and panel id, so nothing silently goes missing.
+  - a panel whose best window still shows a bubble (lettering /
+    face_bubble) is DROPPED and listed with its page and panel id, so
+    nothing silently goes missing. Bubble painting was removed
+    entirely -- a bubble can no longer be painted clean, so a panel
+    with no bubble-free crop is dropped and its time re-paired (the
+    P1 mask-risk rule, now applied to every bubble).
+  - a panel with a character whose only problem is a cut head
+    (head_cut, no bubble) is never dropped: the best window is kept
+    and marked "needs eyes" for the reviewer;
+  - a panel with no character (lettering-only, blank, logo) is dropped
+    and listed with its page and panel id, so nothing silently goes missing.
 
 The designer (plan.py) uses pick_crop() for the same decision, so the report
 and the video agree.
@@ -27,7 +34,9 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from PIL import Image
 
-from .crops import BUBBLE_OK, FIGURE_MIN, _panel_maps, figure_share, shape_candidates
+from .crops import (BUBBLE_OK, FIGURE_MIN, PATCH_VISIBLE, _panel_maps,
+                    face_bubble_boxes, head_of, is_mask_risk, patch_visibility, shape_candidates)
+from .cropcache import crop_key, load_crop, store_crop
 from ..util import atomic_write_text, require_chapter
 from .media import video_dir
 
@@ -49,42 +58,249 @@ def problems_of(c: Dict[str, Any]) -> List[str]:
     return out
 
 
-def pick_crop(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None = None) -> Tuple[float, Tuple, List[str], bool]:
-    """(shape, box, problems, clean). Clean windows beat unclean ones; among equals
-    the lower score wins. The shape choice keeps the panel's own shape close."""
+def pick_card(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """The card for one panel: {"shape", "box", "pad_y", "problems", "clean"}.
+
+    Clean windows beat unclean ones; among equals the lower score wins. The shape choice
+    keeps the panel's own shape close. `box` always lies inside the panel; `pad_y` > 0 means
+    the card is taller than the box by that many panel-heights above and below (a panel
+    too wide for any allowed shape is shown whole on blurred padding, not side-cropped).
+    """
     m = maps or _panel_maps(img)
-    gw, gh = m["soft"].shape[1], m["soft"].shape[0]
-    panel_aspect = gw / gh
+    panel_aspect = img.width / max(1, img.height)
+    risk = is_mask_risk(m)
+    face_bubbles = face_bubble_boxes(m)
     best = None
-    for a in shapes:
-        for c in shape_candidates(img, a, m)[:40]:
-            probs = problems_of(c)
-            cost = c["score"] + 0.4 * max(0.0, math.log(panel_aspect / a)) + 0.02 * abs(math.log(a / panel_aspect))
-            key = (len(probs) > 0, cost)
-            if best is None or key < best[0]:
-                best = (key, a, c["box"], probs)
-    _, shape, box, probs = best
-    return shape, box, probs, not probs
+    for fallback in (False, True):       # a shape that would cost the panel its sides only if none else works
+        for a in shapes:
+            for c in shape_candidates(img, a, m, fallback=fallback, allow_pad=True)[:40]:
+                probs = problems_of(c)
+                # P1: a mask-risk panel whose best window still overlaps a
+                # bubble would have masked a face if painted (painting
+                # removed) -> flag it so the
+                # caller drops the panel instead of masking it. A clean
+                # window (avoids the bubble) has no mask problem.
+                # CapCut bugfix (defect 3): a window showing a bubble that
+                # overlaps the face range would have put a patch on/near the
+                # face -- flag it, so the planner drops the panel instead of
+                # masking it. (Such a window already has the lettering
+                # problem; face_bubble names the face reason.)
+                if face_bubbles and "face_bubble" not in probs:
+                    _bx0, _by0, _bx1, _by1 = c["box"]
+                    for _fb in face_bubbles:
+                        _ix = max(0.0, min(_bx1, _fb[2]) - max(_bx0, _fb[0]))
+                        _iy = max(0.0, min(_by1, _fb[3]) - max(_by0, _fb[1]))
+                        if _ix > 0 and _iy > 0:
+                            probs = [*probs, "face_bubble"]
+                            break
+                if risk and not c["bubble_ok"] and "mask_risk" not in probs:
+                    probs = [*probs, "mask_risk"]
+                cost = (c["score"] + 0.4 * max(0.0, math.log(panel_aspect / a))
+                        + 0.02 * abs(math.log(a / panel_aspect)))
+                # P1 auto-switch: fewer problems always beats a nicer shape
+                # (a clean 3:4 beats a 4:3 with a bubble/head-cut), and on a
+                # tie the narrower shape wins (safer in pair layouts: the Ch4
+                # lesson was a 4:3 crop failing once the panel landed in a pair).
+                key = (len(probs), cost, a)
+                if best is None or key < best[0]:
+                    best = (key, a, c["box"], c.get("pad_y", 0.0), probs)
+        if best is not None:
+            break
+    _, shape, box, pad_y, probs = best
+    return {"shape": shape, "box": box, "pad_y": pad_y, "problems": probs, "clean": not probs}
+
+
+def pick_crop(img: Image.Image, shapes: List[float], maps: Dict[str, Any] | None = None) -> Tuple[float, Tuple, List[str], bool]:
+    """(shape, box, problems, clean) of pick_card(), for callers that don't draw the card
+    (a padded card's box is the whole panel; its padding is in pick_card()["pad_y"])."""
+    card = pick_card(img, shapes, maps)
+    return card["shape"], card["box"], card["problems"], card["clean"]
+
+
+def layout_crop_problems(img: Image.Image, maps: Dict[str, Any] | None,
+                          layout_shapes: Dict[str, List[float]] | None) -> Dict[str, List[str]]:
+    """Per-layout crop problems for one panel (P1 layout-sensitive QA).
+
+    `layout_shapes`: layout name -> allowed shapes for that layout
+    (e.g. {"single": [...], "pair": [...]} from frames.shapes_for).
+    Returns {layout: problems} using pick_card with that layout's shapes
+    only. A panel clean in "single" but not in "pair" is layout-sensitive:
+    its single-layout crop must not be trusted for a pair shot (Ch4
+    lesson: a 4:3 crop passing in a single shot failed in a pair, fixed
+    by switching to 3:4). Returns {} when layout_shapes is None.
+    """
+    if not layout_shapes:
+        return {}
+    out: Dict[str, List[str]] = {}
+    for layout, shapes in layout_shapes.items():
+        card = pick_card(img, list(shapes), maps)
+        out[layout] = list(card["problems"])
+    return out
+
+
+def find_pair_safe_shape(img: Image.Image, maps: Dict[str, Any] | None,
+                           layout_shapes: Dict[str, List[float]] | None,
+                           layout: str = "single") -> Dict[str, Any] | None:
+    """The auto-switch for a panel whose single/wide crop and pair crop are both
+    clean but different shapes (P2).
+
+    P1 only flagged layout-sensitive crops (clean in single, problems in pair).
+    The remaining gap was consistency: the planner picked one crop per layout,
+    so the same panel could show a 4:3 crop in a single shot and a 3:4 crop in
+    a pair shot, and verify/QA judged a different crop than the one rendered
+    (Ch4: a 4:3 crop passing in a single shot failed once the panel landed in
+    a pair — fixed by hand by switching to 3:4). When BOTH layouts have a
+    clean crop but disagree on shape, the planner now uses the pair-safe
+    (narrower) shape everywhere, so one crop passes QA in every layout.
+
+    Returns {"from_shape", "to_shape", "box", "pad_y", "reason"} or None when
+    no switch applies (either layout has no clean crop — that stays a
+    reviewer decision, never a silent switch to a problematic crop — or the
+    shapes already agree). `maps` may be None (computed here).
+    """
+    if not layout_shapes or layout not in layout_shapes or "pair" not in layout_shapes:
+        return None
+    m = maps or _panel_maps(img)
+    main = pick_card(img, list(layout_shapes[layout]), m)
+    pair = pick_card(img, list(layout_shapes["pair"]), m)
+    if not main["clean"] or not pair["clean"]:
+        return None
+    if abs(float(main["shape"]) - float(pair["shape"])) < 1e-9:
+        return None
+    # The switch target must be a shape VALID for the layout it will be
+    # used in: the pair shape is only "safe" when this layout may actually
+    # show it. Pair shapes are a subset of single's, so single switches
+    # are unaffected -- but a WIDE shot may only show 1.333 / 1.777, never
+    # the pair layout's 1.0 square (Ch10 test build: P014-07 was recorded
+    # 1.777 -> 1.0, a square crop in a wide shot). A pair shape outside
+    # the layout's list means no switch: the layout keeps its own crop.
+    allowed = list(layout_shapes[layout])
+    if not any(abs(math.log(float(pair["shape"]) / a)) <= 0.02 for a in allowed):
+        return None
+    return {"from_shape": float(main["shape"]), "to_shape": float(pair["shape"]),
+            "box": list(pair["box"]), "pad_y": float(pair.get("pad_y") or 0.0),
+            "reason": (f"{layout} crop {main['shape']:.3f} and pair crop {pair['shape']:.3f} "
+                       f"are both clean; using the pair-safe {pair['shape']:.3f} everywhere "
+                       f"so one crop passes QA in every layout (Ch4: 4:3 failing in a pair -> 3:4)")}
 
 
 def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, Any]], Image.Image],
                    shapes: List[float], root: Path | None = None, chapter: str | None = None,
-                   log: Callable = print) -> Dict[str, Any]:
+                   log: Callable = print, options: Dict[str, Any] | None = None,
+                   fingerprint: str | None = None,
+                   layout_shapes: Dict[str, List[float]] | None = None) -> Dict[str, Any]:
     """Check every drawn panel. Returns the report (also written to
     video/chapter_N.verify.json when root and chapter are given)."""
     rows: Dict[str, Any] = {}
     dropped: List[Dict[str, Any]] = []
     needs_eyes: List[str] = []
     recropped: List[str] = []
+    low_confidence: List[Dict[str, Any]] = []
+    mask_risk: List[str] = []
+    layout_sensitive: List[str] = []
+    layout_problems: Dict[str, Dict[str, List[str]]] = {}
+    layout_switches: Dict[str, Dict[str, Any]] = {}
+    visible_patches: List[Dict[str, Any]] = []
     for p in panels:
         if p.get("text_only"):
             continue
-        img = image_for(p)
-        maps = _panel_maps(img)
-        shape, box, probs, clean = pick_crop(img, shapes, maps)
-        figure = figure_share(img) >= FIGURE_MIN
+        # Crop cache: on a hit the panel image is never even loaded.
+        card = head = None
+        ckey = None
+        cached_risk = None
+        panel_layout_problems: Dict[str, List[str]] = {}
+        panel_patch = 0.0
+        panel_switch: Dict[str, Any] | None = None
+        if root is not None and chapter is not None and fingerprint:
+            ckey = crop_key(fingerprint, p, shapes, options, None)
+            cached = load_crop(root, chapter, ckey)
+            if cached is not None:
+                card, head = cached["pick"], cached["head"]
+                # P1: cache entries written before P1 lack "mask_risk"; an
+                # entry without it is upgraded below (image reloaded once,
+                # then re-stored with the flag) so drop decisions stay
+                # stable across cached runs.
+                cached_risk = cached.get("mask_risk")
+                # P2: cache entries written before P2 lack "layout_switch";
+                # missing key means "unknown", recomputed below on the
+                # fresh path only when the image is already being loaded.
+                panel_switch = cached.get("layout_switch")
+                # A cached switch recorded before the wide-layout validity
+                # fix may point at a shape this layout cannot show (e.g.
+                # 1.0 for a wide shot): drop it, so the fresh path
+                # recomputes (and now returns None) instead of reusing it.
+                if (isinstance(panel_switch, dict) and layout_shapes
+                        and "single" in layout_shapes):
+                    _to = float(panel_switch.get("to_shape") or 0)
+                    if not any(abs(math.log(_to / a)) <= 0.02
+                               for a in layout_shapes["single"]):
+                        panel_switch = None
+        if card is None or cached_risk is None:
+            img = image_for(p)
+            maps = _panel_maps(img, options)
+            if card is None:
+                card = pick_card(img, shapes, maps)
+                head = head_of(maps)
+            cached_risk = bool(is_mask_risk(maps))
+            if layout_shapes is not None:
+                panel_layout_problems = layout_crop_problems(img, maps, layout_shapes)
+                # P2: the planner applies this switch (pair-safe shape);
+                # verify reports it so the reviewer sees what will change.
+                panel_switch = find_pair_safe_shape(img, maps, layout_shapes)
+            panel_patch = patch_visibility(img, list(maps.get("painted") or []))
+            if ckey is not None:
+                store_crop(root, chapter, ckey,
+                           {"pick": card, "head": head, "edge_rows": list(maps["edge_rows"]),
+                            "mask_risk": cached_risk, "layout_switch": panel_switch})
+        shape, box, probs, clean = card["shape"], card["box"], card["problems"], card["clean"]
+        figure = bool(head["figure"])           # skin colour, or a pale/gray head blob
+        if not head["confident"] and (head["source"] == "pale" or head["keep_top"]):
+            low_confidence.append({"panel": p["id"], "reason": (
+                "head found by shape and brightness, not skin colour (white/silver hair or gray skin): "
+                "check it is whole in the card" if head["source"] == "pale" else
+                "a character is in the panel but no head was located: the card keeps the top "
+                "of the panel, check the head is whole")})
+        panel_risk = bool(cached_risk)
+        if panel_risk:
+            mask_risk.append(p["id"])
+        if panel_layout_problems:
+            layout_problems[p["id"]] = panel_layout_problems
+            single_probs = panel_layout_problems.get("single") or []
+            pair_probs = panel_layout_problems.get("pair")
+            if pair_probs is not None and not single_probs and pair_probs:
+                layout_sensitive.append(p["id"])
+        if panel_switch is not None:
+            # Label the layout this switch is for: verify computes the
+            # SINGLE-layout switch (find_pair_safe_shape's default), and
+            # a wide shot never takes it (wide switches must be 1.333 /
+            # 1.777 -- see find_pair_safe_shape's validity check). An
+            # unlabeled "1.777 -> 1.0" read as a wide-layout switch
+            # (Ch10 test build, P014-07) looks like the wide bug.
+            layout_switches[p["id"]] = {**panel_switch, "layout": "single"}
+        if panel_patch > PATCH_VISIBLE:
+            visible_patches.append({"panel": p["id"], "visibility": panel_patch})
         if clean:
             action = "ok"
+        elif panel_risk and "mask_risk" in probs:
+            # P1: shouting face + dominant bubble with no clean crop.
+            # Never mask the face in render: drop the panel and let
+            # build.py re-pair its time to a neighbour (Ch2 P018-04/P020-04
+            # were fixed exactly this way by hand).
+            action = "dropped"
+            dropped.append({"panel": p["id"],
+                            "reason": "shouting face + dominant bubble would mask the face "
+                                      "(no clean crop); drop and re-pair"})
+        elif "lettering" in probs or "face_bubble" in probs:
+            # Bubble painting is removed: a panel whose best crop still
+            # shows a bubble can no longer be painted clean. Crops already
+            # tried to exclude it (pick_card prefers clean windows); with
+            # no clean crop, drop the panel and let build.py re-pair its
+            # time to a neighbour -- the P1 mask-risk rule, now applied to
+            # every bubble that would have been painted.
+            action = "dropped"
+            dropped.append({"panel": p["id"],
+                            "reason": "best crop still shows a speech bubble or caption and bubble painting "
+                                      "is removed; drop and re-pair"})
         elif figure:
             action = "needs eyes" if "head_cut" in probs else "kept (check)"
             if "head_cut" in probs:
@@ -93,11 +309,23 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             action = "dropped"
             dropped.append({"panel": p["id"], "reason": ", ".join(probs) or "no character"})
         rows[p["id"]] = {"shape": shape, "box": list(box), "problems": probs, "action": action,
-                         "figure": figure}
+                         "figure": figure, "head": head["source"], "head_confident": bool(head["confident"]),
+                         "mask_risk": panel_risk,
+                         "layout_problems": panel_layout_problems,
+                         "patch_visibility": panel_patch}
         if action == "dropped":
             log(f"    {p['id']}: {', '.join(probs) or 'no character'} -> dropped")
     report = {"chapter": chapter, "panels": rows, "dropped": dropped,
-              "needs_eyes": needs_eyes, "recropped": recropped}
+              "needs_eyes": needs_eyes, "recropped": recropped,
+              # P1: mask-risk panels (dropped when no clean crop exists),
+              # layout-sensitive crops (clean in single, not in pair), and
+              # visible painted patches (always empty now: bubble painting
+              # was removed; kept for report shape).
+              "mask_risk": mask_risk, "layout_sensitive": layout_sensitive,
+              "layout_problems": layout_problems, "layout_switches": layout_switches,
+              "visible_patches": visible_patches,
+              # Heads the heuristic is not sure of (it cannot be): where a reviewer should look first.
+              "low_confidence_heads": low_confidence}
     if root is not None and chapter is not None:
         atomic_write_text(video_dir(root) / f"chapter_{require_chapter(chapter)}.verify.json",
                           json.dumps(report, indent=1, ensure_ascii=False))

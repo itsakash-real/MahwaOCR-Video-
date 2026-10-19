@@ -16,11 +16,12 @@ Each shot:
      "sentence": "..."}
 
 Pacing follows manhwa_recap_style_spec.md: one sentence is about one shot
-(about 2.7s on average), hard cuts, eased motion that settles and holds.
+(about 2.7s on average), hard cuts, continuous Ken Burns motion across the whole shot (P3: no frozen holds \u2014 `hold` is reserved for hand-set payoff beats).
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import math
 import random
@@ -31,9 +32,16 @@ from typing import Any, Callable, Dict, List, Tuple
 from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
-from .crops import _panel_maps, tone
-from .verify import pick_crop
-from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
+from . import sync as sync_mod
+from .crops import _panel_maps, head_of, is_mask_risk, is_system_window, tone
+from .cropcache import crop_key, load_crop, store_crop
+from .verify import find_pair_safe_shape, pick_card
+from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_crop, build_chapter_cards, extract_callout, pacing_qa,
+                     plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
+from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
+from .captions import build_captions, build_captions_from_sentences, validate_captions
+from .frames import (BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, GLITCH_MIN_GAP, LAYOUTS, MOTIONS,
+                     TRANSITION_WEIGHTS, TRANSITIONS, Format, format_from, shapes_for, transition_enter)
 from .media import video_dir
 
 PLAN_VERSION = 2
@@ -43,10 +51,13 @@ MAX_PAIR_SHOT = 6.5      # max total duration allowed for a 2-panel pair shot
 PUNCH_GAP = 4.0
 EFFECT_GRACE = 0.35
 MIN_HOLD = 3.0           # seconds: no picture is held on screen for less than this
+PAD_LIMIT = 1.5          # a card's pad_y (blurred padding above and below, in panel heights) is at most this
 
-# Reference recap (measured): hard cuts, almost still pictures, only slight drift.
+# P3 continuous motion (editor.py): the planner never emits `hold`. A reviewer
+# may still hand-set motion="hold" for a deliberate 1-2s post-payoff beat;
+# frames.py keeps the old ease-out-then-hold for exactly that case.
 ENTRANCE_WEIGHTS = [("cut", 90), ("fade_in", 10)]
-MOTION_WEIGHTS = [("hold", 55), ("push_in", 30), ("pan", 15)]
+MOTION_WEIGHTS = P3_MOTION_WEIGHTS
 
 
 def plan_path(root: Path, chapter: str) -> Path:
@@ -75,7 +86,7 @@ def even_units(panels: List[Dict[str, Any]], duration: float, vcfg: Dict[str, An
     """No tags: every drawn panel, in story order, shares the narration's length.
     Longer and text-heavier panels get a little more time. Nothing is dropped:
     text-only panels (captions, blank pages, credits) are the only exclusion,
-    and hold_groups() makes sure no shot is shorter than min_hold."""
+    and hold_groups() packs them into shots under the cut budget."""
     if not panels:
         raise UserError("No panels to put in the video.")
     art = [p for p in panels if not p.get("text_only")] or list(panels)
@@ -234,50 +245,101 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return units
 
 
-def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Pack timed single-panel units into shots that each hold >= min_hold.
+def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
+                lead: float | None = None, max_late: float | None = None,
+                min_hold_short: float | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Pack timed single-panel units into shots with a bounded cut budget.
 
-    A unit shorter than min_hold is paired with its neighbour: the two panels
-    share one shot (one after the other, the second sliding in). A pair that is
-    still too short takes time from a neighbouring shot by moving only the
-    boundary between them, so the total length and every panel stay as they are.
-    Returns (shots, stats). Raises UserError if the narration can't hold them.
+    Every cut may move only inside [sentence_start - lead, sentence_start +
+    max_late]. A picture can no longer borrow seconds from a far-away
+    neighbour - the old donor pass was what made the shot drift away from the
+    voice. A unit shorter than min_hold shares one shot with the next unit
+    (two cards, the second arriving on its own words); a shot still shorter
+    than min_hold_short after that takes at most `lead` more from its start
+    and `max_late` from its end. A shot that even then can't reach the floor
+    is left short and counted in stats["short_shots"] - the plan QA reports
+    it; the timing never silently drifts to hide it.
+
+    Returns (shots, stats). `lead`, `max_late` and `min_hold_short` default to
+    the video.sync values (sync.SYNC_DEFAULTS); build_plan passes the effective
+    settings from manhwa-ocr.yaml.
     """
+    lead = float(sync_mod.SYNC_DEFAULTS["lead"]) if lead is None else float(lead)
+    max_late = float(sync_mod.SYNC_DEFAULTS["max_late"]) if max_late is None else float(max_late)
+    min_hold = float(min_hold)
+    # The floor can never be above the configured min_hold: a user who asks for
+    # 1s cuts gets 1s cuts, not a 2s floor they never set.
+    floor = min(min_hold, float(sync_mod.SYNC_DEFAULTS["min_hold_short"]) if min_hold_short is None
+                else float(min_hold_short))
     if not units:
-        return [], {"min_hold": min_hold, "shots": 0, "pairs": 0, "retimed": 0, "moved_seconds": 0.0}
+        return [], {"min_hold": min_hold, "shots": 0, "pairs": 0, "nudged": 0,
+                    "moved_seconds": 0.0, "short_shots": 0}
+
+    def span(g: List[Dict[str, Any]]) -> float:
+        return float(g[-1]["end"]) - float(g[0]["start"])
+
     groups: List[List[Dict[str, Any]]] = []
     i = 0
     while i < len(units):
-        g = [units[i]]
-        i += 1
-        while sum(u["end"] - u["start"] for u in g) < min_hold and len(g) < 2 and i < len(units):
-            g.append(units[i])
+        if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units):
+            groups.append([units[i], units[i + 1]])
+            i += 2
+        else:
+            groups.append([units[i]])
             i += 1
-        groups.append(g)
+
+    # A lone short tail after a pair sometimes fits better as that pair's
+    # second card (its first panel becomes the short one): slide the last
+    # three units while that lowers the total shortfall.
+    while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2:
+        x, y = groups[-2]
+        z = groups[-1][0]
+        now = max(0.0, floor - span(groups[-2])) + max(0.0, floor - span(groups[-1]))
+        cand = [[x], [y, z]]
+        better = sum(max(0.0, floor - span(c)) for c in cand)
+        if better < now - 1e-9:
+            groups[-2:] = cand
+        else:
+            break
 
     n = len(groups)
-    b = [g[0]["start"] for g in groups] + [groups[-1][-1]["end"]]  # group k spans b[k]..b[k+1]
-    retimed: set = set()
-    moved = 0.0
-    for _ in range(4 * n + 4):
-        short = next((k for k in range(n) if b[k + 1] - b[k] < min_hold - 1e-6), None)
-        if short is None:
-            break
-        need = min_hold - (b[short + 1] - b[short])
-        donor = next((j for j in sorted(range(n), key=lambda j: abs(j - short))
-                      if j != short and b[j + 1] - b[j] - need >= min_hold - 1e-6), None)
-        if donor is None:
-            raise UserError(
-                f"The narration is too short to hold {len(units)} panels for {min_hold:g}s each. "
-                f"Record a longer narration, or lower min_hold in manhwa-ocr.yaml.")
-        if donor > short:
-            for m in range(short + 1, donor + 1):
-                b[m] += need
-        else:
-            for m in range(donor + 1, short + 1):
-                b[m] -= need
-        retimed.update({short, donor})
-        moved += need
+    b = [0.0] + [float(g[0]["start"]) for g in groups[1:]] + [float(groups[-1][-1]["end"])]
+
+    # Every cut sits inside its own budget and in order (shots never overlap).
+    tight = 0
+    for k in range(1, n):
+        s = float(groups[k][0]["start"])
+        b[k] = min(max(b[k], s - lead), s + max_late)
+        if b[k] < b[k - 1] + 0.2:
+            b[k] = b[k - 1] + 0.2
+            tight += 1
+
+    nudged, moved, short_shots = 0, 0.0, 0
+    for k in range(n):
+        if b[k + 1] - b[k] >= floor - 1e-6:
+            continue
+        want = floor - (b[k + 1] - b[k])
+        before = b[k + 1] - b[k]
+        if k + 1 < n:                       # take from the end first (the next shot is often long)
+            room = (float(groups[k + 1][0]["start"]) + max_late) - b[k + 1]
+            take = min(want, max(0.0, room))
+            if take > 1e-9:
+                b[k + 1] += take
+                want -= take
+        if want > 1e-9:                     # then from the start, sparing the previous shot's floor
+            room = b[k] - (float(groups[k][0]["start"]) - lead)
+            if k > 0:
+                room = min(room, b[k] - (b[k - 1] + 0.2),
+                           max(0.0, (b[k] - b[k - 1]) - floor))
+            take = min(want, max(0.0, room))
+            if take > 1e-9:
+                b[k] -= take
+        after = b[k + 1] - b[k]
+        if after > before + 1e-9:
+            nudged += 1
+            moved += after - before
+        if after < floor - 1e-6:
+            short_shots += 1
 
     shots: List[Dict[str, Any]] = []
     pairs = 0
@@ -296,42 +358,311 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD) -> Tupl
     shots[0]["start"] = 0.0
     shots[-1]["end"] = units[-1]["end"]
     stats = {"min_hold": min_hold, "shots": len(shots), "pairs": pairs,
-             "retimed": len(retimed), "moved_seconds": round(moved, 3)}
+             "short_floor": floor, "nudged": nudged, "moved_seconds": round(moved, 3),
+             "short_shots": short_shots, "tight_cuts": tight}
     return shots, stats
 
 
+def shot_frame_bounds(shots, fps, duration):
+    """Exact (f0, f1) frame bounds for each shot: contiguous, no gap, no overlap.
+
+    Joins are frame-exact by construction: each shot starts on the frame the
+    previous shot ends on, and the last shot ends on the video's final frame.
+    A shot that rounds to zero frames is an error (the renderer would have
+    no frame to draw for it). Concat is a hard cut by design -- there is
+    no crossfade, so no frame is ever blended across a cut.
+    """
+    fps = int(fps)
+    bounds = [round(float(s["start"]) * fps) for s in shots] + [round(float(duration) * fps)]
+    out = []
+    for k, s in enumerate(shots):
+        f0, f1 = bounds[k], bounds[k + 1]
+        if f1 <= f0:
+            raise UserError(f"Shot {s.get('id')} is shorter than one frame. Lengthen it in the plan.")
+        out.append((f0, f1))
+    return out
+
+
+def ensure_split_crop_change(shots):
+    """NEVER split a long sentence into multiple shots with the SAME panel and
+    the SAME crop: the entrance restarts and the cut reads as a glitch.
+
+    Walks the shot list; when a shot shows the same single panel with an
+    identical crop to the shot before it, the later shot is punched in 8%
+    (same helper split_long_shot uses) and a restarting pan becomes push_in.
+    Returns (shots, changes) with one reason-logged entry per fix. Shots that
+    already differ in crop are left alone.
+    """
+    changes = []
+    for k in range(1, len(shots)):
+        prev_cards = shots[k - 1].get("cards") or []
+        cur_cards = shots[k].get("cards") or []
+        if len(prev_cards) != 1 or len(cur_cards) != 1:
+            continue
+        if prev_cards[0].get("panel") != cur_cards[0].get("panel"):
+            continue
+        prev_crop = list(prev_cards[0].get("crop") or [0, 0, 1, 1])
+        cur_crop = list(cur_cards[0].get("crop") or [0, 0, 1, 1])
+        if any(abs(a - b) > 1e-9 for a, b in zip(prev_crop, cur_crop)):
+            continue  # already a different crop: the cut reads as a punch-in
+        new_crop = _inset_crop(cur_crop, 0.08)
+        if new_crop == cur_crop:
+            continue  # already at the minimum readable crop: nothing more to punch into
+        cur = dict(cur_cards[0], crop=new_crop)
+        if cur.get("motion") in PAN_DIRECTIONS:
+            cur["motion"] = "push_in"  # a pan would restart q -1 -> +1 on the new shot
+        shots[k] = {**shots[k], "cards": [cur]}
+        changes.append({"shot": shots[k].get("id"), "panel": cur.get("panel"),
+                        "reason": ("same panel + same crop as the previous shot: punched in 8% "
+                                   "(pan -> push_in) so the cut reads as a crop change, not a frozen restart")})
+    return shots, changes
+
+
+def ensure_motion_variety(shots):
+    """Final no-repeat pass: no two consecutive shots share a first-card motion.
+
+    The designer already avoids repeats, and split_long_shot alternates
+    piece motions -- but a split shot's LAST piece can still land on the
+    same motion as the NEXT shot's first card (the designer never saw
+    the flipped piece motion). This pass flips the later shot's
+    first-card motion (push_in <-> pull_out, pan -> push_in) so the
+    invariant holds across the final shot list. Hand-set `hold` is
+    never flipped (a payoff beat). Returns (shots, changes).
+    """
+    changes = []
+    for k in range(1, len(shots)):
+        prev_cards = shots[k - 1].get("cards") or []
+        cur_cards = shots[k].get("cards") or []
+        if not prev_cards or not cur_cards:
+            continue
+        prev_motion = prev_cards[0].get("motion")
+        cur_motion = cur_cards[0].get("motion")
+        if cur_motion is None or cur_motion != prev_motion or cur_motion == "hold":
+            continue
+        new_motion = "push_in" if cur_motion in PAN_DIRECTIONS else (
+            "pull_out" if cur_motion == "push_in" else "push_in")
+        cur = dict(cur_cards[0], motion=new_motion)
+        shots[k] = {**shots[k], "cards": [cur, *cur_cards[1:]]}
+        changes.append({"shot": shots[k].get("id"), "from": cur_motion, "to": new_motion,
+                        "reason": "first-card motion repeated the previous shot; flipped so no two shots drift the same way"})
+    return shots, changes
+
+
+def ensure_panel_diversity(shots):
+    """Never show the same panel 3x consecutively with an identical crop.
+
+    Coverage fillers and repeated tags can leave one panel on screen for
+    three sentences in a row (Ch10 test build: P014-10 for sentences
+    55/56/57, P020-01 for 75/76/77 -- correct pictures, visibly
+    repetitive). When a shot's first-card panel matches the previous
+    two shots' first-card panel, the third shot's crop is punched in
+    until it differs from BOTH predecessors' crops (a different crop of
+    the same panel; a different panel is the alignment's call, not the
+    planner's -- the planner never re-picks a panel). A shot whose crop
+    already differs from both predecessors is left alone. Returns
+    (shots, changes) with one reason-logged entry per fix.
+    """
+    changes = []
+    for k in range(2, len(shots)):
+        cards = shots[k].get("cards") or []
+        if not cards:
+            continue
+        panel = cards[0].get("panel")
+        prev1 = (shots[k - 1].get("cards") or [{}])[0]
+        prev2 = (shots[k - 2].get("cards") or [{}])[0]
+        if panel is None or prev1.get("panel") != panel or prev2.get("panel") != panel:
+            continue
+        prev_crops = [list(prev1.get("crop") or [0, 0, 1, 1]),
+                      list(prev2.get("crop") or [0, 0, 1, 1])]
+        cur_crop = list(cards[0].get("crop") or [0, 0, 1, 1])
+
+        def _differs(crop):
+            return all(any(abs(a - b) > 1e-9 for a, b in zip(crop, pc)) for pc in prev_crops)
+
+        if _differs(cur_crop):
+            continue  # already a different crop from both predecessors
+        new_crop = None
+        for frac in (0.08, 0.16, 0.24, 0.32):
+            cand = _inset_crop(cur_crop, frac)
+            if cand != cur_crop and _differs(cand):
+                new_crop = cand
+                break
+        if new_crop is None:
+            continue  # already at the minimum readable crop: nothing more to punch into
+        cur = dict(cards[0], crop=new_crop)
+        if cur.get("motion") in PAN_DIRECTIONS:
+            cur["motion"] = "push_in"  # a pan would restart q -1 -> +1 on the new shot
+        shots[k] = {**shots[k], "cards": [cur, *cards[1:]]}
+        changes.append({"shot": shots[k].get("id"), "panel": panel,
+                        "reason": ("same panel as the previous two shots: punched in so the third "
+                                   "showing is a different crop, not the same card a third time")})
+    return shots, changes
+
+
+def split_system_window_units(units, by_id):
+    """Split a 2-panel unit that contains a system-window panel.
+
+    A system-window banner must get its own WIDE shot (see
+    crops.is_system_window): the pair layout would cut it to a small
+    square. hold_groups() / _pair_up() may still group one with a
+    neighbour (a short sentence sharing a shot), so this pass -- run
+    after pairing, before the designer -- splits such a unit into two
+    single-panel units at the second panel's arrival (unit['second_at'],
+    the same instant the pair shot would have slid it in). The first
+    piece keeps the unit's sentence/cues; the second gets sentence None
+    (its caption comes from the alignment sentences, never from shots).
+    Units without a system-window panel pass through untouched.
+    """
+    out = []
+    for u in units:
+        panels = list(u.get("panels") or [])
+        if len(panels) == 2 and any(is_system_window(by_id.get(pid) or {}) for pid in panels):
+            try:
+                cut = float(u.get("second_at") or 0)
+            except (TypeError, ValueError):
+                cut = 0.0
+            start, end = float(u["start"]), float(u["end"])
+            cut_t = start + cut if 0 < cut < (end - start) else start + (end - start) / 2
+            first = {**u, "end": cut_t, "panels": panels[:1]}
+            second = {**u, "start": cut_t, "panels": panels[1:],
+                      "sentence": None, "cues": []}
+            first["sentence_starts"] = [s for s in (u.get("sentence_starts") or []) if s <= cut_t] or [start]
+            second["sentence_starts"] = [s for s in (u.get("sentence_starts") or []) if s > cut_t] or [cut_t]
+            first.pop("second_at", None)
+            second.pop("second_at", None)
+            out.extend([first, second])
+            continue
+        out.append(u)
+    return out
+
+
 # ------------------------------------------------------------------ shot design
+
+
+def map_options(vcfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Crop-analysis options from the video config: video.crop and video.panels thresholds."""
+    crop = vcfg.get("crop") if isinstance(vcfg.get("crop"), dict) else {}
+    panels = vcfg.get("panels") if isinstance(vcfg.get("panels"), dict) else {}
+    heads = vcfg.get("heads") if isinstance(vcfg.get("heads"), dict) else {}
+    return {"full_width": bool(crop.get("full_width", True)),
+            "min_width_kept": float(crop.get("min_width_kept", 0.9)),
+            "white_threshold": int(panels.get("white_threshold", 242)),
+            "black_threshold": int(panels.get("black_threshold", 13)),
+            "pale_heads": bool(heads.get("pale", True)),
+            "keep_top": float(heads.get("keep_top", 0.25))}
 
 
 class _Designer:
     """Turns timing units into shots: layouts, crops, backgrounds, animation."""
 
     def __init__(self, chapter: str, panels: List[Dict[str, Any]], fmt: Format, vcfg: Dict[str, Any],
-                 image_for: Callable[[Dict[str, Any]], Image.Image], fixes: Dict[str, Any] | None = None):
+                 image_for: Callable[[Dict[str, Any]], Image.Image], fixes: Dict[str, Any] | None = None,
+                 root: Path | None = None, fingerprint: str | None = None):
         self.chapter, self.fmt, self.vcfg = chapter, fmt, vcfg
-        self.fixes = fixes or {"crop": {}, "face": {}}
+        self._root, self._fingerprint = root, fingerprint
+        self.fixes = {"crop": {}, "face": {}, "shot": {}, **(fixes or {})}
         self.by_id = {p["id"]: p for p in panels}
         self.image_for = image_for
-        self._img: Dict[str, Image.Image] = {}
+        self._img: "OrderedDict[str, Image.Image]" = OrderedDict()
         self._crops: Dict[tuple, List[float]] = {}
+        self._pads: Dict[tuple, float] = {}
         self._maps: Dict[str, Any] = {}
-        self.crop_stats: Dict[str, List[str]] = {"head_risk": [], "side_cut": [], "bubble": []}
+        self.crop_stats: Dict[str, List[Any]] = {"head_risk": [], "side_cut": [], "bubble": [],
+                                                 "padded": [], "white_edge": [],
+                                                 "low_confidence_heads": [],
+                                                 # P1: panels with a dominant bubble overlapping
+                                                 # the head range (mask risk). Informational:
+                                                 # dropping happens in verify.py; here the
+                                                 # clean crop (if one exists) already avoids it.
+                                                 "mask_risk": [],
+                                                 # P2: crops the planner auto-switched to the
+                                                 # pair-safe shape (see crop()). Each entry:
+                                                 # {"panel", "from_shape", "to_shape", "reason"}.
+                                                 "layout_switches": []}
+        self.map_options = map_options(vcfg)
         self._tone: Dict[str, str] = {}
         self.uses: Dict[str, int] = {}
         self.prev_enter: str | None = None
+        self.prev_motion: str | None = None
+        self._prev_shot: Dict[str, Any] | None = None   # CapCut transitions: the shot before this one
+        self.last_glitch = -1e9                          # CapCut: at most one glitch per 60s
         self.prev_bg = "blur"
         self.last_punch = -1e9
 
     def img(self, pid: str) -> Image.Image:
-        if pid not in self._img:
-            if len(self._img) > 12:
-                self._img.clear()
-            self._img[pid] = self.image_for(self.by_id[pid])
+        if pid in self._img:
+            self._img.move_to_end(pid)
+            return self._img[pid]
+        self._img[pid] = self.image_for(self.by_id[pid])
+        # LRU: evict one entry, never wipe the whole cache (the old
+        # `clear()` made the planner re-decode panels it had just loaded).
+        while len(self._img) > 32:
+            self._img.popitem(last=False)
         return self._img[pid]
 
     def panel_aspect(self, pid: str) -> float:
         p = self.by_id[pid]
         return float(p.get("width") or 1) / max(1.0, float(p.get("height") or 1))
+
+    def pad(self, pid: str, layout: str) -> float:
+        """Blurred padding above and below the card's crop, in panel heights (0 for most cards)."""
+        self.crop(pid, layout)
+        return self._pads.get((pid, layout), 0.0)
+
+    def _fixes_crop_for_layout(self, pid: str, layout: str, box: List[float]) -> List[float]:
+        """A reviewer's fixes.json crop is layout-blind: the same box is reused
+        in every layout. If its aspect is not an allowed shape for THIS layout
+        (Ch4: a 4:3 crop failing QA once the panel landed in a pair), P2
+        auto-switches to a clean crop in this layout's shapes when one exists
+        and records the switch. If no clean crop exists the reviewer's crop
+        stands (a human chose it) and QA keeps flagging the shape."""
+        _p = self.by_id[pid]
+        pw, ph = float(_p.get("width") or 1), float(_p.get("height") or 1)
+        w = (box[2] - box[0]) * pw
+        h = (box[3] - box[1]) * ph
+        if h <= 0:
+            return list(box)
+        aspect = w / h
+        allowed = shapes_for(layout, self.fmt)
+        if any(abs(math.log(aspect / a)) <= 0.02 for a in allowed):
+            return list(box)
+        if pid not in self._maps:
+            self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
+        card = pick_card(self.img(pid), list(allowed), self._maps[pid])
+        if not card["clean"]:
+            return list(box)
+        self.crop_stats["layout_switches"].append(
+            {"panel": pid, "layout": layout, "from_shape": "fixes.json",
+             "to_shape": float(card["shape"]), "box": list(card["box"]),
+             "reason": (f"fixes.json crop aspect {aspect:.3f} is not an allowed shape for {layout}; "
+                        f"auto-switched to the clean {card['shape']:.3f} crop")})
+        return list(card["box"])
+
+    def _pair_safe_switch(self, pid: str, layout: str, entry: Dict[str, Any] | None,
+                          ckey: str | None) -> Dict[str, Any] | None:
+        """P2 auto-switch for single/wide layouts (see verify.find_pair_safe_shape).
+        Cache-aware: a stored "layout_switch" is reused without loading the image;
+        a pre-P2 entry without the key is upgraded once."""
+        if layout not in ("single", "wide"):
+            return None
+        if entry is not None and "layout_switch" in entry:
+            cached = entry.get("layout_switch")
+            if cached is None:
+                return None
+            # A cached switch recorded before the wide-layout validity
+            # fix may point at a shape this layout cannot show (wide ->
+            # 1.0): drop it and recompute below (now None for wide)
+            # instead of reusing a square crop in a wide shot.
+            _to = float(cached.get("to_shape") or 0)
+            if any(abs(math.log(_to / a)) <= 0.02 for a in shapes_for(layout, self.fmt)):
+                return cached
+        if pid not in self._maps:
+            self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
+        layout_shapes = {name: shapes_for(name, self.fmt) for name in ("single", "pair", "wide")}
+        switch = find_pair_safe_shape(self.img(pid), self._maps[pid], layout_shapes, layout)
+        if entry is not None and ckey is not None:
+            store_crop(self._root, self.chapter, ckey, {**entry, "layout_switch": switch})
+        return switch
 
     def crop(self, pid: str, layout: str) -> List[float]:
         """The card's crop: one exact shape from the layout's list (crops.py)."""
@@ -339,22 +670,84 @@ class _Designer:
         if key not in self._crops:
             if pid in self.fixes["crop"]:                  # a reviewer's exact crop (fixes.json)
                 shape, box = self.fixes["crop"][pid]
+                # P2: a fixes.json crop is layout-blind; switch it when its
+                # aspect is not allowed in this layout and a clean crop exists.
+                box = self._fixes_crop_for_layout(pid, layout, box)
                 self._crops[key] = list(box)
-                if shape < self.panel_aspect(pid) and pid not in self.crop_stats["side_cut"]:
+                if box[2] - box[0] < 0.999 and pid not in self.crop_stats["side_cut"]:
                     self.crop_stats["side_cut"].append(pid)
                 return self._crops[key]
-            if pid not in self._maps:
-                self._maps[pid] = _panel_maps(self.img(pid))
-            maps = self._maps[pid]
-            if pid in self.fixes["face"]:                   # a reviewer's head position replaces the skin guess
-                maps = {**maps, "face_override": self.fixes["face"][pid]}
-            shape, box, probs, _ = pick_crop(self.img(pid), shapes_for(layout, self.fmt), maps)
+            # Crop cache: on a hit, no image decode and no _panel_maps.
+            shapes = shapes_for(layout, self.fmt)
+            face = self.fixes["face"].get(pid)
+            ckey = None
+            entry = None
+            if self._root is not None and self._fingerprint:
+                ckey = crop_key(self._fingerprint, self.by_id[pid], shapes, self.map_options, face)
+                entry = load_crop(self._root, self.chapter, ckey)
+            if entry is not None:
+                card = entry["pick"]
+                head = entry["head"]
+                top, bottom = entry["edge_rows"]
+                # P1: mask risk rides in the cache entry (or, for pre-P1
+                # entries, in the pick's problems). Recorded in crop_stats
+                # below, next to head_risk / bubble.
+                hit_risk = entry.get("mask_risk", "mask_risk" in card.get("problems", []))
+                if (top + bottom) >= 0.01 and pid not in self.crop_stats["white_edge"]:
+                    # Gutter rows still sit on this panel's edge (panels.json predates edge
+                    # tightening). `video panels --force` re-detects it flush to the art.
+                    self.crop_stats["white_edge"].append(pid)
+            else:
+                if pid not in self._maps:
+                    self._maps[pid] = _panel_maps(self.img(pid), self.map_options)
+                    top, bottom = self._maps[pid]["edge_rows"]
+                    if (top + bottom) >= 0.01 and pid not in self.crop_stats["white_edge"]:
+                        # Gutter rows still sit on this panel's edge (panels.json predates edge
+                        # tightening). `video panels --force` re-detects it flush to the art.
+                        self.crop_stats["white_edge"].append(pid)
+                maps = self._maps[pid]
+                if face is not None:                   # a reviewer's head position replaces the skin guess
+                    maps = {**maps, "face_override": face}
+                head = head_of(maps)
+                card = pick_card(self.img(pid), shapes, maps)
+                if ckey is not None:
+                    store_crop(self._root, self.chapter, ckey,
+                               {"pick": card, "head": head, "edge_rows": list(self._maps[pid]["edge_rows"]),
+                                "mask_risk": bool(is_mask_risk(self._maps[pid]))})
+            if not head["confident"] and (head["source"] == "pale" or head["keep_top"]) \
+                    and pid not in self.crop_stats["low_confidence_heads"]:
+                self.crop_stats["low_confidence_heads"].append(pid)
+            shape, box, probs = card["shape"], card["box"], card["problems"]
+            # P2 auto-switch: when single/wide and pair crops are both clean
+            # but different shapes, use the pair-safe (narrower) shape here
+            # too, so one crop passes QA in every layout. Recorded in
+            # crop_stats["layout_switches"] (surfaced in plan + QA, never silent).
+            switch = self._pair_safe_switch(pid, layout, entry, ckey)
+            if switch is not None and abs(float(switch["to_shape"]) - float(shape)) > 1e-9:
+                box = list(switch["box"])
+                probs = []
+                shape = float(switch["to_shape"])
+                card = {**card, "shape": shape, "box": box,
+                        "pad_y": float(switch.get("pad_y") or 0.0), "problems": []}
+                if not any(s.get("panel") == pid and s.get("layout") == layout
+                           for s in self.crop_stats["layout_switches"]):
+                    self.crop_stats["layout_switches"].append(
+                        {"panel": pid, "layout": layout,
+                         "from_shape": float(switch["from_shape"]), "to_shape": shape,
+                         "reason": switch.get("reason", "")})
+            if ("mask_risk" in probs or (entry is not None and hit_risk)) \
+                    and pid not in self.crop_stats["mask_risk"]:
+                self.crop_stats["mask_risk"].append(pid)
+            if card["pad_y"] > 0:
+                self._pads[key] = float(card["pad_y"])
             if "head_cut" in probs and pid not in self.crop_stats["head_risk"]:
                 self.crop_stats["head_risk"].append(pid)
             if "lettering" in probs and pid not in self.crop_stats["bubble"]:
                 self.crop_stats["bubble"].append(pid)
-            if shape < self.panel_aspect(pid) and pid not in self.crop_stats["side_cut"]:
+            if box[2] - box[0] < 0.999 and pid not in self.crop_stats["side_cut"]:
                 self.crop_stats["side_cut"].append(pid)
+            if card["pad_y"] > 0 and pid not in self.crop_stats["padded"]:
+                self.crop_stats["padded"].append(pid)
             self._crops[key] = list(box)
         return self._crops[key]
 
@@ -377,12 +770,23 @@ class _Designer:
         return kind
 
     def motion(self, rng: random.Random, crop: List[float]) -> str:
-        m = _pick(rng, MOTION_WEIGHTS)
-        if m != "pan":
-            return m
+        # P3 + CapCut bugfix: continuous motion, never `hold` (planner-emitted).
+        # Never repeat the previous motion, and never pan twice in a row: the
+        # old code avoided only the exact previous key, so a previous
+        # "pan_left" did not exclude the "pan" group and the planner could
+        # emit pan_right, pan_left, pan_right, each restarting q -1 -> +1.
+        avoid = "pan" if self.prev_motion in PAN_DIRECTIONS else self.prev_motion
+        picked = _pick(rng, MOTION_WEIGHTS, avoid=avoid)
+        if picked != "pan":
+            self.prev_motion = picked
+            return picked
         if crop[3] - crop[1] > 0.999:
+            self.prev_motion = "push_in"
             return "push_in"     # the whole panel is on the card: nothing to pan over
-        return rng.choice(["pan_down", "pan_up"])
+        dirs = [d for d in PAN_DIRECTIONS if d != self.prev_motion]
+        picked = rng.choice(dirs)
+        self.prev_motion = picked
+        return picked
 
     def entrance(self, rng: random.Random, cues: List[str], layout: str) -> str:
         if "reveal" in cues:
@@ -405,9 +809,13 @@ class _Designer:
         ids = [p for p in dict.fromkeys(unit["panels"]) if p in self.by_id]
         first = ids[0]
 
-        if len(ids) >= 2:
+        if len(ids) == 1 and is_system_window(self.by_id.get(first) or {}):
+            # A system-window banner gets its own WIDE shot (never a
+            # pair: the pair layout would cut it to a small square).
+            layout = "wide"
+        elif len(ids) >= 2:
             # Both panels are cards, whatever the shot's length (hold_groups() has
-            # already given it at least min_hold). The inset layout would turn one
+            # already given it the short floor). The inset layout would turn one
             # panel into a blurred background only, so it is never used here.
             layout = "pair"
         elif self.panel_aspect(first) >= 1.45:
@@ -427,17 +835,32 @@ class _Designer:
         for k, pid in enumerate(card_ids):
             crop = self.crop(pid, layout)
             if layout == "pair" and k == 1:
+                # A pair shorter than a second (a one-word sentence in dense
+                # narration) has no room for a later entrance: the second card
+                # arrives with the first inside the sentence, instead of the
+                # cut drifting away from the voice.
                 if unit.get("second_at") is not None:   # arrives on its own words
-                    at = round(min(max(0.6, float(unit["second_at"])), dur - 1.0), 3)
+                    at = round(max(0.0, min(max(0.6, float(unit["second_at"])), dur - 1.0)), 3)
                 else:
-                    at = round(min(max(0.8, 0.45 * dur), dur - 1.2), 3)
+                    at = round(max(0.0, min(max(0.8, 0.45 * dur), dur - 1.2)), 3)
                 enter = "slide_up" if self.fmt.portrait else "slide_left"
                 motion = "push_in"
             else:
                 at = 0.0
                 enter = self.entrance(rng, unit["cues"], layout)
-                motion = "push_in" if "beat" in unit["cues"] else self.motion(rng, crop)
-            cards.append({"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion})
+                if "beat" in unit["cues"]:
+                    motion = "push_in"
+                    self.prev_motion = "push_in"  # a forced motion still counts as previous
+                else:
+                    motion = self.motion(rng, crop)
+            enter = (self.fixes["shot"].get(pid) or {}).get("enter", enter)   # fixes.json "shot" override
+            card = {"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion}
+            if len(card_ids) == 1 and is_system_window(self.by_id.get(pid) or {}):
+                card["wide_fill"] = True  # fill >=90% of the frame width, never a small square
+            pad = self.pad(pid, layout)
+            if pad > 0:
+                card["pad_y"] = round(pad, 4)       # a wide panel: blurred padding above and below
+            cards.append(card)
 
         effects: List[Dict[str, Any]] = []
         on = {"shake": True, "punch": False, "flash": False}
@@ -457,12 +880,47 @@ class _Designer:
                     effects.append({"type": "punch", "t": round(t, 3)})
                     self.last_punch = t
 
+        # P3: one keyword callout on impact / reveal shots (editor.py).
+        callouts: List[Dict[str, Any]] = []
+        _call = extract_callout(unit.get("sentence") or "", unit.get("cues") or [])
+        if _call is not None:
+            callouts.append({"t": round(start + 0.4, 3), "text": _call["text"],
+                             "style": _call["style"], "dur": 1.2})
+        # CapCut transitions: how this shot ARRIVES (frames.TRANSITIONS).
+        # Hard cut default (90%), fade 10%; slide / zoom / whip / glitch
+        # only on impact / reveal beats, glitch at most once per 60s.
+        # A fade also fades the PREVIOUS shot out; a glitch adds a 0.2s
+        # RGB-split effect at the cut. The first shot always hard-cuts in.
+        transition = "cut"
+        if self._prev_shot is not None:
+            if "impact" in unit["cues"] or "reveal" in unit["cues"]:
+                _pool = ["slide", "zoom", "whip"]
+                if start - self.last_glitch >= GLITCH_MIN_GAP:
+                    _pool.append("glitch")
+                transition = rng.choice(_pool)
+            else:
+                transition = _pick(rng, TRANSITION_WEIGHTS)
+            if transition == "fade":
+                self._prev_shot["exit"] = "fade_out"
+                cards[0]["enter"] = "fade_in"
+            elif transition != "cut":
+                cards[0]["enter"] = transition_enter(transition)
+            if transition == "glitch":
+                effects.append({"type": "glitch", "t": round(start, 3)})
+                self.last_glitch = start
+        background = self.background(rng, (bg_panel or first), layout)
+        background = (self.fixes["shot"].get(first) or {}).get("background", background)
         shot = {
             "id": f"S{i + 1:03d}", "start": round(start, 3), "end": round(end, 3),
-            "layout": layout, "background": self.background(rng, (bg_panel or first), layout),
+            "layout": layout, "background": background,
             "cards": cards, "exit": "fade_out" if last else "cut", "effects": effects,
+            "transition": transition,
+            "callouts": callouts,
             "sentence": (unit.get("sentence") or "")[:300] or None,
         }
+        if self.vcfg.get("grade") == "subtle":
+            shot["grade"] = "subtle"  # CapCut grade, off by default (video.grade)
+        self._prev_shot = shot
         if bg_panel:
             shot["bg_panel"] = bg_panel
         return shot
@@ -487,8 +945,19 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
             wide = lambda p: float(p.get("width") or 1) / max(1.0, float(p.get("height") or 1)) > 1.0  # noqa: E731
             # Synced: each card must be on screen long enough for its words, but not too long.
             long_enough = (not timed or (1.2 <= u["end"] - u["start"] <= 4.0 and 1.5 <= v["end"] - v["start"] <= 4.0))
+            # Only neighbours in story order pair up; impact/reveal stay solo
+            # so their hit reads instead of sharing a card.
+            story_close = True
+            try:
+                all_ids = list(by_id.keys())
+                story_close = abs(all_ids.index(u["panels"][0]) - all_ids.index(v["panels"][0])) <= 6
+            except ValueError:
+                story_close = True
+            solo_cues = set(u.get("cues") or []) | set(v.get("cues") or [])
+            same_sentence = (u.get("sentence") or "") == (v.get("sentence") or "") and bool(u.get("sentence"))
             if (long_enough and len(u["panels"]) == 1 and len(v["panels"]) == 1
                     and u["panels"][0] != v["panels"][0] and not wide(a) and not wide(b)
+                    and story_close and (same_sentence or not (solo_cues & {"impact", "reveal"}))
                     and (2.8 <= (v["end"] - u["start"]) <= MAX_PAIR_SHOT)
                     and _rng(chapter, 10_000 + i).random() < ratio):
                 # The second card slides in exactly when its own part starts.
@@ -510,7 +979,10 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                sync_report: Dict[str, Any] | None = None,
                alignment_units: List[Dict[str, Any]] | None = None,
                fixes: Dict[str, Any] | None = None,
-               alignment_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+               alignment_meta: Dict[str, Any] | None = None,
+               settings: Dict[str, float] | None = None,
+               root: Path | None = None,
+               caption_sentences: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
     this function makes no panel decisions of its own - it only lays out,
@@ -518,13 +990,25 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     (cues.json-driven) and the no-tags `even` fallback remain only for direct
     callers/tests exercising the shot-design logic in isolation; the live
     `video plan` pipeline (build.py) always passes `alignment_units`.
+
+    `settings` are sync.effective_settings() values; the caller (make_plan)
+    prints them and warns about missing config keys. Stored in the plan meta so
+    a finished video can be traced back to the numbers that made it.
+
+    `caption_sentences` are the alignment segments ({text, start, end})
+    captions are timed from -- sentence windows, never per-shot estimates
+    (see captions.build_captions_from_sentences). When omitted, the
+    `sentences` argument is used if it carries timings, else captions
+    fall back to the legacy per-shot build.
     """
     panels = panels_data["panels"]
     fmt = format_from(vcfg.get("format", "16:9"), int(vcfg.get("fps", 30)))
     by_id = {p["id"]: p for p in panels}
+    st = settings or sync_mod.effective_settings(vcfg, log=lambda _msg: None)
     timing = None
     if alignment_units is not None:
-        shots_units, timing = hold_groups(alignment_units, float(vcfg.get("min_hold", MIN_HOLD)))
+        shots_units, timing = hold_groups(alignment_units, st["min_hold"], lead=st["lead"],
+                                          max_late=st["max_late"], min_hold_short=st["min_hold_short"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
         # not a generic "aligned" label - video render's refusal of an
@@ -535,11 +1019,66 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                          float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         mode = "synced"
     else:
-        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), float(vcfg.get("min_hold", MIN_HOLD)))
+        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), st["min_hold"],
+                                          lead=st["lead"], max_late=st["max_late"],
+                                          min_hold_short=st["min_hold_short"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
-    designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes)
+    # A system-window banner in a 2-panel unit gets its own wide shot:
+    # split such units before the designer ever sees a pair with one.
+    units = split_system_window_units(units, by_id)
+    designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes,
+                         root=root, fingerprint=panels_data.get("fingerprint"))
     shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
+    # P3 editor layer: split frozen >8s shots with a punch-in crop change,
+    # then attach chapter cards + SFX. Callouts already ride on each shot.
+    _pacing_before = pacing_qa(shots)
+    shots, _nsplit = split_long_shots(shots)
+    # CapCut bugfix (defect 1d): a split must never leave two shots on the
+    # same panel with the same crop -- the second shot is punched in.
+    shots, _split_crop_changes = ensure_split_crop_change(shots)
+    # CapCut bugfix (defect 2): final no-repeat pass -- a split shot's last
+    # piece can still match the next shot's motion (see ensure_motion_variety).
+    shots, _motion_changes = ensure_motion_variety(shots)
+    # Diversity: never the same panel 3x in a row with an identical crop
+    # (the third showing is punched in to a different crop).
+    shots, _diversity_changes = ensure_panel_diversity(shots)
+    # CapCut beat sync: snap interior cuts to the nearest beat (<=0.15s),
+    # from video.beats or music/beats.json. No beats = no-op.
+    _beats = resolve_beats(vcfg, root)
+    _beat_info = {"enabled": False, "moved": 0, "max_shift": 0.0,
+                  "reason": "no beats (no video.beats or music/beats.json)"}
+    if _beats:
+        shots, _beat_info = snap_cuts_to_beats(shots, _beats)
+    chapter_cards = build_chapter_cards(shots, duration)
+    # P5: reviewer overrides from fixes.json (chapter-card titles, callout
+    # text, keyed by shot id). Unknown shot_ids are warnings, never failures.
+    from .shorts import apply_callout_overrides as _apply_callouts
+    from .shorts import apply_card_overrides as _apply_cards
+    _over = fixes or {}
+    chapter_cards, _card_warn = _apply_cards(chapter_cards, _over.get("chapter_cards") or {}, shots)
+    shots, _call_warn = _apply_callouts(shots, _over.get("callouts") or {})
+    _override_warnings = list(_card_warn) + list(_call_warn)
+    from .shorts import build_end_screen as _build_end_screen
+    _end_screen = _build_end_screen(duration, chapter)
+    # CapCut auto-captions: on by default for NEW builds (video.captions).
+    # Old plans (no captions key) render without them unless the user runs
+    # `video captions --chapter N`, which adds them to the plan.
+    # Captions are timed from the alignment sentences (caption_sentences),
+    # never from per-shot estimates: a shot is not a sentence, and
+    # per-shot captions gap during filler shots and show a sentence's
+    # tail before its words are spoken.
+    _captions_on = bool(vcfg.get("captions", True))
+    _captions = []
+    if _captions_on:
+        _sent = caption_sentences if caption_sentences is not None else sentences
+        if _sent:
+            _captions = build_captions_from_sentences(_sent, duration)
+        if not _captions:
+            _captions = build_captions(shots)  # legacy fallback: no sentence timings
+        for _s in shots:
+            _s["caption_bar"] = True  # dedicated bottom bar, below the cards
+    sfx = plan_sfx(shots, chapter_cards)
     return {
         "version": PLAN_VERSION,
         "chapter": chapter,
@@ -549,13 +1088,36 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "duration": round(duration, 3),
         "sync": mode,
         "sync_report": sync_report,
+        "sync_settings": st,
         "alignment_review_queue": (alignment_meta or {}).get("review_queue"),
-        "music": vcfg.get("music"),
+        # P2: the P0 timing warnings ride with the plan, so status/QA/render
+        # all see the same whisper outcome — no silent estimated render.
+        "timing_warnings": list((alignment_meta or {}).get("timing_warnings") or []),
+        # P3: hook / open-loop status from cues.json (build.py computes it).
+        "hook": (alignment_meta or {}).get("hook"),
+        # P3: explicit video.music wins, else music/bed.mp3 in the series
+        # folder is used when it exists; None renders music-free.
+        "music": resolve_music(vcfg, root),
         "music_volume": float(vcfg.get("music_volume", 0.22)),
         "effects_enabled": dict(vcfg.get("effects") or {}),
         "panels_fingerprint": panels_data.get("fingerprint"),
         "timing": timing,
         "crop_stats": designer.crop_stats,
+        # P3 editor layer (see editor.py).
+        "chapter_cards": chapter_cards,
+        # P5: end-screen spec (window + slots + WATCH NEXT). Native
+        # YouTube end-screen cards only; never burned into pixels.
+        "end_screen": _end_screen,
+        "sfx": sfx,
+        "captions": _captions,
+        "captions_enabled": _captions_on,
+        "beat_sync": _beat_info,
+        "pacing": {"split_shots": _nsplit, "long_shots_flagged": _pacing_before["long_shots"],
+                   "max_shot": pacing_qa(shots)["max_shot"]},
+        "split_crop_changes": _split_crop_changes,
+        "motion_changes": _motion_changes,
+        "diversity_changes": _diversity_changes,
+        "override_warnings": _override_warnings,
         "reviewed": False,
         "shots": shots,
     }
@@ -596,6 +1158,10 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
             errs.append(f"{where}: background must be one of {', '.join(BACKGROUNDS)}")
         if s.get("exit", "cut") not in EXITS:
             errs.append(f"{where}: exit must be one of {', '.join(EXITS)}")
+        if s.get("transition", "cut") not in TRANSITIONS:
+            errs.append(f"{where}: transition must be one of {', '.join(TRANSITIONS)}")
+        if s.get("grade") not in (None, "subtle"):
+            errs.append(f"{where}: grade must be \"subtle\" or absent (off)")
         if s.get("bg_panel") is not None and s["bg_panel"] not in panel_ids:
             errs.append(f"{where}: bg_panel '{s['bg_panel']}' doesn't exist")
         cards = s.get("cards")
@@ -618,6 +1184,11 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     raise ValueError
             except (TypeError, ValueError):
                 errs.append(f"{cw}: crop must be [x0, y0, x1, y1] fractions of the panel, e.g. [0, 0.2, 1, 0.7]")
+            try:
+                if not 0.0 <= float(c.get("pad_y") or 0.0) <= PAD_LIMIT:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errs.append(f"{cw}: pad_y (blurred padding above and below, in panel heights) must be 0 to {PAD_LIMIT:g}")
             if c.get("enter", "cut") not in ENTRANCES:
                 errs.append(f"{cw}: enter must be one of {', '.join(ENTRANCES)}")
             if c.get("motion", "push_in") not in MOTIONS:
@@ -628,6 +1199,10 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     errs.append(f"{cw}: \"at\" ({at}s after the shot starts) must leave it on screen at least 0.2s")
             except (TypeError, ValueError):
                 errs.append(f"{cw}: \"at\" must be seconds after the shot starts")
+        from .editor import validate_callout as _validate_callout
+        for _co in s.get("callouts") or []:
+            for _err in _validate_callout(_co):
+                errs.append(f"{where}: callout: {_err}")
         for e in s.get("effects") or []:
             if not isinstance(e, dict) or e.get("type") not in EFFECTS:
                 errs.append(f"{where}: effect types are {', '.join(EFFECTS)}")
@@ -638,6 +1213,29 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
             except (KeyError, TypeError, ValueError):
                 errs.append(f"{where}: every effect needs a time \"t\" in seconds")
         prev_end = end
+    for _cc in plan.get("chapter_cards") or []:
+        if not isinstance(_cc, dict) or not isinstance(_cc.get("title"), str) or not _cc["title"].strip():
+            errs.append("chapter_cards entries need a non-empty string \"title\"")
+        elif len(_cc["title"]) > 40:
+            errs.append(f"chapter card '{_cc['title'][:20]}...' title must be at most 40 chars")
+        else:
+            try:
+                _t = float(_cc.get("t", -1))
+                if not 0 <= _t <= max(duration, 0):
+                    errs.append(f"chapter card '{_cc.get('title')}' at {_t}s is outside the video")
+            except (TypeError, ValueError):
+                errs.append(f"chapter card '{_cc.get('title')}' needs a numeric \"t\"")
+    for _sfx in plan.get("sfx") or []:
+        if not isinstance(_sfx, dict) or _sfx.get("type") not in tuple(SFX_ALL):
+            errs.append(f"sfx entries need one of {', '.join(sorted(SFX_ALL))}")
+        else:
+            try:
+                if not 0 <= float(_sfx.get("t", -1)) <= max(duration, 0):
+                    errs.append(f"sfx '{_sfx.get('type')}' at {_sfx.get('t')}s is outside the video")
+            except (TypeError, ValueError):
+                errs.append(f"sfx '{_sfx.get('type')}' needs a numeric \"t\"")
+    for _cerr in validate_captions(plan.get("captions") or [], duration):
+        errs.append(f"captions: {_cerr}")
     if duration > 0 and abs(prev_end - duration) > 0.05:
         errs.append(f"the last shot ends at {round(prev_end, 3)}s but the audio is {duration}s long")
     return errs

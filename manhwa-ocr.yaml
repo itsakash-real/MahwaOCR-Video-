@@ -48,12 +48,72 @@ video:
   lead: 0.15              # panel appears this long before its sentence
   min_shot: 1.0           # recap pacing: ~2.7s average shot, 1-5s range
   max_shot: 5.0
+  min_hold: 3.0           # no picture stays up for less than this (seconds)
   target_shot: 2.7        # average seconds per shot (recap channels: about 2.7)
   pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
   workers: 0              # parallel renders; 0 = all your CPU cores
   effects: {shake: true, punch: false, flash: false, end_fade: true}   # calm by default
-  music: null             # e.g. "music/bed.mp3" (relative to the series folder); ducks under narration
-  music_volume: 0.22
+  music: null             # P3: null = use music/bed.mp3 in the series folder when it exists
+                          # (drop a royalty-free loop there), else render music-free. Ducks under narration.
+  music_volume: 0.22      # 15-25% under narration; sidechain lets it rise toward 60-80% when no narration
+  music_fade: 0.5         # music fade in/out, seconds (>= 0.3s)
+  sfx_dir: null           # P3: folder (relative to series folder) with whoosh.mp3, impact.mp3,
+  # ding.mp3, sting.mp3, scratch.mp3, rumble.mp3, hit.mp3. null = no SFX; missing files render
+  # silent, never fail.
+  # CapCut-style auto-captions: 3-5 words at a time, key word yellow, bottom band.
+  # Burned in at render from video/chapter_N.captions.ass. true by default for NEW
+  # builds; old plans (no captions key) render without them -- run
+  # `video captions --chapter N` to add captions to an existing plan.
+  captions: true
+  # Gentle grade: null = off; "subtle" = contrast +5%, saturation +5%. Off by default.
+  grade: null
+  # Beat sync: optional beat times (seconds) to snap interior cuts to, within +/-0.15s.
+  # null = no beat sync (cuts stay exactly on their sentences); or drop
+  # {"beats": [...]} as music/beats.json (from any beat-detection tool).
+  beats: null
+  # Panel detection edges. Rows at a panel's top/bottom that are all white (gray above
+  # white_threshold) or all near-black (below black_threshold) are gutter and are trimmed off.
+  # Existing panels.json files are not re-detected on their own: run `video panels --force`.
+  panels:
+    tighten_edges: true
+    white_threshold: 242
+    black_threshold: 13
+  # Card framing: cards keep the panel's full width and slide a vertical window; a panel too wide
+  # for any allowed shape is shown whole on blurred padding. false = the old zoomed side-cropping.
+  crop:
+    full_width: true
+    min_width_kept: 0.9     # last-resort bubble avoidance may narrow a card, never below this
+  # Heads the skin-colour test cannot see (white/silver hair, gray skin). Such panels are listed
+  # under "low_confidence_heads" in video/chapter_N.verify.json for a reviewer.
+  heads:
+    pale: true
+    keep_top: 0.25          # a figure but no located head: a card never starts this far down the panel (0 = off)
+  # `video intro`: a short trailer in front of the series, built from panels of any chapter
+  # (intro/intro.json + audio/chapter_0.mp3; start with `video intro --prepare`).
+  intro:
+    min_hold: 2.0           # shortest time a picture stays up (the chapter videos use min_hold above)
+    pair_ratio: 0.5         # share of neighbouring panels shown as a staggered pair
+    darken: 0.15            # darker grade, 0 (off) to 0.6
+    backdrop: blur          # always the blurred panel behind the cards, never black bars
+    beat_effects: [shake, flash, fade_out]   # on sentences marked "beat": true in intro.json
+  tts:
+    spell_numbers: true     # new recaps/chapter_N.tts.txt spell digits out (99 -> ninety nine)
+  sync:
+    # Narration sync. `video sync-audit` checks a finished plan against these;
+    # `video build` refuses to render when the match gates fail.
+    min_segment: 0.25    # no sentence is shorter than this (seconds); stops zero-length segments
+    max_late: 0.3        # a cut may start at most this long after its sentence starts
+    lead: 0.2            # hard early bound: a cut may lead its sentence by at most this
+    min_hold_short: 2.0  # shortest hold allowed when a sentence can't be merged into a pair
+    max_hold: 8.0        # a single picture held longer than this is split by a slide-in
+    max_unmatched: 6.0   # speech whisper couldn't match for this long stops the build
+    override_evidence: 20  # OCR-overlap score above which a tag/OCR disagreement is flagged (the tag still shows)
+    filler_full: 6.0     # only sentences longer than this may be filled end to end
+    gate_wrong: 0.05     # build gate: most wrong-picture time (another sentence's panel on
+                         # screen) allowed overall; fillers and pair second cards are excluded.
+                         # PROVISIONAL - will be set from the calibrated after-distribution.
+    gate_window: 0.25    # build gate: most wrong-picture time allowed in any five-second window
+    gate_grace: 0.2      # build gate: extra lateness tolerated before a cut fails
   whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
   whisper_language: null  # e.g. "hi"
   # true: a chapter's video must be approved (video review, or video approve) before rendering

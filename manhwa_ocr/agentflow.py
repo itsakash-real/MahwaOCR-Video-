@@ -68,7 +68,8 @@ class AgentFlow:
 
     # ------------------------------------------------------------------ step 1
 
-    def prepare(self, *, chapter: str, url: str | None = None, folder: Path | None = None) -> Path:
+    def prepare(self, *, chapter: str, url: str | None = None, folder: Path | None = None,
+                shards: int = 1) -> Path:
         chapter = require_chapter(chapter)
         chapter_dir = self._chapter_dir(chapter)
 
@@ -83,7 +84,8 @@ class AgentFlow:
             urls = discover_pages(url, self.cfg.download)
             self.log(f"  {len(urls)} pages found; downloading...")
             pages = download_images(
-                urls, chapter_dir / "pages", referer=url, config=self.cfg.download, log=self.log
+                urls, chapter_dir / "pages", referer=url, config=self.cfg.download, log=self.log,
+                cache_dir=self.workdir / ".cache" / "pages",
             )
         else:
             raise UserError("Give a chapter URL, --folder, or --next.")
@@ -92,9 +94,19 @@ class AgentFlow:
         tiles = build_tiles(pages, chapter_dir / "tiles", config=self.cfg.slicing, log=self.log)
         self.log(f"  {len(pages)} pages -> {len(tiles)} tiles")
 
+        # Shards split the tile list across several agents; each shard writes
+        # its own results file and assemble merges them. Clamped so every
+        # shard gets at least one tile.
+        shards = max(1, int(shards))
+        if tiles:
+            shards = min(shards, len(tiles))
+        else:
+            shards = 1
+
         manifest = {
             "chapter": chapter,
             "series": self.cfg.series_name,
+            "shards": {"count": shards},
             "tiles": [
                 {
                     "id": f"p{t.page_index:03d}_t{t.tile_index:02d}",
@@ -126,16 +138,54 @@ class AgentFlow:
                     if f.exists():
                         f.replace(f.with_name(f.name + ".stale"))
                         self.log(f"  tiles changed; set aside old {name}")
+                for f in sorted(chapter_dir.glob("tile_results_shard_*.json")):
+                    f.replace(f.with_name(f.name + ".stale"))
+                    self.log(f"  tiles changed; set aside old {f.name}")
 
         atomic_write_json(manifest_path, manifest)
-        task_path = chapter_dir / "TASK.md"
-        # TASK.md is what marks "prepared", so it is written last.
-        atomic_write_text(
-            task_path, self._render_task(chapter, tiles, self.memory.as_briefing(), chapter_dir)
-        )
+        briefing = self.memory.as_briefing()
+        if shards == 1:
+            task_path = chapter_dir / "TASK.md"
+            # TASK.md is what marks "prepared", so it is written last.
+            atomic_write_text(task_path, self._render_task(chapter, tiles, briefing, chapter_dir))
+        else:
+            chunk = (len(tiles) + shards - 1) // shards
+            for k in range(1, shards + 1):
+                part = tiles[(k - 1) * chunk: k * chunk]
+                if not part:
+                    continue
+                atomic_write_text(
+                    chapter_dir / f"TASK_{k}.md",
+                    self._render_task(chapter, part, briefing, chapter_dir, shard=k, total_shards=shards),
+                )
+            # TASK.md is the index, and what marks "prepared", so it is written last.
+            task_path = chapter_dir / "TASK.md"
+            atomic_write_text(task_path, self._render_task_index(chapter, shards, chapter_dir))
         return task_path
 
-    def _render_task(self, chapter: str, tiles: List[Tile], briefing: str, chapter_dir: Path) -> str:
+    def _render_task_index(self, chapter: str, shards: int, chapter_dir: Path) -> str:
+        lines = "\n".join(
+            f"- `TASK_{k}.md` — shard {k} of {shards}; writes `{self._rel(chapter_dir / f'tile_results_shard_{k}.json')}`"
+            for k in range(1, shards + 1)
+        )
+        return f"""# Transcription task — {self.cfg.series_name}, chapter {chapter}
+
+This chapter is split into {shards} shards so several agents can read tiles in parallel.
+Work through the shard tasks in any order; each one lists its own tiles and writes its own results file.
+
+{lines}
+
+## Then
+
+Once every shard's results file exists:
+
+```bash
+{command(f"assemble --chapter {chapter}", self.session)}
+```
+"""
+
+    def _render_task(self, chapter: str, tiles: List[Tile], briefing: str, chapter_dir: Path,
+                     *, shard: int | None = None, total_shards: int = 1) -> str:
         sample_prompt = render_tile_prompt(
             briefing=briefing,
             label="<TILE LABEL>",
@@ -146,13 +196,20 @@ class AgentFlow:
             f"{i:>3}. `{self._rel(t.path)}` — id `p{t.page_index:03d}_t{t.tile_index:02d}` — {t.label}"
             for i, t in enumerate(tiles, 1)
         )
-        return f"""# Transcription task — {self.cfg.series_name}, chapter {chapter}
+        if shard is not None:
+            result_name = f"tile_results_shard_{shard}.json"
+            title = f"# Transcription task — {self.cfg.series_name}, chapter {chapter} (shard {shard} of {total_shards})"
+            scope = f"**{len(tiles)} tiles to read in this shard.** Work only on the tiles below; other shards cover the rest."
+        else:
+            result_name = "tile_results.json"
+            title = f"# Transcription task — {self.cfg.series_name}, chapter {chapter}"
+            scope = f"**{len(tiles)} tiles to read.** Batch them a few at a time."
+        return f"""{title}
 
 You are acting as the vision model for `manhwa-ocr`. Read the tile images below
 and write structured results. Paths are relative to `{self.workdir}`.
 
-**{len(tiles)} tiles to read.** Batch them a few at a time. If you are
-interrupted, you can resume: anything already in `tile_results.json` is kept.
+{scope} If you are interrupted, you can resume: anything already in `{result_name}` is kept.
 
 ---
 
@@ -180,7 +237,7 @@ Apply this to every tile, substituting the tile's label for `<TILE LABEL>`:
 
 ## Output
 
-Write `{self._rel(chapter_dir / 'tile_results.json')}` as a JSON array, one entry
+Write `{self._rel(chapter_dir / result_name)}` as a JSON array, one entry
 per tile, using the ids above:
 
 ```json
@@ -211,9 +268,10 @@ Rules:
 
     # ------------------------------------------------------------------ step 2
 
-    def _load_results(self, chapter_dir: Path, manifest: Dict[str, Any]) -> Dict[str, Dict]:
+    def _load_results_file(self, path: Path, ids: List[str] | None) -> Dict[str, Dict]:
+        """Parse one results file (tile_results.json or a shard file)."""
         results = read_agent_json(
-            chapter_dir / "tile_results.json",
+            path,
             "Read the tiles listed in TASK.md and write the results there first.",
         )
         if isinstance(results, dict):
@@ -224,15 +282,47 @@ Rules:
             elif all(isinstance(v, dict) for v in results.values()):
                 results = [{"id": k, **v} for k, v in results.items()]
         if not isinstance(results, list):
-            raise UserError("tile_results.json must be a JSON array of tile entries.")
+            raise UserError(f"{path.name} must be a JSON array of tile entries.")
 
-        ids = [t["id"] for t in manifest["tiles"]]
         entries = [r for r in results if isinstance(r, dict)]
         by_id = {str(r["id"]): r for r in entries if r.get("id") is not None}
-        if not by_id and len(entries) == len(ids):
+        if not by_id and ids is not None and len(entries) == len(ids):
             # The agent wrote entries in order but left the ids off.
             by_id = dict(zip(ids, entries))
-            self.log("  note: entries had no ids; matched to tiles by position")
+            self.log(f"  note: entries in {path.name} had no ids; matched to tiles by position")
+        return by_id
+
+    def _load_results(self, chapter_dir: Path, manifest: Dict[str, Any]) -> Dict[str, Dict]:
+        """Merge every results file present: tile_results.json plus one
+        tile_results_shard_K.json per shard from `prepare --shards N`.
+
+        Shard entries win on duplicate ids (they are the newer, split work);
+        identical duplicates are silent.
+        """
+        ids = [t["id"] for t in manifest["tiles"]]
+        sources: List[Path] = []
+        single = chapter_dir / "tile_results.json"
+        if single.exists():
+            sources.append(single)
+        try:
+            shard_count = int((manifest.get("shards") or {}).get("count", 1))
+        except (TypeError, ValueError):
+            shard_count = 1
+        for k in range(1, max(1, shard_count) + 1):
+            p = chapter_dir / f"tile_results_shard_{k}.json"
+            if p.exists():
+                sources.append(p)
+        if not sources:
+            # No results file at all: the single-file read raises the usual
+            # "read the tiles first" error.
+            return self._load_results_file(single, ids)
+        by_id: Dict[str, Dict] = {}
+        for path in sources:
+            entries = self._load_results_file(path, ids if path == single else None)
+            for tid, entry in entries.items():
+                if tid in by_id and by_id[tid] != entry:
+                    self.log(f"  note: tile {tid} appears in multiple result files; using {path.name}")
+                by_id[tid] = entry
         return by_id
 
     def assemble(self, *, chapter: str) -> Path:

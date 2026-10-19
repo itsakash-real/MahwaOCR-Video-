@@ -130,4 +130,5 @@ def ensure_pages(sess, chapter: str, download_cfg: dict, log: Callable[[str], No
 
     log(f"  chapter {chapter}: page images aren't on disk; downloading them again...")
     urls = discover_pages(url, download_cfg)
-    return download_images(urls, pages_dir(sess.path, chapter), referer=url, config=download_cfg, log=log)
+    return download_images(urls, pages_dir(sess.path, chapter), referer=url, config=download_cfg, log=log,
+                           cache_dir=sess.path / ".cache" / "pages")
