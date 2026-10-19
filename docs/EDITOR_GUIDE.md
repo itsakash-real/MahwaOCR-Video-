@@ -57,6 +57,22 @@ python -m manhwa_ocr video captions --chapter N --session "Your Series Name"
 A subtitles-filter failure keeps the un-captioned video and logs a
 warning, never fails the render.
 
+## Card backgrounds — deterministic rotation (user rule, 2026-10-19)
+
+Shot index `i` (0-based, plan order): `i % 10 == 4` -> solid black,
+`i % 10 == 9` -> solid white, else auto-blur backdrop. 80% blur / 10%
+black / 10% white, evenly spaced, deterministic (no randomness).
+Background only replaces the backdrop behind the card; card unchanged,
+centred, full size, colours never inverted. Recorded per shot as
+`shot["background"]`. `fixes.json` shot background override still wins.
+Chapter cards / end-screen / black tail are not shots: rotation does not
+apply to them.
+
+2s-refresh guard: no panel may read as refreshing every ~2s. Enforced by
+continuous motion + no motion repeat + `ensure_split_crop_change` (no
+same-panel split without a crop change). Regression test:
+`tests/test_background_rotation.py`.
+
 ## Chapter cards (P3 + P5)
 
 Videos ≥6 min get a card every ~6 min at a shot boundary: 1.75s,

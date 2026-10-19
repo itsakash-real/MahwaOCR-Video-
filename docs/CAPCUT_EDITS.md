@@ -246,6 +246,29 @@ those SFX, never fail, never invent audio. Files live in
 saturation +5% (`frames.grade_subtle`). The art still looks like the
 art. The blurred + darkened + vignetted background is unchanged.
 
+### Card backgrounds — deterministic rotation (user rule, 2026-10-19)
+
+Card backgrounds rotate deterministically by shot index (0-based, plan
+order), NOT randomly: shot `i` with `i % 10 == 4` -> solid **black**,
+`i % 10 == 9` -> solid **white**, every other shot -> auto-blur backdrop
+(blurred + darkened + vignetted panel). Exactly 80% blur / 10% black /
+10% white over every 10 shots, evenly spaced (black and white never
+consecutive, never clustered), same plan -> same backgrounds, no seed.
+The background only replaces the blurred backdrop BEHIND the card; the
+card (panel art) is unchanged, centred, full card size, colours never
+inverted. Chapter cards / end-screen / black tail are not shots, so the
+rotation never applies to them. An explicit `fixes.json` shot background
+override still wins. The chosen background is recorded per shot as
+`shot["background"]` in `plan.json`. Implemented in
+`plan.background_for_index()`; `frames.background()` already renders all
+three kinds.
+
+2s-refresh guard (same rule): a panel must never feel like it refreshes
+every ~2s. Already enforced by continuous motion + no motion repeat +
+`ensure_split_crop_change` (no same-panel split without a crop change);
+`tests/test_background_rotation.py` adds an explicit regression test for
+the old 8s-into-4x2s identical-crop pattern.
+
 ## Config knobs (`manhwa-ocr.yaml`, `video:` section)
 
 | Knob | Default | What it does |

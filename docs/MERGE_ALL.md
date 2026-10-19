@@ -216,6 +216,7 @@ docs commit. If a per-phase PR is wanted for the bugfix, open it as
 
 ## What is in `main` vs not in `main`
 
+- **Background rotation + 2s-refresh guard (on `main` after the AGENT_WAY update):** deterministic card backgrounds 80% blur / 10% black / 10% white (shots 4/9 in every 10) + explicit 2s-refresh regression test. See `docs/CAPCUT_EDITS.md` and `tests/test_background_rotation.py`.
 - **AGENT_WAY update (after the `main` merge):** prompts A–H rewritten to
   the current workflow (CapCut fixes, caption timing + caption bar,
   panel diversity, P2 wide-switch guard, system-window wide fill,

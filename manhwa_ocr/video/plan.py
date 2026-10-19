@@ -552,6 +552,28 @@ def map_options(vcfg: Dict[str, Any]) -> Dict[str, Any]:
             "keep_top": float(heads.get("keep_top", 0.25))}
 
 
+def background_for_index(i: int, layout: str = "single") -> str:
+    """Deterministic card-background rotation for shot index i (0-based).
+
+    i % 10 == 4 -> "black" (solid black, no blur)
+    i % 10 == 9 -> "white" (solid white, no blur)
+    otherwise -> "blur" (auto-blur backdrop: existing blurred + darkened +
+    vignetted panel backdrop from frames.background()).
+
+    The background colour only replaces the blurred backdrop BEHIND the
+    card; the card (panel art) is unchanged, centred, full card size, and
+    its colours are never inverted. Chapter cards / end-screen / black
+    tail are not shots, so this rotation never applies to them.
+    """
+    if layout == "inset":
+        return "blur"
+    if i % 10 == 4:
+        return "black"
+    if i % 10 == 9:
+        return "white"
+    return "blur"
+
+
 class _Designer:
     """Turns timing units into shots: layouts, crops, backgrounds, animation."""
 
@@ -586,7 +608,6 @@ class _Designer:
         self.prev_motion: str | None = None
         self._prev_shot: Dict[str, Any] | None = None   # CapCut transitions: the shot before this one
         self.last_glitch = -1e9                          # CapCut: at most one glitch per 60s
-        self.prev_bg = "blur"
         self.last_punch = -1e9
 
     def img(self, pid: str) -> Image.Image:
@@ -756,18 +777,18 @@ class _Designer:
             self._tone[pid] = tone(self.img(pid))
         return self._tone[pid]
 
-    def background(self, rng: random.Random, pid: str, layout: str) -> str:
-        if layout == "inset":
-            return "blur"
-        # Blurred (most shots) or black. Never white: a white screen behind
-        # pale manhwa cards washes the picture out. Dark panels lean on black.
-        t = self.tone(pid)
-        black = {"dark": 0.40}.get(t, 0.15)
-        kind = "black" if rng.random() < black else "blur"
-        if kind != "blur" and kind == self.prev_bg:
-            kind = "blur"  # never two black backgrounds in a row
-        self.prev_bg = kind
-        return kind
+    def background(self, i: int, layout: str) -> str:
+        """Deterministic background rotation (user rule, 2026-10-19).
+
+        Shot index i (0-based, plan order): i % 10 == 4 -> black,
+        i % 10 == 9 -> white, else auto-blur backdrop. Exactly 80% blur /
+        10% black / 10% white over every 10 shots, evenly spaced (black
+        and white never consecutive, never clustered), same plan -> same
+        backgrounds, no randomness, no seed. Inset shots (never emitted)
+        stay blur. An explicit fixes.json shot background override in
+        shot() still wins over this rotation.
+        """
+        return background_for_index(i, layout)
 
     def motion(self, rng: random.Random, crop: List[float]) -> str:
         # P3 + CapCut bugfix: continuous motion, never `hold` (planner-emitted).
@@ -908,7 +929,7 @@ class _Designer:
             if transition == "glitch":
                 effects.append({"type": "glitch", "t": round(start, 3)})
                 self.last_glitch = start
-        background = self.background(rng, (bg_panel or first), layout)
+        background = self.background(i, layout)
         background = (self.fixes["shot"].get(first) or {}).get("background", background)
         shot = {
             "id": f"S{i + 1:03d}", "start": round(start, 3), "end": round(end, 3),
