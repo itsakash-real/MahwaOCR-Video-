@@ -668,6 +668,28 @@ def cmd_video(args) -> int:
             tags = f"{r['tagged']:.0%}" if r["tagged"] is not None else "-"
             _log(f"{r['chapter']:<6}{'yes' if r['recap'] else '-':<8}{tags:<7}{audio_s:<10}{r['panels'] or '-':<8}"
                  f"{align_s:<12}{plan_s:<25} {sync_s:<9}{video_s}")
+            # P5: one-glance editor signals (P0-P3) under each chapter row.
+            ed = r.get("editor") or {}
+            if r["plan"] and not r["plan"].get("broken"):
+                hook = ed.get("hook") or {}
+                hook_s = ("hook: explicit" if hook.get("explicit_hook") else "hook: MISSING (add [HOOK])")
+                hook_s += f", {hook.get('open_loops', 0)} open loop(s)"
+                tw = ed.get("timing_warnings") or []
+                tw_s = ("timing: ok" if not tw else
+                        "timing: " + "; ".join(f"{w.get('code')} (fix: {w.get('fix')})" for w in tw[:2]))
+                sfx = ed.get("sfx") or {}
+                sfx_s = (f"SFX: {sfx.get('events', 0)} event(s)"
+                         + (f", missing files: {', '.join(sfx.get('files_missing') or [])}"
+                            if sfx.get("files_missing") else ", all files present"
+                            if (sfx.get("events") or 0) and not sfx.get("files_missing") else ""))
+                mus = ed.get("music") or {}
+                mus_s = ("music: none" if mus.get("file") is None else
+                         f"music: {mus.get('file')} ({'present' if mus.get('present') else 'MISSING'})")
+                _log(f"      editor: {tw_s} | mask_risk: {ed.get('mask_risk', 0)} | "
+                     f"layout_switches: {ed.get('layout_switches', 0)} | {hook_s} | "
+                     f"cards: {ed.get('chapter_cards', 0)} | callouts: {ed.get('callouts', 0)} | {sfx_s} | {mus_s}")
+                for _w in ed.get("override_warnings") or []:
+                    _log(f"      editor: override ignored: {_w}")
         _log("\n'align' is video align's own check: a sentence it couldn't resolve with full "
             "confidence (never confirmed by you) shows as \"N review\" - open its pairing sheet "
             "(video pair) before trusting the video for that stretch.")
@@ -862,6 +884,21 @@ def cmd_video(args) -> int:
             _log(f"  ch {c:<6} {r}")
         return 1 if any(r.startswith("failed") for r in results.values()) else 0
 
+    if action == "shorts":
+        for c in chapters(default_all=False):
+            manifest = vb.make_shorts(sess, c, cfg, count=args.count or 3, preview=args.preview,
+                                      workers=args.workers, log=_log)
+            _log(f"  next:  upload video/chapter_{c}.shorts_*.mp4 as Shorts; "
+                 f"titles + hooks in video/chapter_{c}.shorts.json")
+        return 0
+
+    if action == "endscreen":
+        for c in chapters(default_all=False):
+            vb.make_end_screen(sess, c, cfg, log=_log)
+            _log(f"  next:  add the slots as native end-screen cards in YouTube Studio, "
+                 f"and paste video/chapter_{c}.watch_next.txt into the description.")
+        return 0
+
     if action == "clip":
         if args.start is None or args.end is None:
             raise UserError("Give the range in seconds:  video clip --chapter 3 --from 45 --to 105 [--format 9:16]")
@@ -994,7 +1031,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
     p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "sync-audit", "storyboard", "render",
-                                      "build", "clip", "compile", "verify", "review", "approve", "intro"])
+                                      "build", "clip", "compile", "verify", "review", "approve", "intro",
+                                      "shorts", "endscreen"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
     p.add_argument("--force", action="store_true", help="rebuild even if up to date (discards plan edits)")
@@ -1008,6 +1046,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="start", type=float, help="clip start, seconds")
     p.add_argument("--to", dest="end", type=float, help="clip end, seconds")
     p.add_argument("--workers", type=int, default=0, help="parallel renders (default: half your CPU cores)")
+    p.add_argument("--count", type=int, default=3, help="shorts: how many Shorts to cut (default 3)")
     p.add_argument("--no-titles", dest="no_titles", action="store_true", help="compile without title cards")
     p.add_argument("--name", help="compiled output name")
     p.add_argument("--apply", action="store_true", help="pair: save the fixed tags from pairs.json")

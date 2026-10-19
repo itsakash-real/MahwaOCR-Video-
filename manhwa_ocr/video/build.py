@@ -275,6 +275,43 @@ def chapter_status(root: Path, chapter: str, *, probe: bool = False) -> Dict[str
         "preview": preview.name if preview.exists() else None,
         "sync_audit": _sync_audit_status(root, chapter, plan_file),
         "storyboards": [p.name for p in storyboard_paths(root, chapter)],
+        # P5: one-glance editor signals (P0-P3) for `video status` / `next`.
+        "editor": _editor_status(root, plan, alignment),
+    }
+
+
+def _editor_status(root: Path, plan: Dict[str, Any] | None, alignment: Dict[str, Any] | None) -> Dict[str, Any]:
+    """One-glance P0-P3 signals for `video status` / `next` / dashboard.
+
+    Never raises: a missing/broken plan reports empty signals, not an error.
+    SFX file presence is checked against the conventional `sfx/` folder
+    (config `video.sfx_dir` may point elsewhere; the plan/build logs name
+    the configured dir when it renders).
+    """
+    from .editor import resolve_sfx_files
+
+    if not isinstance(plan, dict) or plan.get("broken"):
+        return {"timing_warnings": [], "mask_risk": 0, "layout_switches": 0,
+                "hook": None, "chapter_cards": 0, "callouts": 0,
+                "sfx": {"events": 0, "files_present": [], "files_missing": []},
+                "music": {"file": None, "present": None}, "override_warnings": []}
+    cs = plan.get("crop_stats") or {}
+    timing = list((alignment or {}).get("timing_warnings") or []) or list(plan.get("timing_warnings") or [])
+    music_file = plan.get("music")
+    found, missing = resolve_sfx_files(root, "sfx")
+    return {
+        "timing_warnings": [{"code": w.get("code"), "fix": w.get("fix")}
+                            for w in timing if isinstance(w, dict)],
+        "mask_risk": len(cs.get("mask_risk") or []),
+        "layout_switches": len(cs.get("layout_switches") or []),
+        "hook": plan.get("hook"),
+        "chapter_cards": len(plan.get("chapter_cards") or []),
+        "callouts": sum(len(s.get("callouts") or []) for s in plan.get("shots") or []),
+        "sfx": {"events": len(plan.get("sfx") or []),
+                "files_present": sorted(found), "files_missing": sorted(missing)},
+        "music": {"file": music_file,
+                  "present": (root / music_file).is_file() if music_file else None},
+        "override_warnings": list(plan.get("override_warnings") or []),
     }
 
 
@@ -455,7 +492,17 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])
                         + f"\nDetails: video/chapter_{chapter}.qa.json")
     save_plan(root, chapter, plan)
+    # P5: end-screen spec + WATCH NEXT block ride with every plan (native
+    # YouTube cards only; never burned into pixels). Override warnings are
+    # logged here too, next to the other plan-time warnings.
+    from .shorts import build_end_screen as _build_end_screen
+    _es = _build_end_screen(float(plan["duration"]), chapter,
+                            series_name=getattr(sess, "name", None) or sess.slug)
+    atomic_write_text(endscreen_path(root, chapter), json.dumps(_es, indent=1, ensure_ascii=False))
+    atomic_write_text(watch_next_path(root, chapter), _es["watch_next"] + "\n")
     log(f"  chapter {chapter}: {len(plan['shots'])} shots, {mode_note}")
+    for _w in plan.get("override_warnings") or []:
+        log(f"    ! override ignored: {_w}")
     short_note = (f"; {qa['short_shots']} shot(s) under the {qa['floor']:g}s floor (dense narration, "
                   f"left honest instead of stealing time)") if qa["short_shots"] else ""
     log(f"    all {qa['shown_panels']}/{qa['art_panels']} drawn panels shown; shortest shot "
@@ -634,20 +681,20 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
 # ------------------------------------------------------------------ clips (Shorts)
 
 
-def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | None = None,
-              preview: bool = False, workers: int = 0, log: Callable = print) -> Path:
-    """Cut a highlight from a chapter's plan, optionally re-framed as 9:16."""
-    root, chapter = sess.path, require_chapter(chapter)
-    panels = load_panels(root, chapter)
-    if not panels:
-        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
-    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+def _clip_plan(plan: Dict[str, Any], start: float, end: float, fmt: str) -> Dict[str, Any]:
+    """Slice a finished plan to [start, end) and re-frame it as `fmt`.
+
+    Pure plan surgery (no I/O): shots are cut to the window, card entrances
+    that already happened become plain cuts, callouts / chapter cards / SFX
+    shift into clip time, events outside drop out. The narration audio is
+    sliced by the renderer via `audio_offset` — the recording is never
+    re-recorded or regenerated.
+    """
     duration = float(plan["duration"])
     if not 0 <= start < end <= duration + 0.01:
         raise UserError(f"Clip range {start}-{end}s must be inside the chapter (0-{duration:.1f}s).")
-    fmt = fmt or plan.get("format", "16:9")
     if fmt in {"9:16", "shorts"} and end - start > 180:
-        log("  ! YouTube Shorts are limited to 3 minutes; this clip is longer.")
+        pass  # the caller logs the 3-minute Shorts warning; this stays pure
     shots = []
     for s in plan["shots"]:
         a, b = max(float(s["start"]), start), min(float(s["end"]), end)
@@ -693,8 +740,101 @@ def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | N
                 if isinstance(e, dict) and start <= float(e.get("t") or -1) < end]
     clip = {**plan, "format": fmt, "shots": shots, "duration": round(end - start, 3), "audio_offset": start,
             "chapter_cards": clip_cards, "sfx": clip_sfx}
+    return clip
+
+
+def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | None = None,
+              preview: bool = False, workers: int = 0, log: Callable = print) -> Path:
+    """Cut a highlight from a chapter's plan, optionally re-framed as 9:16."""
+    root, chapter = sess.path, require_chapter(chapter)
+    panels = load_panels(root, chapter)
+    if not panels:
+        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
+    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    fmt = fmt or plan.get("format", "16:9")
+    if fmt in {"9:16", "shorts"} and end - start > 180:
+        log("  ! YouTube Shorts are limited to 3 minutes; this clip is longer.")
+    clip = _clip_plan(plan, start, end, fmt)
     tag = f"clip_{start:g}-{end:g}".replace(".", "_") + ("_9x16" if fmt in {"9:16", "shorts"} else "")
     return render(root, chapter, clip, cfg.video, preview=preview, workers=workers, log=log, name=tag)
+
+
+# ------------------------------------------------------------------ P5: Shorts + end screen
+
+def shorts_manifest_path(root: Path, chapter: str) -> Path:
+    return video_dir(root) / f"chapter_{require_chapter(chapter)}.shorts.json"
+
+
+def endscreen_path(root: Path, chapter: str) -> Path:
+    return video_dir(root) / f"chapter_{require_chapter(chapter)}.endscreen.json"
+
+
+def watch_next_path(root: Path, chapter: str) -> Path:
+    return video_dir(root) / f"chapter_{require_chapter(chapter)}.watch_next.txt"
+
+
+def make_end_screen(sess, chapter: str, cfg=None, *, log: Callable = print) -> Dict[str, Any]:
+    """Write `video/chapter_N.endscreen.json` + `video/chapter_N.watch_next.txt`
+    from the finished plan. The plan's `end_screen` is the window/slots spec
+    (P5); this resolves the series name for the playlist slot and the WATCH
+    NEXT block. Never burns cards into pixels — YouTube Studio adds them."""
+    from .shorts import build_end_screen
+
+    root, chapter = sess.path, require_chapter(chapter)
+    panels = load_panels(root, chapter)
+    if not panels:
+        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
+    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    spec = build_end_screen(float(plan["duration"]), chapter, series_name=getattr(sess, "name", None) or sess.slug)
+    atomic_write_text(endscreen_path(root, chapter), json.dumps(spec, indent=1, ensure_ascii=False))
+    atomic_write_text(watch_next_path(root, chapter), spec["watch_next"] + "\n")
+    log(f"  wrote video/chapter_{chapter}.endscreen.json + video/chapter_{chapter}.watch_next.txt")
+    return spec
+
+
+def make_shorts(sess, chapter: str, cfg, *, count: int = 3, preview: bool = False, workers: int = 0,
+                log: Callable = print) -> Dict[str, Any]:
+    """Build up to `count` vertical 9:16 Shorts from a finished chapter plan.
+
+    Picks the highest-impact moments (hook + payoffs), slices the chapter's
+    own narration audio to each window (never re-recorded / generated),
+    re-frames panels vertically (face-centred crops, no black bars — the
+    plan's crop rules run in 9:16), keeps keyword callouts, and ends each
+    Short on a "Full story on channel" card. Writes the manifest
+    `video/chapter_N.shorts.json` plus `video/chapter_N.shorts_1.mp4` etc.
+    """
+    from .shorts import END_CARD_DUR, END_CARD_TEXT, pick_shorts_windows, shorts_manifest, validate_shorts_manifest
+
+    root, chapter = sess.path, require_chapter(chapter)
+    panels = load_panels(root, chapter)
+    if not panels:
+        raise UserError(f"Plan the chapter first:  video plan --chapter {chapter}")
+    plan = load_plan(root, chapter, {p["id"] for p in panels["panels"]})
+    windows = pick_shorts_windows(plan, count=count)
+    if not windows:
+        raise UserError(f"Chapter {chapter} has no shots to cut Shorts from.")
+    manifest = shorts_manifest(plan, windows)
+    problems = validate_shorts_manifest(manifest)
+    if problems:
+        raise UserError("Internal error: generated Shorts manifest is invalid:\n  - " + "\n  - ".join(problems))
+    outputs: List[str] = []
+    for entry in manifest["shorts"]:
+        start, end = float(entry["start"]), float(entry["end"])
+        clip = _clip_plan(plan, start, end, "9:16")
+        # End card: a chapter-card-style overlay on the Short's last shot,
+        # rendered by the existing chapter-card machinery (frames.py) —
+        # text only, no new audio, no burned YouTube end-screen cards.
+        clip["chapter_cards"] = [{**c} for c in clip.get("chapter_cards") or []] + [
+            {"t": round(max(0.0, clip["duration"] - END_CARD_DUR), 3),
+             "title": END_CARD_TEXT, "dur": END_CARD_DUR}]
+        out = render(root, chapter, clip, cfg.video, preview=preview, workers=workers, log=log,
+                     name=f"shorts_{entry['index']}")
+        outputs.append(out.name)
+        log(f"  short {entry['index']}: {start:.1f}s-{end:.1f}s -> {out.name} ({entry['title_suggestion']})")
+    manifest["files"] = outputs
+    atomic_write_text(shorts_manifest_path(root, chapter), json.dumps(manifest, indent=1, ensure_ascii=False))
+    log(f"  wrote video/chapter_{chapter}.shorts.json ({len(outputs)} Shorts)")
+    return manifest
 
 
 # ------------------------------------------------------------------ compilations

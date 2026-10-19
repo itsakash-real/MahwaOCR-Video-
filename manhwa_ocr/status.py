@@ -135,6 +135,30 @@ def after_transcription(sess: Session, chapters: List[str]) -> List[str]:
                   "     pictures only in pairs.json. Never edit the plan by hand.",
                   f"  4. Finish: {_cmd('video approve --chapter N', sess)}   then   {_cmd('video render --chapter N', sess)}",
                   "  The full routine and rules: dashboard \"Copy agent prompt: build videos\", or USER_GUIDE.md (Step 5)."]
+        # P5: one-glance editor signals (P0-P3) for chapters waiting on video,
+        # so `next` shows what the build will complain about before it runs.
+        try:
+            from .video.build import chapter_status as _chapter_status
+            for c in need_video:
+                ed = (_chapter_status(sess.path, c) or {}).get("editor") or {}
+                bits = []
+                for w in ed.get("timing_warnings") or []:
+                    bits.append(f"timing {w.get('code')}: fix {w.get('fix')}")
+                if ed.get("mask_risk"):
+                    bits.append(f"mask_risk: {ed['mask_risk']} panel(s) (drop + re-pair, never show the oval)")
+                if ed.get("layout_switches"):
+                    bits.append(f"layout_switches: {ed['layout_switches']}")
+                hook = ed.get("hook") or {}
+                if hook and not hook.get("explicit_hook"):
+                    bits.append("hook: MISSING (add a [HOOK] marker to the recap)")
+                if hook and hook.get("open_loops") is not None:
+                    bits.append(f"open loops: {hook['open_loops']}")
+                if ed.get("sfx") and ed["sfx"].get("files_missing"):
+                    bits.append("SFX missing files: " + ", ".join(ed["sfx"]["files_missing"]))
+                if bits:
+                    lines.append(f"  editor (ch{c}): " + "; ".join(bits))
+        except Exception:  # noqa: BLE001 - editor signals never break `next`
+            pass
     if need_audio:
         from .video.cues import tts_path
 
@@ -155,7 +179,7 @@ def after_transcription(sess: Session, chapters: List[str]) -> List[str]:
         lines += ["", "STEP 4 done: every chapter has a recap and an up-to-date video.",
                   f"  One long video:   {_cmd(f'video compile --chapters {everything}', sess)}",
                   f"  One long script:  {_cmd(f'compile --chapters {everything}', sess)}",
-                  f"  A Short:          {_cmd('video clip --chapter N --from 30 --to 90 --format 9:16', sess)}"]
+                  f"  Shorts:           {_cmd('video shorts --chapter N', sess)}"]
     return lines
 
 
