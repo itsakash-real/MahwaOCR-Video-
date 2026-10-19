@@ -27,7 +27,9 @@ PACING_TARGET_MIN = 3.0   # panel hold target: 3-4s
 PACING_TARGET_MAX = 4.0
 PACING_TEXT_MAX = 7.0     # readable text panels may hold up to 7s
 PACING_MAX_HOLD = 8.0     # never hold one frame longer than this without a crop change
-PACING_SPLIT_TO = 4.0     # long shots split into pieces of at most this long
+# Split pieces are sized by ceil(dur / PACING_MAX_HOLD), so every piece lands
+# in (4, 8]s: under the 8s cap, and above the 3s min_hold floor (a split
+# into <=4s pieces would break min_hold for e.g. an 8.6s shot -> 2.9s pieces).
 
 # Continuous-motion weights for the planner (plan.py MOTION_WEIGHTS mirrors this).
 # `hold` is deliberately absent: the planner never emits it. A reviewer may still
@@ -77,7 +79,7 @@ def _inset_crop(box: List[float], frac: float) -> List[float]:
 
 
 def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Split one >8s shot into <=4s pieces with a punch-in crop change per piece.
+    """Split one >8s shot into <=8s pieces with a punch-in crop change per piece.
 
     Pure geometry: no image access. Every piece keeps the same panels, sentence
     and effects that fall inside it; each later piece's cards are inset by 8%
@@ -93,7 +95,7 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
     cards = shot.get("cards") or []
     if dur <= PACING_MAX_HOLD or not cards:
         return [shot]
-    n = max(2, int(-(-dur // PACING_SPLIT_TO)))  # ceil
+    n = max(2, int(-(-dur // PACING_MAX_HOLD)))  # ceil -> every piece in (4, 8]s
     piece = dur / n
     out: List[Dict[str, Any]] = []
     for k in range(n):

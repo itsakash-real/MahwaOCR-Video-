@@ -99,13 +99,13 @@ def test_split_long_shot_punches_in():
             "cards": [{"panel": "P001-01", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0, "motion": "push_in"}],
             "exit": "cut", "effects": [], "sentence": "A very long sentence."}
     parts = split_long_shot(shot)
-    assert len(parts) == 3
-    assert all(p["end"] - p["start"] <= 4.0 + 0.001 for p in parts)
+    assert len(parts) == 2  # ceil(10 / 8): every piece in (4, 8]s, above the 3s min_hold floor
+    assert all(3.0 <= p["end"] - p["start"] <= 8.0 + 0.001 for p in parts)
     assert parts[0]["start"] == 0.0 and parts[-1]["end"] == 10.0
     # Later pieces punch in: the crop shrinks toward the centre.
     assert parts[1]["cards"][0]["crop"] != [0, 0, 1, 1]
     assert parts[1]["cards"][0]["crop"][0] > 0 and parts[1]["cards"][0]["crop"][2] < 1
-    assert parts[0]["id"] == "S001-a" and parts[2]["id"] == "S001-c"
+    assert parts[0]["id"] == "S001-a" and parts[1]["id"] == "S001-b"
 
 
 def test_split_long_shot_leaves_short_shots_alone():
@@ -125,7 +125,7 @@ def test_build_plan_splits_long_units():
               "sentence": "A very long sentence that holds one frame far too long.",
               "cues": [], "sentence_starts": [0.0]}]
     plan = _plan(12.0, alignment_units=units)
-    assert len(plan["shots"]) >= 3
+    assert len(plan["shots"]) >= 2
     assert all(s["end"] - s["start"] <= 8.0 + 0.001 for s in plan["shots"])
     assert plan["pacing"]["split_shots"] >= 1
     assert validate(plan, {p["id"] for p in PANELS}) == []
