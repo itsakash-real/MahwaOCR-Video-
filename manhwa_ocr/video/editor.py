@@ -143,7 +143,7 @@ _CALLOUT_MAX_LINES = 2
 
 # Rank / skill / number patterns, most specific first. A callout is the single
 # most checkable promise in the sentence: a rank, a damage number, a level.
-_RANK_RE = re.compile(r"\b([A-Z]{1,3}(?:\+)?-?rank|SS|SSS|S-rank|A-rank|B-rank|C-rank|D-rank|E-rank|F-rank)\b")
+_RANK_RE = re.compile(r"\b([A-Z]{1,3}(?:\+)?-?rank|SS|SSS|S-rank|A-rank|B-rank|C-rank|D-rank|E-rank|F-rank)\b", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"\b\d[\d,]*(?:\.\d+)?\s*(?:million|billion|thousand|damage|HP|gold|won|dollars?|percent|%)?\b",
                         re.IGNORECASE)
 _LEVEL_RE = re.compile(r"\b(?:Level|Lv\.?|Floor|Chapter)\s*\d+\b", re.IGNORECASE)

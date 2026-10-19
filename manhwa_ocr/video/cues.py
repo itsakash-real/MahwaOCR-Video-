@@ -120,18 +120,22 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
     own sentence. They are never spoken (CUE_LINE / INLINE_CUE strip them
     from tts text), and old recaps without markers parse exactly as before.
     """
-    # Whole-line markers are editing cues for the NEXT sentence. Capture them
-    # before CUE_LINE drops the line; [Panel: ...] lines still just drop.
-    pending_hook = False
-    pending_loops: List[str] = []
+    # Whole-line markers are editing cues for the NEXT sentence. They are
+    # interleaved onto the next non-empty line as zero-width tokens (stripped
+    # again in the chunk loop), so a marker can never leak onto an earlier
+    # sentence. [Panel: ...] lines still just drop.
+    _tokens: List[str] = []
     kept_lines: List[str] = []
     for ln in (narration or "").splitlines():
         if HOOK_MARKER.match(ln):
-            pending_hook = True
+            _tokens.append("\x00HOOK\x00")
         elif CUE_LINE.match(ln):
             m = LOOP_MARKER.search(ln)
             if m:
-                pending_loops.append(m.group(1).strip())
+                _tokens.append("\x00LOOP:" + m.group(1).strip() + "\x00")
+        elif ln.strip():
+            kept_lines.append("".join(_tokens) + ln)
+            _tokens = []
         else:
             kept_lines.append(ln)
     body = "\n".join(kept_lines)
@@ -142,6 +146,17 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
     tagged = 0
     for chunk in SENTENCE_END.split(body):
         chunk = chunk.strip()
+        if not chunk:
+            continue
+        # P3: markers in this chunk (inline, or tokens interleaved from a
+        # preceding whole-line marker) attach to its sentence. Extract and
+        # strip the interleaved tokens BEFORE any text is derived, so they
+        # can never pollute the spoken sentence.
+        chunk_hook = bool(HOOK_INLINE.search(chunk) or "\x00HOOK\x00" in chunk)
+        chunk_loops = [m.strip() for m in LOOP_MARKER.findall(chunk)]
+        chunk_loops += [m.strip() for m in re.findall(r"\x00LOOP:([^\x00]+)\x00", chunk)]
+        chunk = chunk.replace("\x00HOOK\x00", "")
+        chunk = re.sub(r"\x00LOOP:[^\x00]+\x00", "", chunk).strip()
         if not chunk:
             continue
         panels, cues = [], []
@@ -166,9 +181,6 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
             emphasis = [spell_numbers(e) for e in emphasis]
             text = spell_numbers(text)
         chunk = _restore_abbrev(chunk)
-        # P3: inline markers in this chunk attach to its sentence.
-        chunk_hook = bool(HOOK_INLINE.search(chunk))
-        chunk_loops = [m.strip() for m in LOOP_MARKER.findall(chunk)]
         if not text:
             # A tag-only fragment: carry its tags onto the next sentence.
             if sentences is not None and (panels or cues or chunk_hook or chunk_loops):
@@ -188,14 +200,10 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
         sentence: Dict[str, Any] = {"text": text, "panels": [p for p in panels if p != "same"],
                           "same": "same" in panels and not any(p != "same" for p in panels),
                           "cues": sorted(set(cues)), "emphasis": [e for e in emphasis if e]}
-        # Whole-line markers captured above apply to this (the next) sentence.
-        if pending_hook or chunk_hook:
+        if chunk_hook:
             sentence["hook"] = True
-        loops = list(pending_loops) + chunk_loops
-        if loops:
-            sentence["loops"] = loops
-        pending_hook = False
-        pending_loops = []
+        if chunk_loops:
+            sentence["loops"] = chunk_loops
         sentences.append(sentence)
     sentences = [s for s in sentences if s["text"]]
     return {
