@@ -1,8 +1,10 @@
 """Drawing video frames in the recap-channel style.
 
 Style (see manhwa_recap_style_spec.md, measured from a real recap channel):
-  * Hard cuts between shots. Motion starts on the cut and *eases out*: a
-    Ken Burns move over ~2.6s, then the shot holds still until the next cut.
+  * Hard cuts between shots. P3: continuous Ken Burns motion across the
+    whole shot (push_in 100->115%, pull_out 118->100%, pans traverse the
+    crop) with ease_in_out, so the frame is never frozen. `hold` keeps the
+    old ease-out-then-hold, for hand-set payoff beats only.
   * Panels are shown as cards: a focal crop of the panel, thin white border,
     rounded corners and a strong black drop shadow.
   * Layouts: single (centred card), pair (first card centred, then slides
@@ -26,7 +28,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 LAYOUTS = ("single", "pair", "inset", "wide")
 BACKGROUNDS = ("blur", "black", "white")
@@ -39,7 +41,7 @@ EFFECTS = ("shake", "punch", "flash")
 ENTER_DUR = {"cut": 0.0, "fade_in": 0.6, "slide_left": 0.7, "slide_right": 0.7, "slide_up": 0.7,
              "slide_down": 0.7, "pull_down": 0.75, "zoom_in": 0.7, "fit_in_frame": 0.75, "blur_in": 0.8,
              "swing_right": 0.8}
-KB_MAX = 2.6          # Ken Burns eases out over at most this long, then holds
+KB_MAX = 2.6          # P3: only `hold` still settles after this long; other motions run the whole shot
 PAIR_MOVE = 0.7       # first card's slide to the left when the second arrives
 EXIT_FADE = 0.6
 SHAKE_LEN, PUNCH_LEN, FLASH_LEN = 0.5, 0.85, 0.6
@@ -292,7 +294,12 @@ class Card:
         self.enter = spec.get("enter") if spec.get("enter") in ENTRANCES else "cut"
         self.enter_dur = ENTER_DUR[self.enter]
         self.motion = spec.get("motion") if spec.get("motion") in MOTIONS else "push_in"
-        self.kb_dur = max(0.01, min(shot_end - self.appear, KB_MAX))
+        # P3: non-hold motions run the whole visible shot (continuous Ken
+        # Burns); `hold` keeps the old settle-then-hold (payoff beats only).
+        if self.motion == "hold":
+            self.kb_dur = max(0.01, min(shot_end - self.appear, KB_MAX))
+        else:
+            self.kb_dur = max(0.01, shot_end - self.appear)
         self.start_c, self.rest_c = slot_centres(layout, fmt, (self.cw, self.ch), index)
         self.pair_move_at = pair_move_at if (layout == "pair" and index == 0) else None
 
@@ -309,9 +316,11 @@ class Card:
 
     def _viewport(self, t: float, extra_zoom: float) -> Tuple[float, float, float, float]:
         sw, sh = self.src.size
-        p = ease_out((t - self.appear) / self.kb_dur)
         m = self.motion
-        zoom = {"push_in": 1.0 + 0.07 * p, "pull_out": 1.10 - 0.10 * p, "hold": 1.01 + 0.02 * p}.get(m, 1.08)
+        # P3: non-hold motions ease in-out across the whole shot (continuous
+        # motion); `hold` keeps ease-out-then-hold.
+        p = ease_out((t - self.appear) / self.kb_dur) if m == "hold" else ease_in_out((t - self.appear) / self.kb_dur)
+        zoom = {"push_in": 1.0 + 0.15 * p, "pull_out": 1.18 - 0.18 * p, "hold": 1.01 + 0.02 * p}.get(m, 1.08)
         zoom *= 1 + extra_zoom
         # The source is the whole crop (at extra resolution, so zoomed views stay
         # sharp); zoom 1 shows all of it, zoom 1.1 shows the middle 1/1.1.
@@ -413,6 +422,92 @@ def flash_alpha(t: float, times: List[float]) -> float:
     return best
 
 
+# ------------------------------------------------------------------ P3 overlays
+
+def _overlay_font(size: int):
+    """Bold sans-serif for callouts / chapter cards, with a plain fallback.
+
+    DejaVuSans-Bold ships with most Pillow installs; when it is absent the
+    default bitmap font still renders (smaller, but never crashes a render).
+    """
+    for name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # Pillow < 10.1
+        return ImageFont.load_default()
+
+
+def _draw_callout(img: Image.Image, callout: dict, fmt: "Format", t: float) -> None:
+    """One keyword callout: bottom banner, max 2 lines, never over faces.
+
+    Faces sit in the upper part of a card; the banner sits in the bottom
+    14% of the frame (lower-third), where cards show torso / background.
+    `keyword` style is yellow; other styles are white. No-op outside the
+    callout's [t, t+dur) window or when the text is empty.
+    """
+    try:
+        start = float(callout.get("t") or 0)
+        dur = float(callout.get("dur") or 1.2)
+    except (TypeError, ValueError):
+        return
+    if not start <= t < start + dur:
+        return
+    text = str(callout.get("text") or "").strip()
+    if not text:
+        return
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()][:2]
+    if not lines:
+        return
+    W, H = fmt.width, fmt.height
+    u = fmt.unit
+    font = _overlay_font(max(10, int(44 * u)))
+    draw = ImageDraw.Draw(img, "RGBA")
+    lh = max(10, int(58 * u))
+    band_h = lh * len(lines) + int(18 * u)
+    y0 = H - band_h - int(8 * u)
+    draw.rectangle((0, y0, W, H), fill=(0, 0, 0, 140))
+    fill = (255, 214, 90) if callout.get("style") == "keyword" else (255, 255, 255)
+    for i, ln in enumerate(lines):
+        w = draw.textlength(ln, font=font)
+        draw.text(((W - w) / 2, y0 + int(9 * u) + i * lh), ln, font=font, fill=fill,
+                  stroke_width=max(1, int(3 * u)), stroke_fill=(0, 0, 0))
+
+
+def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) -> bool:
+    """A chapter card: full-screen dark overlay + centred stakes title.
+
+    Returns True when a card was active at t (the overlay covers the panels
+    for its 1.5-2s window — a deliberate pattern interrupt, not a glitch).
+    """
+    try:
+        start = float(card.get("t") or 0)
+        dur = float(card.get("dur") or 1.75)
+    except (TypeError, ValueError):
+        return False
+    if not start <= t < start + dur:
+        return False
+    title = str(card.get("title") or "").strip()
+    if not title:
+        return False
+    W, H = fmt.width, fmt.height
+    u = fmt.unit
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 150))
+    img.paste(Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB"), (0, 0))
+    draw = ImageDraw.Draw(img)
+    font = _overlay_font(max(12, int(72 * u)))
+    w = draw.textlength(title, font=font)
+    draw.text(((W - w) / 2, H / 2 - int(36 * u)), title, font=font, fill=(255, 255, 255),
+              stroke_width=max(1, int(4 * u)), stroke_fill=(0, 0, 0))
+    rule = max(2, int(4 * u))
+    draw.rectangle(((W - w) / 2, H / 2 + int(40 * u), (W + w) / 2, H / 2 + int(40 * u) + rule),
+                   fill=(255, 214, 90))
+    return True
+
+
 # ------------------------------------------------------------------ shot
 
 
@@ -427,7 +522,11 @@ class ShotRenderer:
 
     def __init__(self, shot: Dict[str, Any], images: Dict[str, Image.Image], fmt: Format,
                  effects_on: Dict[str, bool] | None = None, video_end: float | None = None,
-                 end_fade: bool = False):
+                 end_fade: bool = False, chapter_cards: List[Dict[str, Any]] | None = None):
+        # P3: shot-level callouts ride on the shot dict; plan-level chapter
+        # cards are passed in (render.py) so a clip can shift them with the shot.
+        self.callouts = [c for c in (shot.get("callouts") or []) if isinstance(c, dict)]
+        self.chapter_cards = list(chapter_cards or [])
         self.fmt = fmt
         self.shot = shot
         self.start, self.end = float(shot["start"]), float(shot["end"])
@@ -505,6 +604,10 @@ class ShotRenderer:
             x = int(round(cx + ent["dx"] + dx_s - spr.width / 2))
             y = int(round(cy + ent["dy"] + dy_s - spr.height / 2))
             img.paste(spr.convert("RGB"), (x, y), alpha)
+        for _co in self.callouts:
+            _draw_callout(img, _co, self.fmt, t)
+        for _cc in self.chapter_cards:
+            _draw_chapter_card(img, _cc, self.fmt, t)
         out = np.asarray(img, dtype=np.uint8)
         if self.darken > 0:
             out = (out.astype(np.float32) * (1.0 - self.darken)).astype(np.uint8)

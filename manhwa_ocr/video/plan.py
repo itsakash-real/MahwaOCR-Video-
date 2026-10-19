@@ -16,7 +16,7 @@ Each shot:
      "sentence": "..."}
 
 Pacing follows manhwa_recap_style_spec.md: one sentence is about one shot
-(about 2.7s on average), hard cuts, eased motion that settles and holds.
+(about 2.7s on average), hard cuts, continuous Ken Burns motion across the whole shot (P3: no frozen holds \u2014 `hold` is reserved for hand-set payoff beats).
 """
 
 from __future__ import annotations
@@ -36,6 +36,9 @@ from . import sync as sync_mod
 from .crops import _panel_maps, head_of, is_mask_risk, tone
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
+from .editor import (PAN_DIRECTIONS, build_chapter_cards, extract_callout, pacing_qa, plan_sfx,
+                     resolve_music, split_long_shots)
+from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
 from .frames import BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, LAYOUTS, MOTIONS, Format, format_from, shapes_for
 from .media import video_dir
 
@@ -48,9 +51,11 @@ EFFECT_GRACE = 0.35
 MIN_HOLD = 3.0           # seconds: no picture is held on screen for less than this
 PAD_LIMIT = 1.5          # a card's pad_y (blurred padding above and below, in panel heights) is at most this
 
-# Reference recap (measured): hard cuts, almost still pictures, only slight drift.
+# P3 continuous motion (editor.py): the planner never emits `hold`. A reviewer
+# may still hand-set motion="hold" for a deliberate 1-2s post-payoff beat;
+# frames.py keeps the old ease-out-then-hold for exactly that case.
 ENTRANCE_WEIGHTS = [("cut", 90), ("fade_in", 10)]
-MOTION_WEIGHTS = [("hold", 55), ("push_in", 30), ("pan", 15)]
+MOTION_WEIGHTS = P3_MOTION_WEIGHTS
 
 
 def plan_path(root: Path, chapter: str) -> Path:
@@ -403,6 +408,7 @@ class _Designer:
         self._tone: Dict[str, str] = {}
         self.uses: Dict[str, int] = {}
         self.prev_enter: str | None = None
+        self.prev_motion: str | None = None
         self.prev_bg = "blur"
         self.last_punch = -1e9
 
@@ -578,12 +584,19 @@ class _Designer:
         return kind
 
     def motion(self, rng: random.Random, crop: List[float]) -> str:
-        m = _pick(rng, MOTION_WEIGHTS)
+        # P3: continuous motion, never `hold` (planner-emitted). Pan expands
+        # to all four directions, and the previous motion is avoided so two
+        # consecutive shots never drift the same way.
+        m = _pick(rng, MOTION_WEIGHTS, avoid=self.prev_motion)
         if m != "pan":
+            self.prev_motion = m
             return m
         if crop[3] - crop[1] > 0.999:
+            self.prev_motion = "push_in"
             return "push_in"     # the whole panel is on the card: nothing to pan over
-        return rng.choice(["pan_down", "pan_up"])
+        m = rng.choice(list(PAN_DIRECTIONS))
+        self.prev_motion = m
+        return m
 
     def entrance(self, rng: random.Random, cues: List[str], layout: str) -> str:
         if "reveal" in cues:
@@ -667,12 +680,19 @@ class _Designer:
                     effects.append({"type": "punch", "t": round(t, 3)})
                     self.last_punch = t
 
+        # P3: one keyword callout on impact / reveal shots (editor.py).
+        callouts: List[Dict[str, Any]] = []
+        _call = extract_callout(unit.get("sentence") or "", unit.get("cues") or [])
+        if _call is not None:
+            callouts.append({"t": round(start + 0.4, 3), "text": _call["text"],
+                             "style": _call["style"], "dur": 1.2})
         background = self.background(rng, (bg_panel or first), layout)
         background = (self.fixes["shot"].get(first) or {}).get("background", background)
         shot = {
             "id": f"S{i + 1:03d}", "start": round(start, 3), "end": round(end, 3),
             "layout": layout, "background": background,
             "cards": cards, "exit": "fade_out" if last else "cut", "effects": effects,
+            "callouts": callouts,
             "sentence": (unit.get("sentence") or "")[:300] or None,
         }
         if bg_panel:
@@ -774,6 +794,12 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes,
                          root=root, fingerprint=panels_data.get("fingerprint"))
     shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
+    # P3 editor layer: split frozen >8s shots with a punch-in crop change,
+    # then attach chapter cards + SFX. Callouts already ride on each shot.
+    _pacing_before = pacing_qa(shots)
+    shots, _nsplit = split_long_shots(shots)
+    chapter_cards = build_chapter_cards(shots, duration)
+    sfx = plan_sfx(shots, chapter_cards)
     return {
         "version": PLAN_VERSION,
         "chapter": chapter,
@@ -788,12 +814,19 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         # P2: the P0 timing warnings ride with the plan, so status/QA/render
         # all see the same whisper outcome — no silent estimated render.
         "timing_warnings": list((alignment_meta or {}).get("timing_warnings") or []),
-        "music": vcfg.get("music"),
+        # P3: explicit video.music wins, else music/bed.mp3 in the series
+        # folder is used when it exists; None renders music-free.
+        "music": resolve_music(vcfg, root),
         "music_volume": float(vcfg.get("music_volume", 0.22)),
         "effects_enabled": dict(vcfg.get("effects") or {}),
         "panels_fingerprint": panels_data.get("fingerprint"),
         "timing": timing,
         "crop_stats": designer.crop_stats,
+        # P3 editor layer (see editor.py).
+        "chapter_cards": chapter_cards,
+        "sfx": sfx,
+        "pacing": {"split_shots": _nsplit, "long_shots_flagged": _pacing_before["long_shots"],
+                   "max_shot": pacing_qa(shots)["max_shot"]},
         "reviewed": False,
         "shots": shots,
     }
@@ -871,6 +904,10 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     errs.append(f"{cw}: \"at\" ({at}s after the shot starts) must leave it on screen at least 0.2s")
             except (TypeError, ValueError):
                 errs.append(f"{cw}: \"at\" must be seconds after the shot starts")
+        from .editor import validate_callout as _validate_callout
+        for _co in s.get("callouts") or []:
+            for _err in _validate_callout(_co):
+                errs.append(f"{where}: callout: {_err}")
         for e in s.get("effects") or []:
             if not isinstance(e, dict) or e.get("type") not in EFFECTS:
                 errs.append(f"{where}: effect types are {', '.join(EFFECTS)}")
@@ -881,6 +918,25 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
             except (KeyError, TypeError, ValueError):
                 errs.append(f"{where}: every effect needs a time \"t\" in seconds")
         prev_end = end
+    for _cc in plan.get("chapter_cards") or []:
+        if not isinstance(_cc, dict) or not isinstance(_cc.get("title"), str) or not _cc["title"].strip():
+            errs.append("chapter_cards entries need a non-empty string \"title\"")
+        else:
+            try:
+                _t = float(_cc.get("t", -1))
+                if not 0 <= _t <= max(duration, 0):
+                    errs.append(f"chapter card '{_cc.get('title')}' at {_t}s is outside the video")
+            except (TypeError, ValueError):
+                errs.append(f"chapter card '{_cc.get('title')}' needs a numeric \"t\"")
+    for _sfx in plan.get("sfx") or []:
+        if not isinstance(_sfx, dict) or _sfx.get("type") not in ("whoosh", "impact", "ding", "sting"):
+            errs.append("sfx entries need type whoosh | impact | ding | sting")
+        else:
+            try:
+                if not 0 <= float(_sfx.get("t", -1)) <= max(duration, 0):
+                    errs.append(f"sfx '{_sfx.get('type')}' at {_sfx.get('t')}s is outside the video")
+            except (TypeError, ValueError):
+                errs.append(f"sfx '{_sfx.get('type')}' needs a numeric \"t\"")
     if duration > 0 and abs(prev_end - duration) > 0.05:
         errs.append(f"the last shot ends at {round(prev_end, 3)}s but the audio is {duration}s long")
     return errs
