@@ -275,7 +275,7 @@ Check a chapter's state with `video status --session "<name>"`.
 | You want to change | Edit this | Then |
 |---|---|---|
 | Which picture a sentence shows | the recap's tags (`recaps/chapter_N.cues.json`) or `pairs.json` | `video pair --apply`, `video align`, `video plan --force` |
-| Framing: drop a panel, head position, exact crop, a shot's background, how a card enters | `video/chapter_N.fixes.json` (`drop`, `face`, `crop`, `shot`) | `video plan --force` |
+| Framing: drop a panel, head position, exact crop, a shot's background, how a card enters, a chapter-card title, a callout's text | `video/chapter_N.fixes.json` (`drop`, `face`, `crop`, `shot`, `chapter_cards`, `callouts`) | `video plan --force` |
 | Anything else about presentation | nothing by hand | change a setting in `manhwa-ocr.yaml` |
 
 `video/chapter_N.plan.json` is **presentation only**. `video plan --force` rebuilds it from the
