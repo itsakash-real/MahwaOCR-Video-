@@ -418,6 +418,36 @@ def ensure_split_crop_change(shots):
     return shots, changes
 
 
+def ensure_motion_variety(shots):
+    """Final no-repeat pass: no two consecutive shots share a first-card motion.
+
+    The designer already avoids repeats, and split_long_shot alternates
+    piece motions -- but a split shot's LAST piece can still land on the
+    same motion as the NEXT shot's first card (the designer never saw
+    the flipped piece motion). This pass flips the later shot's
+    first-card motion (push_in <-> pull_out, pan -> push_in) so the
+    invariant holds across the final shot list. Hand-set `hold` is
+    never flipped (a payoff beat). Returns (shots, changes).
+    """
+    changes = []
+    for k in range(1, len(shots)):
+        prev_cards = shots[k - 1].get("cards") or []
+        cur_cards = shots[k].get("cards") or []
+        if not prev_cards or not cur_cards:
+            continue
+        prev_motion = prev_cards[0].get("motion")
+        cur_motion = cur_cards[0].get("motion")
+        if cur_motion is None or cur_motion != prev_motion or cur_motion == "hold":
+            continue
+        new_motion = "push_in" if cur_motion in PAN_DIRECTIONS else (
+            "pull_out" if cur_motion == "push_in" else "push_in")
+        cur = dict(cur_cards[0], motion=new_motion)
+        shots[k] = {**shots[k], "cards": [cur, *cur_cards[1:]]}
+        changes.append({"shot": shots[k].get("id"), "from": cur_motion, "to": new_motion,
+                        "reason": "first-card motion repeated the previous shot; flipped so no two shots drift the same way"})
+    return shots, changes
+
+
 # ------------------------------------------------------------------ shot design
 
 
@@ -717,7 +747,11 @@ class _Designer:
             else:
                 at = 0.0
                 enter = self.entrance(rng, unit["cues"], layout)
-                motion = "push_in" if "beat" in unit["cues"] else self.motion(rng, crop)
+                if "beat" in unit["cues"]:
+                    motion = "push_in"
+                    self.prev_motion = "push_in"  # a forced motion still counts as previous
+                else:
+                    motion = self.motion(rng, crop)
             enter = (self.fixes["shot"].get(pid) or {}).get("enter", enter)   # fixes.json "shot" override
             card = {"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion}
             pad = self.pad(pid, layout)
@@ -890,6 +924,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     # CapCut bugfix (defect 1d): a split must never leave two shots on the
     # same panel with the same crop -- the second shot is punched in.
     shots, _split_crop_changes = ensure_split_crop_change(shots)
+    # CapCut bugfix (defect 2): final no-repeat pass -- a split shot's last
+    # piece can still match the next shot's motion (see ensure_motion_variety).
+    shots, _motion_changes = ensure_motion_variety(shots)
     # CapCut beat sync: snap interior cuts to the nearest beat (<=0.15s),
     # from video.beats or music/beats.json. No beats = no-op.
     _beats = resolve_beats(vcfg, root)
@@ -950,6 +987,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "pacing": {"split_shots": _nsplit, "long_shots_flagged": _pacing_before["long_shots"],
                    "max_shot": pacing_qa(shots)["max_shot"]},
         "split_crop_changes": _split_crop_changes,
+        "motion_changes": _motion_changes,
         "override_warnings": _override_warnings,
         "reviewed": False,
         "shots": shots,

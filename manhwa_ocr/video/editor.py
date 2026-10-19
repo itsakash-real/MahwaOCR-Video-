@@ -98,15 +98,24 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
         return [shot]
     n = max(2, int(-(-dur // PACING_MAX_HOLD)))  # ceil -> every piece in (4, 8]s
     piece = dur / n
+    prev_motions = [c.get("motion") for c in cards]  # motion of the previous piece, per card
     out: List[Dict[str, Any]] = []
     for k in range(n):
         part = dict(shot)
         part["start"] = round(float(shot["start"]) + k * piece, 3)
         part["end"] = round(float(shot["start"]) + (k + 1) * piece, 3)
+        # CapCut bugfix: only the FIRST piece arrives with the shot's
+        # transition (later pieces are punch-in continuations, not new
+        # arrivals), and only the LAST piece carries the shot's exit
+        # (an exit copied to every piece would fade out mid-shot).
+        if k > 0:
+            part["transition"] = "cut"
+        if k < n - 1:
+            part["exit"] = "cut"
         if n > 1:
             part["id"] = f"{shot.get('id', 'S?')}-{chr(ord('a') + k)}"
         new_cards = []
-        for c in cards:
+        for ci, c in enumerate(cards):
             cc = dict(c)
             crop = c.get("crop")
             if crop and k > 0:
@@ -119,6 +128,13 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
             # A punch-in (crop inset above) already gives the piece its own move.
             if k > 0 and cc.get("motion") in PAN_DIRECTIONS:
                 cc["motion"] = "push_in"
+            # CapCut bugfix (defect 2): a later piece must not repeat the
+            # previous piece's motion either (split pieces all copied the
+            # same motion, reading as one frozen drift). Flip push_in <->
+            # pull_out; hand-set `hold` is left alone (payoff beat).
+            if k > 0 and cc.get("motion") == prev_motions[ci] and cc.get("motion") != "hold":
+                cc["motion"] = "pull_out" if cc.get("motion") == "push_in" else "push_in"
+            prev_motions[ci] = cc.get("motion")
             new_cards.append(cc)
         part["cards"] = new_cards
         # Effect / callout times are ABSOLUTE timeline times (like the pieces'
