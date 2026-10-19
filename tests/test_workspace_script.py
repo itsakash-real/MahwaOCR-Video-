@@ -230,6 +230,27 @@ def test_prompt_demands_original_writing():
     assert "original narration" in low and "sparingly" in low
 
 
+def test_speedrun_style_selects_speedrun_system_prompt(tmp_path):
+    from manhwa_ocr.script import SPEEDRUN_SYSTEM
+
+    cfg, _ = _transcripts(tmp_path)
+    assert (cfg.recap or {}).get("style") == "default"
+    assert RecapBuilder(cfg, log=lambda *_: None)._system_prompt() == SCRIPT_SYSTEM
+
+    cfg2 = load_config(series__workdir=str(tmp_path / "ws"), series__name="T",
+                       recap__style="speedrun")
+    assert RecapBuilder(cfg2, log=lambda *_: None)._system_prompt() == SPEEDRUN_SYSTEM
+
+    low = SPEEDRUN_SYSTEM.lower()
+    assert "past tense" in low and "only to" in low and "original narration" in low
+
+
+def test_speedrun_style_has_a_spec_doc():
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "RECAP_STYLE_SPEEDRUN.md")
+    text = doc.read_text(encoding="utf-8")
+    assert "Speedrun Gossip" in text and "style: speedrun" in text
+
+
 def test_word_count_excludes_cues_and_comments():
     assert _count_words("one [Panel: big shot] two <!-- meta --> three") == 3
 

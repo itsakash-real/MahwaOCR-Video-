@@ -151,6 +151,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # written. These are the bulk of disk use. Set false while iterating.
         "cleanup": True,
     },
+    "recap": {
+        # Narration voice for recap writing ("default" or "speedrun").
+        # "default": calm present-tense voice telling a friend why the chapter matters.
+        # "speedrun": Speedrun Gossip voice — breathless past-tense gossip, role
+        #   labels instead of names, chain-of-consequences sentences with So/But/
+        #   only-to pivots, an editorial aside every few sentences. Full spec:
+        #   docs/RECAP_STYLE_SPEEDRUN.md
+        "style": "default",
+    },
 }
 
 
@@ -162,6 +171,7 @@ class Config:
     download: Dict[str, Any] = field(default_factory=dict)
     pipeline: Dict[str, Any] = field(default_factory=dict)
     video: Dict[str, Any] = field(default_factory=dict)
+    recap: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def workdir(self) -> Path:

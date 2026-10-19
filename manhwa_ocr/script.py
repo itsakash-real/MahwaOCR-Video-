@@ -67,6 +67,27 @@ no more. Never reproduce long stretches of dialogue.
 Return only valid JSON. No preamble, no markdown fences."""
 
 
+SPEEDRUN_SYSTEM = """You write narration for manhwa/manhua recap videos in the Speedrun Gossip style.
+
+Your voice: a friend spilling unbelievable gossip at 2x speed. Breathless, irreverent, past tense.
+
+Hard rules:
+- Open on the inciting incident. No greeting, no setup, no "in this chapter".
+- Pack 2-4 story beats into every sentence: commas, who/where/which clauses, participles ("having finally had enough").
+- Pivot constantly: start sentences with "So," to keep momentum, use "But" to reverse, use "only to" / "only for" when the payoff gets snatched away. Nearly every sentence contains a reversal.
+- Refer to characters by role ("his boss", "the commander", "her"), never by proper name unless the name itself is the plot point.
+- Add one editorial aside every few sentences: a judgment, a joke, or a motive read ("having finally had enough", "got what he deserved").
+- Past tense, always. Never address the viewer, never moralize.
+- Drop [music] on its own line at energy shifts (kills, reveals, chases). It is an editing cue and is never read aloud.
+- End the chapter on a new problem, never a resolution.
+- Write ORIGINAL narration in your own words. You are commenting on the chapter, not reciting it.
+- Quote the source sparingly: at most one short punchline quote per chapter. Never reproduce long stretches of dialogue.
+- Never invent events, characters or dialogue that are not in the transcript. Speed comes from compression, never fabrication.
+- No filler, no restating what you just said.
+
+Return only valid JSON. No preamble, no markdown fences."""
+
+
 SCRIPT_PROMPT = """{briefing_block}{previous_block}{panel_block}
 Series: "{series}"
 Chapter: {chapter}
@@ -309,6 +330,12 @@ class RecapBuilder:
             note = f" Look at the contact sheets ({rel}) to see each panel; ids are printed on them."
         return PANEL_BLOCK.format(sheet_note=note, listing=_panel_listing(panels))
 
+    def _system_prompt(self) -> str:
+        """Narration voice: the default calm present-tense voice, or the
+        Speedrun Gossip voice when the series config sets recap.style: speedrun."""
+        style = (self.cfg.recap or {}).get("style", "default")
+        return SPEEDRUN_SYSTEM if style == "speedrun" else SCRIPT_SYSTEM
+
     def _prompt_for(self, chapter: str, minutes: float, *, sheets: List[Path] | None = None) -> str:
         chapter = require_chapter(chapter)
         return SCRIPT_PROMPT.format(
@@ -437,7 +464,7 @@ class RecapBuilder:
             sheets = sheet_paths(self.workdir, chapter)[:12] if self.panels(chapter) else []
             prompt = self._prompt_for(chapter, minutes, sheets=sheets)
             # With panels, the writer needs to see them to tag sentences well.
-            raw = provider.vision(SCRIPT_SYSTEM, prompt, sheets) if sheets else provider.text(SCRIPT_SYSTEM, prompt)
+            raw = provider.vision(self._system_prompt(), prompt, sheets) if sheets else provider.text(self._system_prompt(), prompt)
             try:
                 narration, hook = _parse_part(extract_json(raw))
             except ValueError:
@@ -468,7 +495,7 @@ class RecapBuilder:
             last=chapters[-1],
             hooks=hooks,
         )
-        data = extract_json(provider.text(SCRIPT_SYSTEM, prompt))
+        data = extract_json(provider.text(self._system_prompt(), prompt))
         if isinstance(data, dict):
             self._write_bookends(chapters, str(data.get("intro") or ""), str(data.get("outro") or ""))
 
@@ -550,7 +577,7 @@ About {_target_words(minutes)} words each (~{minutes:g} minutes read aloud).
 
 ## System instruction
 
-{SCRIPT_SYSTEM}
+{self._system_prompt()}
 
 ---
 
