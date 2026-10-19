@@ -216,6 +216,11 @@ docs commit. If a per-phase PR is wanted for the bugfix, open it as
 
 ## What is in `main` vs not in `main`
 
+- **AGENT_WAY update (after the `main` merge):** prompts A–H rewritten to
+  the current workflow (CapCut fixes, caption timing + caption bar,
+  panel diversity, P2 wide-switch guard, system-window wide fill,
+  bubble-painting removal, review + rebuild procedure as new Prompt H).
+  See `docs/AGENT_WAY.md`.
 - **In `main` (merge `f0e7d4c`):** everything below — the older
   alignment/tag-wins + README work (old HEAD `95403d8`), PR1–PR4,
   P0–P5, Intro/Previously, CapCut edits + bugfixes, and the Ch10
