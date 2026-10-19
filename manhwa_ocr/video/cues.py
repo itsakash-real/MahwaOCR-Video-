@@ -29,6 +29,10 @@ PANEL_ID = re.compile(r"^P\d{3}-\d{2}$")
 CUE_WORDS = {"beat", "impact", "reveal"}
 CUE_LINE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 INLINE_CUE = re.compile(r"\[[^\]\n]*\]")
+# P3 editor cues (never spoken; parse() attaches them to the next sentence):
+HOOK_MARKER = re.compile(r"^\s*\[HOOK\]\s*$", re.IGNORECASE)
+LOOP_MARKER = re.compile(r"\[LOOP:\s*([^\]\n]+)\]", re.IGNORECASE)
+HOOK_INLINE = re.compile(r"\[HOOK\]", re.IGNORECASE)
 SENTENCE_END = re.compile(r"(?<=[.!?…])[\"”’)\]]*\s+")
 
 
@@ -109,8 +113,28 @@ def _restore_abbrev(text: str) -> str:
 
 def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = False) -> Dict[str, Any]:
     """Split tagged narration into spoken sentences with their panels and cues.
-    With spell, each sentence's text is the spelled-out-numbers text that tts.txt holds."""
-    body = "\n".join(ln for ln in (narration or "").splitlines() if not CUE_LINE.match(ln))
+    With spell, each sentence's text is the spelled-out-numbers text that tts.txt holds.
+
+    P3: whole-line [HOOK] / [LOOP: ...] editing cues are attached to the next
+    sentence (as "hook": True / "loops": [...]); inline markers attach to their
+    own sentence. They are never spoken (CUE_LINE / INLINE_CUE strip them
+    from tts text), and old recaps without markers parse exactly as before.
+    """
+    # Whole-line markers are editing cues for the NEXT sentence. Capture them
+    # before CUE_LINE drops the line; [Panel: ...] lines still just drop.
+    pending_hook = False
+    pending_loops: List[str] = []
+    kept_lines: List[str] = []
+    for ln in (narration or "").splitlines():
+        if HOOK_MARKER.match(ln):
+            pending_hook = True
+        elif CUE_LINE.match(ln):
+            m = LOOP_MARKER.search(ln)
+            if m:
+                pending_loops.append(m.group(1).strip())
+        else:
+            kept_lines.append(ln)
+    body = "\n".join(kept_lines)
     body = re.sub(r"\s+", " ", body).strip()
     body = _protect_abbrev(body)
     sentences: List[Dict[str, Any]] = []
@@ -142,10 +166,14 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
             emphasis = [spell_numbers(e) for e in emphasis]
             text = spell_numbers(text)
         chunk = _restore_abbrev(chunk)
+        # P3: inline markers in this chunk attach to its sentence.
+        chunk_hook = bool(HOOK_INLINE.search(chunk))
+        chunk_loops = [m.strip() for m in LOOP_MARKER.findall(chunk)]
         if not text:
             # A tag-only fragment: carry its tags onto the next sentence.
-            if sentences is not None and (panels or cues):
-                sentences.append({"text": "", "panels": panels, "cues": cues, "emphasis": []})
+            if sentences is not None and (panels or cues or chunk_hook or chunk_loops):
+                sentences.append({"text": "", "panels": panels, "cues": cues, "emphasis": [],
+                                  "hook": chunk_hook, "loops": chunk_loops})
             continue
         # Merge *all* consecutive tag-only fragments, so stacked tags like
         # {P001} {P002} sentence keep every panel instead of dropping the first.
@@ -153,11 +181,22 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
             carry = sentences.pop()
             panels = carry["panels"] + panels
             cues = carry["cues"] + cues
+            chunk_hook = chunk_hook or bool(carry.get("hook"))
+            chunk_loops = list(carry.get("loops") or []) + chunk_loops
         if any(p != "same" for p in panels):
             tagged += 1
-        sentences.append({"text": text, "panels": [p for p in panels if p != "same"],
+        sentence: Dict[str, Any] = {"text": text, "panels": [p for p in panels if p != "same"],
                           "same": "same" in panels and not any(p != "same" for p in panels),
-                          "cues": sorted(set(cues)), "emphasis": [e for e in emphasis if e]})
+                          "cues": sorted(set(cues)), "emphasis": [e for e in emphasis if e]}
+        # Whole-line markers captured above apply to this (the next) sentence.
+        if pending_hook or chunk_hook:
+            sentence["hook"] = True
+        loops = list(pending_loops) + chunk_loops
+        if loops:
+            sentence["loops"] = loops
+        pending_hook = False
+        pending_loops = []
+        sentences.append(sentence)
     sentences = [s for s in sentences if s["text"]]
     return {
         "sentences": sentences,
@@ -321,6 +360,13 @@ def validate_cues(data: Any) -> List[str]:
         if emphasis is not None and (not isinstance(emphasis, list)
                                      or not all(isinstance(e, str) for e in emphasis)):
             problems.append(f"{where}: \"emphasis\" must be a list of strings")
+        # P3: hook / loop markers (optional; old cues.json files omit them).
+        if "hook" in s and not isinstance(s.get("hook"), bool):
+            problems.append(f"{where}: \"hook\" must be true or false")
+        loops = s.get("loops")
+        if loops is not None and (not isinstance(loops, list)
+                                  or not all(isinstance(x, str) and x.strip() for x in loops)):
+            problems.append(f"{where}: \"loops\" must be a list of non-empty strings")
     return problems
 
 

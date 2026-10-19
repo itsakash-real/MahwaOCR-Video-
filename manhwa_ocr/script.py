@@ -89,6 +89,9 @@ emotional logic: why a character does a thing, why a moment lands.
 - Call out the one or two beats that genuinely matter -- a reveal, a reversal, a \
 line that recontextualizes something. Say why it matters.
 - End on the cliffhanger or the open question that pulls into the next chapter.
+- Mark the hook with a [HOOK] line on its own line before it, and open a loop
+  every 2-3 minutes with a [LOOP: question] line on its own line before the
+  sentence. These bracketed lines are editing cues, never spoken.
 
 Include editing cues in square brackets on their own lines, for example \
 `[Panel: the rooftop reveal]` or `[Beat -- hold here]`. These are directions for \

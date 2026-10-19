@@ -240,9 +240,18 @@ Ask me before running anything with --force that discards edits.
 5. Length check: at least about 7.5 spoken words per drawn panel in the chapter
    (3-second minimum hold at about 150 words per minute).
    Take the panel count from the tool's own output, never from a script of your own.
-6. Run `python -m manhwa_ocr recap --session "the-hero-cannot-rest" --finalize`.
+-6. Hook and open loops (P3 editor layer).
+   - Open with a hook: the first 30 seconds must give proof (the exact
+     rank/number/beat the title promises), stakes, and a one-line roadmap.
+     Mark the hook sentence with [HOOK] on its own line before it.
+   - Open a loop every 2-3 minutes: a question the viewer must keep watching
+     to answer. Mark it [LOOP: the question] on its own line before the sentence.
+   - End on an open question or cliffhanger, not a summary.
+   - [HOOK] / [LOOP: ...] are editing cues, never spoken: they never appear
+     in tts.txt, and the bracketed text is not read aloud.
+7. Run `python -m manhwa_ocr recap --session "the-hero-cannot-rest" --finalize`.
    Fix every error. Read every warning. Report the tagged ratio and the word count per chapter.
-7. Then STOP. Tell me to record each recaps\chapter_N.tts.txt and save it as audio\chapter_N.mp3.
+8. Then STOP. Tell me to record each recaps\chapter_N.tts.txt and save it as audio\chapter_N.mp3.
    Remind me: record from the finalized tts.txt. If the recap is edited afterwards, I must record again.
 ```
 
