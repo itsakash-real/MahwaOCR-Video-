@@ -398,7 +398,13 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"  ! {len(report['visible_patches'])} panel(s) with a visible painted patch: "
             + ", ".join(d['panel'] for d in report['visible_patches'][:12]))
     align_cov = None
-    if not cues_mod.load_cues_strict(root, chapter):
+    # P3: hook / open-loop status comes from the same cues.json the plan uses.
+    cues_data = cues_mod.load_cues_strict(root, chapter)
+    hook_info = None
+    if cues_data is not None:
+        from .editor import hook_status as _hook_status
+        hook_info = _hook_status(list((cues_data or {}).get("sentences") or []))
+    if not cues_data:
         units, mode_note, meta = None, "even timing (recap has no panel tags)", None
     else:
         align_path = align_engine.alignment_path(root, chapter)
@@ -427,7 +433,8 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         # P2: timing warnings ride with the plan (see build_plan), so status/QA/render
         # all report the same whisper outcome.
         meta = {"sync_mode": alignment.get("sync_mode"), "review_queue": queue,
-                "timing_warnings": list(alignment.get("timing_warnings") or [])}
+                "timing_warnings": list(alignment.get("timing_warnings") or []),
+                "hook": hook_info}
         mode_note = (f"{len(alignment['segments'])} sentences from the alignment engine "
                     f"({alignment.get('sync_mode', '?')} timing, {len(queue)} flagged for review)")
 
@@ -455,6 +462,16 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         f"{qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} placed by story order{short_note}")
     if qa["head_risk"]:
         log(f"    ! {len(qa['head_risk'])} panel(s) where a head may be cut: {', '.join(qa['head_risk'][:8])}")
+    if plan.get("chapter_cards"):
+        from .editor import chapter_cards_to_timestamps as _ts
+        log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))
+    _ncall = sum(len(sh.get("callouts") or []) for sh in plan.get("shots") or [])
+    if _ncall:
+        log(f"    {_ncall} keyword callout(s) (impact/reveal peaks only)")
+    if plan.get("sfx"):
+        log(f"    {len(plan['sfx'])} SFX event(s) (missing files render silent, never fail)")
+    if (plan.get("hook") or {}).get("warning"):
+        log(f"    ! hook: {plan['hook']['warning']}")
     if qa["review_queue"]:
         log(f"    ! {len(qa['review_queue'])} sentence(s) flagged for review (non-blocking; "
             f"see video/chapter_{chapter}.qa.json)")
@@ -643,7 +660,13 @@ def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | N
             # A card that already arrived before the clip starts is simply there:
             # replaying its entrance would look like a glitch.
             cards.append({**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"})
-        extra: Dict[str, Any] = {}
+        # P3: callouts ride on shots with absolute times — shift them into
+        # the clip timeline and drop ones outside the clip.
+        clip_callouts = [{"t": round(float(c["t"]) - start, 3), "text": c.get("text"),
+                          "style": c.get("style"), "dur": c.get("dur", 1.2)}
+                         for c in (s.get("callouts") or [])
+                         if isinstance(c, dict) and a <= float(c.get("t") or -1) <= b]
+        extra: Dict[str, Any] = {"callouts": clip_callouts}
         if len(cards) >= 2:
             # Where the pair's slide really happens, relative to the clipped shot
             # (negative = already happened, so the first card starts in place).
@@ -661,7 +684,15 @@ def make_clip(sess, chapter: str, cfg, start: float, end: float, *, fmt: str | N
     shots[-1]["end"] = round(end - start, 3)
     for prev, cur in zip(shots, shots[1:]):
         cur["start"] = prev["end"]
-    clip = {**plan, "format": fmt, "shots": shots, "duration": round(end - start, 3), "audio_offset": start}
+    # P3: chapter cards + SFX shift with the clip; events outside it drop out.
+    clip_cards = [{**c, "t": round(float(c["t"]) - start, 3)}
+                  for c in (plan.get("chapter_cards") or [])
+                  if isinstance(c, dict) and start <= float(c.get("t") or -1) < end]
+    clip_sfx = [{**e, "t": round(float(e["t"]) - start, 3)}
+                for e in (plan.get("sfx") or [])
+                if isinstance(e, dict) and start <= float(e.get("t") or -1) < end]
+    clip = {**plan, "format": fmt, "shots": shots, "duration": round(end - start, 3), "audio_offset": start,
+            "chapter_cards": clip_cards, "sfx": clip_sfx}
     tag = f"clip_{start:g}-{end:g}".replace(".", "_") + ("_9x16" if fmt in {"9:16", "shorts"} else "")
     return render(root, chapter, clip, cfg.video, preview=preview, workers=workers, log=log, name=tag)
 

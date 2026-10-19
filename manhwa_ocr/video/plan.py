@@ -814,6 +814,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         # P2: the P0 timing warnings ride with the plan, so status/QA/render
         # all see the same whisper outcome — no silent estimated render.
         "timing_warnings": list((alignment_meta or {}).get("timing_warnings") or []),
+        # P3: hook / open-loop status from cues.json (build.py computes it).
+        "hook": (alignment_meta or {}).get("hook"),
         # P3: explicit video.music wins, else music/bed.mp3 in the series
         # folder is used when it exists; None renders music-free.
         "music": resolve_music(vcfg, root),

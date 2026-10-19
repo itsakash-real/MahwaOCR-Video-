@@ -53,8 +53,12 @@ video:
   pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
   workers: 0              # parallel renders; 0 = all your CPU cores
   effects: {shake: true, punch: false, flash: false, end_fade: true}   # calm by default
-  music: null             # e.g. "music/bed.mp3" (relative to the series folder); ducks under narration
-  music_volume: 0.22
+  music: null             # P3: null = use music/bed.mp3 in the series folder when it exists
+                          # (drop a royalty-free loop there), else render music-free. Ducks under narration.
+  music_volume: 0.22      # 15-25% under narration; sidechain lets it rise toward 60-80% when no narration
+  music_fade: 0.5         # music fade in/out, seconds (>= 0.3s)
+  sfx_dir: null           # P3: folder (relative to series folder) with whoosh.mp3, impact.mp3,
+                          # ding.mp3, sting.mp3. null = no SFX; missing files render silent, never fail.
   # Panel detection edges. Rows at a panel's top/bottom that are all white (gray above
   # white_threshold) or all near-black (below black_threshold) are gutter and are trimmed off.
   # Existing panels.json files are not re-detected on their own: run `video panels --force`.

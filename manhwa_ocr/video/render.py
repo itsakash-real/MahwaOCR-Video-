@@ -26,6 +26,7 @@ from ..workspace import work_root
 from .ffmpeg import close_encoder, open_encoder, run
 import numpy as np
 
+from .editor import SFX_VOLUME, resolve_sfx_files
 from .frames import Format, ShotRenderer, format_from
 from .media import pages_dir, video_dir
 from .panels import load_panels, panel_image
@@ -76,7 +77,8 @@ def render_segment(job: Dict[str, Any]) -> str:
     images = {pid: _panel(job["root"], job["chapter"], p, job["norm_w"], job["fingerprint"])
               for pid, p in job["panels"].items()}
     shot = ShotRenderer(job["shot"], images, fmt, job["effects_on"],
-                        video_end=job["video_end"], end_fade=job["end_fade"])
+                        video_end=job["video_end"], end_fade=job["end_fade"],
+                        chapter_cards=job.get("chapter_cards") or [])
 
     out = Path(job["out"])
     tmp = out.with_name(out.stem + ".part.mp4")
@@ -140,6 +142,7 @@ def _jobs(root: Path, chapter: str, plan: Dict[str, Any], panels_data: Dict[str,
             "fingerprint": panels_data.get("fingerprint", ""),
             "panels": {pid: panels[pid] for pid in dict.fromkeys(used) if pid in panels},
             "shot": shot, "fmt": (fmt.width, fmt.height, fmt.fps), "f0": f0, "f1": f1,
+            "chapter_cards": list(plan.get("chapter_cards") or []),
             "video_end": duration if last else None, "end_fade": end_fade and last,
             "effects_on": effects_on, "crf": crf, "preset": preset, "page_stamp": page_stamp,
         }
@@ -154,17 +157,38 @@ def _jobs(root: Path, chapter: str, plan: Dict[str, Any], panels_data: Dict[str,
     return jobs
 
 
-def _audio_graph(has_music: bool, duration: float, volume: float) -> str:
+def _audio_graph(has_music: bool, duration: float, volume: float,
+                   sfx_inputs: List[tuple] | None = None) -> str:
+    """Narration + ducked music + timed SFX.
+
+    sfx_inputs: [(input_index, delay_ms, type)] — one ffmpeg input per SFX
+    event (inputs are added by render()). Each SFX is delayed to its event
+    time, kept below the narration, and mixed in. Empty list == old graph.
+    Music fades in (>=0.3s) and the final mix fades out; the sidechain
+    compressor ducks the bed under speech and lets it rise (toward the
+    60-80% solo target) when the narration pauses.
+    """
     fade = f"afade=t=out:st={max(0.0, duration - AUDIO_FADE):.3f}:d={AUDIO_FADE}"
-    if not has_music:
-        return f"[1:a]aresample=48000,{fade}[aout]"
-    # Music ducks under the narration: the voice drives a sidechain compressor.
-    return (
-        f"[1:a]aresample=48000,asplit=2[narr][key];"
-        f"[2:a]aresample=48000,atrim=0:{duration:.3f},volume={volume:.3f}[mus];"
-        f"[mus][key]sidechaincompress=threshold=0.02:ratio=12:attack=15:release=450[duck];"
-        f"[narr][duck]amix=inputs=2:duration=first:normalize=0,{fade}[aout]"
-    )
+    parts: List[str] = []
+    # Narration is always input 1; music is input 2 when present; SFX inputs
+    # follow (their indices are assigned by render()).
+    if has_music:
+        parts.append(
+            f"[1:a]aresample=48000,asplit=2[narr][key];"
+            f"[2:a]aresample=48000,atrim=0:{duration:.3f},"
+            f"afade=t=in:st=0:d=0.5,volume={volume:.3f}[mus];"
+            f"[mus][key]sidechaincompress=threshold=0.02:ratio=12:attack=15:release=450[duck]")
+        mix_inputs = ["[narr]", "[duck]"]
+    else:
+        parts.append("[1:a]aresample=48000[narr]")
+        mix_inputs = ["[narr]"]
+    for i, (idx, delay_ms, _kind) in enumerate(sfx_inputs or []):
+        parts.append(f"[{idx}:a]aresample=48000,adelay={int(delay_ms)}|{int(delay_ms)},"
+                     f"volume={SFX_VOLUME:.3f}[sfx{i}]")
+        mix_inputs.append(f"[sfx{i}]")
+    n = len(mix_inputs)
+    parts.append(f"{''.join(mix_inputs)}amix=inputs={n}:duration=first:normalize=0,{fade}[aout]")
+    return ";".join(parts)
 
 
 def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any], *, preview: bool = False,
@@ -225,10 +249,27 @@ def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any],
             music_file = None
         if music_file is not None:
             args += ["-stream_loop", "-1", "-i", str(music_file)]
+        # P3 SFX: one ffmpeg input per event with a real file. Missing
+        # sfx_dir / files are a warning, never a failure (editor.py).
+        sfx_inputs: List[tuple] = []
+        _sfx_dir = (vcfg or {}).get("sfx_dir") if isinstance(vcfg, dict) else None
+        _found, _missing = resolve_sfx_files(root, _sfx_dir)
+        if _missing and (plan.get("sfx") or []):
+            log(f"  ! SFX missing for {', '.join(sorted(set(_missing)))} "
+                f"(no file in {_sfx_dir or 'sfx_dir'}); rendering without those SFX")
+        _next_idx = 3 if music_file is not None else 2
+        for _ev in plan.get("sfx") or []:
+            _f = _found.get(_ev.get("type"))
+            if _f is None:
+                continue
+            args += ["-i", str(_f)]
+            sfx_inputs.append((_next_idx, round(float(_ev.get("t") or 0) * 1000), _ev.get("type")))
+            _next_idx += 1
         # 48 kHz stereo everywhere, so chapter videos (and title cards) can be
         # joined by stream copy regardless of how each narration was recorded.
         args += ["-filter_complex", _audio_graph(music_file is not None, duration,
-                                                 float(plan.get("music_volume", 0.22))),
+                                                 float(plan.get("music_volume", 0.22)),
+                                                 sfx_inputs),
                  "-map", "0:v", "-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
     else:
         args += ["-map", "0:v"]

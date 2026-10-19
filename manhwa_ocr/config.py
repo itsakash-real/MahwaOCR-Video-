@@ -94,8 +94,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         # Recap style is calm: only a gentle shake on {impact} lines by default.
         "effects": {"shake": True, "punch": False, "flash": False, "end_fade": True},
-        "music": None,              # path to a music file, relative to the series folder
-        "music_volume": 0.22,
+        "music": None,              # path to a music file, relative to the series folder.
+                                 # None still means: use music/bed.mp3 in the series folder when
+                                 # it exists (P3 safe default), else render music-free.
+        "music_volume": 0.22,     # 15-25% under narration (sidechain ducks further under speech)
+        "music_fade": 0.5,        # music fade in/out, seconds (>= 0.3s)
+        "sfx_dir": None,          # folder (relative to the series folder) with whoosh.mp3,
+                                 # impact.mp3, ding.mp3, sting.mp3. None = no SFX, never fails.
         # Narration sync and hold limits. These are the numbers `video plan` and
         # `video sync-audit` actually use; sync.effective_settings() reads them
         # from here (video.min_hold and video.sync.*) or warns by name.
