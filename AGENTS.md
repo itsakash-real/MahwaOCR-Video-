@@ -233,6 +233,14 @@ someone else's script. Do not paste transcript dialogue in bulk.
 
 ## Making videos
 
+Building or continuing a `video.mode: wide`/`adaptive` chapter video (any
+multi-chapter continuation, e.g. chapter 1 then 2 then 3 in one session):
+read `docs/CHAPTER_BUILD_WORKFLOW.md` in full before starting, and read it
+again before starting each NEW chapter in the same session -- never rely on
+memory of it from earlier in the conversation, even if you built an earlier
+chapter a few messages ago. The `/build-chapter` skill does this
+automatically; if asked directly instead, go read that file now.
+
 Once the user has recorded `audio/chapter_N.mp3` (or `.wav`, `.m4a`), make the video
 with these commands. Use the routine in this order, one chapter at a time:
 

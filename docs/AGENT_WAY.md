@@ -20,10 +20,11 @@ sources, never from memory:
 - `USER_GUIDE.md` — section "Which prompt do I use?" lists them verbatim.
 
 Letters: A = transcribe, B = recaps, C = build, D = review, E = intro,
-F = fix. Prompt G (Shorts + end-screen + publish checklist) and Prompt H
-(Full review + rebuild with new fixes) are docs-level prompts defined
-below in full — they are NOT in `agent_prompts.py`, because they are
-checklists / rebuild procedures, not base prompts.
+F = fix. Prompt G (Shorts + end-screen + publish checklist), Prompt H
+(Full review + rebuild with new fixes) and Prompt I (build/continue a wide
+or adaptive-mode chapter video) are docs-level prompts defined below in
+full — they are NOT in `agent_prompts.py`, because they are checklists /
+rebuild / workflow-trigger procedures, not base prompts.
 
 ## Before you start (applies to every prompt)
 
@@ -266,6 +267,24 @@ REPORT:
 15. Report ONLY facts you verified (ffprobe + sync-audit JSON + frames you viewed). Be honest: if something still breaks, say so. Do not claim perfection.
 16. Deliver: test output path, duration, bytes, shots, sentences, sync-gate PASS/FAIL + wrong-picture %, drops list, captions status, SFX/music status, spot-check table (timestamp + result), old-vs-new comparison table, fixed / still-broken / new-issues lists.
 ```
+
+## Prompt I — Build/continue a wide or adaptive-mode chapter video (NEW)
+
+Prompt I is a docs-level prompt, like G and H: not in `agent_prompts.py`. Use
+it for a `video/wide-mode-v2`-style build (or any multi-chapter continuation
+session) instead of Prompt C, which assumes classic mode. The workflow
+itself is canonical in `docs/CHAPTER_BUILD_WORKFLOW.md`; this entry is just
+the trigger.
+
+```
+Build (or continue) the chapter video for chapter <N> of <SERIES>. My narration audio is at audio/chapter_<N>.<ext> in the session folder.
+Read docs/CHAPTER_BUILD_WORKFLOW.md in full and follow it exactly, phase by phase. Re-read it again before starting any further chapter in this same session, even if you already built one a moment ago.
+```
+
+Or just invoke the `/build-chapter` skill with the series name, chapter
+number(s), and audio file (if it isn't the default `audio/chapter_N.*`) —
+it parses those and reads the workflow file for you, every time, so this
+never depends on what's still "remembered" from earlier in a long session.
 
 ## After the agent finishes
 

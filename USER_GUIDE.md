@@ -20,6 +20,7 @@ common rules, and they all come from one file, `manhwa_ocr/agent_prompts.py`, so
 | Check a storyboard shot by shot | D: review | Step 5b, Way A (also in `.work/video/chN/REVIEW.md`) |
 | Make the intro (chapter 0) | E: intro | The intro section |
 | Fix one chapter after an error or a wrong shot | F: fix chapter | Step 6 |
+| Build/continue a wide or adaptive-mode chapter video | I: build workflow (`/build-chapter`, or `docs/CHAPTER_BUILD_WORKFLOW.md`) | Step 5, `docs/AGENT_WAY.md` |
 
 ---
 
