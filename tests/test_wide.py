@@ -46,15 +46,30 @@ def test_wide_crop_wide_panel_goes_fullbleed():
     assert h == 900
 
 
-def test_wide_crop_stays_on_focal_centre():
-    # A focal box low in the panel keeps the window near the bottom,
-    # centred on the focal point (0.85 -> window 1685.1-2405.1).
+def test_wide_crop_anchors_to_focal_top():
+    # The window starts at the classic crop's top (never centred): what the
+    # classic crop kept at the top -- heads, bubbles -- stays in frame.
     box = wide_crop(900, 2406, [0, 0.7, 1, 1.0], min_win_h=720)
     y0 = box[1] * 2406
     y1 = box[3] * 2406
-    assert abs(y0 - 1685.1) < 1e-6
+    assert abs(y0 - 0.7 * 2406) < 1e-6
     assert abs(y1 - y0 - 720) < 1e-6
-    assert y0 > 2406 / 2
+
+
+def test_wide_crop_shows_whole_panel_when_wide_enough():
+    # A 1.0-aspect panel (>= 0.889) shown whole at full height is 1080px
+    # wide: the full figure stays visible, nothing cropped.
+    box = wide_crop(900, 900, [0, 0.1, 1, 0.6], min_win_h=720)
+    assert box == [0.0, 0.0, 1.0, 1.0]
+
+
+def test_wide_crop_too_narrow_panel_still_windows():
+    # Aspect 0.71 < 0.889: still a focal window, anchored to the focal top.
+    box = wide_crop(900, 1273, [0, 0, 1, 0.9], min_win_h=720)
+    w = (box[2] - box[0]) * 900
+    h = (box[3] - box[1]) * 1273
+    assert w / h == 1.25 and h == 720
+    assert box[1] == 0.0
 
 
 def test_wide_crop_pair_aspect():
@@ -134,3 +149,23 @@ def test_card_classic_sizing_unchanged():
                 "single", 0, 0.0, 4.0, FMT, None)
     assert card.wide_display is False
     assert card.ch < 1080  # classic cards stay in the top 92%
+
+
+def test_wide_background_is_brighter_than_classic():
+    from manhwa_ocr.video.frames import background
+    panel = _panel(900, 1200, (120, 40, 40))
+    classic = background("blur", panel, FMT).mean()
+    light = background("blur", panel, FMT, light=True).mean()
+    assert light > classic * 1.3
+
+
+def test_write_ass_margin_override():
+    import tempfile
+    from manhwa_ocr.video.captions import write_ass
+    with tempfile.TemporaryDirectory() as d:
+        ass = write_ass([{"start": 0.0, "end": 1.0, "text": "hello"}], d + "/c.ass", fmt=FMT)
+        text = ass.read_text()
+        assert ",16,1" in text  # default MarginV
+    with tempfile.TemporaryDirectory() as d:
+        ass = write_ass([{"start": 0.0, "end": 1.0, "text": "hello"}], d + "/c.ass", fmt=FMT, margin_v=90)
+        assert ",90,1" in ass.read_text()

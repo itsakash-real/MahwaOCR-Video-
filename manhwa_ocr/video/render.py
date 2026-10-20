@@ -291,7 +291,8 @@ def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any],
     if plan.get("captions_enabled") and _caps:
         from .captions import captions_path, write_ass
         _ass = captions_path(root, chapter)
-        write_ass(_caps, _ass, fmt=fmt)
+        write_ass(_caps, _ass, fmt=fmt,
+                  margin_v=90 if plan.get("mode") == "wide" else None)
         _escaped = str(_ass).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
         _captioned = tmp.with_name(tmp.stem + ".captioned.mp4")
         _preset = "ultrafast" if preview else str(vcfg.get("preset", "veryfast"))

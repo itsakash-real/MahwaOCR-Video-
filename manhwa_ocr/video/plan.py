@@ -1030,10 +1030,22 @@ WIDE_SINGLE_ASPECTS = (1.777, 1.333, 1.25, 1.0, 0.944)
 
 def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
               pair_aspect: float | None = None) -> List[float]:
+    try:
+        bx0, by0 = float(box[0]), float(box[1])
+    except (TypeError, ValueError, IndexError):
+        bx0, by0 = 0.0, 0.0
+    bx0 = max(0.0, min(1.0, bx0))
+    by0 = max(0.0, min(1.0, by0))
+    panel_aspect = pw / max(ph, 1e-9)
+    # A panel that already fills >= 8/16 at full height and stays within the
+    # upscale cap is shown whole: the full figure stays visible, nothing
+    # is cropped (the reference look).
+    if pair_aspect is None and 0.889 <= panel_aspect < 1.777 and ph >= min_win_h:
+        return [0.0, 0.0, 1.0, 1.0]
     aspects = (pair_aspect,) if pair_aspect else WIDE_SINGLE_ASPECTS
     chosen: tuple = (aspects[-1], pw, ph)
     for A in aspects:
-        if pw / max(ph, 1e-9) >= A:
+        if panel_aspect >= A:
             win_w, win_h = ph * A, ph
         else:
             win_w, win_h = pw, pw / A
@@ -1041,15 +1053,11 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
             chosen = (A, win_w, win_h)
             break
     _A, win_w, win_h = chosen
-    try:
-        cx = (float(box[0]) + float(box[2])) / 2.0
-        cy = (float(box[1]) + float(box[3])) / 2.0
-    except (TypeError, ValueError, IndexError):
-        cx, cy = 0.5, 0.5
-    cx = max(0.0, min(1.0, cx))
-    cy = max(0.0, min(1.0, cy))
-    x0 = max(0.0, min(pw - win_w, cx * pw - win_w / 2.0)) / pw
-    y0 = max(0.0, min(ph - win_h, cy * ph - win_h / 2.0)) / ph
+    # Anchor to the classic crop's top-left (its framing already avoids heads
+    # and bubbles) instead of centring: anything the classic crop kept at the
+    # top -- heads, speech bubbles -- stays in frame, never clipped.
+    x0 = max(0.0, min(pw - win_w, bx0 * pw)) / pw
+    y0 = max(0.0, min(ph - win_h, by0 * ph)) / ph
     return [x0, y0, x0 + win_w / pw, y0 + win_h / ph]
 
 
@@ -1190,10 +1198,12 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         for _s in shots:
             _s["caption_bar"] = True  # dedicated bottom bar, below the cards
     sfx = plan_sfx(shots, chapter_cards)
-    if str(vcfg.get("mode") or "classic") == "wide":
+    _mode = str(vcfg.get("mode") or "classic")
+    if _mode == "wide":
         _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     return {
         "version": PLAN_VERSION,
+        "mode": _mode,
         "chapter": chapter,
         "format": vcfg.get("format", "16:9"),
         "fps": int(vcfg.get("fps", 30)),

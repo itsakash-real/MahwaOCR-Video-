@@ -222,22 +222,23 @@ def slot_centres(layout: str, fmt: Format, size: Tuple[int, int], index: int) ->
 
 
 @lru_cache(maxsize=8)
-def _vignette_grid(width: int, height: int) -> np.ndarray:
+def _vignette_grid(width: int, height: int, strength: float = 0.45) -> np.ndarray:
     ys, xs = np.ogrid[0:height, 0:width]
     nx = (xs - width / 2) / (width / 2)
     ny = (ys - height / 2) / (height / 2)
     d = np.sqrt(nx ** 2 + ny ** 2) / math.sqrt(2)
-    return (1.0 - 0.45 * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
+    return (1.0 - strength * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
 
 
-def _vignette(fmt: Format) -> np.ndarray:
+def _vignette(fmt: Format, strength: float = 0.45) -> np.ndarray:
     # The vignette depends only on the frame size: identical for every shot
     # in a chapter, so build it once. Callers must not mutate the result
     # (background() only multiplies by it).
-    return _vignette_grid(fmt.width, fmt.height)
+    return _vignette_grid(fmt.width, fmt.height, strength)
 
 
-def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
+def background(kind: str, panel: Image.Image | None, fmt: Format,
+             light: bool = False) -> np.ndarray:
     if kind == "black" or (kind == "blur" and panel is None):
         return np.zeros((fmt.height, fmt.width, 3), np.uint8)
     if kind == "white":
@@ -250,7 +251,11 @@ def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
     left, top = (small.width - sw) // 2, (small.height - sh) // 2
     small = small.crop((left, top, left + sw, top + sh)).filter(ImageFilter.GaussianBlur(4.5))
     big = np.asarray(small.resize((fmt.width, fmt.height), Image.BICUBIC), dtype=np.float32)
-    return np.clip(big * 0.72 * _vignette(fmt), 0, 255).astype(np.uint8)
+    # Wide mode keeps the side fill bright (the reference look): the
+    # darkened-to-0.36 classic pillars made the whole frame feel dim.
+    factor = 0.90 if light else 0.72
+    vig = _vignette(fmt, 0.18) if light else _vignette(fmt)
+    return np.clip(big * factor * vig, 0, 255).astype(np.uint8)
 
 
 # ------------------------------------------------------------------ P4 caches
@@ -266,7 +271,7 @@ _SRC_CACHE_MAX = 32
 
 
 def _cached_background(kind: str, panel: Image.Image | None, fmt: Format,
-                       bg_panel_id: str | None) -> np.ndarray:
+                       bg_panel_id: str | None, light: bool = False) -> np.ndarray:
     """background() with a cross-shot cache. Consecutive shots usually
     share a bg_panel (same panel across sentences); rebuilding the
     blurred + vignetted 1080p backdrop per shot re-pays the upscale +
@@ -274,20 +279,20 @@ def _cached_background(kind: str, panel: Image.Image | None, fmt: Format,
     different image under the same panel id can never hit a stale entry.
     Solid (black/white) backgrounds are cached by kind + frame size."""
     if panel is None:
-        key = (kind, fmt.width, fmt.height, None, None)
+        key = (kind, fmt.width, fmt.height, None, None, light)
         hit = _BG_CACHE.get(key)
         if hit is not None:
             _BG_CACHE.move_to_end(key)
             return hit[1]
-        arr = background(kind, None, fmt)
+        arr = background(kind, None, fmt, light=light)
         _BG_CACHE[key] = (None, arr)
     else:
-        key = (kind, fmt.width, fmt.height, bg_panel_id, id(panel))
+        key = (kind, fmt.width, fmt.height, bg_panel_id, id(panel), light)
         hit = _BG_CACHE.get(key)
         if hit is not None and hit[0] is panel:
             _BG_CACHE.move_to_end(key)
             return hit[1]
-        arr = background(kind, panel, fmt)
+        arr = background(kind, panel, fmt, light=light)
         _BG_CACHE[key] = (panel, arr)
     while len(_BG_CACHE) > _BG_CACHE_MAX:
         _BG_CACHE.popitem(last=False)
@@ -738,7 +743,7 @@ class ShotRenderer:
         # P4: cross-shot bg cache; bg_panel id is the shot's panel id (None
         # keeps the old behaviour for shots without one).
         self.bg = _cached_background(bg_kind, images.get(bg_panel) if bg_panel else None,
-                                     fmt, bg_panel)
+                                     fmt, bg_panel, light=bool(shot.get("wide")))
         # P4: Image.fromarray(self.bg) per frame re-validates + copies the 6MB
         # backdrop; one PIL copy per frame from a cached PIL image is cheaper.
         self._bg_pil = Image.fromarray(self.bg)
