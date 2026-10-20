@@ -1171,17 +1171,21 @@ def _wide_style_card(c: Dict[str, Any], designer: "_Designer", pw: float, ph: fl
         if (head.get("figure") and head.get("top") is not None
                 and head.get("bottom") is not None
                 and pid not in (designer.fixes.get("crop") or {})):
-            top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
-            # Grow only while the figure still fits a legal wide window. An
-            # over-tall "figure" (often most of the panel) would otherwise
-            # swallow the focal crop -- reviewer fixes included -- and
-            # force wide_crop's top-anchored figure_risk fallback, cutting
-            # whatever lives at the panel's bottom. The focal crop already
-            # frames the subject; keep it, and let wide_crop flag the risk
-            # honestly.
-            if (bottom - top) * ph * (1.0 + 2.0 * WIDE_HEADROOM) <= pw / WIDE_MIN_ASPECT:
-                box[1] = min(box[1], top)
-                box[3] = max(box[3], bottom)
+            # Cap the extension at exactly the span this panel's own legal
+            # window can hold (pre-grow), instead of a flat default: an
+            # all-or-nothing guard against an over-tall "figure" used to
+            # discard the WHOLE union on a narrow panel (pw/WIDE_MIN_ASPECT
+            # too small for even a 75%-of-panel span), reverting to the
+            # un-extended focal crop and reintroducing the same full-body
+            # cutoff this hardening exists to fix. A legal-but-partial
+            # extension, centred on the figure, is always better than none.
+            grow = 1.0 + 2.0 * WIDE_HEADROOM
+            max_h_px = ph if pair_aspect is not None else min(ph, pw / WIDE_MIN_ASPECT)
+            max_span = max_h_px / grow / ph
+            top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]),
+                                              max_span=max_span)
+            box[1] = min(box[1], top)
+            box[3] = max(box[3], bottom)
     crop, info = wide_crop(pw, ph, box, min_win_h, pair_aspect, img=img)
     c["crop"] = crop
     flags["caption_risk"] = bool(info.get("caption_risk"))
@@ -1358,7 +1362,14 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                 if img is not None and pid not in (designer.fixes.get("crop") or {}):
                     head = head_of(_panel_maps(img, designer.map_options))
                     if head.get("figure") and head.get("top") is not None and head.get("bottom") is not None:
-                        top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
+                        # The crop box's height is FIXED (reposition only
+                        # slides it, never resizes -- it must stay an
+                        # allowed classic shape), so that height is exactly
+                        # this call's legal budget: a figure taller than it
+                        # already gets _reposition_for_figure's own
+                        # best-effort centring, not a mid-way geometry mess.
+                        top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]),
+                                                          max_span=box[3] - box[1])
                         new_box = _reposition_for_figure(box, top, bottom)
                         yb = content_bands(img, axis="y", exclude=[(top, bottom)])
                         h = new_box[3] - new_box[1]

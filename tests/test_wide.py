@@ -189,6 +189,19 @@ def test_extend_figure_range_caps_runaway_growth():
     assert top <= 500 / 1200 and bottom >= 560 / 1200   # input never shrinks
 
 
+def test_extend_figure_range_honours_a_tighter_caller_supplied_max_span():
+    # Regression: a flat default cap (MAX_SPAN_FRAC) could still exceed a
+    # SPECIFIC narrow panel's own legal window budget, and the caller's
+    # old all-or-nothing guard then discarded the whole union, reverting
+    # to the un-extended head alone -- worse than a legal, partial,
+    # figure-centred extension. A caller-supplied max_span must be honoured
+    # exactly, even when tighter than the default.
+    img = _long_figure_panel(w=300, h=1200, body_top=100, body_bottom=1000)
+    top, bottom = extend_figure_range(img, 400 / 1200, 460 / 1200, max_span=0.2)
+    assert (bottom - top) <= 0.201
+    assert top <= 400 / 1200 and bottom >= 460 / 1200
+
+
 def test_wide_crop_flags_figure_risk_when_the_subject_cannot_fit():
     # a subject spanning almost the whole height of a panel whose width
     # forces a much shorter window (upscale cap): cannot be fully contained.

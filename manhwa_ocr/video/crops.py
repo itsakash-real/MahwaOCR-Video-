@@ -220,7 +220,8 @@ MAX_SPAN_FRAC = 0.75   # extend_figure_range never returns a span wider than thi
 
 
 def extend_figure_range(img: Image.Image, top: float, bottom: float,
-                        lo: float = 0.0, hi: float = 1.0) -> Tuple[float, float]:
+                        lo: float = 0.0, hi: float = 1.0,
+                        max_span: float | None = None) -> Tuple[float, float]:
     """Grow a known figure range (e.g. a head's top/bottom from head_of)
     outward while the panel keeps showing dense, non-text art -- the rest
     of the body, wings, tail -- stopping at the first clearly empty or
@@ -233,6 +234,13 @@ def extend_figure_range(img: Image.Image, top: float, bottom: float,
     legs) even with a confident head. Wide mode's generous height budget
     should include the whole figure where the panel allows it, not just
     the head, so a full-body subject is never "totally cut off".
+
+    `max_span`, when given, overrides the default cap (MAX_SPAN_FRAC) with
+    the caller's own known legal budget (e.g. a narrow panel's window
+    height cap): callers that know exactly how much room they have should
+    pass it, so a budget that is itself under MAX_SPAN_FRAC still gets a
+    PARTIAL, figure-centred extension here instead of having to discard
+    the whole union when the generic default doesn't fit.
     Returns (new_top, new_bottom), both widened or equal to the input.
     """
     rgb = _small(img, 160)
@@ -273,8 +281,9 @@ def extend_figure_range(img: Image.Image, top: float, bottom: float,
     # panel, trimming back whichever side(s) grew (never the original
     # input itself) so the caller always gets a bounded, usable result
     # without needing its own guard against this case.
-    if (new_bottom - new_top) > MAX_SPAN_FRAC:
-        budget = max(0.0, MAX_SPAN_FRAC - (bottom - top))
+    cap = MAX_SPAN_FRAC if max_span is None else max(0.0, max_span)
+    if (new_bottom - new_top) > cap:
+        budget = max(0.0, cap - (bottom - top))
         grown_top, grown_bottom = top - new_top, new_bottom - bottom
         grown_total = grown_top + grown_bottom
         if grown_total > 1e-9:
