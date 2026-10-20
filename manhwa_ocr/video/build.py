@@ -97,7 +97,9 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
                 if s.get("layout") == "pair":
                     ok = abs(math.log(aspect / 0.889)) <= 0.02
                 else:
-                    ok = 0.885 <= aspect <= 1.79
+                    # Wide singles are >= 8/16 wide: a focal window in
+                    # [0.889, 1.777], or a whole panel (any aspect).
+                    ok = aspect >= 0.885
             else:
                 ok = min(abs(math.log(aspect / a)) for a in allowed) <= 0.02
             if not ok:
