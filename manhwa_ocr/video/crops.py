@@ -197,6 +197,55 @@ def safe_span(extent: float, win: float, lo: float, hi: float,
     return best[1] if best else anchor
 
 
+def extend_figure_range(img: Image.Image, top: float, bottom: float,
+                        lo: float = 0.0, hi: float = 1.0) -> Tuple[float, float]:
+    """Grow a known figure range (e.g. a head's top/bottom from head_of)
+    outward while the panel keeps showing dense, non-text art -- the rest
+    of the body, wings, tail -- stopping at the first clearly empty or
+    text/background band. Small gaps (a thin neck, a gutter line) are
+    tolerated so the scan doesn't stop at the first dip.
+
+    This exists because a head/face detector only answers "where is the
+    head", not "where does the figure end" -- a focal crop or a classic
+    card can authentically overlook the rest of the body (wings, tail,
+    legs) even with a confident head. Wide mode's generous height budget
+    should include the whole figure where the panel allows it, not just
+    the head, so a full-body subject is never "totally cut off".
+    Returns (new_top, new_bottom), both widened or equal to the input.
+    """
+    rgb = _small(img, 160)
+    soft, hard, flat_white = _art_maps(rgb)
+    content = np.clip(soft + 0.6 * hard, 0, 1) * (1 - flat_white)
+    density = content.mean(axis=1)
+    n = len(density)
+    if n < 4:
+        return top, bottom
+    top = max(0.0, min(1.0, top))
+    bottom = max(top, min(1.0, bottom))
+    lo_i, hi_i = max(0, int(round(lo * n))), min(n, int(round(hi * n)))
+    span_h = max(1, int(round((bottom - top) * n)))
+    max_gap = max(3, span_h // 2)
+    thresh = 0.05
+
+    def extend(start: int, step: int, limit: int) -> int:
+        i, gap, last_good = start, 0, start
+        while lo_i <= i < hi_i and i != limit:
+            if density[i] > thresh:
+                last_good, gap = i, 0
+            else:
+                gap += step
+                if abs(gap) > max_gap:
+                    break
+            i += step
+        return last_good
+
+    new_top_i = extend(max(lo_i, int(round(top * n)) - 1), -1, lo_i - 1)
+    new_bottom_i = extend(min(hi_i - 1, int(round(bottom * n))), 1, hi_i)
+    new_top = min(top, new_top_i / n)
+    new_bottom = max(bottom, (new_bottom_i + 1) / n)
+    return max(lo, new_top), min(hi, new_bottom)
+
+
 def focal_crops(img: Image.Image, aspect: float, k: int = 3, zoom: float = 1.0,
                 trim_text: bool = True) -> List[Box]:
     """Up to k crop boxes of width/height `aspect`, best first.

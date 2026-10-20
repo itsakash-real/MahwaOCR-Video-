@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw
 
 from manhwa_ocr.config import load_config
 from manhwa_ocr.video import build as build_mod
+from manhwa_ocr.video.crops import extend_figure_range, head_of, _panel_maps
 from manhwa_ocr.video.frames import Format, ShotRenderer, format_from
 from manhwa_ocr.video.plan import WIDE_MIN_ASPECT, build_plan, wide_crop
 
@@ -107,6 +108,84 @@ def test_window_edge_avoids_slicing_a_bubble():
     assert not (122 < top_px < 198)
 
 
+# ------------------------------------------------------------------ full-body hardening
+
+
+def _long_figure_panel(w=300, h=1200, body_top=100, body_bottom=1000):
+    """A tall panel: flat background, with a textured, skin-toned body from
+    body_top to body_bottom -- simulating a figure a head-only crop misses."""
+    img = Image.new("RGB", (w, h), (235, 235, 235))
+    d = ImageDraw.Draw(img)
+    for y in range(body_top, body_bottom, 6):
+        d.line((20, y, w - 20, y), fill=(205, 145, 100))
+        d.line((20 + (y % 12), y + 2, w - 20, y + 2), fill=(170, 110, 70))
+    return img
+
+
+def test_extend_figure_range_grows_to_cover_the_whole_body():
+    img = _long_figure_panel()
+    # a head-only range (just the first slice of the textured body)
+    top, bottom = extend_figure_range(img, 100 / 1200, 160 / 1200)
+    # must grow to roughly cover the drawn body (100-1000), not stay at 160
+    assert bottom >= 900 / 1200
+    assert top <= 100 / 1200
+
+
+def test_extend_figure_range_stops_at_a_real_empty_gap():
+    img = _long_figure_panel(body_top=100, body_bottom=400)
+    # a second, separate textured block far below, with a long empty gap
+    d = ImageDraw.Draw(img)
+    for y in range(900, 1100, 6):
+        d.line((20, y, 280, y), fill=(90, 60, 50))
+    top, bottom = extend_figure_range(img, 100 / 1200, 160 / 1200)
+    # must not jump the empty gap to swallow the unrelated second block
+    assert bottom < 900 / 1200
+
+
+def test_extend_figure_range_never_shrinks_the_input():
+    img = Image.new("RGB", (300, 800), (255, 255, 255))   # nothing drawn at all
+    top, bottom = extend_figure_range(img, 0.3, 0.5)
+    assert top <= 0.3 and bottom >= 0.5
+
+
+def test_wide_crop_flags_figure_risk_when_the_subject_cannot_fit():
+    # a subject spanning almost the whole height of a panel whose width
+    # forces a much shorter window (upscale cap): cannot be fully contained.
+    crop, info = wide_crop(300, 3000, [0.1, 0.02, 0.9, 0.98], min_win_h=200)
+    assert info["figure_risk"] is True
+    x0, y0, x1, y1 = crop
+    assert 0.0 <= y0 < y1 <= 1.0  # still a valid window, just flagged
+
+
+def test_wide_crop_no_figure_risk_when_the_subject_fits():
+    crop, info = wide_crop(300, 900, [0.1, 0.3, 0.9, 0.6], min_win_h=400)
+    assert info["figure_risk"] is False
+
+
+def test_wide_pass_recovers_a_full_body_crop_the_classic_box_missed():
+    # A panel where the classic focal crop (simulated) is just the head's
+    # own narrow strip; head_of should find the whole textured figure below
+    # it, and wide_crop's window should end up covering most of it --
+    # the regression this hardening pass fixes (dragons cut mid-body).
+    img = _long_figure_panel(w=600, h=2400, body_top=200, body_bottom=2100)
+    classic_box = [0.0, 200 / 2400, 1.0, 320 / 2400]   # head-only, like a bad classic pick
+    head = head_of(_panel_maps(img, {}))
+    box = list(classic_box)
+    if head.get("figure"):
+        top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
+        box[1] = min(box[1], top)
+        box[3] = max(box[3], bottom)
+    crop, info = wide_crop(600, 2400, box, min_win_h=720)
+    x0, y0, x1, y1 = crop
+    # the window must now reach well past the head-only classic box -- up to
+    # the max height a single-card aspect (6/16) allows for this panel width
+    assert y1 - y0 > (320 - 200) / 2400 * 3   # much taller than the head-only strip
+    assert y1 - y0 == pytest.approx((600 / WIDE_MIN_ASPECT) / 2400, rel=0.02)
+    # the figure (200-2100) is taller than any single window this panel
+    # width allows, so it is honestly flagged rather than silently cut.
+    assert info["figure_risk"] is True
+
+
 # ------------------------------------------------------------------ _wide_pass integration
 
 
@@ -141,6 +220,8 @@ def _wide_plan(duration=24.0, panels=PANELS, mode_cfg=None):
 def test_wide_pass_sets_wide_fields_on_every_card():
     plan = _wide_plan()
     assert plan["mode"] == "wide"
+    assert isinstance(plan.get("wide_caption_risk"), list)
+    assert isinstance(plan.get("wide_figure_risk"), list)
     shots = plan["shots"]
     assert shots, "plan produced no shots"
     for s in shots:

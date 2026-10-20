@@ -33,7 +33,8 @@ from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
 from . import sync as sync_mod
-from .crops import _panel_maps, content_bands, head_of, is_mask_risk, is_system_window, safe_span, tone
+from .crops import (_panel_maps, content_bands, extend_figure_range, head_of, is_mask_risk,
+                    is_system_window, safe_span, tone)
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
 from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_crop, build_chapter_cards, extract_callout, pacing_qa,
@@ -1051,7 +1052,7 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
     bx0 = max(0.0, min(1.0, bx0)); by0 = max(0.0, min(1.0, by0))
     bx1 = max(bx0, min(1.0, bx1)); by1 = max(by0, min(1.0, by1))
     panel_aspect = pw / max(ph, 1e-9)
-    info: Dict[str, Any] = {"whole": False, "edge_text": False, "caption_risk": False}
+    info: Dict[str, Any] = {"whole": False, "edge_text": False, "caption_risk": False, "figure_risk": False}
     # A panel that already fills >= 6/16 at full height is shown whole: the
     # full figure stays visible, nothing is cropped. (Super-wide panels are
     # shown whole too, full-bleed, with fill covering the top/bottom margin.)
@@ -1079,6 +1080,10 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
     lo_y = max(0.0, by1 * ph - win_h)
     hi_y = min(by0 * ph, max(0.0, ph - win_h))
     if hi_y < lo_y:
+        # The subject is taller than any window this layout/upscale cap
+        # allows: it cannot be fully contained. Flagged, not silently cut --
+        # see plan["wide_figure_risk"] / qa["wide_figure_risk"].
+        info["figure_risk"] = True
         lo_y, hi_y = 0.0, max(0.0, ph - win_h)
     y0 = max(lo_y, min(hi_y, by0 * ph))
     # Horizontal: centred on the focal crop, same containment clamp.
@@ -1128,7 +1133,7 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
 
 
 def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
-               wcfg: Dict[str, Any]) -> List[str]:
+               wcfg: Dict[str, Any]) -> Dict[str, List[str]]:
     """Rewrite a classic plan for wide mode: single + pair layouts only
     (inset/classic-wide become full-height singles), crops become wide
     focal windows, caption_bar is off so panels touch the bottom edge and
@@ -1136,15 +1141,18 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
     (punch-ins, pairs, splits already decided) so every card -- first
     showing, punch-in, each side of a pair -- gets the same edge audit.
 
-    Returns the ids of panels flagged with a caption/text collision risk
-    that could not be resolved by repositioning (plan["wide_caption_risk"]),
-    for an honest report rather than a silent miss.
+    Returns {"caption_risk": [...], "figure_risk": [...]} -- panel ids
+    flagged with a caption/text collision, or a figure too tall for any
+    window this layout/upscale cap allows to fully contain, for an honest
+    report rather than a silent miss (plan["wide_caption_risk"] /
+    plan["wide_figure_risk"]).
     """
     if fmt.width <= fmt.height:
-        return []  # portrait formats are untouched
+        return {"caption_risk": [], "figure_risk": []}  # portrait formats are untouched
     min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
     pair_aspect = (fmt.width / 2.0) / fmt.height
     caption_risk: List[str] = []
+    figure_risk: List[str] = []
     for s in shots:
         s["wide"] = True
         s["caption_bar"] = False
@@ -1168,16 +1176,25 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                     # classic mode's own card just shows that strip. Wide
                     # mode's generous full-height window must not inherit
                     # that miss: grow the subject to also cover the detected
-                    # figure's own vertical span before anchoring to it.
+                    # head AND the rest of the figure's own body (wings,
+                    # tail, legs) connected to it, before anchoring to it.
+                    # A head/face detector only answers "where is the head",
+                    # never "where does the figure end" -- that is a
+                    # separate, full-body cutoff a confident head alone
+                    # cannot catch (see wide_mode_v3_all_issues.md: dragons
+                    # cut mid-body even where the head detector was right).
                     head = head_of(_panel_maps(img, designer.map_options))
                     if head.get("figure"):
-                        box[1] = min(box[1], float(head["top"]))
-                        box[3] = max(box[3], float(head["bottom"]))
+                        top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
+                        box[1] = min(box[1], top)
+                        box[3] = max(box[3], bottom)
                 crop, info = wide_crop(pw, ph, box, min_win_h,
                                        pair_aspect if pair else None, img=img)
                 c["crop"] = crop
                 if info.get("caption_risk") and pid not in caption_risk:
                     caption_risk.append(pid)
+                if info.get("figure_risk") and pid not in figure_risk:
+                    figure_risk.append(pid)
                 # Whole-panel windows have zero margin: the Ken Burns zoom
                 # would clip text sitting at the panel's own edge. Cut the
                 # zoom amplitude further for just this card instead of the
@@ -1186,7 +1203,7 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
             c["pad_y"] = 0.0
             c["wide_display"] = True
         s["cards"] = cards
-    return caption_risk
+    return {"caption_risk": caption_risk, "figure_risk": figure_risk}
 
 
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
@@ -1298,13 +1315,14 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
             _s["caption_bar"] = True  # dedicated bottom bar, below the cards
     sfx = plan_sfx(shots, chapter_cards)
     _mode = str(vcfg.get("mode") or "classic")
-    _wide_caption_risk: List[str] = []
+    _wide_risk = {"caption_risk": [], "figure_risk": []}
     if _mode == "wide":
-        _wide_caption_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
+        _wide_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     return {
         "version": PLAN_VERSION,
         "mode": _mode,
-        "wide_caption_risk": _wide_caption_risk,
+        "wide_caption_risk": _wide_risk["caption_risk"],
+        "wide_figure_risk": _wide_risk["figure_risk"],
         "chapter": chapter,
         "format": vcfg.get("format", "16:9"),
         "fps": int(vcfg.get("fps", 30)),

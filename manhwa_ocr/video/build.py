@@ -136,9 +136,13 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "filler_shots": cov.get("filler_shots", 0),
         "filler_seconds": cov.get("filler_seconds", 0.0),
         # Wide mode only: panels whose window could not be repositioned
-        # clear of a caption/text collision (see plan._wide_pass). INFO ONLY
-        # -- never a failure -- so a reviewer can see and fix it by hand.
+        # clear of a caption/text collision, or whose figure is taller than
+        # any window the layout/upscale cap allows to fully contain (see
+        # plan._wide_pass). INFO ONLY -- never a failure -- so a reviewer
+        # sees it and can fix it by hand (fixes.json crop) instead of it
+        # being a silent cut.
         "wide_caption_risk": list(plan.get("wide_caption_risk") or []),
+        "wide_figure_risk": list(plan.get("wide_figure_risk") or []),
         "min_shot": round(shortest, 2),
         "max_shots": max(0, int(duration // 3.0)) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
@@ -542,6 +546,12 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         f"shortest shot {qa['shortest_shot']:.1f}s; {len(qa['placed_by_order'])} impactful filler(s){short_note}")
     if qa["head_risk"]:
         log(f"    ! {len(qa['head_risk'])} panel(s) where a head may be cut: {', '.join(qa['head_risk'][:8])}")
+    if qa.get("wide_figure_risk"):
+        log(f"    ! wide mode: {len(qa['wide_figure_risk'])} panel(s) whose figure is taller than any "
+            f"window the upscale cap allows to fully contain: {', '.join(qa['wide_figure_risk'][:8])}")
+    if qa.get("wide_caption_risk"):
+        log(f"    ! wide mode: {len(qa['wide_caption_risk'])} panel(s) where the overlaid caption may "
+            f"cover panel text: {', '.join(qa['wide_caption_risk'][:8])}")
     if plan.get("chapter_cards"):
         from .editor import chapter_cards_to_timestamps as _ts
         log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))
