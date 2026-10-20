@@ -114,6 +114,7 @@ RULES (current editor, all in main):
 - Panel diversity: never 3 identical cards in a row. Third showing must use a different panel or a different (punched-tighter) crop.
 - P2 switch: never switch to square 1.0 in a wide layout.
 - SFX/music: render mixes SFX from video.sfx_dir and music from music/bed.mp3 if present. Missing files -> warning, render without, never fail, never invent audio.
+- Cinematic mode (opt-in): set `video.mode: cinematic` in manhwa-ocr.yaml for full-screen panels (full-height tall panels with luminous pillars, full-bleed wide panels, hard cuts, slow zoom, no caption bar/cards). Shot floor 2.0s, reframe splits on long sentences, lower-third name cards on first character appearance. See docs/VIDEO_STYLE_CINEMATIC.md. Classic stays the default.
 ACCEPTANCE: video/chapter_N.mp4 exists (1080p), sync gate PASS, spot-checks clean (see Prompt F). Report duration, file size, every shot changed + why, every dropped panel + reason, every pairs.json change.
 ```
 

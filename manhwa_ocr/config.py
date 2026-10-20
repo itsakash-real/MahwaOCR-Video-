@@ -63,6 +63,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
         "format": "16:9",           # 16:9 (1920x1080) or 9:16 (1080x1920, Shorts)
         "fps": 30,
+        # Editing mode: "classic" (floating cards on blurred backdrops) or
+        # "cinematic" (full-screen panels: full-height tall panels with
+        # luminous pillars, full-bleed wide panels, hard cuts, slow zoom,
+        # no caption bar). See docs/VIDEO_STYLE_CINEMATIC.md.
+        "mode": "classic",
+        # Cinematic-mode tuning (only read when video.mode == "cinematic").
+        "cinematic": {
+            "captions": False,      # burn minimal captions (no black bar) if true
+            "name_cards": True,     # lower-third name overlay on a character's first appearance
+            "reframe": True,        # intra-sentence reframe cuts on long sentences
+            "zoom": 0.06,           # slow push-in amount per shot (0 = static)
+            "min_hold": 2.0,        # shot floor in cinematic mode (viral refs cut ~2.7s mean)
+        },
         "crf": 20,                  # x264 quality: lower = better and bigger
         "preset": "veryfast",
         "lead": 0.15,               # show a panel this long before its sentence starts

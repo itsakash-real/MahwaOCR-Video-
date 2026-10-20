@@ -343,6 +343,16 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         f"lead={sync_settings['lead']:g}s, max_late={sync_settings['max_late']:g}s, "
         f"max_hold={sync_settings['max_hold']:g}s, "
         f"max_unmatched={sync_settings['max_unmatched']:g}s")
+    # Cinematic mode: character names for the lower-third name cards on
+    # first appearance (from the series memory's character list).
+    _characters: List[str] = []
+    if vcfg.get("mode") == "cinematic":
+        try:
+            from ..memory import SeriesMemory
+            _mem = SeriesMemory.load(sess.path / "series_memory.json")
+            _characters = [n for n in (_mem.characters or {}) if n]
+        except Exception:
+            _characters = []
 
     if pages_from:
         from ..images import import_pages, list_images
@@ -497,6 +507,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
                       caption_sentences=_caption_sentences,
+                      characters=_characters,
                       image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True,
                                                       fingerprint=panels.get("fingerprint")),
                       fixes=fixes, settings=sync_settings, root=root)
@@ -505,7 +516,9 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
-    qa = quality_report(plan, panels, align_cov, sync_settings["min_hold"])
+    _qa_floor = float((vcfg.get("cinematic") or {}).get("min_hold", 2.0)) \
+        if vcfg.get("mode") == "cinematic" else sync_settings["min_hold"]
+    qa = quality_report(plan, panels, align_cov, _qa_floor)
     atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
     if qa["failures"]:
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])

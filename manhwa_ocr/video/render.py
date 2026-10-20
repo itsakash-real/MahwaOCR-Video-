@@ -81,9 +81,15 @@ def render_segment(job: Dict[str, Any]) -> str:
     fmt = Format(*job["fmt"])
     images = {pid: _panel(job["root"], job["chapter"], p, job["norm_w"], job["fingerprint"])
               for pid, p in job["panels"].items()}
-    shot = ShotRenderer(job["shot"], images, fmt, job["effects_on"],
-                        video_end=job["video_end"], end_fade=job["end_fade"],
-                        chapter_cards=job.get("chapter_cards") or [])
+    if job["shot"].get("cinematic"):
+        # Cinematic mode: full-screen panels, no cards (video/cinematic.py).
+        from .cinematic import CinematicShot
+        shot = CinematicShot(job["shot"], images, fmt,
+                             zoom=float((job.get("cinematic_cfg") or {}).get("zoom", 0.06)))
+    else:
+        shot = ShotRenderer(job["shot"], images, fmt, job["effects_on"],
+                            video_end=job["video_end"], end_fade=job["end_fade"],
+                            chapter_cards=job.get("chapter_cards") or [])
 
     out = Path(job["out"])
     tmp = out.with_name(out.stem + ".part.mp4")

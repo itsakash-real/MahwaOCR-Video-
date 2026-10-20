@@ -40,6 +40,7 @@ from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_crop, build_chapter_cards, 
                      plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
 from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
 from .captions import build_captions, build_captions_from_sentences, validate_captions
+from .cinematic import layout_for as _cinematic_layout_for
 from .frames import (BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, GLITCH_MIN_GAP, LAYOUTS, MOTIONS,
                      TRANSITION_WEIGHTS, TRANSITIONS, Format, format_from, shapes_for, transition_enter)
 from .media import video_dir
@@ -1016,6 +1017,94 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
     return out
 
 
+def _cinematic_pass(shots: List[Dict[str, Any]], units: List[Dict[str, Any]],
+                    designer: "_Designer", ccfg: Dict[str, Any],
+                    characters: List[str] | None) -> List[Dict[str, Any]]:
+    """Convert classic card shots into cinematic full-screen shots.
+
+    - Marks every shot ``cinematic: True`` and assigns the cinematic layout
+      (tall / fullbleed) from the panel's aspect ratio. The classic
+      ``layout``/``background`` keys are left valid ("single"/"blur") so
+      validate(), QA and review tooling keep working; render.py swaps in
+      CinematicShot for shots carrying the cinematic flag.
+    - Hard cuts only: transition/exit forced to "cut" (except the final
+      end-fade, which render handles).
+    - Zoom direction alternates per shot for motion variety.
+    - Name cards: the first shot whose sentence first mentions a known
+      character gets a lower-third name overlay.
+    - Reframes: a shot longer than 5.5s is split at its midpoint into two
+      shots of the same panel with different focal points (>= 2.0s each),
+      giving the fast-cut feel of the reference videos without breaking
+      narration sync (the sync gate counts same-panel reframes as correct).
+    """
+    import re
+    chars = [c for c in (characters or []) if c and len(c) >= 2]
+    # Longest names first so "Kim Jin-Ho" wins over "Kim".
+    chars.sort(key=len, reverse=True)
+    patterns = [(c, re.compile(r"\b" + re.escape(c) + r"\b", re.IGNORECASE)) for c in chars]
+    seen: set = set()
+    zoom_flip = 1
+    out: List[Dict[str, Any]] = []
+    reframe_at = 5.5
+    floor = max(2.0, float(ccfg.get("min_hold", 2.0)))
+
+    def _reframe_pieces(shot: Dict[str, Any], name_card: str | None) -> List[Dict[str, Any]]:
+        """Recursively split a long shot into reframe pieces."""
+        dur = float(shot["end"]) - float(shot["start"])
+        if not (ccfg.get("reframe", True) and dur > reframe_at):
+            return [shot]
+        mid = round(shot["start"] + dur / 2, 3)
+        if mid - shot["start"] < floor or shot["end"] - mid < floor:
+            return [shot]
+        first = dict(shot)
+        first.update({"end": mid, "focus": (0.5, 0.35), "name_card": name_card})
+        second = dict(shot)
+        second.update({"start": mid, "zoom_dir": -shot["zoom_dir"],
+                       "focus": (0.5, 0.65), "name_card": None, "reframe": True})
+        # Alternate focal heights per piece so consecutive reframes differ.
+        pieces = _reframe_pieces(first, name_card) + _reframe_pieces(second, None)
+        for k, p in enumerate(pieces[1:], 1):
+            p["focus"] = (0.5, 0.35 if k % 2 else 0.65)
+        return pieces
+
+    for i, shot in enumerate(shots):
+        unit = units[i] if i < len(units) else {}
+        cards = shot.get("cards") or []
+        pid = cards[0].get("panel") if cards else None
+        aspect = designer.panel_aspect(pid) if pid else 1.0
+        clayout = _cinematic_layout_for(aspect)
+        text = str(unit.get("sentence") or "")
+        name_card = None
+        if ccfg.get("name_cards", True) and text:
+            for cname, pat in patterns:
+                if cname.lower() not in seen and pat.search(text):
+                    name_card = cname
+                    seen.add(cname.lower())
+                    break
+        base = dict(shot)
+        base.update({
+            "cinematic": True,
+            "cinematic_layout": clayout,
+            "zoom_dir": zoom_flip,
+            "zoom": float(ccfg.get("zoom", 0.06)),
+            "transition": "cut",
+            "exit": "cut",
+            "name_card": name_card,
+            "name_card_at": 0.15,
+        })
+        base.pop("caption_bar", None)
+        zoom_flip = -zoom_flip
+
+        if len(cards) == 1:
+            out.extend(_reframe_pieces(base, name_card))
+        else:
+            out.append(base)
+    # Re-number shot ids so they stay sequential.
+    for j, s in enumerate(out):
+        s["id"] = f"S{j + 1:03d}"
+    return out
+
+
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
                vcfg: Dict[str, Any], image_for: Callable[[Dict[str, Any]], Image.Image],
                sentences: List[Dict[str, Any]] | None = None,
@@ -1025,7 +1114,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                alignment_meta: Dict[str, Any] | None = None,
                settings: Dict[str, float] | None = None,
                root: Path | None = None,
-               caption_sentences: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+               caption_sentences: List[Dict[str, Any]] | None = None,
+               characters: List[str] | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
     this function makes no panel decisions of its own - it only lays out,
@@ -1048,23 +1138,30 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     fmt = format_from(vcfg.get("format", "16:9"), int(vcfg.get("fps", 30)))
     by_id = {p["id"]: p for p in panels}
     st = settings or sync_mod.effective_settings(vcfg, log=lambda _msg: None)
+    # Cinematic mode: full-screen panels, faster cutting. The shot floor
+    # drops to 2.0s (the viral references average ~2.7s/shot) and pair
+    # layouts are disabled — one panel per shot, always.
+    cinematic = vcfg.get("mode") == "cinematic"
+    ccfg = vcfg.get("cinematic") if isinstance(vcfg.get("cinematic"), dict) else {}
+    hold_floor = float(ccfg.get("min_hold", 2.0)) if cinematic else float(st["min_hold"])
+    pair_ratio = 0.0 if cinematic else float(vcfg.get("pair_ratio", 0.3))
     timing = None
     if alignment_units is not None:
-        shots_units, timing = hold_groups(alignment_units, st["min_hold"], lead=st["lead"],
+        shots_units, timing = hold_groups(alignment_units, hold_floor, lead=st["lead"],
                                           max_late=st["max_late"])
-        units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
+        units = _pair_up(shots_units, chapter, pair_ratio, by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
         # not a generic "aligned" label - video render's refusal of an
         # "estimated" plan must keep working exactly as it did before this.
         mode = (alignment_meta or {}).get("sync_mode") or "aligned"
     elif sentences:
         units = _pair_up(synced_units(panels, sentences, duration, vcfg), chapter,
-                         float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
+                         pair_ratio, by_id, timed=True)
         mode = "synced"
     else:
-        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), st["min_hold"],
+        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), hold_floor,
                                           lead=st["lead"], max_late=st["max_late"])
-        units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
+        units = _pair_up(shots_units, chapter, pair_ratio, by_id)
         mode = "even"
     # A system-window banner in a 2-panel unit gets its own wide shot:
     # split such units before the designer ever sees a pair with one.
@@ -1072,10 +1169,18 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes,
                          root=root, fingerprint=panels_data.get("fingerprint"))
     shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
+    if cinematic:
+        # Full-screen panels, hard cuts, reframe splits, name cards.
+        shots = _cinematic_pass(shots, units, designer, ccfg, characters)
     # P3 editor layer: split frozen >8s shots with a punch-in crop change,
     # then attach chapter cards + SFX. Callouts already ride on each shot.
     _pacing_before = pacing_qa(shots)
-    shots, _nsplit = split_long_shots(shots)
+    if cinematic:
+        # Reframe splits already happened in _cinematic_pass; the classic
+        # punch-in split would be invisible to the cinematic renderer.
+        _nsplit = 0
+    else:
+        shots, _nsplit = split_long_shots(shots)
     # CapCut bugfix (defect 1d): a split must never leave two shots on the
     # same panel with the same crop -- the second shot is punched in.
     shots, _split_crop_changes = ensure_split_crop_change(shots)
@@ -1113,7 +1218,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     # never from per-shot estimates: a shot is not a sentence, and
     # per-shot captions gap during filler shots and show a sentence's
     # tail before its words are spoken.
-    _captions_on = bool(vcfg.get("captions", True))
+    # Cinematic mode keeps the frame clean like the reference videos: no
+    # caption bar, no burned-in captions unless explicitly enabled.
+    _captions_on = bool(ccfg.get("captions", False)) if cinematic else bool(vcfg.get("captions", True))
     _captions = []
     if _captions_on:
         _sent = caption_sentences if caption_sentences is not None else sentences
@@ -1159,10 +1266,11 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "beat_sync": _beat_info,
         "pacing": {"split_shots": _nsplit, "long_shots_flagged": _pacing_before["long_shots"],
                    "max_shot": pacing_qa(shots)["max_shot"],
-                   # Rule 1: max shots = floor(audio_seconds / 3). More shots
-                   # than this means the average shot is under the 3s floor.
-                   "max_shots": max(0, int(float(duration) // MIN_SHOT)),
-                   "min_shot": MIN_SHOT},
+                   # Rule 1: max shots = floor(audio_seconds / floor). More shots
+                   # than this means the average shot is under the floor.
+                   "max_shots": max(0, int(float(duration) // hold_floor)),
+                   "min_shot": hold_floor,
+                   "mode": "cinematic" if cinematic else "classic"},
         "split_crop_changes": _split_crop_changes,
         "motion_changes": _motion_changes,
         "diversity_changes": _diversity_changes,

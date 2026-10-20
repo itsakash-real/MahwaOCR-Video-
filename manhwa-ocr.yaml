@@ -43,6 +43,16 @@ download:
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
+  mode: classic          # "classic" (floating cards) or "cinematic" (full-screen
+                         # panels: full-height tall panels with luminous pillars,
+                         # full-bleed wide panels, hard cuts, slow zoom, no captions).
+                         # See docs/VIDEO_STYLE_CINEMATIC.md.
+  cinematic:             # only read when video.mode == "cinematic"
+    captions: false      # burn minimal captions (no black bar) if true
+    name_cards: true     # lower-third name overlay on a character's first appearance
+    reframe: true        # intra-sentence reframe cuts on long sentences
+    zoom: 0.06           # slow push-in amount per shot (0 = static)
+    min_hold: 2.0        # shot floor in cinematic mode (viral refs cut ~2.7s mean)
   crf: 20                 # quality: lower = better and bigger files
   preset: veryfast
   lead: 0.15              # panel appears this long before its sentence

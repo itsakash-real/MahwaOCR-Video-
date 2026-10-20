@@ -183,6 +183,9 @@ def evaluate_gate(wrong: Dict[str, Any], over: List[Dict[str, Any]], late: List[
     Returns the failure strings (empty = PASS).
     """
     failures: List[str] = []
+    # The shot floor is per-plan (cinematic mode cuts faster); the plan
+    # stores it in pacing.min_shot and audit() passes it via st.
+    floor = float(st.get("min_shot_floor", MIN_SHOT))
     if float(wrong.get("ratio") or 0.0) > st["gate_wrong"] + 1e-9:
         failures.append(f"wrong-picture time {float(wrong.get('seconds') or 0.0):.1f}s "
                         f"({float(wrong.get('ratio') or 0.0):.1%} of judged) "
@@ -197,7 +200,7 @@ def evaluate_gate(wrong: Dict[str, Any], over: List[Dict[str, Any]], late: List[
                         f"sentence starts (worst {worst_late['offset']:.1f}s, sentence {worst_late['sentence']})")
     if short_shots:
         shortest = min(float(s.get("duration") or 0.0) for s in short_shots)
-        failures.append(f"{len(short_shots)} shot(s) under the {MIN_SHOT:.1f}s minimum shot "
+        failures.append(f"{len(short_shots)} shot(s) under the {floor:.1f}s minimum shot "
                         f"(shortest {shortest:.2f}s, shot {(min(short_shots, key=lambda s: float(s.get('duration') or 0.0)).get('shot'))})")
     if coverage_failures:
         worst_cov = min(coverage_failures, key=lambda c: float(c.get("coverage") or 0.0))
@@ -392,9 +395,13 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
     # P2: the gate decision lives in evaluate_gate() — audit() and the render
     # gate (gate_from_report) share it, so the two gates cannot drift apart.
     # Rule 2: any plan shot under the MIN_SHOT floor fails the gate.
+    # The shot floor is per-plan: cinematic mode plans store their own
+    # (faster) floor in pacing.min_shot; classic plans use MIN_SHOT.
+    shot_floor = float((plan.get("pacing") or {}).get("min_shot", MIN_SHOT))
+    st["min_shot_floor"] = shot_floor
     short_shots = [{"shot": s.get("id"), "duration": round(float(s["end"]) - float(s["start"]), 3)}
                    for s in shots
-                   if float(s["end"]) - float(s["start"]) < MIN_SHOT - 1e-6]
+                   if float(s["end"]) - float(s["start"]) < shot_floor - 1e-6]
     # Rule 7: tagged coverage per sentence — the share of the sentence's
     # judged samples where a tagged panel is on screen. <=8s sentences
     # need >=80% (trivially 100% when the tagged panel holds the window);
