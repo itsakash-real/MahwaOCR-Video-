@@ -1211,6 +1211,16 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                 # zoom amplitude further for just this card instead of the
                 # mode-wide 0.5 factor.
                 c["wide_zoom_scale"] = 0.12 if info.get("edge_text") else 0.5
+                # A pan across a window that already spans the panel's full
+                # width (or full height) has nowhere to travel: the card
+                # renders as a frozen still while only the captions change,
+                # which reads as the picture "refreshing" every couple of
+                # seconds. Swap dead pans for a zoom, which always moves.
+                _m = c.get("motion")
+                if _m in ("pan_left", "pan_right") and crop[2] - crop[0] >= 0.999:
+                    c["motion"] = "push_in" if _m == "pan_right" else "pull_out"
+                elif _m in ("pan_up", "pan_down") and crop[3] - crop[1] >= 0.999:
+                    c["motion"] = "push_in" if _m == "pan_down" else "pull_out"
             c["pad_y"] = 0.0
             c["wide_display"] = True
         s["cards"] = cards
