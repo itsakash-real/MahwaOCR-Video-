@@ -1184,7 +1184,8 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                     # cannot catch (see wide_mode_v3_all_issues.md: dragons
                     # cut mid-body even where the head detector was right).
                     head = head_of(_panel_maps(img, designer.map_options))
-                    if head.get("figure"):
+                    if (head.get("figure") and head.get("top") is not None
+                            and head.get("bottom") is not None):
                         top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
                         box[1] = min(box[1], top)
                         box[3] = max(box[3], bottom)
