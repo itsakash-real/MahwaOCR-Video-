@@ -50,9 +50,10 @@ video:
   cinematic:             # only read when video.mode == "cinematic"
     captions: false      # burn minimal captions (no black bar) if true
     name_cards: true     # lower-third name overlay on a character's first appearance
-    reframe: true        # intra-sentence reframe cuts on long sentences
+    callouts: true       # upper-right emphasis keyword (e.g. "172?") on impact/reveal beats
+    reframe: true        # intra-sentence reframe cuts (shot pieces ~1.8-2.5s)
     zoom: 0.06           # slow push-in amount per shot (0 = static)
-    min_hold: 2.0        # shot floor in cinematic mode (viral refs cut ~2.7s mean)
+    min_hold: 1.5        # shot floor in cinematic mode (reference median: 1.77s)
   crf: 20                 # quality: lower = better and bigger files
   preset: veryfast
   lead: 0.15              # panel appears this long before its sentence

@@ -69,12 +69,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # no caption bar). See docs/VIDEO_STYLE_CINEMATIC.md.
         "mode": "classic",
         # Cinematic-mode tuning (only read when video.mode == "cinematic").
+        # Reverse-engineered from the Frieren Manhwa viral recap (1.28M views):
+        # median shot 1.77s, darkened blurred pillars, hard cuts, name cards,
+        # upper-right emphasis callouts. See docs/VIDEO_STYLE_CINEMATIC.md.
         "cinematic": {
             "captions": False,      # burn minimal captions (no black bar) if true
             "name_cards": True,     # lower-third name overlay on a character's first appearance
-            "reframe": True,        # intra-sentence reframe cuts on long sentences
+            "callouts": True,       # upper-right emphasis keyword (e.g. "172?") on impact/reveal beats
+            "reframe": True,        # intra-sentence reframe cuts (shot pieces ~1.8-2.5s)
             "zoom": 0.06,           # slow push-in amount per shot (0 = static)
-            "min_hold": 2.0,        # shot floor in cinematic mode (viral refs cut ~2.7s mean)
+            "min_hold": 1.5,        # shot floor in cinematic mode (reference median: 1.77s)
         },
         "crf": 20,                  # x264 quality: lower = better and bigger
         "preset": "veryfast",

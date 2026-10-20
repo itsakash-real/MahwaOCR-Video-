@@ -1045,8 +1045,8 @@ def _cinematic_pass(shots: List[Dict[str, Any]], units: List[Dict[str, Any]],
     seen: set = set()
     zoom_flip = 1
     out: List[Dict[str, Any]] = []
-    reframe_at = 5.5
-    floor = max(2.0, float(ccfg.get("min_hold", 2.0)))
+    reframe_at = 3.2
+    floor = max(1.2, float(ccfg.get("min_hold", 1.5)))
 
     def _reframe_pieces(shot: Dict[str, Any], name_card: str | None) -> List[Dict[str, Any]]:
         """Recursively split a long shot into reframe pieces."""
@@ -1060,7 +1060,9 @@ def _cinematic_pass(shots: List[Dict[str, Any]], units: List[Dict[str, Any]],
         first.update({"end": mid, "focus": (0.5, 0.35), "name_card": name_card})
         second = dict(shot)
         second.update({"start": mid, "zoom_dir": -shot["zoom_dir"],
-                       "focus": (0.5, 0.65), "name_card": None, "reframe": True})
+                       "focus": (0.5, 0.65), "name_card": None, "reframe": True,
+                       # One-shot overlays stay on the first piece only.
+                       "callout": None, "black_flash_in": False})
         # Alternate focal heights per piece so consecutive reframes differ.
         pieces = _reframe_pieces(first, name_card) + _reframe_pieces(second, None)
         for k, p in enumerate(pieces[1:], 1):
@@ -1092,6 +1094,17 @@ def _cinematic_pass(shots: List[Dict[str, Any]], units: List[Dict[str, Any]],
             "name_card": name_card,
             "name_card_at": 0.15,
         })
+        # Emphasis callout (report: large white outlined keyword like "172?"
+        # upper-right on impact/reveal beats). Reuses the classic keyword
+        # extractor; the cinematic renderer draws it without a black bar.
+        _co = extract_callout(text, unit.get("cues") or [])
+        if _co and ccfg.get("callouts", True):
+            base["callout"] = _co["text"]
+            base["callout_at"] = 0.3
+        # Cold open: the first shot flashes in from black (the reference
+        # opens straight into action; a 0.12s flash-in reads as a hard cut).
+        if i == 0:
+            base["black_flash_in"] = True
         base.pop("caption_bar", None)
         zoom_flip = -zoom_flip
 

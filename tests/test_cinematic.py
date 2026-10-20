@@ -33,12 +33,15 @@ def test_layout_for_picks_tall_and_fullbleed():
     assert layout_for("junk") == cine.LAYOUT_TALL
 
 
-def test_luminous_pillars_fill_frame_and_stay_bright():
+def test_dark_pillars_fill_frame_and_dim():
+    from manhwa_ocr.video.cinematic import dark_pillars
     panel = _panel(300, 500, (180, 100, 60))
-    out = luminous_pillars(panel, 640, 360)
+    out = dark_pillars(panel, 640, 360)
     assert out.size == (640, 360)
-    # Luminous, never a dark scrim: mean brightness stays close to the panel's.
-    assert np.asarray(out).mean() > np.asarray(panel).mean() * 0.75
+    # Darkened sides, clearly dimmer than the panel (report + screenshots).
+    assert np.asarray(out).mean() < np.asarray(panel).mean() * 0.7
+    # ...but not black: still visibly the art's colour.
+    assert np.asarray(out).mean() > 20
 
 
 def test_name_card_draws_in_lower_third():
@@ -139,7 +142,7 @@ def test_cinematic_pass_marks_shots_and_hard_cuts():
     designer = _Designer({"P001-01": 0.6, "P002-01": 1.8})
     shots = [_mkshot(0, 4), _mkshot(4, 8, panel="P002-01")]
     units = [_mkunit(0, 4, "Squishy wakes up."), _mkunit(4, 8, "A dragon appears.")]
-    out = _cinematic_pass(shots, units, designer, {}, ["Squishy"])
+    out = _cinematic_pass(shots, units, designer, {"reframe": False}, ["Squishy"])
     assert all(s["cinematic"] for s in out)
     assert all(s["transition"] == "cut" and s["exit"] == "cut" for s in out)
     assert out[0]["cinematic_layout"] == cine.LAYOUT_TALL
@@ -165,8 +168,8 @@ def test_reframe_splits_long_shots():
     shots = [_mkshot(0, 12)]
     units = [_mkunit(0, 12, "A very long sentence about the battle.")]
     out = _cinematic_pass(shots, units, designer, {}, [])
-    assert len(out) >= 3  # 12s -> recursive halves
-    assert all(float(s["end"]) - float(s["start"]) >= 2.0 for s in out)
+    assert len(out) >= 4  # 12s -> recursive halves at reframe_at=3.2
+    assert all(float(s["end"]) - float(s["start"]) >= 1.5 for s in out)
     panels = [s["cards"][0]["panel"] for s in out]
     assert all(p == "P001-01" for p in panels)  # same panel, reframe only
     assert any(s.get("reframe") for s in out[1:])
@@ -218,7 +221,7 @@ def test_build_plan_cinematic_end_to_end():
     shots = plan["shots"]
     assert shots and all(s.get("cinematic") for s in shots)
     assert plan["captions_enabled"] is False
-    assert plan["pacing"]["min_shot"] == 2.0
+    assert plan["pacing"]["min_shot"] == 1.5
     assert plan["pacing"]["mode"] == "cinematic"
     # Name card fires once, on the first sentence mentioning Squishy.
     named = [s for s in shots if s.get("name_card")]
@@ -254,4 +257,68 @@ def test_config_defaults_to_classic_with_cinematic_section():
     assert ccfg["captions"] is False
     assert ccfg["name_cards"] is True
     assert ccfg["reframe"] is True
-    assert ccfg["min_hold"] == 2.0
+    assert ccfg["callouts"] is True
+    assert ccfg["min_hold"] == 1.5
+
+
+def test_callout_draws_upper_right():
+    from manhwa_ocr.video.cinematic import draw_callout
+    img = Image.new("RGB", (640, 360), (30, 30, 30))
+    before = np.asarray(img).copy()
+    draw_callout(img, "172?", alpha=1.0)
+    after = np.asarray(img)
+    assert not (before == after).all()
+    diff = (after.astype(int) - before.astype(int)).sum(axis=2) != 0
+    ys, xs = np.where(diff)
+    assert ys.max() < 360 * 0.4   # upper area
+    assert xs.max() > 640 * 0.6   # right area
+
+
+def test_callout_renders_on_shot_and_fades():
+    cs = _cshot(_panel(300, 500), callout="172?", callout_at=0.3)
+    a = cs.frame_array(0.5).astype(int)
+    b = _cshot(_panel(300, 500)).frame_array(0.5).astype(int)
+    assert not (a == b).all()
+    # After the 1.5s window the frame is clean again (same t).
+    c = cs.frame_array(2.5).astype(int)
+    d = _cshot(_panel(300, 500)).frame_array(2.5).astype(int)
+    assert (d == c).all()
+
+
+def test_black_flash_opens_first_shot():
+    a = _cshot(_panel(300, 500), black_flash_in=True).frame_array(0.01)
+    b = _cshot(_panel(300, 500)).frame_array(0.01)
+    assert a.mean() < b.mean() * 0.5
+    # Flash is over after 0.12s (same t).
+    c = _cshot(_panel(300, 500), black_flash_in=True).frame_array(0.5).astype(int)
+    d = _cshot(_panel(300, 500)).frame_array(0.5).astype(int)
+    assert (d == c).all()
+
+
+def test_pair_layout_side_by_side():
+    shot = {"start": 0, "end": 4,
+            "cards": [{"panel": "A"}, {"panel": "B"}],
+            "cinematic_layout": "pair"}
+    cs = CinematicShot(shot, {"A": _panel(300, 500, (200, 50, 50)),
+                              "B": _panel(300, 500, (50, 200, 50))},
+                       Format(640, 360, 30))
+    arr = cs.frame_array(1.0)
+    assert arr.shape == (360, 640, 3)
+    left = arr[30, 160].astype(int)
+    right = arr[30, 480].astype(int)
+    # Left panel is reddish, right panel greenish: both visible.
+    assert left[0] > left[1] and right[1] > right[0]
+
+
+def test_cinematic_pass_adds_callout_and_flash():
+    designer = _Designer({})
+    shots = [_mkshot(0, 4), _mkshot(4, 8)]
+    units = [_mkunit(0, 4, "He reached level 172!", ),
+             _mkunit(4, 8, "They ran.")]
+    # impact cue -> keyword callout fires
+    units[0]["cues"] = ["impact"]
+    out = _cinematic_pass(shots, units, designer, {}, [])
+    assert "172" in out[0].get("callout")
+    assert out[0].get("black_flash_in") is True
+    assert out[1].get("callout") is None
+    assert out[1].get("black_flash_in") is not True
