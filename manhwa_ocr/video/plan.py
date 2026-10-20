@@ -1185,10 +1185,20 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                     # cut mid-body even where the head detector was right).
                     head = head_of(_panel_maps(img, designer.map_options))
                     if (head.get("figure") and head.get("top") is not None
-                            and head.get("bottom") is not None):
+                            and head.get("bottom") is not None
+                            and pid not in (designer.fixes.get("crop") or {})):
                         top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
-                        box[1] = min(box[1], top)
-                        box[3] = max(box[3], bottom)
+                        # Grow only while the figure still fits a legal wide
+                        # window. An over-tall "figure" (often most of the
+                        # panel) would otherwise swallow the focal crop --
+                        # reviewer fixes included -- and force wide_crop's
+                        # top-anchored figure_risk fallback, cutting whatever
+                        # lives at the panel's bottom. The focal crop already
+                        # frames the subject; keep it, and let wide_crop flag
+                        # the risk honestly.
+                        if (bottom - top) * ph * (1.0 + 2.0 * WIDE_HEADROOM) <= pw / WIDE_MIN_ASPECT:
+                            box[1] = min(box[1], top)
+                            box[3] = max(box[3], bottom)
                 crop, info = wide_crop(pw, ph, box, min_win_h,
                                        pair_aspect if pair else None, img=img)
                 c["crop"] = crop
