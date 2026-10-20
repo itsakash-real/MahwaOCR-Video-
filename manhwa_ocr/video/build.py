@@ -92,14 +92,14 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
             aspect = ((x1 - x0) * pw) / max(1e-9, ((y1 - y0) + 2 * pad) * ph)
             if wide:
                 # Mode-2 wide shots don't use the classic layout shapes:
-                # every panel is full frame height, width >= 8/16
+                # every panel is full frame height, width >= 6/16
                 # (pairs exactly 8/16 per card).
                 if s.get("layout") == "pair":
                     ok = abs(math.log(aspect / 0.889)) <= 0.02
                 else:
-                    # Wide singles are >= 8/16 wide: a focal window in
-                    # [0.889, 1.777], or a whole panel (any aspect).
-                    ok = aspect >= 0.885
+                    # Wide singles are >= 6/16 wide: a focal window in
+                    # [0.667, 1.777], or a whole panel (aspect >= 0.667).
+                    ok = aspect >= 0.66
             else:
                 ok = min(abs(math.log(aspect / a)) for a in allowed) <= 0.02
             if not ok:

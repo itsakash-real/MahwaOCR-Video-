@@ -380,7 +380,7 @@ class Card:
         else:
             self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
         # Wide mode ("video.mode: wide"): the card is full frame height and
-        # at least 8.5/16 of the frame wide -- no thin strips, ever. Pairs
+        # at least 6/16 of the frame wide -- no thin slivers, ever. Pairs
         # split the frame in two. Portrait formats keep classic sizing.
         self.wide_display = bool(spec.get("wide_display")) and fmt.width > fmt.height
         if self.wide_display:
@@ -393,7 +393,7 @@ class Card:
                 self.cw, self.ch = W, max(2, round(W / aspect))
             else:
                 self.ch = H
-                self.cw = max(round(0.53125 * W), min(W, round(H * aspect)))
+                self.cw = max(round(0.375 * W), min(W, round(H * aspect)))
         self.border = max(1, round(3 * u))
         self.radius = max(2, round(12 * u))
         self.margin = max(6, round(46 * u))

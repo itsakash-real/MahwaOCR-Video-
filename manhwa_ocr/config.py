@@ -63,9 +63,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
         "format": "16:9",           # 16:9 (1920x1080) or 9:16 (1080x1920, Shorts)
         "fps": 30,
-        "mode": "classic",          # classic | wide (wide: full-height panels, min 8.5/16 wide)
+        "mode": "classic",          # classic | wide (wide: full-height panels, min 6/16 wide)
         "wide": {
-            "min_width_ratio": 0.53125,  # 8.5/16 of frame width; no thin strips
+            "min_width_ratio": 0.375,  # 6/16 of frame width; no thin slivers
             "max_upscale": 1.5,          # a panel is never upscaled past this (1080p sharpness)
         },
         "crf": 20,                  # x264 quality: lower = better and bigger

@@ -45,11 +45,11 @@ video:
   fps: 30
   mode: classic           # classic | wide
                           # wide = classic editing, but panels are always full
-                          # frame height and at least 8.5/16 of the frame wide
-                          # (no thin strips), with an upscale cap for 1080p
+                          # frame height and at least 6/16 of the frame wide
+                          # (no thin slivers), with an upscale cap for 1080p
                           # sharpness. Captions overlay the art (no black bar).
   wide:
-    min_width_ratio: 0.53125  # 8.5/16 of frame width
+    min_width_ratio: 0.375  # 6/16 of frame width
     max_upscale: 1.5          # never upscale a panel more than this
   crf: 20                 # quality: lower = better and bigger files
   preset: veryfast

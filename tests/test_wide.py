@@ -1,5 +1,5 @@
 """Wide mode ("video.mode: wide"): classic editing, full-height panels,
-min 8.5/16 of the frame wide, upscale capped for 1080p sharpness."""
+min 6/16 of the frame wide, upscale capped for 1080p sharpness."""
 from PIL import Image
 
 from manhwa_ocr.video.frames import Card, Format
@@ -30,16 +30,16 @@ FMT = Format(1920, 1080, 30)
 
 def test_wide_crop_window_fills_min_width_and_contains_subject():
     # A tall panel, classic crop = whole panel: the window is the tallest
-    # the min-width rule allows (900/0.889 = 1012px), centred on the subject.
+    # the min-width rule allows (900/0.667 = 1349px), centred on the subject.
     box = wide_crop(900, 2406, [0, 0, 1, 1], min_win_h=720)
     w = (box[2] - box[0]) * 900
     h = (box[3] - box[1]) * 2406
-    assert abs(w / h - 0.889) < 0.01
+    assert abs(w / h - 0.667) < 0.01
     assert h >= 720
 
 
 def test_wide_crop_wide_panel_goes_fullbleed():
-    # A wide panel (>= 0.889): shown whole, never cropped.
+    # A wide panel (>= 0.667): shown whole, never cropped.
     box = wide_crop(1600, 900, [0, 0, 1, 1], min_win_h=720)
     assert box == [0.0, 0.0, 1.0, 1.0]
 
@@ -89,22 +89,29 @@ def test_wide_crop_pair_window():
 
 
 def test_wide_crop_shows_whole_panel_when_wide_enough():
-    # A 1.0-aspect panel (>= 0.889) shown whole at full height is 1080px
+    # A 1.0-aspect panel (>= 0.667) shown whole at full height is 1080px
     # wide: the full figure stays visible, nothing cropped.
     box = wide_crop(900, 900, [0, 0.1, 1, 0.6], min_win_h=720)
     assert box == [0.0, 0.0, 1.0, 1.0]
 
 
 def test_wide_crop_narrow_panel_window():
-    # Aspect 0.71 < 0.889: a window at the min display width, containing
-    # the classic crop's subject.
-    box = wide_crop(900, 1273, [0, 0, 1, 0.9], min_win_h=720)
+    # Aspect 0.374 < 0.667: a window at the min display width (6/16),
+    # containing the classic crop's subject.
+    box = wide_crop(900, 2406, [0, 0, 1, 0.9], min_win_h=720)
     w = (box[2] - box[0]) * 900
-    h = (box[3] - box[1]) * 1273
-    assert abs(w / h - 0.889) < 0.01
-    # Subject (1146px) is taller than the min-width cap (1012px): the
+    h = (box[3] - box[1]) * 2406
+    assert abs(w / h - 0.667) < 0.01
+    # Subject (2165px) is taller than the min-width cap (1349px): the
     # window covers its centre instead.
-    assert box[1] * 1273 < 0.45 * 1273 < box[3] * 1273
+    assert box[1] * 2406 < 0.45 * 2406 < box[3] * 2406
+
+
+def test_wide_crop_slim_panel_now_shown_whole():
+    # Aspect 0.71 >= 0.667: with the 6/16 relief the panel is shown whole
+    # (it used to need a window under the old 8/16 rule).
+    box = wide_crop(900, 1273, [0, 0, 1, 0.9], min_win_h=720)
+    assert box == [0.0, 0.0, 1.0, 1.0]
 
 
 def test_wide_crop_pair_aspect():
@@ -165,7 +172,7 @@ def test_card_wide_display_min_width():
                 "single", 0, 0.0, 4.0, FMT, None)
     assert card.wide_display is True
     assert card.ch == 1080
-    assert card.cw >= round(0.53125 * 1920)  # 8.5/16 of the frame
+    assert card.cw >= round(0.375 * 1920)  # 6/16 of the frame
     assert card.rest_c == (960.0, 540.0)
 
 

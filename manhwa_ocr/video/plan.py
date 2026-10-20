@@ -1019,13 +1019,13 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
 # ------------------------------------------------------------------ wide mode
 
 # Wide mode ("video.mode: wide") is classic editing with wide panels: every
-# panel touches the top and bottom of the frame and is at least 8.5/16 of the
-# frame wide — no thin strips ever. Single-crop shapes run widest-first; the
-# first window whose height keeps the display upscale within max_upscale
-# wins (1080p sharpness), falling back to the narrowest shape for very short
-# panels. The window is centred on the classic focal crop's centre, so the
-# head-aware, bubble-avoiding framing carries over.
-WIDE_SINGLE_ASPECTS = (1.777, 1.333, 1.25, 1.0, 0.944)
+# panel touches the top and bottom of the frame and is at least 6/16 of the
+# frame wide (the owner's relief: narrower is fine when the tile reads
+# better that way; full-bleed is the max) — no thin slivers ever. The
+# window contains the classic focal crop (plus headroom), so the
+# head-aware, bubble-avoiding framing carries over, and it is clamped
+# inside the panel.
+WIDE_MIN_ASPECT = 0.667   # 6/16 of the frame at full height (720px @1080p)
 WIDE_HEADROOM = 0.08   # window grows this much past the focal crop on each end
 
 
@@ -1036,7 +1036,7 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
     The subject is the classic focal crop (`box`): the window CONTAINS it
     (expanded by WIDE_HEADROOM on both ends, so the Ken Burns zoom never
     eats the subject's edges), is clamped inside the panel, keeps the
-    display width >= 8/16 (pairs: exactly 8/16 per card) and the upscale
+    display width >= 6/16 (pairs: exactly 8/16 per card) and the upscale
     within the cap wherever the panel allows.
     """
     try:
@@ -1046,10 +1046,10 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
     bx0 = max(0.0, min(1.0, bx0)); by0 = max(0.0, min(1.0, by0))
     bx1 = max(bx0, min(1.0, bx1)); by1 = max(by0, min(1.0, by1))
     panel_aspect = pw / max(ph, 1e-9)
-    # A panel that already fills >= 8/16 at full height is shown whole:
+    # A panel that already fills >= 6/16 at full height is shown whole:
     # the full figure stays visible, nothing is cropped. (Super-wide
     # panels are shown whole too, full-bleed with fill top/bottom.)
-    if pair_aspect is None and panel_aspect >= 0.889:
+    if pair_aspect is None and panel_aspect >= WIDE_MIN_ASPECT:
         return [0.0, 0.0, 1.0, 1.0]
     subj_w, subj_h = (bx1 - bx0) * pw, (by1 - by0) * ph
     grow = 1.0 + 2.0 * WIDE_HEADROOM
@@ -1059,10 +1059,11 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
         if win_w > pw:                       # panel narrower than the window
             win_w, win_h = pw, pw / pair_aspect
     else:
-        win_h = min(ph, pw / 0.889, max(subj_h * grow, min(min_win_h, ph)))
+        win_h = min(ph, pw / WIDE_MIN_ASPECT,
+                    max(subj_h * grow, min(min_win_h, ph)))
         win_w = min(pw, win_h * 1.777)
-        if win_w / max(win_h, 1e-9) < 0.889:
-            win_h = win_w / 0.889
+        if win_w / max(win_h, 1e-9) < WIDE_MIN_ASPECT:
+            win_h = win_w / WIDE_MIN_ASPECT
     # Position: centre the window on the subject, clamped inside the panel.
     cx, cy = (bx0 + bx1) / 2.0 * pw, (by0 + by1) / 2.0 * ph
     x0 = max(0.0, min(pw - win_w, cx - win_w / 2.0))
