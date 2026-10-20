@@ -113,6 +113,7 @@ RULES (current editor, all in main):
 - Faces: never mask a face, never paint a bubble, never cut a face at edges. Crop to exclude bubbles, else drop + re-pair. System-window panels get wide fill (>=90% frame width, >=1.33 aspect), never a small square.
 - Panel diversity: never 3 identical cards in a row. Third showing must use a different panel or a different (punched-tighter) crop.
 - P2 switch: never switch to square 1.0 in a wide layout.
+- Wide mode (video.mode: wide, opt-in, landscape only): every card is full frame height (no letterbox above/below), >=6/16 of the frame wide (no thin slivers, pairs exactly 8/16 each), captions OVERLAY the art (no black bar), upscale capped at 1.5x. The motion zoom eats ~4% of the window height at its extremes (push_in end / pull_out start) -- a crop is only safe if heads, horns and bubble text clear the window edge by MORE than that at the worst moment. Measure reviewer crops from the actual panel pixels, never from thumbnails.
 - SFX/music: render mixes SFX from video.sfx_dir and music from music/bed.mp3 if present. Missing files -> warning, render without, never fail, never invent audio.
 ACCEPTANCE: video/chapter_N.mp4 exists (1080p), sync gate PASS, spot-checks clean (see Prompt F). Report duration, file size, every shot changed + why, every dropped panel + reason, every pairs.json change.
 ```
@@ -249,6 +250,7 @@ STORYBOARD REVIEW — check every shot for ALL of these (this is the review we f
 - Panel diversity: never 3 identical cards in a row. Third showing must use a different panel or a different (punched-tighter) crop.
 - P2 switch: never switch to square 1.0 in a wide layout.
 - System windows: system-notification / status-window panels get wide fill (>=90% frame width, >=1.33 aspect), never a small centred square. Check ~34s-style banner shots.
+- Wide mode (video.mode: wide): same framing rule as Prompt C -- full frame height, >=6/16 wide, captions overlay the art. Final-render check: view the FIRST and LAST frame of EVERY shot plus a 1fps pass. Sampled timestamps are NOT a pass -- a spot-check can look clean while faces/bubbles are cut elsewhere in the same shot's zoom extremes.
 - Transitions: hard cut default, fade 10%, slide/zoom/whip/glitch only on impact/reveal beats (glitch max 1 per 60s). No transition may cause a flicker. No effect may cover a face.
 - SFX/music: plan SFX events, but render without SFX/music if files are missing (warning, never fail, never invent audio). Grade OFF by default.
 

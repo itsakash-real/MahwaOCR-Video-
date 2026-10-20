@@ -36,7 +36,7 @@ from .frames import Format, ShotRenderer, format_from
 from .media import pages_dir, video_dir
 from .panels import load_panels, panel_image
 
-RENDER_VERSION = 2
+RENDER_VERSION = 3  # v3: wide mode -- cards render full-height, with different sizes/motion
 AUDIO_FADE = 0.8
 
 
@@ -291,13 +291,16 @@ def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any],
     if plan.get("captions_enabled") and _caps:
         from .captions import captions_path, write_ass
         _ass = captions_path(root, chapter)
-        write_ass(_caps, _ass, fmt=fmt)
+        write_ass(_caps, _ass, fmt=fmt, margin_v=90 if plan.get("mode") == "wide" else None)
         _escaped = str(_ass).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
         _captioned = tmp.with_name(tmp.stem + ".captioned.mp4")
         _preset = "ultrafast" if preview else str(vcfg.get("preset", "veryfast"))
         _crf = int(vcfg.get("crf", 20)) + (6 if preview else 0)
         try:
-            run(["-i", str(tmp), "-vf", f"subtitles={_escaped}", "-map", "0",
+            # The path must be quoted inside the filter value: on some ffmpeg
+            # builds (7.1), an unquoted escaped drive letter ("C\:/...")
+            # still gets mis-parsed as a filter option ("original_size").
+            run(["-i", str(tmp), "-vf", f"subtitles='{_escaped}'", "-map", "0",
                  "-c:v", "libx264", "-preset", _preset, "-crf", str(_crf),
                  "-c:a", "copy", "-movflags", "+faststart", str(_captioned)], timeout=1800)
             assembled = _captioned

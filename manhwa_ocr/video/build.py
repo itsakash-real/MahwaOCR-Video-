@@ -83,13 +83,23 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     missing = [p for p in art if p not in shown]
     shape_bad = []
     for s in shots:
+        wide = bool(s.get("wide"))
         allowed = shapes_for(s.get("layout", "single"), fmt)
         for c in s.get("cards") or []:
             pw, ph = dims.get(c["panel"], (1.0, 1.0))
             x0, y0, x1, y1 = (float(v) for v in c["crop"])
             pad = float(c.get("pad_y") or 0.0)          # blurred padding above and below the crop
             aspect = ((x1 - x0) * pw) / max(1e-9, ((y1 - y0) + 2 * pad) * ph)
-            if min(abs(math.log(aspect / a)) for a in allowed) > 0.02:
+            if wide:
+                # Wide-mode shots don't use the classic layout shapes: every
+                # card is full frame height, width >= 6/16 (pairs exactly
+                # 8/16). A whole panel shown as-is is always >= 6/16 wide
+                # (that's the rule that puts it there), so a single aspect
+                # floor covers both windowed and whole-panel singles.
+                ok = abs(math.log(aspect / 0.889)) <= 0.02 if s.get("layout") == "pair" else aspect >= 0.66
+            else:
+                ok = min(abs(math.log(aspect / a)) for a in allowed) <= 0.02
+            if not ok:
                 shape_bad.append(f"{s.get('id')} {c['panel']} ({aspect:.2f})")
     shortest = min((float(s["end"]) - float(s["start"]) for s in shots), default=0.0)
     cs = plan.get("crop_stats") or {}
@@ -125,6 +135,10 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "tagged_coverage": cov.get("tagged_coverage", {}),
         "filler_shots": cov.get("filler_shots", 0),
         "filler_seconds": cov.get("filler_seconds", 0.0),
+        # Wide mode only: panels whose window could not be repositioned
+        # clear of a caption/text collision (see plan._wide_pass). INFO ONLY
+        # -- never a failure -- so a reviewer can see and fix it by hand.
+        "wide_caption_risk": list(plan.get("wide_caption_risk") or []),
         "min_shot": round(shortest, 2),
         "max_shots": max(0, int(duration // 3.0)) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),

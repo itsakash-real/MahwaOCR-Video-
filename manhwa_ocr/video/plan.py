@@ -33,7 +33,7 @@ from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
 from . import sync as sync_mod
-from .crops import _panel_maps, head_of, is_mask_risk, is_system_window, tone
+from .crops import _panel_maps, content_bands, head_of, is_mask_risk, is_system_window, safe_span, tone
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
 from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_crop, build_chapter_cards, extract_callout, pacing_qa,
@@ -1016,6 +1016,179 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
     return out
 
 
+# ------------------------------------------------------------------ wide mode
+
+# Wide mode ("video.mode: wide") is classic editing with wide panels: every
+# card touches the top and bottom of the frame and is at least 6/16 of the
+# frame wide (pairs exactly 8/16); no thin slivers ever. The window CONTAINS
+# the classic focal crop (the head-aware, bubble-avoiding crop the classic
+# planner already computed), grown by headroom on each end, top-anchored to
+# that crop's own top, then nudged so its edges never land mid-bubble or
+# mid-caption (crops.content_bands / crops.safe_span). Centring the window
+# on the subject was tried first and rejected: the overflow split both ways
+# and landed edges mid-bubble, mid-horns (wide_mode_v3_all_issues.md).
+WIDE_MIN_ASPECT = 0.667    # 6/16 of the frame at full height (720px @1080p)
+WIDE_HEADROOM = 0.08       # window grows this much past the focal crop per end
+WIDE_CAPTION_ZONE = 0.12   # bottom share of the window captions overlay (no bar in wide mode)
+WIDE_EDGE_MARGIN = 0.06    # whole-panel: text within this of an edge needs zoom protection
+
+
+def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
+             pair_aspect: float | None = None, img: Image.Image | None = None
+             ) -> Tuple[List[float], Dict[str, Any]]:
+    """A wide-mode window over one panel, in panel fractions, plus diagnostics
+    {"whole", "edge_text", "caption_risk"} (all bool).
+
+    `box` is the classic focal crop for the panel. `img`, when given, lets
+    the window edges avoid landing mid-bubble/mid-caption/mid-SFX and warns
+    about a whole panel's own edge text (zoom would clip it) or a window
+    whose bottom share collides with the overlaid captions.
+    """
+    try:
+        bx0, by0, bx1, by1 = (float(v) for v in box[:4])
+    except (TypeError, ValueError, IndexError):
+        bx0, by0, bx1, by1 = 0.0, 0.0, 1.0, 1.0
+    bx0 = max(0.0, min(1.0, bx0)); by0 = max(0.0, min(1.0, by0))
+    bx1 = max(bx0, min(1.0, bx1)); by1 = max(by0, min(1.0, by1))
+    panel_aspect = pw / max(ph, 1e-9)
+    info: Dict[str, Any] = {"whole": False, "edge_text": False, "caption_risk": False}
+    # A panel that already fills >= 6/16 at full height is shown whole: the
+    # full figure stays visible, nothing is cropped. (Super-wide panels are
+    # shown whole too, full-bleed, with fill covering the top/bottom margin.)
+    if pair_aspect is None and panel_aspect >= WIDE_MIN_ASPECT:
+        info["whole"] = True
+        if img is not None:
+            bands = content_bands(img, axis="y") + content_bands(img, axis="x")
+            info["edge_text"] = any(b0 <= WIDE_EDGE_MARGIN or b1 >= 1 - WIDE_EDGE_MARGIN for b0, b1 in bands)
+        return [0.0, 0.0, 1.0, 1.0], info
+    subj_w, subj_h = (bx1 - bx0) * pw, (by1 - by0) * ph
+    grow = 1.0 + 2.0 * WIDE_HEADROOM
+    if pair_aspect is not None:
+        win_h = min(ph, max(subj_h * grow, min(min_win_h, ph)))
+        win_w = win_h * pair_aspect
+        if win_w > pw:                       # panel narrower than the window
+            win_w, win_h = pw, pw / pair_aspect
+    else:
+        win_h = min(ph, pw / WIDE_MIN_ASPECT, max(subj_h * grow, min(min_win_h, ph)))
+        win_w = min(pw, win_h * 1.777)
+        if win_w / max(win_h, 1e-9) < WIDE_MIN_ASPECT:
+            win_h = win_w / WIDE_MIN_ASPECT
+
+    # Vertical: top-anchored to the focal crop's own top, clamped so the
+    # window still contains the whole subject and stays inside the panel.
+    lo_y = max(0.0, by1 * ph - win_h)
+    hi_y = min(by0 * ph, max(0.0, ph - win_h))
+    if hi_y < lo_y:
+        lo_y, hi_y = 0.0, max(0.0, ph - win_h)
+    y0 = max(lo_y, min(hi_y, by0 * ph))
+    # Horizontal: centred on the focal crop, same containment clamp.
+    cx = (bx0 + bx1) / 2.0 * pw
+    lo_x = max(0.0, bx1 * pw - win_w)
+    hi_x = min(bx0 * pw, max(0.0, pw - win_w))
+    if hi_x < lo_x:
+        lo_x, hi_x = 0.0, max(0.0, pw - win_w)
+    x0 = max(lo_x, min(hi_x, cx - win_w / 2.0))
+
+    if img is not None:
+        yb = content_bands(img, axis="y")
+        xb = content_bands(img, axis="x")
+        y0 = safe_span(ph, win_h, lo_y, hi_y, yb, y0)
+        x0 = safe_span(pw, win_w, lo_x, hi_x, xb, x0)
+
+        # Captions overlay the art in wide mode: a band inside the window's
+        # bottom share collides with the caption zone. First try pushing
+        # the window down (more panel below the text); a single (not a
+        # pair -- its aspect is fixed) may also grow taller, which shrinks
+        # the band's share of the window. If neither clears it, flag it.
+        def _collides(y0v: float, h: float) -> bool:
+            zone = h * WIDE_CAPTION_ZONE
+            return any(b0 * ph < y0v + h and b1 * ph > y0v + h - zone for b0, b1 in yb)
+
+        if _collides(y0, win_h):
+            pushed = safe_span(ph, win_h, y0, hi_y, yb, hi_y)
+            if not _collides(pushed, win_h):
+                y0 = pushed
+            elif pair_aspect is None:
+                max_h = min(ph, win_w / WIDE_MIN_ASPECT)
+                step = max(ph * 0.02, 4.0)
+                grown_h, found = win_h, False
+                while grown_h < max_h - 1e-6:
+                    grown_h = min(max_h, grown_h + step)
+                    grown_y0 = max(0.0, min(by0 * ph, ph - grown_h))
+                    if not _collides(grown_y0, grown_h):
+                        win_h, y0, found = grown_h, grown_y0, True
+                        break
+                if not found:
+                    info["caption_risk"] = True
+            else:
+                info["caption_risk"] = True
+
+    return [round(x0 / pw, 4), round(y0 / ph, 4), round((x0 + win_w) / pw, 4),
+           round((y0 + win_h) / ph, 4)], info
+
+
+def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+               wcfg: Dict[str, Any]) -> List[str]:
+    """Rewrite a classic plan for wide mode: single + pair layouts only
+    (inset/classic-wide become full-height singles), crops become wide
+    focal windows, caption_bar is off so panels touch the bottom edge and
+    captions overlay the art. Runs after the classic plan is fully built
+    (punch-ins, pairs, splits already decided) so every card -- first
+    showing, punch-in, each side of a pair -- gets the same edge audit.
+
+    Returns the ids of panels flagged with a caption/text collision risk
+    that could not be resolved by repositioning (plan["wide_caption_risk"]),
+    for an honest report rather than a silent miss.
+    """
+    if fmt.width <= fmt.height:
+        return []  # portrait formats are untouched
+    min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
+    pair_aspect = (fmt.width / 2.0) / fmt.height
+    caption_risk: List[str] = []
+    for s in shots:
+        s["wide"] = True
+        s["caption_bar"] = False
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        if not pair:
+            s["layout"] = "single"
+            cards = cards[:1]
+        for c in cards:
+            pid = c.get("panel")
+            p = designer.by_id.get(pid) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if pw > 0 and ph > 0:
+                img = designer.img(pid) if pid in designer.by_id else None
+                box = list(c.get("crop") or [0, 0, 1, 1])
+                if img is not None:
+                    # The classic focal crop can itself exclude the figure
+                    # (a narrow landscape/portrait shape outscores a window
+                    # that includes the head, or the pick lands on a
+                    # different detail) -- it is still flagged head_cut, but
+                    # classic mode's own card just shows that strip. Wide
+                    # mode's generous full-height window must not inherit
+                    # that miss: grow the subject to also cover the detected
+                    # figure's own vertical span before anchoring to it.
+                    head = head_of(_panel_maps(img, designer.map_options))
+                    if head.get("figure"):
+                        box[1] = min(box[1], float(head["top"]))
+                        box[3] = max(box[3], float(head["bottom"]))
+                crop, info = wide_crop(pw, ph, box, min_win_h,
+                                       pair_aspect if pair else None, img=img)
+                c["crop"] = crop
+                if info.get("caption_risk") and pid not in caption_risk:
+                    caption_risk.append(pid)
+                # Whole-panel windows have zero margin: the Ken Burns zoom
+                # would clip text sitting at the panel's own edge. Cut the
+                # zoom amplitude further for just this card instead of the
+                # mode-wide 0.5 factor.
+                c["wide_zoom_scale"] = 0.12 if info.get("edge_text") else 0.5
+            c["pad_y"] = 0.0
+            c["wide_display"] = True
+        s["cards"] = cards
+    return caption_risk
+
+
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
                vcfg: Dict[str, Any], image_for: Callable[[Dict[str, Any]], Image.Image],
                sentences: List[Dict[str, Any]] | None = None,
@@ -1124,8 +1297,14 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         for _s in shots:
             _s["caption_bar"] = True  # dedicated bottom bar, below the cards
     sfx = plan_sfx(shots, chapter_cards)
+    _mode = str(vcfg.get("mode") or "classic")
+    _wide_caption_risk: List[str] = []
+    if _mode == "wide":
+        _wide_caption_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     return {
         "version": PLAN_VERSION,
+        "mode": _mode,
+        "wide_caption_risk": _wide_caption_risk,
         "chapter": chapter,
         "format": vcfg.get("format", "16:9"),
         "fps": int(vcfg.get("fps", 30)),

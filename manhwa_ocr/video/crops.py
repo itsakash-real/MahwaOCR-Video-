@@ -121,6 +121,82 @@ def text_bands(img: Image.Image, limit: float = 0.45) -> Tuple[float, float]:
     return top / n, 1 - bottom / n
 
 
+def content_bands(img: Image.Image, axis: str = "y", threshold: float = 0.4,
+                  min_run_frac: float = 0.015) -> List[Tuple[float, float]]:
+    """Bands dense with lettering or flat white -- speech bubbles, caption
+    boxes, SFX lettering, chat rows, UI banners -- as fractions of the
+    panel's height (axis="y") or width (axis="x").
+
+    Used by wide mode to keep a crop window's edge from landing in the
+    middle of one of these (see safe_span): a window edge is fine right
+    at a band's boundary, but splitting it mid-bubble/mid-line is the
+    defect wide mode must avoid.
+    """
+    rgb = _small(img, 160)
+    _, hard, flat_white = _art_maps(rgb)
+    texty = np.clip(flat_white + hard, 0, 1)
+    density = texty.mean(axis=1) if axis == "y" else texty.mean(axis=0)
+    n = len(density)
+    rows = density > threshold
+    min_run = max(1, int(min_run_frac * n))
+    bands: List[Tuple[float, float]] = []
+    i = 0
+    while i < n:
+        if rows[i]:
+            j = i
+            while j < n and rows[j]:
+                j += 1
+            if j - i >= min_run:
+                bands.append((i / n, j / n))
+            i = j
+        else:
+            i += 1
+    return bands
+
+
+def safe_span(extent: float, win: float, lo: float, hi: float,
+             bands: List[Tuple[float, float]], anchor: float) -> float:
+    """A start coordinate in [lo, hi] (same units as `extent`) for a window
+    of length `win` whose edges (p, p + win) land outside every band
+    (`bands`, fractions of `extent`), as close to `anchor` as possible.
+
+    Falls back to `anchor` (clamped into range) when no clean position
+    exists -- growing the window further would break the layout's fixed
+    aspect (pairs) or push it out of the panel.
+    """
+    lo = max(0.0, lo)
+    hi = min(extent - win, hi)
+    if hi < lo:
+        lo, hi = 0.0, max(0.0, extent - win)
+    anchor = max(lo, min(hi, anchor))
+
+    def clean(p: float) -> bool:
+        q = p + win
+        for b0, b1 in bands:
+            x0, x1 = b0 * extent, b1 * extent
+            if x0 + 1e-6 < p < x1 - 1e-6:
+                return False
+            if x0 + 1e-6 < q < x1 - 1e-6:
+                return False
+        return True
+
+    if clean(anchor):
+        return anchor
+    candidates = {lo, hi}
+    for b0, b1 in bands:
+        x0, x1 = b0 * extent, b1 * extent
+        candidates.update({x0, x1, x0 - win, x1 - win})
+    best = None
+    for c in candidates:
+        if lo - 1e-6 <= c <= hi + 1e-6:
+            c = max(lo, min(hi, c))
+            if clean(c):
+                d = abs(c - anchor)
+                if best is None or d < best[0]:
+                    best = (d, c)
+    return best[1] if best else anchor
+
+
 def focal_crops(img: Image.Image, aspect: float, k: int = 3, zoom: float = 1.0,
                 trim_text: bool = True) -> List[Box]:
     """Up to k crop boxes of width/height `aspect`, best first.

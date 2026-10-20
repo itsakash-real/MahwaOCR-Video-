@@ -43,6 +43,12 @@ download:
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
+  mode: classic           # classic | wide. wide: every card full frame height (no letterbox),
+                          # min 6/16 of the frame wide (pairs exactly 8/16), captions overlay
+                          # the art (no black bar). Landscape only; portrait stays classic.
+  wide:
+    min_width_ratio: 0.375  # 6/16 of the frame wide; no thin slivers, ever
+    max_upscale: 1.5        # a panel is never upscaled past this (keeps 1080p sharp)
   crf: 20                 # quality: lower = better and bigger files
   preset: veryfast
   lead: 0.15              # panel appears this long before its sentence

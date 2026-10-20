@@ -222,27 +222,30 @@ def slot_centres(layout: str, fmt: Format, size: Tuple[int, int], index: int) ->
 
 
 @lru_cache(maxsize=8)
-def _vignette_grid(width: int, height: int) -> np.ndarray:
+def _vignette_grid(width: int, height: int, strength: float = 0.45) -> np.ndarray:
     ys, xs = np.ogrid[0:height, 0:width]
     nx = (xs - width / 2) / (width / 2)
     ny = (ys - height / 2) / (height / 2)
     d = np.sqrt(nx ** 2 + ny ** 2) / math.sqrt(2)
-    return (1.0 - 0.45 * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
+    return (1.0 - strength * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
 
 
-def _vignette(fmt: Format) -> np.ndarray:
+def _vignette(fmt: Format, strength: float = 0.45) -> np.ndarray:
     # The vignette depends only on the frame size: identical for every shot
     # in a chapter, so build it once. Callers must not mutate the result
     # (background() only multiplies by it).
-    return _vignette_grid(fmt.width, fmt.height)
+    return _vignette_grid(fmt.width, fmt.height, strength)
 
 
-def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
+def background(kind: str, panel: Image.Image | None, fmt: Format, light: bool = False) -> np.ndarray:
     if kind == "black" or (kind == "blur" and panel is None):
         return np.zeros((fmt.height, fmt.width, 3), np.uint8)
     if kind == "white":
         return np.full((fmt.height, fmt.width, 3), 255, np.uint8)
     # Blur: the panel scaled to cover the frame, blurred, darkened, vignetted.
+    # Wide mode (`light=True`): the side fill stays bright (0.90 + a soft
+    # 0.18 vignette) -- the classic dark pillars (0.72 + 0.45) look too
+    # heavy next to a full-height card.
     sw, sh = max(4, fmt.width // 8), max(4, fmt.height // 8)
     k = max(sw / panel.width, sh / panel.height)
     small = panel.convert("RGB").resize((max(4, int(panel.width * k) + 1), max(4, int(panel.height * k) + 1)),
@@ -250,7 +253,9 @@ def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
     left, top = (small.width - sw) // 2, (small.height - sh) // 2
     small = small.crop((left, top, left + sw, top + sh)).filter(ImageFilter.GaussianBlur(4.5))
     big = np.asarray(small.resize((fmt.width, fmt.height), Image.BICUBIC), dtype=np.float32)
-    return np.clip(big * 0.72 * _vignette(fmt), 0, 255).astype(np.uint8)
+    factor = 0.90 if light else 0.72
+    vig = _vignette(fmt, 0.18) if light else _vignette(fmt)
+    return np.clip(big * factor * vig, 0, 255).astype(np.uint8)
 
 
 # ------------------------------------------------------------------ P4 caches
@@ -266,7 +271,7 @@ _SRC_CACHE_MAX = 32
 
 
 def _cached_background(kind: str, panel: Image.Image | None, fmt: Format,
-                       bg_panel_id: str | None) -> np.ndarray:
+                       bg_panel_id: str | None, light: bool = False) -> np.ndarray:
     """background() with a cross-shot cache. Consecutive shots usually
     share a bg_panel (same panel across sentences); rebuilding the
     blurred + vignetted 1080p backdrop per shot re-pays the upscale +
@@ -274,20 +279,20 @@ def _cached_background(kind: str, panel: Image.Image | None, fmt: Format,
     different image under the same panel id can never hit a stale entry.
     Solid (black/white) backgrounds are cached by kind + frame size."""
     if panel is None:
-        key = (kind, fmt.width, fmt.height, None, None)
+        key = (kind, fmt.width, fmt.height, None, None, light)
         hit = _BG_CACHE.get(key)
         if hit is not None:
             _BG_CACHE.move_to_end(key)
             return hit[1]
-        arr = background(kind, None, fmt)
+        arr = background(kind, None, fmt, light=light)
         _BG_CACHE[key] = (None, arr)
     else:
-        key = (kind, fmt.width, fmt.height, bg_panel_id, id(panel))
+        key = (kind, fmt.width, fmt.height, bg_panel_id, id(panel), light)
         hit = _BG_CACHE.get(key)
         if hit is not None and hit[0] is panel:
             _BG_CACHE.move_to_end(key)
             return hit[1]
-        arr = background(kind, panel, fmt)
+        arr = background(kind, panel, fmt, light=light)
         _BG_CACHE[key] = (panel, arr)
     while len(_BG_CACHE) > _BG_CACHE_MAX:
         _BG_CACHE.popitem(last=False)
@@ -374,6 +379,22 @@ class Card:
             self.cw, self.ch = fit(aspect, card_box(layout, fmt), None)
         else:
             self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
+        # Wide mode ("video.mode: wide"): the card is full frame height and
+        # at least 6/16 of the frame wide -- no thin slivers, ever. Pairs
+        # split the frame exactly in two. Portrait formats keep classic sizing.
+        self.wide_display = bool(spec.get("wide_display")) and fmt.width > fmt.height
+        self.wide_zoom_scale = float(spec.get("wide_zoom_scale", 0.5))
+        if self.wide_display:
+            H, W = fmt.height, fmt.width
+            if layout == "pair":
+                self.cw, self.ch = W // 2, H  # 8/16 each: two panels fill the frame
+            elif aspect > 1.777:
+                # Super-wide panel shown whole: full-bleed width, the
+                # light side fill covers the top/bottom instead.
+                self.cw, self.ch = W, max(2, round(W / aspect))
+            else:
+                self.ch = H
+                self.cw = max(round(0.375 * W), min(W, round(H * aspect)))
         self.border = max(1, round(3 * u))
         self.radius = max(2, round(12 * u))
         self.margin = max(6, round(46 * u))
@@ -381,6 +402,10 @@ class Card:
         self.iw, self.ih = iw, ih
         # P4: cache the LANCZOS resize; same panel + crop + target size reuses it.
         self.src = _cached_src(panel, region, (x0, y0, x1, y1, pad_y), iw, ih)
+        if self.wide_display and region.width < iw:
+            # Wide mode often upscales a narrow window: a gentle unsharp
+            # mask after the Lanczos resize keeps it from reading soft.
+            self.src = self.src.filter(ImageFilter.UnsharpMask(radius=2.0, percent=60, threshold=3))
 
         # Static parts of the sprite, built once: shadow + white rounded border.
         m = self.margin
@@ -408,6 +433,16 @@ class Card:
         else:
             self.kb_dur = max(0.01, shot_end - self.appear)
         self.start_c, self.rest_c = slot_centres(layout, fmt, (self.cw, self.ch), index)
+        if self.wide_display:
+            # Full frame height, no caption-bar offset: cards sit on the
+            # frame's true vertical centre, not the classic top-92% centre.
+            cy = fmt.height / 2.0
+            if layout == "pair":
+                lx, rx = self.cw / 2.0, fmt.width - self.cw / 2.0
+                self.rest_c = (lx, cy) if index == 0 else (rx, cy)
+                self.start_c = (fmt.width / 2.0, cy) if index == 0 else self.rest_c
+            else:
+                self.start_c = self.rest_c = (fmt.width / 2.0, cy)
         self.pair_move_at = pair_move_at if (layout == "pair" and index == 0) else None
 
     # -------------------------------------------------- time-varying parts
@@ -428,6 +463,12 @@ class Card:
         # motion); `hold` keeps ease-out-then-hold.
         p = ease_out((t - self.appear) / self.kb_dur) if m == "hold" else ease_in_out((t - self.appear) / self.kb_dur)
         zoom = {"push_in": 1.0 + 0.15 * p, "pull_out": 1.18 - 0.18 * p, "hold": 1.01 + 0.02 * p}.get(m, 1.08)
+        if self.wide_display:
+            # Wide cards touch the frame edges on every side: full-amplitude
+            # zoom eats the art (bubbles, faces at the crop edge). Scaled
+            # down to the headroom actually built into the window (half by
+            # default; further for a whole panel with edge-adjacent text).
+            zoom = 1.0 + (zoom - 1.0) * self.wide_zoom_scale
         zoom *= 1 + extra_zoom
         # The source is the whole crop (at extra resolution, so zoomed views stay
         # sharp); zoom 1 shows all of it, zoom 1.1 shows the middle 1/1.1.
@@ -716,7 +757,7 @@ class ShotRenderer:
         # P4: cross-shot bg cache; bg_panel id is the shot's panel id (None
         # keeps the old behaviour for shots without one).
         self.bg = _cached_background(bg_kind, images.get(bg_panel) if bg_panel else None,
-                                     fmt, bg_panel)
+                                     fmt, bg_panel, light=bool(shot.get("wide")))
         # P4: Image.fromarray(self.bg) per frame re-validates + copies the 6MB
         # backdrop; one PIL copy per frame from a cached PIL image is cheaper.
         self._bg_pil = Image.fromarray(self.bg)
