@@ -37,8 +37,8 @@ from .crops import (_panel_maps, content_bands, extend_figure_range, head_of, is
                     is_system_window, safe_span, tone)
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
-from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_crop, build_chapter_cards, extract_callout, pacing_qa,
-                     plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
+from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_card, _inset_crop, build_chapter_cards, extract_callout,
+                     pacing_qa, plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
 from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
 from .captions import build_captions, build_captions_from_sentences, validate_captions
 from .frames import (BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, GLITCH_MIN_GAP, LAYOUTS, MOTIONS,
@@ -423,7 +423,7 @@ def ensure_split_crop_change(shots):
         new_crop = _inset_crop(cur_crop, 0.08)
         if new_crop == cur_crop:
             continue  # already at the minimum readable crop: nothing more to punch into
-        cur = dict(cur_cards[0], crop=new_crop)
+        cur = _inset_card(cur_cards[0], 0.08)
         if cur.get("motion") in PAN_DIRECTIONS:
             cur["motion"] = "push_in"  # a pan would restart q -1 -> +1 on the new shot
         shots[k] = {**shots[k], "cards": [cur]}
@@ -497,14 +497,15 @@ def ensure_panel_diversity(shots):
         if _differs(cur_crop):
             continue  # already a different crop from both predecessors
         new_crop = None
+        new_frac = None
         for frac in (0.08, 0.16, 0.24, 0.32):
             cand = _inset_crop(cur_crop, frac)
             if cand != cur_crop and _differs(cand):
-                new_crop = cand
+                new_crop, new_frac = cand, frac
                 break
         if new_crop is None:
             continue  # already at the minimum readable crop: nothing more to punch into
-        cur = dict(cards[0], crop=new_crop)
+        cur = _inset_card(cards[0], new_frac)
         if cur.get("motion") in PAN_DIRECTIONS:
             cur["motion"] = "push_in"  # a pan would restart q -1 -> +1 on the new shot
         shots[k] = {**shots[k], "cards": [cur, *cards[1:]]}
@@ -1132,6 +1133,79 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
            round((y0 + win_h) / ph, 4)], info
 
 
+def _wide_style_card(c: Dict[str, Any], designer: "_Designer", pw: float, ph: float,
+                     min_win_h: float, pair_aspect: float | None) -> Dict[str, bool]:
+    """Rewrite one card's crop/motion/sizing fields in place for the wide-mode
+    treatment (full frame height, edge-safe window, halved/capped Ken Burns,
+    dead pans swapped for zooms). Shared by _wide_pass (every card) and
+    _adaptive_pass (only the cards a naturally wide/landscape panel picks
+    for this treatment), so the two never drift out of sync.
+
+    Returns {"caption_risk", "figure_risk", "reviewer_focal_ignored"} (bool)
+    for THIS card -- the caller appends its panel id to its own risk lists.
+    """
+    pid = c.get("panel")
+    flags = {"caption_risk": False, "figure_risk": False, "reviewer_focal_ignored": False}
+    img = designer.img(pid) if pid in designer.by_id else None
+    box = list(c.get("crop") or [0, 0, 1, 1])
+    if img is not None:
+        # The classic focal crop can itself exclude the figure (a narrow
+        # landscape/portrait shape outscores a window that includes the
+        # head, or the pick lands on a different detail) -- it is still
+        # flagged head_cut, but classic mode's own card just shows that
+        # strip. Wide-style windows must not inherit that miss: grow the
+        # subject to also cover the detected head AND the rest of the
+        # figure's own body (wings, tail, legs) connected to it, before
+        # anchoring to it. A head/face detector only answers "where is the
+        # head", never "where does the figure end" -- that is a separate,
+        # full-body cutoff a confident head alone cannot catch (see
+        # wide_mode_v3_all_issues.md: dragons cut mid-body even where the
+        # head detector was right).
+        head = head_of(_panel_maps(img, designer.map_options))
+        if (head.get("figure") and head.get("top") is not None
+                and head.get("bottom") is not None
+                and pid not in (designer.fixes.get("crop") or {})):
+            top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
+            # Grow only while the figure still fits a legal wide window. An
+            # over-tall "figure" (often most of the panel) would otherwise
+            # swallow the focal crop -- reviewer fixes included -- and
+            # force wide_crop's top-anchored figure_risk fallback, cutting
+            # whatever lives at the panel's bottom. The focal crop already
+            # frames the subject; keep it, and let wide_crop flag the risk
+            # honestly.
+            if (bottom - top) * ph * (1.0 + 2.0 * WIDE_HEADROOM) <= pw / WIDE_MIN_ASPECT:
+                box[1] = min(box[1], top)
+                box[3] = max(box[3], bottom)
+    crop, info = wide_crop(pw, ph, box, min_win_h, pair_aspect, img=img)
+    c["crop"] = crop
+    flags["caption_risk"] = bool(info.get("caption_risk"))
+    flags["figure_risk"] = bool(info.get("figure_risk"))
+    has_reviewer_crop = pid in (designer.fixes.get("crop") or {})
+    if has_reviewer_crop and (info.get("whole") or info.get("figure_risk")):
+        # The reviewer's own focal is either discarded (panel shown whole)
+        # or taller than any window this panel's width/upscale cap can
+        # fully contain: wide_crop still shows something (top-anchored
+        # fallback), but not the exact box the reviewer set.
+        flags["reviewer_focal_ignored"] = True
+    # Whole-panel windows have zero margin: the Ken Burns zoom would clip
+    # text sitting at the panel's own edge. Cut the zoom amplitude further
+    # for just this card instead of the mode-wide 0.5 factor.
+    c["wide_zoom_scale"] = 0.12 if info.get("edge_text") else 0.5
+    # A pan across a window that already spans the panel's full width (or
+    # full height) has nowhere to travel: the card renders as a frozen
+    # still while only the captions change, which reads as the picture
+    # "refreshing" every couple of seconds. Swap dead pans for a zoom,
+    # which always moves.
+    _m = c.get("motion")
+    if _m in ("pan_left", "pan_right") and crop[2] - crop[0] >= 0.999:
+        c["motion"] = "push_in" if _m == "pan_right" else "pull_out"
+    elif _m in ("pan_up", "pan_down") and crop[3] - crop[1] >= 0.999:
+        c["motion"] = "push_in" if _m == "pan_down" else "pull_out"
+    c["pad_y"] = 0.0
+    c["wide_display"] = True
+    return flags
+
+
 def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                wcfg: Dict[str, Any]) -> Dict[str, List[str]]:
     """Rewrite a classic plan for wide mode: single + pair layouts only
@@ -1170,74 +1244,79 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
             p = designer.by_id.get(pid) or {}
             pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
             if pw > 0 and ph > 0:
-                img = designer.img(pid) if pid in designer.by_id else None
-                box = list(c.get("crop") or [0, 0, 1, 1])
-                if img is not None:
-                    # The classic focal crop can itself exclude the figure
-                    # (a narrow landscape/portrait shape outscores a window
-                    # that includes the head, or the pick lands on a
-                    # different detail) -- it is still flagged head_cut, but
-                    # classic mode's own card just shows that strip. Wide
-                    # mode's generous full-height window must not inherit
-                    # that miss: grow the subject to also cover the detected
-                    # head AND the rest of the figure's own body (wings,
-                    # tail, legs) connected to it, before anchoring to it.
-                    # A head/face detector only answers "where is the head",
-                    # never "where does the figure end" -- that is a
-                    # separate, full-body cutoff a confident head alone
-                    # cannot catch (see wide_mode_v3_all_issues.md: dragons
-                    # cut mid-body even where the head detector was right).
-                    head = head_of(_panel_maps(img, designer.map_options))
-                    if (head.get("figure") and head.get("top") is not None
-                            and head.get("bottom") is not None
-                            and pid not in (designer.fixes.get("crop") or {})):
-                        top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
-                        # Grow only while the figure still fits a legal wide
-                        # window. An over-tall "figure" (often most of the
-                        # panel) would otherwise swallow the focal crop --
-                        # reviewer fixes included -- and force wide_crop's
-                        # top-anchored figure_risk fallback, cutting whatever
-                        # lives at the panel's bottom. The focal crop already
-                        # frames the subject; keep it, and let wide_crop flag
-                        # the risk honestly.
-                        if (bottom - top) * ph * (1.0 + 2.0 * WIDE_HEADROOM) <= pw / WIDE_MIN_ASPECT:
-                            box[1] = min(box[1], top)
-                            box[3] = max(box[3], bottom)
-                crop, info = wide_crop(pw, ph, box, min_win_h,
-                                       pair_aspect if pair else None, img=img)
-                c["crop"] = crop
-                if info.get("caption_risk") and pid not in caption_risk:
+                flags = _wide_style_card(c, designer, pw, ph, min_win_h, pair_aspect if pair else None)
+                if flags["caption_risk"] and pid not in caption_risk:
                     caption_risk.append(pid)
-                if info.get("figure_risk") and pid not in figure_risk:
+                if flags["figure_risk"] and pid not in figure_risk:
                     figure_risk.append(pid)
-                has_reviewer_crop = pid in (designer.fixes.get("crop") or {})
-                if has_reviewer_crop and pid not in reviewer_focal_ignored:
-                    if info.get("whole"):
-                        reviewer_focal_ignored.append(pid)
-                    elif info.get("figure_risk"):
-                        # The reviewer's own focal is taller than any window
-                        # this panel's width/upscale cap can fully contain:
-                        # wide_crop still shows something (top-anchored
-                        # fallback), but not the exact box the reviewer set.
-                        reviewer_focal_ignored.append(pid)
-                # Whole-panel windows have zero margin: the Ken Burns zoom
-                # would clip text sitting at the panel's own edge. Cut the
-                # zoom amplitude further for just this card instead of the
-                # mode-wide 0.5 factor.
-                c["wide_zoom_scale"] = 0.12 if info.get("edge_text") else 0.5
-                # A pan across a window that already spans the panel's full
-                # width (or full height) has nowhere to travel: the card
-                # renders as a frozen still while only the captions change,
-                # which reads as the picture "refreshing" every couple of
-                # seconds. Swap dead pans for a zoom, which always moves.
-                _m = c.get("motion")
-                if _m in ("pan_left", "pan_right") and crop[2] - crop[0] >= 0.999:
-                    c["motion"] = "push_in" if _m == "pan_right" else "pull_out"
-                elif _m in ("pan_up", "pan_down") and crop[3] - crop[1] >= 0.999:
-                    c["motion"] = "push_in" if _m == "pan_down" else "pull_out"
-            c["pad_y"] = 0.0
-            c["wide_display"] = True
+                if flags["reviewer_focal_ignored"] and pid not in reviewer_focal_ignored:
+                    reviewer_focal_ignored.append(pid)
+            else:
+                c["pad_y"] = 0.0
+                c["wide_display"] = True
         s["cards"] = cards
+    return {"caption_risk": caption_risk, "figure_risk": figure_risk,
+           "reviewer_focal_ignored": reviewer_focal_ignored}
+
+
+def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                   acfg: Dict[str, Any], wcfg: Dict[str, Any]) -> Dict[str, List[str]]:
+    """video.mode: adaptive -- per shot (not the whole video), show the panel
+    in whichever treatment actually suits its own shape:
+
+    - a naturally wide/landscape panel (its own aspect >= video.adaptive.
+      wide_threshold) gets the SAME full-frame-height, edge-safe wide-mode
+      window as video.mode: wide (via _wide_style_card -- the two modes
+      share one implementation so they can never drift apart);
+    - a narrower panel keeps its classic crop/shape exactly as the planner
+      already chose, but drops the equal-area shrink (card.wide_fill) that
+      forces every shape onto the same on-screen size -- the "stale, small
+      panel" the equal-area rule otherwise produces regardless of how much
+      visual weight a panel's own content actually carries.
+
+    Pairs are never wide-style (classic pairing already excludes landscape
+    panels from pairing -- see _pair_up's `wide()` guard), so a pair shot's
+    two cards are always the classic-style branch.
+
+    Captions always overlay the art here (never a dedicated bar), the same
+    way for every shot regardless of which treatment that shot's own card
+    took -- a video that flips between a caption bar and overlaid captions
+    shot to shot is exactly the kind of visual inconsistency this mode
+    exists to avoid.
+
+    Returns the same {"caption_risk", "figure_risk", "reviewer_focal_ignored"}
+    shape as _wide_pass (plan["wide_caption_risk"] / etc. are reused).
+    """
+    if fmt.width <= fmt.height:
+        return {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
+    threshold = float((acfg or {}).get("wide_threshold", 1.333))
+    min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
+    caption_risk: List[str] = []
+    figure_risk: List[str] = []
+    reviewer_focal_ignored: List[str] = []
+    for s in shots:
+        s["caption_bar"] = False
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        any_wide = False
+        for c in cards:
+            pid = c.get("panel")
+            p = designer.by_id.get(pid) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if pw <= 0 or ph <= 0:
+                continue
+            if not pair and (pw / ph) >= threshold:
+                flags = _wide_style_card(c, designer, pw, ph, min_win_h, None)
+                if flags["caption_risk"] and pid not in caption_risk:
+                    caption_risk.append(pid)
+                if flags["figure_risk"] and pid not in figure_risk:
+                    figure_risk.append(pid)
+                if flags["reviewer_focal_ignored"] and pid not in reviewer_focal_ignored:
+                    reviewer_focal_ignored.append(pid)
+                any_wide = True
+            else:
+                c["wide_fill"] = True
+        s["wide"] = any_wide
     return {"caption_risk": caption_risk, "figure_risk": figure_risk,
            "reviewer_focal_ignored": reviewer_focal_ignored}
 
@@ -1354,6 +1433,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
     if _mode == "wide":
         _wide_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
+    elif _mode == "adaptive":
+        _wide_risk = _adaptive_pass(shots, designer, fmt, vcfg.get("adaptive") or {}, vcfg.get("wide") or {})
     return {
         "version": PLAN_VERSION,
         "mode": _mode,

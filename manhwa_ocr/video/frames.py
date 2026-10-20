@@ -506,7 +506,14 @@ class Card:
         d = self.enter_dur
         p = ease_out(u / d)
         W, H, e = self.fmt.width, self.fmt.height, self.enter
-        fade = min(1.0, u / (0.55 * d))
+        # Opacity ramps across the FULL entrance duration, not just the
+        # first 55% of it: that mismatch meant a card became fully opaque
+        # while it was still 90%+ through a fast ease-out slide (both
+        # changing fastest in the same early window), reading as a pop/snap
+        # into place rather than a smooth entrance -- most visible on a
+        # pair's second card arriving mid-shot. Matches the same curve
+        # fade_in/zoom_in/swing_right already use for alpha.
+        fade = ease_in_out(u / d)
         if e == "fade_in":
             out["alpha"] = ease_in_out(u / d)
         elif e == "slide_left":       # comes in from the right

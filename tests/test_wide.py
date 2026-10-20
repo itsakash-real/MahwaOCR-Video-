@@ -348,7 +348,7 @@ def _quality(shots, fmt="16:9"):
 
 def test_qa_gate_wide_single_window_passes_the_wide_floor():
     shots = [{"id": "S001", "wide": True, "layout": "single",
-             "cards": [{"panel": "A", "crop": [0.1, 0.1, 0.9, 0.55], "pad_y": 0.0}]}]
+             "cards": [{"panel": "A", "crop": [0.1, 0.1, 0.9, 0.55], "pad_y": 0.0, "wide_display": True}]}]
     # aspect = 0.8*500 / (0.45*1600) = 400/720 = 0.555 -- below 0.66, should FAIL
     report = _quality(shots)
     assert any("A" in bad for bad in report["failures"][0:1]) or report["failures"]
@@ -356,7 +356,7 @@ def test_qa_gate_wide_single_window_passes_the_wide_floor():
 
 def test_qa_gate_wide_single_window_above_floor_passes():
     shots = [{"id": "S001", "wide": True, "layout": "single",
-             "cards": [{"panel": "A", "crop": [0.0, 0.1, 1.0, 0.63], "pad_y": 0.0}]}]
+             "cards": [{"panel": "A", "crop": [0.0, 0.1, 1.0, 0.63], "pad_y": 0.0, "wide_display": True}]}]
     # aspect = 1.0*500 / (0.53*1600) = 500/848 = 0.59 -- still under 0.66; use a wider one
     shots[0]["cards"][0]["crop"] = [0.0, 0.3, 1.0, 0.65]
     # aspect = 500 / (0.35*1600) = 500/560 = 0.89 -- passes
@@ -366,8 +366,8 @@ def test_qa_gate_wide_single_window_above_floor_passes():
 
 def test_qa_gate_wide_pair_requires_0_889_aspect():
     good = [{"id": "S001", "wide": True, "layout": "pair",
-            "cards": [{"panel": "A", "crop": [0.0, 0.3, 1.0, 0.925], "pad_y": 0.0},   # 500/(0.625*1600)=0.5 -> no
-                     {"panel": "B", "crop": [0.0, 0.3, 1.0, 0.925], "pad_y": 0.0}]}]
+            "cards": [{"panel": "A", "crop": [0.0, 0.3, 1.0, 0.925], "pad_y": 0.0, "wide_display": True},
+                     {"panel": "B", "crop": [0.0, 0.3, 1.0, 0.925], "pad_y": 0.0, "wide_display": True}]}]
     # pick a crop whose aspect really is 0.889: width/height = 0.889 ->
     # height = width/0.889; with pw=500 -> height=562.4px -> frac=562.4/1600=0.3515
     good[0]["cards"][0]["crop"] = [0.0, 0.0, 1.0, 0.3515]
@@ -376,8 +376,8 @@ def test_qa_gate_wide_pair_requires_0_889_aspect():
     assert report["failures"] == []
 
     bad = [{"id": "S002", "wide": True, "layout": "pair",
-           "cards": [{"panel": "A", "crop": [0.0, 0.0, 1.0, 0.5], "pad_y": 0.0},
-                    {"panel": "B", "crop": [0.0, 0.0, 1.0, 0.5], "pad_y": 0.0}]}]
+           "cards": [{"panel": "A", "crop": [0.0, 0.0, 1.0, 0.5], "pad_y": 0.0, "wide_display": True},
+                    {"panel": "B", "crop": [0.0, 0.0, 1.0, 0.5], "pad_y": 0.0, "wide_display": True}]}]
     report_bad = _quality(bad)
     assert report_bad["failures"]
 

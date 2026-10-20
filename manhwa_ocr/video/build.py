@@ -92,19 +92,22 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     missing = [p for p in art if p not in shown]
     shape_bad = []
     for s in shots:
-        wide = bool(s.get("wide"))
         allowed = shapes_for(s.get("layout", "single"), fmt)
         for c in s.get("cards") or []:
             pw, ph = dims.get(c["panel"], (1.0, 1.0))
             x0, y0, x1, y1 = (float(v) for v in c["crop"])
             pad = float(c.get("pad_y") or 0.0)          # blurred padding above and below the crop
             aspect = ((x1 - x0) * pw) / max(1e-9, ((y1 - y0) + 2 * pad) * ph)
-            if wide:
-                # Wide-mode shots don't use the classic layout shapes: every
-                # card is full frame height, width >= 6/16 (pairs exactly
-                # 8/16). A whole panel shown as-is is always >= 6/16 wide
-                # (that's the rule that puts it there), so a single aspect
-                # floor covers both windowed and whole-panel singles.
+            if c.get("wide_display"):
+                # A wide-display card (video.mode: wide, or an adaptive-mode
+                # card its own panel earned the wide treatment) doesn't use
+                # the classic layout shapes: full frame height, width >= 6/16
+                # (pairs exactly 8/16). A whole panel shown as-is is always
+                # >= 6/16 wide (that's the rule that puts it there), so a
+                # single aspect floor covers both windowed and whole-panel
+                # singles. Checked per CARD, not per shot: adaptive mode can
+                # mix a wide-style card with classic-style ones in the same
+                # video (never the same shot -- pairs are never wide-style).
                 ok = abs(math.log(aspect / 0.889)) <= 0.02 if s.get("layout") == "pair" else aspect >= 0.66
             else:
                 ok = min(abs(math.log(aspect / a)) for a in allowed) <= 0.02

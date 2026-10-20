@@ -36,7 +36,7 @@ from .frames import Format, ShotRenderer, format_from
 from .media import pages_dir, video_dir
 from .panels import load_panels, panel_image
 
-RENDER_VERSION = 3  # v3: wide mode -- cards render full-height, with different sizes/motion
+RENDER_VERSION = 4  # v4: entrance alpha now tracks the full motion curve (was front-loaded, a pop/snap)
 AUDIO_FADE = 0.8
 
 
@@ -291,7 +291,7 @@ def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any],
     if plan.get("captions_enabled") and _caps:
         from .captions import captions_path, write_ass
         _ass = captions_path(root, chapter)
-        write_ass(_caps, _ass, fmt=fmt, margin_v=90 if plan.get("mode") == "wide" else None)
+        write_ass(_caps, _ass, fmt=fmt, margin_v=90 if plan.get("mode") in ("wide", "adaptive") else None)
         _escaped = str(_ass).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
         _captioned = tmp.with_name(tmp.stem + ".captioned.mp4")
         _preset = "ultrafast" if preview else str(vcfg.get("preset", "veryfast"))

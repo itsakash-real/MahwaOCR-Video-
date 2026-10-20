@@ -17,9 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from manhwa_ocr.config import load_config  # noqa: E402
 from manhwa_ocr.video import cues  # noqa: E402
-from manhwa_ocr.video.editor import (build_chapter_cards, chapter_cards_to_timestamps,  # noqa: E402
-                                     extract_callout, hook_status, pacing_qa, plan_sfx, resolve_music,
-                                     resolve_sfx_files, split_long_shot, validate_callout)
+from manhwa_ocr.video.editor import (_inset_card, _inset_crop, build_chapter_cards,  # noqa: E402
+                                     chapter_cards_to_timestamps, extract_callout, hook_status, pacing_qa,
+                                     plan_sfx, resolve_music, resolve_sfx_files, split_long_shot, validate_callout)
 from manhwa_ocr.video.frames import Format, ShotRenderer, _draw_callout  # noqa: E402
 from manhwa_ocr.video.plan import build_plan, validate  # noqa: E402
 from manhwa_ocr.video.render import _audio_graph  # noqa: E402
@@ -106,6 +106,43 @@ def test_split_long_shot_punches_in():
     assert parts[1]["cards"][0]["crop"] != [0, 0, 1, 1]
     assert parts[1]["cards"][0]["crop"][0] > 0 and parts[1]["cards"][0]["crop"][2] < 1
     assert parts[0]["id"] == "S001-a" and parts[1]["id"] == "S001-b"
+
+
+def test_inset_crop_preserves_aspect_even_near_the_30pct_floor():
+    # Regression: clamping width and height independently against the 30%
+    # floor could stop one axis earlier than the other, skewing the
+    # punched-in box's pixel aspect into one no allowed card shape matches
+    # -- QA then failed on exactly the punched-in (second) piece of a split
+    # shot. A box whose two axes sit at different fractions of the floor
+    # must still come out with the SAME w/h ratio as the input.
+    box = [0.0, 0.0, 1.0, 0.32]   # h=0.32 sits right at the 30% floor; w=1.0 has plenty of room
+    out = _inset_crop(box, 0.08)
+    in_ratio = (box[2] - box[0]) / (box[3] - box[1])
+    out_ratio = (out[2] - out[0]) / (out[3] - out[1])
+    assert out_ratio == pytest.approx(in_ratio, rel=1e-3)   # 4dp rounding in the return is expected
+    assert out[3] - out[1] >= 0.30 - 1e-3   # the floor itself still holds
+
+
+def test_inset_card_scales_pad_y_with_the_crop_so_effective_aspect_holds():
+    # Regression: a whole-panel-with-padding card (pad_y > 0) punched in by
+    # crop alone left pad_y's fraction unchanged while the crop shrank,
+    # growing padding's share of the card's EFFECTIVE height (crop + 2*pad)
+    # and skewing it into an aspect no allowed shape matches -- this broke
+    # exactly the punched-in (second) piece of a split shot in real builds
+    # (P011-02, P026-01 in chapter 1: QA failed only on the "-b" piece).
+    card = {"panel": "A", "crop": [0.0, 0.0, 1.0, 1.0], "pad_y": 0.125, "motion": "push_in"}
+    pw, ph = 900.0, 720.0
+
+    def effective_aspect(c):
+        x0, y0, x1, y1 = c["crop"]
+        return ((x1 - x0) * pw) / (((y1 - y0) + 2 * c.get("pad_y", 0.0)) * ph)
+
+    before = effective_aspect(card)
+    after_card = _inset_card(card, 0.08)
+    after = effective_aspect(after_card)
+    assert after == pytest.approx(before, rel=1e-2)
+    assert after_card["pad_y"] < card["pad_y"]   # padding shrank along with the crop
+    assert after_card["crop"] != card["crop"]
 
 
 def test_split_long_shot_leaves_short_shots_alone():

@@ -555,6 +555,24 @@ def test_entrances_are_not_rushed(enter):
     assert r.cards[0].entrance(0.2) != r.cards[0].entrance(3.9)  # still animating at 0.2s
 
 
+@pytest.mark.parametrize("enter", ["slide_left", "slide_right", "slide_up", "slide_down",
+                                   "pull_down", "fit_in_frame", "blur_in"])
+def test_entrance_alpha_does_not_outrun_its_own_motion(enter):
+    # Regression: alpha used to ramp to 100% by just 55% of the entrance
+    # duration while position (dx/dy/scale/blur) kept changing fast over
+    # the full duration -- a card went fully opaque while still rapidly
+    # sliding/shrinking/sharpening, reading as a pop/snap instead of a
+    # smooth entrance (found via a pair's second card arriving mid-shot).
+    # Alpha must now still be ramping while there is real motion left.
+    fmt = Format(320, 180, 30)
+    cards = [{"panel": "A", "crop": [0, 0, 1, 1], "enter": enter, "at": 0, "motion": "hold"}]
+    card = ShotRenderer(_shot(cards=cards), {"A": _card_panel()}, fmt).cards[0]
+    d = card.enter_dur
+    mid = card.entrance(mid_t := d * 0.5)
+    motion_left = abs(mid["dx"]) + abs(mid["dy"]) + abs(mid["scale"] - 1) + mid["blur"]
+    assert mid["alpha"] < 0.98 or motion_left < 1.0
+
+
 def test_pair_first_card_moves_left_when_second_arrives():
     fmt = Format(640, 360, 30)
     images = {"A": _card_panel(), "B": Image.new("RGB", (300, 400), (30, 200, 30))}

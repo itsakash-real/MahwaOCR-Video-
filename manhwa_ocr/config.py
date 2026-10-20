@@ -63,10 +63,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
         "format": "16:9",           # 16:9 (1920x1080) or 9:16 (1080x1920, Shorts)
         "fps": 30,
-        "mode": "classic",          # classic | wide (wide: full-height panels, min 6/16 wide)
+        "mode": "classic",          # classic | wide | adaptive
+                                    #   wide: every card full-height, min 6/16 wide
+                                    #   adaptive: per shot, a naturally wide/landscape panel gets
+                                    #   the wide treatment; a narrower one keeps its classic
+                                    #   crop/shape but without the equal-area shrink (no more
+                                    #   stale small cards) -- real per-panel variety in one video
         "wide": {
             "min_width_ratio": 0.375,  # 6/16 of the frame wide; no thin slivers, ever
             "max_upscale": 1.5,         # a panel is never upscaled past this (1080p sharpness)
+        },
+        "adaptive": {
+            "wide_threshold": 1.333,   # a panel's own aspect >= this (4:3) earns the wide treatment
         },
         "crf": 20,                  # x264 quality: lower = better and bigger
         "preset": "veryfast",
