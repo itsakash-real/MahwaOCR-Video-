@@ -28,32 +28,64 @@ FMT = Format(1920, 1080, 30)
 # ------------------------------------------------------------- wide_crop
 
 
-def test_wide_crop_prefers_widest_valid_window():
-    # 900x2406 panel: 1.777 -> 506px tall (too soft), 1.333 -> 675 (too
-    # soft), 1.25 -> 720 (upscale exactly 1.5) -- the first valid window wins.
+def test_wide_crop_window_fills_min_width_and_contains_subject():
+    # A tall panel, classic crop = whole panel: the window is the tallest
+    # the min-width rule allows (900/0.889 = 1012px), centred on the subject.
     box = wide_crop(900, 2406, [0, 0, 1, 1], min_win_h=720)
     w = (box[2] - box[0]) * 900
     h = (box[3] - box[1]) * 2406
-    assert w / h == 1.25
-    assert h == 720
+    assert abs(w / h - 0.889) < 0.01
+    assert h >= 720
 
 
 def test_wide_crop_wide_panel_goes_fullbleed():
+    # A wide panel (>= 0.889): shown whole, never cropped.
     box = wide_crop(1600, 900, [0, 0, 1, 1], min_win_h=720)
-    w = (box[2] - box[0]) * 1600
-    h = (box[3] - box[1]) * 900
-    assert abs(w / h - 1.777) < 1e-9
-    assert h == 900
+    assert box == [0.0, 0.0, 1.0, 1.0]
 
 
-def test_wide_crop_anchors_to_focal_top():
-    # The window starts at the classic crop's top (never centred): what the
-    # classic crop kept at the top -- heads, bubbles -- stays in frame.
+def test_wide_crop_superwide_panel_shown_whole():
+    # An extra-wide panel: shown whole too (the card goes full-bleed
+    # with fill top/bottom rather than cropping the sides).
+    box = wide_crop(900, 361, [0, 0, 1, 1], min_win_h=720)
+    assert box == [0.0, 0.0, 1.0, 1.0]
+
+
+def test_wide_crop_contains_subject_with_headroom():
+    # The subject (classic crop) sits fully inside the window, with room
+    # to spare on both ends (the zoom eats the headroom, not the subject).
+    box = wide_crop(900, 2406, [0, 0.30, 1, 0.55], min_win_h=720)
+    assert box[1] * 2406 < 0.30 * 2406
+    assert box[3] * 2406 > 0.55 * 2406
+
+
+def test_wide_crop_bottom_subject_stays_in_panel():
     box = wide_crop(900, 2406, [0, 0.7, 1, 1.0], min_win_h=720)
-    y0 = box[1] * 2406
-    y1 = box[3] * 2406
-    assert abs(y0 - 0.7 * 2406) < 1e-6
-    assert abs(y1 - y0 - 720) < 1e-6
+    assert box[3] == 1.0                      # window bottom = panel bottom
+    assert box[1] * 2406 <= 0.7 * 2406       # subject top inside the window
+
+
+def test_wide_crop_short_panel_shown_whole():
+    # A short panel (< the upscale floor tall): shown whole rather than
+    # cropped -- a chat window's text must not be cut at the sides.
+    box = wide_crop(900, 579, [0, 0, 1, 1], min_win_h=720)
+    assert box == [0.0, 0.0, 1.0, 1.0]
+
+
+def test_wide_crop_never_leaves_the_panel():
+    for pw, ph in ((900, 2406), (900, 579), (500, 1200), (1600, 900)):
+        for box0 in ([0, 0, 1, 1], [0.1, 0.4, 0.9, 0.8]):
+            b = wide_crop(pw, ph, box0, min_win_h=720)
+            assert 0.0 <= b[0] <= b[2] <= 1.0 and 0.0 <= b[1] <= b[3] <= 1.0
+
+
+def test_wide_crop_pair_window():
+    box = wide_crop(900, 2406, [0.1, 0.1, 0.9, 0.9], min_win_h=720,
+                    pair_aspect=0.889)
+    w = (box[2] - box[0]) * 900
+    h = (box[3] - box[1]) * 2406
+    assert abs(w / h - 0.889) < 1e-6
+    assert h >= 720
 
 
 def test_wide_crop_shows_whole_panel_when_wide_enough():
@@ -63,13 +95,16 @@ def test_wide_crop_shows_whole_panel_when_wide_enough():
     assert box == [0.0, 0.0, 1.0, 1.0]
 
 
-def test_wide_crop_too_narrow_panel_still_windows():
-    # Aspect 0.71 < 0.889: still a focal window, anchored to the focal top.
+def test_wide_crop_narrow_panel_window():
+    # Aspect 0.71 < 0.889: a window at the min display width, containing
+    # the classic crop's subject.
     box = wide_crop(900, 1273, [0, 0, 1, 0.9], min_win_h=720)
     w = (box[2] - box[0]) * 900
     h = (box[3] - box[1]) * 1273
-    assert w / h == 1.25 and h == 720
-    assert box[1] == 0.0
+    assert abs(w / h - 0.889) < 0.01
+    # Subject (1146px) is taller than the min-width cap (1012px): the
+    # window covers its centre instead.
+    assert box[1] * 1273 < 0.45 * 1273 < box[3] * 1273
 
 
 def test_wide_crop_pair_aspect():
@@ -132,6 +167,15 @@ def test_card_wide_display_min_width():
     assert card.ch == 1080
     assert card.cw >= round(0.53125 * 1920)  # 8.5/16 of the frame
     assert card.rest_c == (960.0, 540.0)
+
+
+def test_card_wide_display_superwide_fullbleed():
+    card = Card(_panel(900, 361), {"panel": "A", "crop": [0, 0, 1, 1],
+                                  "wide_display": True},
+                "single", 0, 0.0, 4.0, FMT, None)
+    assert card.cw == 1920
+    assert card.ch == round(1920 / (900 / 361))   # full width, scaled height
+    assert card.rest_c == (960.0, 540.0)           # centred vertically
 
 
 def test_card_wide_display_pair_splits_frame():

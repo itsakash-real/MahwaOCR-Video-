@@ -387,6 +387,10 @@ class Card:
             H, W = fmt.height, fmt.width
             if layout == "pair":
                 self.cw, self.ch = W // 2, H  # 8/16 each: two panels fill the frame
+            elif aspect > 1.777:
+                # Super-wide panel shown whole: full-bleed width, the
+                # light side fill covers the top/bottom instead.
+                self.cw, self.ch = W, max(2, round(W / aspect))
             else:
                 self.ch = H
                 self.cw = max(round(0.53125 * W), min(W, round(H * aspect)))
@@ -455,6 +459,11 @@ class Card:
         # motion); `hold` keeps ease-out-then-hold.
         p = ease_out((t - self.appear) / self.kb_dur) if m == "hold" else ease_in_out((t - self.appear) / self.kb_dur)
         zoom = {"push_in": 1.0 + 0.15 * p, "pull_out": 1.18 - 0.18 * p, "hold": 1.01 + 0.02 * p}.get(m, 1.08)
+        if self.wide_display:
+            # Wide cards touch the frame edges: full-amplitude zoom eats
+            # the art (bubbles, faces at the crop edge). Half amplitude
+            # keeps the motion smooth and inside the crop headroom.
+            zoom = 1.0 + (zoom - 1.0) * 0.5
         zoom *= 1 + extra_zoom
         # The source is the whole crop (at extra resolution, so zoomed views stay
         # sharp); zoom 1 shows all of it, zoom 1.1 shows the middle 1/1.1.

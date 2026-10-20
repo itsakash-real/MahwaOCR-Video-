@@ -1026,40 +1026,48 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
 # panels. The window is centred on the classic focal crop's centre, so the
 # head-aware, bubble-avoiding framing carries over.
 WIDE_SINGLE_ASPECTS = (1.777, 1.333, 1.25, 1.0, 0.944)
+WIDE_HEADROOM = 0.08   # window grows this much past the focal crop on each end
 
 
 def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
               pair_aspect: float | None = None) -> List[float]:
-    try:
-        bx0, by0 = float(box[0]), float(box[1])
-    except (TypeError, ValueError, IndexError):
-        bx0, by0 = 0.0, 0.0
-    bx0 = max(0.0, min(1.0, bx0))
-    by0 = max(0.0, min(1.0, by0))
-    panel_aspect = pw / max(ph, 1e-9)
-    # A panel that already fills >= 8/16 at full height and stays within the
-    # upscale cap is shown whole: the full figure stays visible, nothing
-    # is cropped (the reference look).
-    if pair_aspect is None and 0.889 <= panel_aspect < 1.777 and ph >= min_win_h:
-        return [0.0, 0.0, 1.0, 1.0]
-    aspects = (pair_aspect,) if pair_aspect else WIDE_SINGLE_ASPECTS
-    chosen: tuple = (aspects[-1], pw, ph)
-    for A in aspects:
-        if panel_aspect >= A:
-            win_w, win_h = ph * A, ph
-        else:
-            win_w, win_h = pw, pw / A
-        if win_h >= min_win_h or A == aspects[-1]:
-            chosen = (A, win_w, win_h)
-            break
-    _A, win_w, win_h = chosen
-    # Anchor to the classic crop's top-left (its framing already avoids heads
-    # and bubbles) instead of centring: anything the classic crop kept at the
-    # top -- heads, speech bubbles -- stays in frame, never clipped.
-    x0 = max(0.0, min(pw - win_w, bx0 * pw)) / pw
-    y0 = max(0.0, min(ph - win_h, by0 * ph)) / ph
-    return [x0, y0, x0 + win_w / pw, y0 + win_h / ph]
+    """A wide-mode window over one panel, in panel fractions.
 
+    The subject is the classic focal crop (`box`): the window CONTAINS it
+    (expanded by WIDE_HEADROOM on both ends, so the Ken Burns zoom never
+    eats the subject's edges), is clamped inside the panel, keeps the
+    display width >= 8/16 (pairs: exactly 8/16 per card) and the upscale
+    within the cap wherever the panel allows.
+    """
+    try:
+        bx0, by0, bx1, by1 = (float(v) for v in box[:4])
+    except (TypeError, ValueError, IndexError):
+        bx0, by0, bx1, by1 = 0.0, 0.0, 1.0, 1.0
+    bx0 = max(0.0, min(1.0, bx0)); by0 = max(0.0, min(1.0, by0))
+    bx1 = max(bx0, min(1.0, bx1)); by1 = max(by0, min(1.0, by1))
+    panel_aspect = pw / max(ph, 1e-9)
+    # A panel that already fills >= 8/16 at full height is shown whole:
+    # the full figure stays visible, nothing is cropped. (Super-wide
+    # panels are shown whole too, full-bleed with fill top/bottom.)
+    if pair_aspect is None and panel_aspect >= 0.889:
+        return [0.0, 0.0, 1.0, 1.0]
+    subj_w, subj_h = (bx1 - bx0) * pw, (by1 - by0) * ph
+    grow = 1.0 + 2.0 * WIDE_HEADROOM
+    if pair_aspect is not None:
+        win_h = min(ph, max(subj_h * grow, min(min_win_h, ph)))
+        win_w = win_h * pair_aspect
+        if win_w > pw:                       # panel narrower than the window
+            win_w, win_h = pw, pw / pair_aspect
+    else:
+        win_h = min(ph, pw / 0.889, max(subj_h * grow, min(min_win_h, ph)))
+        win_w = min(pw, win_h * 1.777)
+        if win_w / max(win_h, 1e-9) < 0.889:
+            win_h = win_w / 0.889
+    # Position: centre the window on the subject, clamped inside the panel.
+    cx, cy = (bx0 + bx1) / 2.0 * pw, (by0 + by1) / 2.0 * ph
+    x0 = max(0.0, min(pw - win_w, cx - win_w / 2.0))
+    y0 = max(0.0, min(ph - win_h, cy - win_h / 2.0))
+    return [x0 / pw, y0 / ph, (x0 + win_w) / pw, (y0 + win_h) / ph]
 
 def _wide_pass(shots: List[Dict[str, Any]], designer, fmt, wcfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Rewrite a classic plan for wide mode. Single + pair layouts only
