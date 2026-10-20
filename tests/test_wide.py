@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw
 
 from manhwa_ocr.config import load_config
 from manhwa_ocr.video import build as build_mod
-from manhwa_ocr.video.crops import extend_figure_range, head_of, _panel_maps
+from manhwa_ocr.video.crops import content_bands, extend_figure_range, head_of, _panel_maps
 from manhwa_ocr.video.frames import Format, ShotRenderer, format_from
 from manhwa_ocr.video.plan import WIDE_MIN_ASPECT, build_plan, wide_crop
 
@@ -50,10 +50,18 @@ def test_panel_aspect_at_or_above_6_over_16_is_shown_whole():
     assert info["whole"]
 
 
-def test_super_wide_panel_is_also_shown_whole():
-    crop, info = wide_crop(1800, 600, [0.3, 0.2, 0.7, 0.8], min_win_h=720)  # aspect 3.0
-    assert crop == [0.0, 0.0, 1.0, 1.0]
-    assert info["whole"]
+def test_super_wide_panel_is_windowed_not_shown_whole_with_a_gap():
+    # Every wide card touches BOTH top and bottom, no exception: a panel
+    # wider than 16:9 is windowed (full height, sides cropped, centred),
+    # never "shown whole" with the top/bottom filled instead -- that used
+    # to leave a real gap (no card content) at the very top/bottom rows.
+    pw, ph = 1800, 600   # aspect 3.0
+    crop, info = wide_crop(pw, ph, [0.3, 0.2, 0.7, 0.8], min_win_h=720)
+    assert not info["whole"]
+    x0, y0, x1, y1 = crop
+    win_w, win_h = (x1 - x0) * pw, (y1 - y0) * ph
+    assert y0 == pytest.approx(0.0, abs=1e-6) and y1 == pytest.approx(1.0, abs=1e-6)  # full height
+    assert win_w / win_h == pytest.approx(1.777, rel=0.01)   # width capped to 16:9, sides cropped
 
 
 def test_bottom_anchored_subject_window_stays_inside_the_panel():
@@ -108,6 +116,26 @@ def test_window_edge_avoids_slicing_a_bubble():
     assert not (122 < top_px < 198)
 
 
+def test_content_bands_exclude_drops_a_band_overlapping_the_figure():
+    # A row-density band detector can't tell "a bubble" from "detailed
+    # bright/pale character art with crisp outline linework" -- both score
+    # high on flat-white + hard-edge density. When the band overlaps a
+    # region already known to be the subject's own figure, it must be
+    # dropped rather than treated as a bubble/caption to avoid, or the
+    # avoidance pushes the window AWAY from the character it should frame.
+    panel = Image.new("RGB", (300, 800), (90, 90, 90))
+    d = ImageDraw.Draw(panel)
+    # a dense, high-contrast "figure" (outlined white shape) spanning 0.3-0.7
+    d.rectangle((40, 240, 260, 560), fill=(250, 250, 250), outline=(10, 10, 10), width=4)
+    for y in range(260, 560, 10):
+        d.line((50, y, 250, y), fill=(15, 15, 15), width=3)
+    bands_unfiltered = content_bands(panel, axis="y")
+    assert any(0.3 < b0 < 0.7 or 0.3 < b1 < 0.7 for b0, b1 in bands_unfiltered), \
+        "test setup should trigger a false-positive band over the figure"
+    bands_excluded = content_bands(panel, axis="y", exclude=[(0.3, 0.7)])
+    assert not any(0.3 < b0 < 0.7 or 0.3 < b1 < 0.7 for b0, b1 in bands_excluded)
+
+
 # ------------------------------------------------------------------ full-body hardening
 
 
@@ -146,6 +174,19 @@ def test_extend_figure_range_never_shrinks_the_input():
     img = Image.new("RGB", (300, 800), (255, 255, 255))   # nothing drawn at all
     top, bottom = extend_figure_range(img, 0.3, 0.5)
     assert top <= 0.3 and bottom >= 0.5
+
+
+def test_extend_figure_range_caps_runaway_growth():
+    # A detailed, textured background (gentle shading/halftone) can keep
+    # density above the threshold almost everywhere, letting the scan run
+    # to the panel's edges -- a real regression (a white dragon's own
+    # scales/outline art triggered this, extending 0-1 and then centring
+    # the crop on the WHOLE panel instead of the dragon). The result must
+    # stay bounded, never swallowing virtually the whole panel.
+    img = _long_figure_panel(w=300, h=1200, body_top=0, body_bottom=1200)
+    top, bottom = extend_figure_range(img, 500 / 1200, 560 / 1200)
+    assert (bottom - top) <= 0.751   # MAX_SPAN_FRAC + float slack
+    assert top <= 500 / 1200 and bottom >= 560 / 1200   # input never shrinks
 
 
 def test_wide_crop_flags_figure_risk_when_the_subject_cannot_fit():
@@ -277,6 +318,26 @@ def test_single_wide_card_is_at_least_6_over_16_wide():
     assert card.wide_display
     assert card.ch == fmt.height
     assert card.cw >= round(0.375 * fmt.width)
+
+
+def test_super_wide_card_still_touches_top_and_bottom_when_rendered():
+    # Regression: a super-wide (>16:9) panel used to be sized W x round(W/
+    # aspect), leaving a real gap (no card content at all) at the top/bottom
+    # rows -- every wide card must touch both edges, no exception.
+    fmt = Format(1920, 1080, 30)
+    panel = Image.new("RGB", (1800, 600), (60, 60, 90))  # aspect 3.0
+    shot = {"start": 0, "end": 4, "layout": "single", "background": "blur", "wide": True,
+           "caption_bar": False, "cards": [{"panel": "A", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0,
+                                            "motion": "push_in", "wide_display": True, "pad_y": 0.0}],
+           "exit": "cut", "effects": []}
+    r = ShotRenderer(shot, {"A": panel}, fmt)
+    card = r.cards[0]
+    assert card.ch == fmt.height
+    arr = r.frame_array(2.0)
+    bg = r.bg
+    import numpy as np
+    assert np.abs(arr[0:2].astype(int) - bg[0:2].astype(int)).mean() > 3.0
+    assert np.abs(arr[-2:].astype(int) - bg[-2:].astype(int)).mean() > 3.0
 
 
 def test_pair_wide_cards_are_exactly_half_the_frame_each():

@@ -1054,13 +1054,19 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
     bx1 = max(bx0, min(1.0, bx1)); by1 = max(by0, min(1.0, by1))
     panel_aspect = pw / max(ph, 1e-9)
     info: Dict[str, Any] = {"whole": False, "edge_text": False, "caption_risk": False, "figure_risk": False}
-    # A panel that already fills >= 6/16 at full height is shown whole: the
-    # full figure stays visible, nothing is cropped. (Super-wide panels are
-    # shown whole too, full-bleed, with fill covering the top/bottom margin.)
-    if pair_aspect is None and panel_aspect >= WIDE_MIN_ASPECT:
+    # A panel whose own aspect already fits the 6/16-16/9 single-card range
+    # is shown whole: the full figure stays visible, nothing is cropped, and
+    # it still touches the top AND bottom of the frame at this aspect. A
+    # panel WIDER than 16/9 is never "shown whole" with top/bottom fill
+    # instead -- every card touches both top and bottom, no exception --
+    # so it falls through to the windowed branch below, which already caps
+    # the width to the 16/9 shape (cropping the sides, centred) while
+    # keeping the full panel height.
+    if pair_aspect is None and WIDE_MIN_ASPECT <= panel_aspect <= 1.777:
         info["whole"] = True
         if img is not None:
-            bands = content_bands(img, axis="y") + content_bands(img, axis="x")
+            bands = (content_bands(img, axis="y", exclude=[(by0, by1)])
+                    + content_bands(img, axis="x", exclude=[(bx0, bx1)]))
             info["edge_text"] = any(b0 <= WIDE_EDGE_MARGIN or b1 >= 1 - WIDE_EDGE_MARGIN for b0, b1 in bands)
         return [0.0, 0.0, 1.0, 1.0], info
     subj_w, subj_h = (bx1 - bx0) * pw, (by1 - by0) * ph
@@ -1096,8 +1102,8 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
     x0 = max(lo_x, min(hi_x, cx - win_w / 2.0))
 
     if img is not None:
-        yb = content_bands(img, axis="y")
-        xb = content_bands(img, axis="x")
+        yb = content_bands(img, axis="y", exclude=[(by0, by1)])
+        xb = content_bands(img, axis="x", exclude=[(bx0, bx1)])
         y0 = safe_span(ph, win_h, lo_y, hi_y, yb, y0)
         x0 = safe_span(pw, win_w, lo_x, hi_x, xb, x0)
 
@@ -1259,6 +1265,29 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
            "reviewer_focal_ignored": reviewer_focal_ignored}
 
 
+def _reposition_for_figure(box: List[float], fig_top: float, fig_bottom: float) -> List[float]:
+    """Slide a FIXED-size crop box (same width/height -- it must stay one of
+    the classic allowed shapes) vertically within the panel so it best
+    contains [fig_top, fig_bottom] (panel fractions), instead of wherever
+    the classic bubble-avoidance pick happened to land it. Never changes
+    the box's width or height, only its position; when the box is shorter
+    than the figure it cannot fully contain it (same honest limit as
+    wide_crop's figure_risk), so it centres on the figure as a best effort.
+    """
+    x0, y0, x1, y1 = box
+    h = y1 - y0
+    if h <= 0:
+        return box
+    lo = max(0.0, fig_bottom - h)
+    hi = min(fig_top, 1.0 - h)
+    if hi < lo:
+        mid = (fig_top + fig_bottom) / 2.0
+        y0n = max(0.0, min(1.0 - h, mid - h / 2.0))
+    else:
+        y0n = max(lo, min(hi, fig_top))
+    return [x0, round(y0n, 4), x1, round(y0n + h, 4)]
+
+
 def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                    acfg: Dict[str, Any], wcfg: Dict[str, Any]) -> Dict[str, List[str]]:
     """video.mode: adaptive -- per shot (not the whole video), show the panel
@@ -1315,6 +1344,27 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                     reviewer_focal_ignored.append(pid)
                 any_wide = True
             else:
+                # Classic-style: the card is bigger on screen (wide_fill, no
+                # equal-area shrink) than a classic build ever showed it, so
+                # a crop that excludes part of the figure -- the same thing
+                # _wide_style_card hardens against for wide-aspect panels --
+                # is far more visible here too. Reposition the SAME fixed
+                # shape (never resized, so it stays an allowed classic
+                # shape) to best contain the detected figure, instead of
+                # leaving it wherever classic's bubble-avoidance-only pick
+                # happened to land.
+                img = designer.img(pid) if pid in designer.by_id else None
+                box = list(c.get("crop") or [0, 0, 1, 1])
+                if img is not None and pid not in (designer.fixes.get("crop") or {}):
+                    head = head_of(_panel_maps(img, designer.map_options))
+                    if head.get("figure") and head.get("top") is not None and head.get("bottom") is not None:
+                        top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]))
+                        new_box = _reposition_for_figure(box, top, bottom)
+                        yb = content_bands(img, axis="y", exclude=[(top, bottom)])
+                        h = new_box[3] - new_box[1]
+                        y0 = safe_span(1.0, h, 0.0, 1.0 - h, yb, new_box[1])
+                        box = [new_box[0], round(y0, 4), new_box[2], round(y0 + h, 4)]
+                c["crop"] = box
                 c["wide_fill"] = True
         s["wide"] = any_wide
     return {"caption_risk": caption_risk, "figure_risk": figure_risk,

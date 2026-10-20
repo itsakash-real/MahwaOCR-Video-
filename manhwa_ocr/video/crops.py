@@ -122,7 +122,8 @@ def text_bands(img: Image.Image, limit: float = 0.45) -> Tuple[float, float]:
 
 
 def content_bands(img: Image.Image, axis: str = "y", threshold: float = 0.4,
-                  min_run_frac: float = 0.015) -> List[Tuple[float, float]]:
+                  min_run_frac: float = 0.015,
+                  exclude: List[Tuple[float, float]] | None = None) -> List[Tuple[float, float]]:
     """Bands dense with lettering or flat white -- speech bubbles, caption
     boxes, SFX lettering, chat rows, UI banners -- as fractions of the
     panel's height (axis="y") or width (axis="x").
@@ -131,6 +132,16 @@ def content_bands(img: Image.Image, axis: str = "y", threshold: float = 0.4,
     middle of one of these (see safe_span): a window edge is fine right
     at a band's boundary, but splitting it mid-bubble/mid-line is the
     defect wide mode must avoid.
+
+    This is a cheap row/column density scan, not a shape-aware bubble
+    detector (see bubble_regions for that): detailed white/pale-coloured
+    character art with crisp outline linework (a white dragon's scales,
+    say) can score just as "flat white + hard edges" as an actual bubble
+    or caption, flagging the character's OWN body as a band to avoid --
+    which then pushes a crop window AWAY from the character it was meant
+    to frame. `exclude` (panel fractions, same axis) drops any band that
+    mostly overlaps a region already known to be the subject -- pass the
+    detected figure's own range when calling this during figure framing.
     """
     rgb = _small(img, 160)
     _, hard, flat_white = _art_maps(rgb)
@@ -151,6 +162,14 @@ def content_bands(img: Image.Image, axis: str = "y", threshold: float = 0.4,
             i = j
         else:
             i += 1
+    if exclude:
+        def _overlap_frac(b: Tuple[float, float]) -> float:
+            span = b[1] - b[0]
+            if span <= 1e-9:
+                return 0.0
+            covered = sum(max(0.0, min(b[1], e[1]) - max(b[0], e[0])) for e in exclude)
+            return covered / span
+        bands = [b for b in bands if _overlap_frac(b) < 0.5]
     return bands
 
 
@@ -195,6 +214,9 @@ def safe_span(extent: float, win: float, lo: float, hi: float,
                 if best is None or d < best[0]:
                     best = (d, c)
     return best[1] if best else anchor
+
+
+MAX_SPAN_FRAC = 0.75   # extend_figure_range never returns a span wider than this share of the panel
 
 
 def extend_figure_range(img: Image.Image, top: float, bottom: float,
@@ -243,6 +265,23 @@ def extend_figure_range(img: Image.Image, top: float, bottom: float,
     new_bottom_i = extend(min(hi_i - 1, int(round(bottom * n))), 1, hi_i)
     new_top = min(top, new_top_i / n)
     new_bottom = max(bottom, (new_bottom_i + 1) / n)
+    # A gently shaded/halftoned background can keep "content" density above
+    # the threshold almost everywhere, letting the scan run all the way to
+    # the panel's edges instead of stopping at the figure -- a runaway
+    # extension that swallows most of the panel is a worse crop than the
+    # un-extended head alone. Cap the total span at MAX_SPAN_FRAC of the
+    # panel, trimming back whichever side(s) grew (never the original
+    # input itself) so the caller always gets a bounded, usable result
+    # without needing its own guard against this case.
+    if (new_bottom - new_top) > MAX_SPAN_FRAC:
+        budget = max(0.0, MAX_SPAN_FRAC - (bottom - top))
+        grown_top, grown_bottom = top - new_top, new_bottom - bottom
+        grown_total = grown_top + grown_bottom
+        if grown_total > 1e-9:
+            new_top = top - budget * (grown_top / grown_total)
+            new_bottom = bottom + budget * (grown_bottom / grown_total)
+        else:
+            new_top, new_bottom = top, bottom
     return max(lo, new_top), min(hi, new_bottom)
 
 

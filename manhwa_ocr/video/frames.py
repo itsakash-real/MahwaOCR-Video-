@@ -385,13 +385,15 @@ class Card:
         self.wide_display = bool(spec.get("wide_display")) and fmt.width > fmt.height
         self.wide_zoom_scale = float(spec.get("wide_zoom_scale", 0.5))
         if self.wide_display:
+            # Every wide card touches BOTH the top and bottom of the frame,
+            # no exception -- a panel wider than 16:9 is never "shown whole"
+            # with the sides full-bleed and top/bottom filled instead (that
+            # was tried and rejected: it reads as a gap, not a wide shot).
+            # wide_crop() already keeps a windowed crop's width within the
+            # 6/16-16/9 range, so aspect here is never above 1.777.
             H, W = fmt.height, fmt.width
             if layout == "pair":
                 self.cw, self.ch = W // 2, H  # 8/16 each: two panels fill the frame
-            elif aspect > 1.777:
-                # Super-wide panel shown whole: full-bleed width, the
-                # light side fill covers the top/bottom instead.
-                self.cw, self.ch = W, max(2, round(W / aspect))
             else:
                 self.ch = H
                 self.cw = max(round(0.375 * W), min(W, round(H * aspect)))
