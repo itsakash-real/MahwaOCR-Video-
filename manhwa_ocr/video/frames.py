@@ -374,6 +374,17 @@ class Card:
             self.cw, self.ch = fit(aspect, card_box(layout, fmt), None)
         else:
             self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
+        # Wide mode ("video.mode: wide"): the card is full frame height and
+        # at least 8.5/16 of the frame wide -- no thin strips, ever. Pairs
+        # split the frame in two. Portrait formats keep classic sizing.
+        self.wide_display = bool(spec.get("wide_display")) and fmt.width > fmt.height
+        if self.wide_display:
+            H, W = fmt.height, fmt.width
+            if layout == "pair":
+                self.cw, self.ch = W // 2, H  # 8/16 each: two panels fill the frame
+            else:
+                self.ch = H
+                self.cw = max(round(0.53125 * W), min(W, round(H * aspect)))
         self.border = max(1, round(3 * u))
         self.radius = max(2, round(12 * u))
         self.margin = max(6, round(46 * u))
@@ -381,6 +392,9 @@ class Card:
         self.iw, self.ih = iw, ih
         # P4: cache the LANCZOS resize; same panel + crop + target size reuses it.
         self.src = _cached_src(panel, region, (x0, y0, x1, y1, pad_y), iw, ih)
+        if self.wide_display and region.width < iw:
+            # Wide mode upscale: the 480p-look fix -- mild sharpen after Lanczos.
+            self.src = self.src.copy().filter(ImageFilter.UnsharpMask(radius=2.0, percent=60, threshold=3))
 
         # Static parts of the sprite, built once: shadow + white rounded border.
         m = self.margin
@@ -408,6 +422,14 @@ class Card:
         else:
             self.kb_dur = max(0.01, shot_end - self.appear)
         self.start_c, self.rest_c = slot_centres(layout, fmt, (self.cw, self.ch), index)
+        if self.wide_display:
+            cy = fmt.height / 2.0
+            if layout == "pair":
+                lx, rx = self.cw / 2.0, fmt.width - self.cw / 2.0
+                self.rest_c = (lx, cy) if index == 0 else (rx, cy)
+                self.start_c = (fmt.width / 2.0, cy) if index == 0 else self.rest_c
+            else:
+                self.start_c = self.rest_c = (fmt.width / 2.0, cy)
         self.pair_move_at = pair_move_at if (layout == "pair" and index == 0) else None
 
     # -------------------------------------------------- time-varying parts

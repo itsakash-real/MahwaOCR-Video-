@@ -36,7 +36,7 @@ from .frames import Format, ShotRenderer, format_from
 from .media import pages_dir, video_dir
 from .panels import load_panels, panel_image
 
-RENDER_VERSION = 2
+RENDER_VERSION = 3  # v3: wide-mode cards render full-height (different sizes)
 AUDIO_FADE = 0.8
 
 

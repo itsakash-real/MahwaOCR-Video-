@@ -1016,6 +1016,72 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
     return out
 
 
+# ------------------------------------------------------------------ wide mode
+
+# Wide mode ("video.mode: wide") is classic editing with wide panels: every
+# panel touches the top and bottom of the frame and is at least 8.5/16 of the
+# frame wide — no thin strips ever. Single-crop shapes run widest-first; the
+# first window whose height keeps the display upscale within max_upscale
+# wins (1080p sharpness), falling back to the narrowest shape for very short
+# panels. The window is centred on the classic focal crop's centre, so the
+# head-aware, bubble-avoiding framing carries over.
+WIDE_SINGLE_ASPECTS = (1.777, 1.333, 1.25, 1.0, 0.944)
+
+
+def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
+              pair_aspect: float | None = None) -> List[float]:
+    aspects = (pair_aspect,) if pair_aspect else WIDE_SINGLE_ASPECTS
+    chosen: tuple = (aspects[-1], pw, ph)
+    for A in aspects:
+        if pw / max(ph, 1e-9) >= A:
+            win_w, win_h = ph * A, ph
+        else:
+            win_w, win_h = pw, pw / A
+        if win_h >= min_win_h or A == aspects[-1]:
+            chosen = (A, win_w, win_h)
+            break
+    _A, win_w, win_h = chosen
+    try:
+        cx = (float(box[0]) + float(box[2])) / 2.0
+        cy = (float(box[1]) + float(box[3])) / 2.0
+    except (TypeError, ValueError, IndexError):
+        cx, cy = 0.5, 0.5
+    cx = max(0.0, min(1.0, cx))
+    cy = max(0.0, min(1.0, cy))
+    x0 = max(0.0, min(pw - win_w, cx * pw - win_w / 2.0)) / pw
+    y0 = max(0.0, min(ph - win_h, cy * ph - win_h / 2.0)) / ph
+    return [x0, y0, x0 + win_w / pw, y0 + win_h / ph]
+
+
+def _wide_pass(shots: List[Dict[str, Any]], designer, fmt, wcfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Rewrite a classic plan for wide mode. Single + pair layouts only
+    (inset/classic-wide become full-height singles); crops are wide focal
+    windows; caption_bar is off so panels touch the bottom edge and captions
+    overlay the art."""
+    if fmt.width <= fmt.height:
+        return shots  # portrait formats are untouched
+    min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
+    pair_aspect = (fmt.width / 2.0) / fmt.height
+    for s in shots:
+        s["wide"] = True
+        s["caption_bar"] = False
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        if not pair:
+            s["layout"] = "single"
+            cards = cards[:1]
+        for c in cards:
+            p = designer.by_id.get(c.get("panel")) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if pw > 0 and ph > 0:
+                c["crop"] = wide_crop(pw, ph, c.get("crop") or [0, 0, 1, 1], min_win_h,
+                                      pair_aspect if pair else None)
+            c["pad_y"] = 0.0
+            c["wide_display"] = True
+        s["cards"] = cards
+    return shots
+
+
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
                vcfg: Dict[str, Any], image_for: Callable[[Dict[str, Any]], Image.Image],
                sentences: List[Dict[str, Any]] | None = None,
@@ -1124,6 +1190,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         for _s in shots:
             _s["caption_bar"] = True  # dedicated bottom bar, below the cards
     sfx = plan_sfx(shots, chapter_cards)
+    if str(vcfg.get("mode") or "classic") == "wide":
+        _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     return {
         "version": PLAN_VERSION,
         "chapter": chapter,

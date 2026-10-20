@@ -43,6 +43,14 @@ download:
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
+  mode: classic           # classic | wide
+                          # wide = classic editing, but panels are always full
+                          # frame height and at least 8.5/16 of the frame wide
+                          # (no thin strips), with an upscale cap for 1080p
+                          # sharpness. Captions overlay the art (no black bar).
+  wide:
+    min_width_ratio: 0.53125  # 8.5/16 of frame width
+    max_upscale: 1.5          # never upscale a panel more than this
   crf: 20                 # quality: lower = better and bigger files
   preset: veryfast
   lead: 0.15              # panel appears this long before its sentence
