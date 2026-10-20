@@ -183,6 +183,25 @@ def test_unknown_panel_ids_are_reported_not_used():
     assert data["unknown_panels"] == ["P009-09"]
 
 
+def test_quoted_question_mark_does_not_orphan_its_panel_tag():
+    # A quoted ?/! followed by a lowercase continuation is a sub-clause, not
+    # a sentence end -- splitting there would orphan the fragment from the
+    # tag that opened the sentence.
+    data = cues.parse('{P001-01} She asked, "Is it over?" but no one answered. '
+                      '{P001-02} Then it happened.', {"P001-01", "P001-02"})
+    texts = [s["text"] for s in data["sentences"]]
+    assert texts == ['She asked, "Is it over?" but no one answered.', "Then it happened."]
+    assert data["sentences"][0]["panels"] == ["P001-01"]
+
+
+def test_quoted_exclamation_before_a_capitalised_sentence_still_splits():
+    # The quote still closes a real sentence boundary when what follows is
+    # capitalised -- only the lowercase-continuation case is protected.
+    data = cues.parse('{P001-01} He shouted, "Stop!" She froze.', {"P001-01"})
+    texts = [s["text"] for s in data["sentences"]]
+    assert texts == ['He shouted, "Stop!', "She froze."]
+
+
 def test_tts_text_has_no_tags_cues_or_markdown():
     text = cues.tts_text(NARRATION)
     assert "{" not in text and "[" not in text and "*" not in text

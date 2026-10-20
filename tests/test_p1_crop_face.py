@@ -199,18 +199,38 @@ def test_verify_marks_head_cut_panel_needs_eyes_not_dropped(monkeypatch):
     assert report["dropped"] == []
 
 
-def test_verify_drops_panel_whose_best_crop_still_shows_a_bubble(monkeypatch):
-    # Bubble painting removed: a figure panel with no clean crop (best
-    # window still shows a bubble) is DROPPED and re-paired -- the P1
-    # mask-risk rule, now applied to every bubble. Head-cut-only panels
-    # still go to needs-eyes (see the test above), not to dropped.
+def test_verify_drops_panel_whose_bubble_overlaps_the_face(monkeypatch):
+    # face_bubble (CapCut bugfix defect 3): the best crop's bubble overlaps
+    # the face range specifically -- a real masking risk caught per-crop,
+    # distinct from ordinary lettering. Always drops, figure or not: the
+    # F2 "keep figure panels with ordinary lettering" relaxation must not
+    # weaken this.
+    report = _verify_with(monkeypatch,
+                          {"shape": 0.75, "box": (0, 0, 1, 0.5), "pad_y": 0.0,
+                           "problems": ["lettering", "face_bubble"], "clean": False},
+                          risk=False)
+    assert report["panels"]["P001-01"]["action"] == "dropped"
+    assert report["dropped"][0]["panel"] == "P001-01"
+    assert "face" in report["dropped"][0]["reason"]
+
+
+def test_verify_keeps_figure_panel_with_ordinary_lettering_not_dropped(monkeypatch):
+    # F2 hardening: a figure panel whose best crop still shows ordinary
+    # (non-mask-risk, non-face-overlapping) bubble/caption lettering is
+    # normal webtoon paneling -- it is KEPT and flagged for review, not
+    # auto-dropped. Dropping every panel with any lettering in its window
+    # (ch4: heavy speech lettering) threw away genuinely drawn panels and
+    # only surfaced at the sync gate, a full align->plan->verify cycle
+    # later. A bubble actually overlapping the face is still dropped (see
+    # test_verify_drops_mask_risk_panel_with_no_clean_crop and the
+    # face_bubble branch in verify.py).
     report = _verify_with(monkeypatch,
                           {"shape": 0.75, "box": (0, 0, 1, 0.5), "pad_y": 0.0,
                            "problems": ["lettering"], "clean": False},
                           risk=False)
-    assert report["panels"]["P001-01"]["action"] == "dropped"
-    assert report["dropped"][0]["panel"] == "P001-01"
-    assert "re-pair" in report["dropped"][0]["reason"]
+    assert report["panels"]["P001-01"]["action"] == "kept (check lettering)"
+    assert report["dropped"] == []
+    assert report["bubble_beside_figure"] == ["P001-01"]
 
 
 def test_verify_flags_layout_sensitive_crop(monkeypatch):

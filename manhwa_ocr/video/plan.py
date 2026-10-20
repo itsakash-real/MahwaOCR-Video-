@@ -1141,18 +1141,22 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
     (punch-ins, pairs, splits already decided) so every card -- first
     showing, punch-in, each side of a pair -- gets the same edge audit.
 
-    Returns {"caption_risk": [...], "figure_risk": [...]} -- panel ids
-    flagged with a caption/text collision, or a figure too tall for any
-    window this layout/upscale cap allows to fully contain, for an honest
-    report rather than a silent miss (plan["wide_caption_risk"] /
-    plan["wide_figure_risk"]).
+    Returns {"caption_risk": [...], "figure_risk": [...],
+    "reviewer_focal_ignored": [...]} -- panel ids flagged with a caption/
+    text collision, a figure too tall for any window this layout/upscale
+    cap allows to fully contain, or a fixes.json focal crop that wide mode
+    could not use as-is (the panel was shown whole because its own aspect
+    is >= 6/16, or the focal itself doesn't fit and was re-anchored) --
+    for an honest report rather than a silent miss (plan["wide_caption_risk"]
+    / plan["wide_figure_risk"] / plan["wide_reviewer_focal_ignored"]).
     """
     if fmt.width <= fmt.height:
-        return {"caption_risk": [], "figure_risk": []}  # portrait formats are untouched
+        return {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}  # portrait formats untouched
     min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
     pair_aspect = (fmt.width / 2.0) / fmt.height
     caption_risk: List[str] = []
     figure_risk: List[str] = []
+    reviewer_focal_ignored: List[str] = []
     for s in shots:
         s["wide"] = True
         s["caption_bar"] = False
@@ -1206,6 +1210,16 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                     caption_risk.append(pid)
                 if info.get("figure_risk") and pid not in figure_risk:
                     figure_risk.append(pid)
+                has_reviewer_crop = pid in (designer.fixes.get("crop") or {})
+                if has_reviewer_crop and pid not in reviewer_focal_ignored:
+                    if info.get("whole"):
+                        reviewer_focal_ignored.append(pid)
+                    elif info.get("figure_risk"):
+                        # The reviewer's own focal is taller than any window
+                        # this panel's width/upscale cap can fully contain:
+                        # wide_crop still shows something (top-anchored
+                        # fallback), but not the exact box the reviewer set.
+                        reviewer_focal_ignored.append(pid)
                 # Whole-panel windows have zero margin: the Ken Burns zoom
                 # would clip text sitting at the panel's own edge. Cut the
                 # zoom amplitude further for just this card instead of the
@@ -1224,7 +1238,8 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
             c["pad_y"] = 0.0
             c["wide_display"] = True
         s["cards"] = cards
-    return {"caption_risk": caption_risk, "figure_risk": figure_risk}
+    return {"caption_risk": caption_risk, "figure_risk": figure_risk,
+           "reviewer_focal_ignored": reviewer_focal_ignored}
 
 
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
@@ -1336,7 +1351,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
             _s["caption_bar"] = True  # dedicated bottom bar, below the cards
     sfx = plan_sfx(shots, chapter_cards)
     _mode = str(vcfg.get("mode") or "classic")
-    _wide_risk = {"caption_risk": [], "figure_risk": []}
+    _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
     if _mode == "wide":
         _wide_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     return {
@@ -1344,6 +1359,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "mode": _mode,
         "wide_caption_risk": _wide_risk["caption_risk"],
         "wide_figure_risk": _wide_risk["figure_risk"],
+        "wide_reviewer_focal_ignored": _wide_risk["reviewer_focal_ignored"],
         "chapter": chapter,
         "format": vcfg.get("format", "16:9"),
         "fps": int(vcfg.get("fps", 30)),

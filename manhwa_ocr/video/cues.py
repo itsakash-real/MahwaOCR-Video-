@@ -111,6 +111,26 @@ def _restore_abbrev(text: str) -> str:
     return text.replace(_DOT, ".")
 
 
+# A quoted question/exclamation whose quote closes and is followed by a
+# lowercase word is a sub-clause inside a larger sentence ('she asked,
+# "is it over?" but no one answered'), not the end of one -- SENTENCE_END
+# otherwise splits right after the closing quote, orphaning the fragment
+# from the tag/panel that opened the sentence. Protect the terminator the
+# same way _protect_abbrev protects a dot, then restore it once the split
+# is done.
+_QUOTE_BANG, _QUOTE_Q = "\u0002", "\u0003"
+_QUOTE_CONTINUATION = re.compile(r'(["“][^"”\n]{1,200}?)([?!])(["”])(?=\s+[a-z])')
+
+
+def _protect_quoted_continuation(text: str) -> str:
+    return _QUOTE_CONTINUATION.sub(
+        lambda m: m.group(1) + (_QUOTE_BANG if m.group(2) == "!" else _QUOTE_Q) + m.group(3), text)
+
+
+def _restore_quoted_continuation(text: str) -> str:
+    return text.replace(_QUOTE_BANG, "!").replace(_QUOTE_Q, "?")
+
+
 def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = False) -> Dict[str, Any]:
     """Split tagged narration into spoken sentences with their panels and cues.
     With spell, each sentence's text is the spelled-out-numbers text that tts.txt holds.
@@ -141,6 +161,7 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
     body = "\n".join(kept_lines)
     body = re.sub(r"\s+", " ", body).strip()
     body = _protect_abbrev(body)
+    body = _protect_quoted_continuation(body)
     sentences: List[Dict[str, Any]] = []
     unknown: List[str] = []
     tagged = 0
@@ -175,12 +196,13 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
                         panels.append(pid)
                     else:
                         unknown.append(pid)
-        emphasis = [_spoken(_restore_abbrev(m)) for m in re.findall(r"\*{1,2}([^*\n]{1,60})\*{1,2}", chunk)]
-        text = _restore_abbrev(_spoken(chunk))
+        emphasis = [_spoken(_restore_quoted_continuation(_restore_abbrev(m)))
+                   for m in re.findall(r"\*{1,2}([^*\n]{1,60})\*{1,2}", chunk)]
+        text = _restore_quoted_continuation(_restore_abbrev(_spoken(chunk)))
         if spell:
             emphasis = [spell_numbers(e) for e in emphasis]
             text = spell_numbers(text)
-        chunk = _restore_abbrev(chunk)
+        chunk = _restore_quoted_continuation(_restore_abbrev(chunk))
         if not text:
             # A tag-only fragment: carry its tags onto the next sentence.
             if sentences is not None and (panels or cues or chunk_hook or chunk_loops):

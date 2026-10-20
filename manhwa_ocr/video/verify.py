@@ -196,6 +196,7 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
     needs_eyes: List[str] = []
     recropped: List[str] = []
     low_confidence: List[Dict[str, Any]] = []
+    bubble_beside_figure: List[str] = []
     mask_risk: List[str] = []
     layout_sensitive: List[str] = []
     layout_problems: Dict[str, Dict[str, List[str]]] = {}
@@ -290,21 +291,41 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             dropped.append({"panel": p["id"],
                             "reason": "shouting face + dominant bubble would mask the face "
                                       "(no clean crop); drop and re-pair"})
-        elif "lettering" in probs or "face_bubble" in probs:
+        elif "face_bubble" in probs:
+            # The best window's bubble overlaps the face range specifically
+            # (CapCut bugfix defect 3) -- the same masking risk as the
+            # mask_risk branch above, just caught per-crop instead of by the
+            # panel-wide heuristic. Never show it, figure or not: this is a
+            # drop-and-re-pair case like mask_risk, not ordinary lettering.
+            action = "dropped"
+            dropped.append({"panel": p["id"],
+                            "reason": "best crop's bubble overlaps the face range; drop and re-pair"})
+        elif "lettering" in probs and not figure:
             # Bubble painting is removed: a panel whose best crop still
             # shows a bubble can no longer be painted clean. Crops already
             # tried to exclude it (pick_card prefers clean windows); with
             # no clean crop, drop the panel and let build.py re-pair its
             # time to a neighbour -- the P1 mask-risk rule, now applied to
-            # every bubble that would have been painted.
+            # every bubble that would have been painted. A panel with no
+            # drawn figure at all (pure lettering/caption/logo) has nothing
+            # else worth showing, so this is the right call here.
             action = "dropped"
             dropped.append({"panel": p["id"],
                             "reason": "best crop still shows a speech bubble or caption and bubble painting "
                                       "is removed; drop and re-pair"})
         elif figure:
-            action = "needs eyes" if "head_cut" in probs else "kept (check)"
+            # A drawn figure beside some ordinary bubble/caption lettering
+            # (not over the face -- that's the face_bubble branch above) is
+            # normal webtoon paneling, not a masking problem. Dropping every
+            # panel with ANY lettering in its best window (ch4: heavy speech
+            # lettering fooled this into dropping genuinely drawn panels)
+            # throws good panels away; keep it and flag it for review instead.
+            bubbly = "lettering" in probs
+            action = "needs eyes" if "head_cut" in probs else ("kept (check lettering)" if bubbly else "kept (check)")
             if "head_cut" in probs:
                 needs_eyes.append(p["id"])
+            if bubbly:
+                bubble_beside_figure.append(p["id"])
         else:
             action = "dropped"
             dropped.append({"panel": p["id"], "reason": ", ".join(probs) or "no character"})
@@ -325,7 +346,12 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
               "layout_problems": layout_problems, "layout_switches": layout_switches,
               "visible_patches": visible_patches,
               # Heads the heuristic is not sure of (it cannot be): where a reviewer should look first.
-              "low_confidence_heads": low_confidence}
+              "low_confidence_heads": low_confidence,
+              # Panels kept (not dropped) despite a bubble/caption in their best
+              # window, because a drawn figure is also confidently present --
+              # check the bubble doesn't sit over the face (mask_risk catches
+              # that already; this is the milder "beside the figure" case).
+              "bubble_beside_figure": bubble_beside_figure}
     if root is not None and chapter is not None:
         atomic_write_text(video_dir(root) / f"chapter_{require_chapter(chapter)}.verify.json",
                           json.dumps(report, indent=1, ensure_ascii=False))

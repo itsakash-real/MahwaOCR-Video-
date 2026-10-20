@@ -18,7 +18,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Tuple
 
 from PIL import Image
 
@@ -42,11 +42,16 @@ from .storyboard import storyboard_paths, write_review_task, write_storyboard
 END_TAIL = 1.5   # seconds the video runs on after the last word
 
 
-def _replace_dropped(units: List[Dict[str, Any]], drop: Dict[str, str]) -> List[Dict[str, Any]]:
+def _replace_dropped(units: List[Dict[str, Any]], drop: Dict[str, str]
+                     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """A dropped panel's time is kept but shows the nearest panel that stays on
-    screen (the one before it, or after it if it comes first). Timing unchanged."""
+    screen (the one before it, or after it if it comes first). Timing unchanged.
+
+    Also returns the substitutions made ({"sentence", "dropped", "shown", "reason"}),
+    so the caller can log them loudly instead of a plan that looks fine until the
+    sync gate fails that sentence later (see make_plan)."""
     if not drop or not units:
-        return units
+        return units, []
     kept = [u["panels"][0] not in drop for u in units]
     after: List[str | None] = [None] * len(units)
     cur: str | None = None
@@ -54,15 +59,19 @@ def _replace_dropped(units: List[Dict[str, Any]], drop: Dict[str, str]) -> List[
         if kept[i]:
             cur = units[i]["panels"][0]
         after[i] = cur
-    out, prev = [], None
+    out, prev, subs = [], None, []
     for i, u in enumerate(units):
         if kept[i]:
             prev = u["panels"][0]
             out.append(u)
             continue
         rep = prev or after[i]
+        dropped_id = u["panels"][0]
+        if rep:
+            subs.append({"sentence": (u.get("sentence") or "")[:80], "dropped": dropped_id,
+                        "shown": rep, "reason": drop.get(dropped_id, "")})
         out.append({**u, "panels": [rep]} if rep else u)
-    return out
+    return out, subs
 
 
 def qa_path(root: Path, chapter: str) -> Path:
@@ -143,6 +152,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         # being a silent cut.
         "wide_caption_risk": list(plan.get("wide_caption_risk") or []),
         "wide_figure_risk": list(plan.get("wide_figure_risk") or []),
+        "wide_reviewer_focal_ignored": list(plan.get("wide_reviewer_focal_ignored") or []),
         "min_shot": round(shortest, 2),
         "max_shots": max(0, int(duration // 3.0)) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
@@ -493,7 +503,11 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
             raise UserError(
                 f"Chapter {chapter}'s alignment failed validation, so planning stopped (no silent fallback):\n"
                 f"  {problems}\nFix it and rebuild with:  video align --chapter {chapter}")
-        units = _replace_dropped(units_from_alignment(alignment["segments"]), drop)
+        units, _dropped_subs = _replace_dropped(units_from_alignment(alignment["segments"]), drop)
+        for _sub in _dropped_subs:
+            log(f"  ! tagged panel {_sub['dropped']} was dropped ({_sub['reason']}) -- sentence "
+                f"\"{_sub['sentence']}\" now shows {_sub['shown']} instead. Re-pair it (video pair) "
+                f"if {_sub['shown']} doesn't fit, rather than discovering this at the sync gate.")
         align_cov = alignment.get("coverage")
         queue = alignment.get("review_queue") or []
         # P2: timing warnings ride with the plan (see build_plan), so status/QA/render
@@ -552,6 +566,10 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if qa.get("wide_caption_risk"):
         log(f"    ! wide mode: {len(qa['wide_caption_risk'])} panel(s) where the overlaid caption may "
             f"cover panel text: {', '.join(qa['wide_caption_risk'][:8])}")
+    if qa.get("wide_reviewer_focal_ignored"):
+        log(f"    ! wide mode: {len(qa['wide_reviewer_focal_ignored'])} panel(s) where a fixes.json focal "
+            f"crop was not used as-is (panel shown whole, or the focal doesn't fit): "
+            f"{', '.join(qa['wide_reviewer_focal_ignored'][:8])}")
     if plan.get("chapter_cards"):
         from .editor import chapter_cards_to_timestamps as _ts
         log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))

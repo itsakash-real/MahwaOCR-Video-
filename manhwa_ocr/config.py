@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from typing import Any, Dict
 
@@ -167,6 +167,11 @@ class Config:
     download: Dict[str, Any] = field(default_factory=dict)
     pipeline: Dict[str, Any] = field(default_factory=dict)
     video: Dict[str, Any] = field(default_factory=dict)
+    # Top-level YAML sections this build doesn't know about (e.g. a `recap:`
+    # section from a sibling branch's config). Kept, not dropped, so a config
+    # file shared between checkouts never crashes load_config -- only code
+    # that actually reads a given section needs to know about it.
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def workdir(self) -> Path:
@@ -331,7 +336,9 @@ def load_config(path: str | Path | None = None, **overrides: Any) -> Config:
             data[section][key] = value
 
     _fit_provider_to_kind(data["provider"])
-    return Config(**data)
+    known = {f.name for f in fields(Config)} - {"extra"}
+    extra = {k: v for k, v in data.items() if k not in known}
+    return Config(**{k: v for k, v in data.items() if k in known}, extra=extra)
 
 
 def write_example_config(dest: str | Path) -> Path:

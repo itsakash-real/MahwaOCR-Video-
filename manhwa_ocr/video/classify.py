@@ -31,7 +31,12 @@ INTERNAL_PATTERNS = [
     (re.compile(r"\bto (?:himself|herself|themselves|itself)\b", re.I), "to himself/herself"),
     (re.compile(r"\bthought to (?:himself|herself|themselves|itself)\b", re.I), "thought to himself/herself"),
     (re.compile(r"\bunder (?:his|her|their|its) breath\b", re.I), "under his/her breath"),
-    (re.compile(r"\b(?:he|she|they)\s+(?:thinks?|thought|mused?|muses|recalled?|recalls?|realiz(?:ed|es)|wonders?)\b", re.I), "he/she thinks"),
+    # Excludes "she thought it/that/this was..." -- a common retrospective
+    # comparison about something VISIBLE ("not the argument she thought it
+    # was"), not a description of an unspoken internal thought. Ch4: this
+    # false positive held the previous panel for ~15s.
+    (re.compile(r"\b(?:he|she|they)\s+(?:thinks?|thought|mused?|muses|recalled?|recalls?|realiz(?:ed|es)|wonders?)\b"
+               r"(?!\s+(?:it|that|this)\b)", re.I), "he/she thinks"),
     (re.compile(r"\binternally\b", re.I), "internally"),
     (re.compile(r"\bin (?:his|her|their|its) mind'?s eye\b", re.I), "in his/her mind's eye"),
     (re.compile(r"\b(?:silently|mutely) (?:tells?|begs?|pleads?|screams?|whispers?)\b", re.I), "silently tells/begs"),
