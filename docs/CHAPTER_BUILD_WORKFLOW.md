@@ -64,7 +64,10 @@ session) whichever of those three you don't already have before starting.
   must depict the sentence's subject (right character, action, location).
   Never use text-only, bubble-only, blank, or credit panels. A sentence may
   hold 1-2 panels (two tagged panels show as a sequence or pair -- use this
-  for two-beat sentences instead of re-showing one panel).
+  for two-beat sentences instead of re-showing one panel). Sequence rule:
+  on a sentence of <=8s ONLY the first tagged panel displays (the second
+  tag is silently unused), so put the single best panel first; a two-panel
+  sequence needs a >8s sentence.
 - Edit `.work/video/ch<N>/pairs.json` (its numbering = alignment sentence
   numbering -- verify against the segment text first), then
   `video pair --chapter <N> --apply`. After any pairing change you MUST
@@ -104,8 +107,7 @@ session) whichever of those three you don't already have before starting.
 **Code issues:** if you hit a genuine code bug, stop, fix it on
 `video/wide-mode-v2`, run the tests (`python -m pytest tests/ -q`), commit
 and push, then continue the build (this pattern is pre-approved; merging to
-`main` is not). Check `TODO.md` at the repo root first -- a bug you're about
-to re-diagnose may already be fixed or already listed there as known.
+`main` is not).
 
 ## Phase 4 — Gates, in this order
 
