@@ -233,6 +233,14 @@ someone else's script. Do not paste transcript dialogue in bulk.
 
 ## Making videos
 
+Taking a chapter all the way from its link to a finished video with
+Deepgram doing the narration (no human recording involved): read
+`docs/FULL_PIPELINE_WORKFLOW.md` in full before starting, and read it again
+before starting each NEW chapter in the same session. It covers the
+transcript/recap/consistency-check/voice/TTS-readiness/audio-verification
+stages, then hands off to the file below for the video itself. The
+`/make-recap-video` skill does this automatically.
+
 Building or continuing a `video.mode: wide`/`adaptive` chapter video (any
 multi-chapter continuation, e.g. chapter 1 then 2 then 3 in one session):
 read `docs/CHAPTER_BUILD_WORKFLOW.md` in full before starting, and read it
