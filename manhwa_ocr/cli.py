@@ -785,6 +785,15 @@ def cmd_video(args) -> int:
             syncaudit.run(sess.path, c, cfg, log=_log)
         return 0
 
+    if action == "tts":
+        from .video import tts as tts_mod
+
+        for c in chapters(default_all=False):
+            tts_mod.synthesize_chapter(sess.path, c, cfg, log=_log, force=args.force,
+                                       model=args.voice, key_file=args.key_file)
+            _log(f"  next:  python -m manhwa_ocr video align --chapter {c}{_pin(sess)}")
+        return 0
+
     if action == "pair":
         from .video import pairing
 
@@ -1101,7 +1110,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "pair", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "pair", "tts", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
@@ -1128,6 +1137,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prepare", action="store_true",
                    help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
     p.add_argument("--audio", help="hook/previously: narration audio file, e.g. audio/chapter_0.mp3")
+    p.add_argument("--voice", help="tts: Deepgram voice model (default: tts.model config or aura-2-thalia-en)")
+    p.add_argument("--key-file", dest="key_file",
+                   help="tts: file holding the Deepgram API key (default: DEEPGRAM_API_KEY env, else ~/.config/manhwa/deepgram.key)")
     p.add_argument("--script", help="hook/previously: narration script, one sentence per line")
     p.add_argument("--cues", help="hook/previously: cues.json file with the narration sentences (alternative to --script); a sentence may pin its panels with a \"panels\" list of refs like \"ch2:P010-14\"")
     p.add_argument("--auto", action="store_true",
