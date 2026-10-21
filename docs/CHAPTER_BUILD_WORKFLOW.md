@@ -43,6 +43,15 @@ session) whichever of those three you don't already have before starting.
 
 ## Phase 1 — Deep audio↔video mapping BEFORE building
 
+- **Handle `video align` failures in ONE full pass, not one at a time.** If
+  the recording reworded sentences or added a spoken intro the script
+  doesn't have, the first `video align` will fail, and fixing just the one
+  mismatch it reports and re-running often just fails on the NEXT mismatch
+  -- three or four such cycles can cost an hour by itself. Instead, the
+  moment align fails for a reason that looks like "recording differs from
+  script" (not a single typo), diff the actual recording's words against
+  every sentence in `cues.json` in one full pass, fix every mismatch you
+  find, THEN re-run `video align` once.
 - From the alignment: list every sentence, its time window, and its tagged
   panel(s). Confirm each tagged panel actually shows during its sentence
   window.
@@ -98,7 +107,15 @@ session) whichever of those three you don't already have before starting.
   pixel aspect must match its named shape within 2% (9:16=0.5625, 3:4=0.75,
   1:1=1.0, 4:3=1.333, 16:9=1.777) or the WHOLE file is refused and nothing
   applies. After writing fixes, re-plan and verify the windows actually
-  landed where intended via the storyboard -- do not assume.
+  landed where intended via the storyboard -- do not assume. **Every single
+  time you write a fixes.json crop, check where it lands relative to the
+  burned-in caption band (bottom ~12%) on the re-planned storyboard tile --
+  not just whether the subject/text is inside the window.** A crop that
+  correctly contains its subject/text can still land that content IN the
+  caption band, unreadable; this is easy to miss because the fix "worked"
+  by the subject-containment check alone, and it has shipped before and
+  only been caught at the final Phase 6 frame review -- a whole rebuild
+  cycle later than it needed to be.
 - Check `plan["wide_figure_risk"]` / `plan["wide_caption_risk"]` /
   `plan["wide_reviewer_focal_ignored"]` (also in the QA file) for anything
   flagged on a panel you're about to ship -- these are honest, non-silent
@@ -139,6 +156,17 @@ Sampled spot-checks are NOT a pass.
 - Classify every flaw you find and its reason. Fix real defects (pairing ->
   align -> plan, or fixes.json -> plan, or code -> push) and rebuild.
   Report honestly what remains and why (e.g. source-panel bleeds).
+
+## Known friction (not fully fixable from this file, but don't lose work to it)
+
+A service restart can kill a running `align` or an in-progress upload
+mid-job, and a large file's upload time is unpredictable (anywhere from
+under a minute to tens of minutes for ~75MB). After any interruption,
+restart, or long gap: verify what's actually on disk (mtime, size, and for
+a video file `ffprobe`'s duration/clean-decode check -- see Phase 5) before
+trusting that a job finished or that cached progress is still good, the
+same way you'd never trust two concurrent renders not to have corrupted
+their shared output file.
 
 ## Delivery
 
