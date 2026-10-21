@@ -40,6 +40,12 @@ download:
   headers:
     User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36
 
+tts:
+  # Deepgram Aura voice for `video tts`. aura-2-orion-en: calm, approachable
+  # American male -- picked for a gentle recap narrator, not a trailer/news
+  # voice. Override per command with --voice.
+  model: aura-2-orion-en
+
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
