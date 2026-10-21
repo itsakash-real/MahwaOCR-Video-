@@ -167,7 +167,14 @@ def open_encoder(out: Path, width: int, height: int, fps: int, *, crf: int, pres
         # threads per process -- oversubscription thrash on top of the frame
         # drawing. Let the process pool provide the parallelism.
         "-threads", "2",
-        "-pix_fmt", "yuv420p", "-r", str(fps), "-video_track_timescale", str(fps * 512),
+        # Tag the RGB->YUV conversion explicitly (BT.709, tv range): without
+        # this, libswscale guesses a matrix at encode time while players
+        # assume BT.709 at decode time, and a mismatch renders as a flat,
+        # washed-out picture even though nothing was actually lossy.
+        "-vf", "scale=out_color_matrix=bt709:out_range=tv",
+        "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709",
+        "-color_trc", "bt709", "-color_range", "tv",
+        "-r", str(fps), "-video_track_timescale", str(fps * 512),
         "-movflags", "+faststart",
         str(out),
     ]
