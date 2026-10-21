@@ -792,7 +792,7 @@ def cmd_video(args) -> int:
 
         for c in chapters(default_all=False):
             tts_mod.synthesize_chapter(sess.path, c, cfg, log=_log, force=args.force,
-                                       model=args.voice, key_file=args.key_file)
+                                       model=args.voice, key_file=args.key_file, speed=args.speed)
             if getattr(args, "no_verify", False):
                 _log("  tts-verify: skipped (--no-verify)")
             elif not sync_mod.available():
@@ -1157,6 +1157,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="tts: file holding the Deepgram API key (default: DEEPGRAM_API_KEY env, else ~/.config/manhwa/deepgram.key)")
     p.add_argument("--no-verify", dest="no_verify", action="store_true",
                    help="tts: skip the automatic whisper-based audio self-check after synthesizing")
+    p.add_argument("--speed", type=float,
+                   help="tts: playback speed, Aura-2 models only (default: tts.speed config or 1.23)")
     p.add_argument("--script", help="hook/previously: narration script, one sentence per line")
     p.add_argument("--cues", help="hook/previously: cues.json file with the narration sentences (alternative to --script); a sentence may pin its panels with a \"panels\" list of refs like \"ch2:P010-14\"")
     p.add_argument("--auto", action="store_true",

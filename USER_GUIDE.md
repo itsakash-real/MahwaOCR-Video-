@@ -337,7 +337,10 @@ The Deepgram API key is read from the `DEEPGRAM_API_KEY` environment variable,
 or from a key file (default `~/.config/manhwa/deepgram.key`, one line, the key
 only). Keep the key on your own machine: it is never written into the series
 folder or the repo. Pick the voice with `--voice aura-2-orion-en` or a `tts:`
-section in the config (`model`, `gap_seconds`, `key_file`). Re-running the
+section in the config (`model`, `gap_seconds`, `key_file`, `speed`).
+Playback speed defaults to `1.23` (Aura-2 models only, range 0.7-1.5) --
+a touch faster reads less like a performance, more like a narrator moving
+the story along; override per command with `--speed 1.1`. Re-running the
 command reuses cached sentences; `--force` re-synthesizes everything.
 
 **Important:** record from the *current* script. If a recap is rewritten later,

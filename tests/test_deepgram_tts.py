@@ -99,8 +99,15 @@ def test_deepgram_speak_sends_token_header_and_text():
     req = opener.request
     assert req.full_url.startswith("https://api.deepgram.com/v1/speak?")
     assert "model=aura-2-thalia-en" in req.full_url
+    assert f"speed={tts.DEFAULT_SPEED}" in req.full_url
     assert req.get_header("Authorization") == "Token SECRETKEY"
     assert json.loads(req.data) == {"text": "Hello world."}
+
+
+def test_deepgram_speak_uses_the_given_speed():
+    opener = _FakeOpener(_tiny_wav(0.1))
+    tts.deepgram_speak("Hello.", "aura-2-thalia-en", "SECRETKEY", speed=1.23, opener=opener)
+    assert "speed=1.23" in opener.request.full_url
 
 
 def test_deepgram_speak_error_surfaces_message_but_not_key():
@@ -156,6 +163,7 @@ def test_synthesize_chapter_writes_audio_manifest_and_caches(tmp_path, monkeypat
 
     manifest = json.loads((tmp_path / "audio" / "chapter_1.tts.json").read_text(encoding="utf-8"))
     assert manifest["model"] == "aura-2-orion-en"
+    assert manifest["speed"] == tts.DEFAULT_SPEED
     assert manifest["total_seconds"] == pytest.approx(0.2 + 0.1 + 0.2)
     assert [s["n"] for s in manifest["sentences"]] == [1, 2]
     assert "SECRETKEY" not in json.dumps(manifest)
@@ -164,6 +172,39 @@ def test_synthesize_chapter_writes_audio_manifest_and_caches(tmp_path, monkeypat
     calls.clear()
     tts.synthesize_chapter(tmp_path, "1", cfg, log=logs.append, speak=fake_speak)
     assert calls == []
+
+
+def test_synthesize_chapter_default_speed_is_1_23(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    _write_cues(tmp_path, texts=("One sentence.",))
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "SECRETKEY")
+    monkeypatch.setattr(tts, "encode_m4a", lambda wav_path, out_path: out_path.write_bytes(b"m4a"))
+    tts.synthesize_chapter(tmp_path, "1", SimpleNamespace(extra={}), log=print,
+                           speak=lambda *a: _tiny_wav(0.2))
+    manifest = json.loads((tmp_path / "audio" / "chapter_1.tts.json").read_text(encoding="utf-8"))
+    assert manifest["speed"] == 1.23
+
+
+def test_changing_speed_invalidates_the_cache(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    _write_cues(tmp_path, texts=("One sentence.",))
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "SECRETKEY")
+    monkeypatch.setattr(tts, "encode_m4a", lambda wav_path, out_path: out_path.write_bytes(b"m4a"))
+    calls = []
+
+    def fake_speak(text, model, key):
+        calls.append(text)
+        return _tiny_wav(0.2)
+
+    cfg = SimpleNamespace(extra={})
+    tts.synthesize_chapter(tmp_path, "1", cfg, log=print, speed=1.0, speak=fake_speak)
+    assert len(calls) == 1
+
+    calls.clear()
+    tts.synthesize_chapter(tmp_path, "1", cfg, log=print, speed=1.23, speak=fake_speak)
+    assert calls == ["One sentence."]  # different speed -> cache miss, re-synthesized
 
 
 def test_synthesize_chapter_resynthesizes_a_corrupted_cache_entry(tmp_path, monkeypatch):

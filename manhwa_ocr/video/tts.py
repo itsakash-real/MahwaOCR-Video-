@@ -21,6 +21,7 @@ Config (all optional, under a ``tts:`` section):
       model: aura-2-thalia-en   # any Deepgram Aura voice model
       gap_seconds: 0.35         # silence between sentences
       key_file: ~/.config/manhwa/deepgram.key
+      speed: 1.23               # playback speed; Aura-2 models only (0.7-1.5)
 
 Per-sentence WAVs are cached under ``.work/tts/ch<N>/`` keyed by the
 sentence text and the model, so re-running after a one-sentence script edit
@@ -48,6 +49,10 @@ from .tts_lint import format_report, lint_sentences
 DEEPGRAM_URL = "https://api.deepgram.com/v1/speak"
 DEFAULT_MODEL = "aura-2-thalia-en"
 DEFAULT_GAP_SECONDS = 0.35
+# A touch faster than natural reads less like a performance, more like a
+# narrator moving the story along -- picked after listening to 1.2/1.23/1.25/1.3
+# samples of an Aura-2 voice side by side. Only Aura-2 models accept it.
+DEFAULT_SPEED = 1.23
 SAMPLE_RATE = 24000
 DEFAULT_KEY_FILE = "~/.config/manhwa/deepgram.key"
 
@@ -101,10 +106,10 @@ def load_api_key(cfg_tts: dict, key_file: str | None = None) -> str:
 
 
 def deepgram_speak(text: str, model: str, api_key: str, *,
-                   opener=None) -> bytes:  # noqa: ANN001 - urllib opener
+                   speed: float = DEFAULT_SPEED, opener=None) -> bytes:  # noqa: ANN001 - urllib opener
     """One sentence -> WAV bytes (linear16, mono) from Deepgram's /v1/speak."""
     url = (f"{DEEPGRAM_URL}?model={model}&encoding=linear16"
-           f"&sample_rate={SAMPLE_RATE}&container=wav")
+           f"&sample_rate={SAMPLE_RATE}&container=wav&speed={speed}")
     body = json.dumps({"text": text}).encode("utf-8")
     request = urllib.request.Request(url, data=body, method="POST")
     request.add_header("Content-Type", "application/json")
@@ -181,7 +186,7 @@ def encode_m4a(wav_path: Path, out_path: Path) -> None:
 
 def synthesize_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], None],
                        force: bool = False, model: str | None = None,
-                       key_file: str | None = None,
+                       key_file: str | None = None, speed: float | None = None,
                        speak: Callable[[str, str, str], bytes] | None = None) -> Path:
     """Synthesize a chapter's narration into audio/chapter_N.m4a. Returns that path."""
     cfg_tts = {}
@@ -189,12 +194,13 @@ def synthesize_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], No
         cfg_tts = (getattr(cfg, "extra", None) or {}).get("tts") or {}
     model = model or cfg_tts.get("model") or DEFAULT_MODEL
     gap = float(cfg_tts.get("gap_seconds", DEFAULT_GAP_SECONDS))
+    speed = float(speed if speed is not None else cfg_tts.get("speed", DEFAULT_SPEED))
     sentences = load_sentences(root, chapter)
     issues = lint_sentences(sentences)
     if issues:
         raise UserError(format_report(issues))
     api_key = load_api_key(cfg_tts, key_file)
-    speak = speak or (lambda text, mdl, key: deepgram_speak(text, mdl, key))
+    speak = speak or (lambda text, mdl, key: deepgram_speak(text, mdl, key, speed=speed))
 
     cache_dir = Path(root) / ".work" / "tts" / f"ch{chapter}"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -210,7 +216,7 @@ def synthesize_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], No
     total_chars = 0
     for i, text in enumerate(sentences, start=1):
         total_chars += len(text)
-        digest = hashlib.sha256(f"{model}\n{text}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(f"{model}\n{speed}\n{text}".encode("utf-8")).hexdigest()
         cached = cache.get(str(i))
         wav_path = cache_dir / f"s{i:03d}.wav"
         if not force and cached and cached.get("sha") == digest and wav_path.exists():
@@ -245,6 +251,7 @@ def synthesize_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], No
         "chapter": str(chapter),
         "provider": "deepgram",
         "model": model,
+        "speed": speed,
         "gap_seconds": gap,
         "chars": total_chars,
         "total_seconds": total_seconds,
