@@ -24,7 +24,7 @@ _DIGIT = re.compile(r"\d")
 _DASH_PAUSE = re.compile(r"\s[-–—]{1,2}\s|--")
 _ELLIPSIS = re.compile(r"\.\.\.|…")
 _DOUBLE_PUNCT = re.compile(r"[!?.,]{2,}")
-_TERMINAL = re.compile(r"[.!?][\"'’”]?$")
+_TERMINAL = re.compile(r"[.!?][\"'’”)\]]*$")
 _WORD = re.compile(r"[A-Za-z0-9']+")
 RUN_ON_WORDS = 30
 
