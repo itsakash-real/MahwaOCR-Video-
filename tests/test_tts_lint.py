@@ -36,6 +36,16 @@ def test_double_punctuation_flagged():
     assert any(i.code == "double-punct" for i in issues)
 
 
+def test_parenthetical_aside_ending_in_period_is_not_flagged_unterminated():
+    issues = lint_sentence(1, "She finally made it (after all that time.)")
+    assert not any(i.code == "unterminated" for i in issues)
+
+
+def test_quoted_sentence_ending_is_not_flagged_unterminated():
+    issues = lint_sentence(1, 'He said, "I am done."')
+    assert not any(i.code == "unterminated" for i in issues)
+
+
 def test_unterminated_sentence_flagged():
     issues = lint_sentence(1, "He ran until he couldn't anymore")
     assert any(i.code == "unterminated" for i in issues)
