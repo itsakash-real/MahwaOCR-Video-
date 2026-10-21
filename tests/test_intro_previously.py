@@ -359,3 +359,71 @@ def test_manual_intro_still_builds_plan(hook_session):
     plan, _ = intro_mod.build_intro(sess, cfg, sync="off", log=lambda *_: None)
     assert (sess.path / "video" / "chapter_0.plan.json").exists()
     assert len(plan["shots"]) >= 2
+
+
+# ------------------------------------------------------------------ pinned panels
+
+
+def test_parse_cues_data_panels():
+    sents = hook_mod.parse_cues_data(
+        {"sentences": [{"text": "Hello.", "panels": ["ch1:P001-01", "ch2:P002-01"]},
+                       {"text": "World.", "panels": "ch1:P001-02"}]})
+    assert sents[0]["panels"] == ["ch1:P001-01", "ch2:P002-01"]
+    assert sents[1]["panels"] == ["ch1:P001-02"]  # a bare string is one pin
+    assert hook_mod.parse_cues_data({"sentences": [{"text": "No pins."}]})[0]["panels"] == []
+
+
+def test_pinned_picks_use_exact_panels():
+    pool = _pool()
+    sents = [{"text": "A cat.", "panels": ["ch1:P001-03"]},
+             {"text": "A dragon.", "panels": ["ch1:P001-01", "ch2:P002-01"], "hook": True}]
+    picks = hook_mod.pinned_picks(sents, pool)
+    assert [p["panels"] for p in picks] == [["ch1:P001-03"], ["ch1:P001-01", "ch2:P002-01"]]
+    assert picks[1]["hook"] is True
+    assert all(p["reason"] == "pinned in cues file" for p in picks)
+
+
+def test_pinned_picks_reject_bad_pins():
+    from manhwa_ocr.util import UserError
+
+    pool = _pool()
+    pool[0]["text_only"] = True  # ch1:P001-01 becomes unshowable
+    with pytest.raises(UserError):
+        hook_mod.pinned_picks([{"text": "X.", "panels": ["ch9:P999-99"]}], pool)  # unknown ref
+    with pytest.raises(UserError):
+        hook_mod.pinned_picks([{"text": "X.", "panels": ["ch1:P001-01"]}], pool)  # text-only
+    with pytest.raises(UserError):
+        hook_mod.pinned_picks([{"text": "X.", "panels": ["ch1:P001-02"]},
+                               {"text": "Y.", "panels": ["ch1:P001-02"]}], pool)  # duplicate
+    with pytest.raises(UserError):
+        hook_mod.pinned_picks([{"text": "X.", "panels": ["ch1:P001-02"]},
+                               {"text": "Y."}], pool)  # half-pinned: never silently mixed
+    with pytest.raises(UserError):
+        hook_mod.pinned_picks([{"text": "X.", "panels": ["ch1:P001-02", "ch1:P001-03",
+                                                         "ch1:P001-04", "ch1:P001-05"]}],
+                              pool)  # more than 3
+
+
+@needs_ffmpeg
+def test_previously_pinned_cues_build_exact_panels(hook_session):
+    """A previously bridge whose cues pin panels shows exactly those panels."""
+    _, sess, cfg = hook_session
+    _sine(sess, "previously_3.mp3", seconds=12)
+    a = [p["id"] for p in load_panels(sess.path, "1")["panels"] if not p.get("text_only")]
+    b = [p["id"] for p in load_panels(sess.path, "2")["panels"] if not p.get("text_only")]
+    pins = [[f"ch1:{a[0]}"], [f"ch1:{a[1]}", f"ch2:{b[0]}"]]
+    (sess.path / "previously").mkdir(exist_ok=True)
+    cues = {"sentences": [
+        {"text": "Previously, he woke up in a strange new world.",
+         "panels": pins[0], "hook": True},
+        {"text": "The enemy attacked the village at dawn and he walked on.",
+         "panels": pins[1]}]}
+    cues_path = sess.path / "previously" / "previously_3.cues.json"
+    cues_path.write_text(json.dumps(cues), encoding="utf-8")
+    plan, _ = hook_mod.build_previously(sess, cfg, chapters=["1", "2"], cues=str(cues_path),
+                                        plan_only=True, sync="off", log=lambda *_: None)
+    shown = [c["panel"] for s in plan["shots"] for c in s["cards"]]
+    assert sorted(shown) == sorted(pins[0] + pins[1])  # exactly the pins, nothing auto-picked
+    auto = json.loads((sess.path / "previously" / "previously_prev3.auto.json").read_text(encoding="utf-8"))
+    assert auto["source"] == "panels pinned in cues file"
+    assert [s["panels"] for s in auto["sentences"]] == pins

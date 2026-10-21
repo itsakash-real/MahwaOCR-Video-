@@ -770,7 +770,7 @@ def cmd_video(args) -> int:
 
         out = hook_mod.build_previously(
             sess, cfg, chapters=chapters(default_all=False),
-            audio=args.audio, script=args.script, target_seconds=args.duration,
+            audio=args.audio, script=args.script, cues=args.cues, target_seconds=args.duration,
             sync="off" if args.no_sync else "auto", fmt=args.format,
             plan_only=args.dry_run, workers=args.workers,
             allow_reuse=args.allow_reuse, log=_log)[1]
@@ -1129,7 +1129,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
     p.add_argument("--audio", help="hook/previously: narration audio file, e.g. audio/chapter_0.mp3")
     p.add_argument("--script", help="hook/previously: narration script, one sentence per line")
-    p.add_argument("--cues", help="hook: cues.json file with the narration sentences (alternative to --script)")
+    p.add_argument("--cues", help="hook/previously: cues.json file with the narration sentences (alternative to --script); a sentence may pin its panels with a \"panels\" list of refs like \"ch2:P010-14\"")
     p.add_argument("--auto", action="store_true",
                    help="intro: auto-pick panels from the script instead of reading intro.json")
     p.add_argument("--allow-reuse", dest="allow_reuse", action="store_true",
