@@ -386,6 +386,7 @@ def build_intro(sess, cfg, *, sync: str = "auto", fmt: str | None = None, log=pr
     plan = build_plan(chapter=chapter, panels_data=panels_data, duration=duration, audio=rel_audio,
                       vcfg=fmt_vcfg, alignment_units=units,
                       alignment_meta={"sync_mode": mode, "review_queue": []},
+                      caption_sentences=segments,
                       image_for=lambda p: panel_image(root, p["src_chapter"], p, p["src_norm_w"], clean=True),
                       fixes=fixes)
     style_plan(plan, segments, icfg, fixes)

@@ -427,3 +427,33 @@ def test_previously_pinned_cues_build_exact_panels(hook_session):
     auto = json.loads((sess.path / "previously" / "previously_prev3.auto.json").read_text(encoding="utf-8"))
     assert auto["source"] == "panels pinned in cues file"
     assert [s["panels"] for s in auto["sentences"]] == pins
+
+
+@needs_ffmpeg
+def test_intro_captions_span_the_full_sentence_not_just_its_first_shot(hook_session):
+    """Regression: intro/previously builds must time captions from the
+    sentence windows (build_captions_from_sentences), not the legacy
+    per-shot fallback -- a multi-shot sentence's tail words used to be
+    captioned inside its first shot, seconds before they are spoken, and
+    its later shots showed no captions at all."""
+    _, sess, cfg = hook_session
+    _sine(sess, "chapter_0.mp3", seconds=12)
+    a = [p["id"] for p in load_panels(sess.path, "1")["panels"] if not p.get("text_only")]
+    b = [p["id"] for p in load_panels(sess.path, "2")["panels"] if not p.get("text_only")]
+    (sess.path / "intro").mkdir(exist_ok=True)
+    intro_doc = {"version": 1, "sentences": [
+        {"text": "He chopped trees for a living every single day of his quiet little life.",
+         "panels": [f"ch1:{a[0]}", f"ch1:{a[1]}", f"ch1:{a[2]}"]},
+        {"text": "Then something woke up inside him and everything began to change.",
+         "panels": [f"ch2:{b[0]}"]}]}
+    (sess.path / "intro" / "intro.json").write_text(json.dumps(intro_doc), encoding="utf-8")
+    plan, _ = intro_mod.build_intro(sess, cfg, sync="off", log=lambda *_: None)
+    alignment = json.loads((sess.path / "video" / "chapter_0.alignment.json").read_text(encoding="utf-8"))
+    seg1 = alignment["segments"][0]
+    caps1 = [c for c in plan["captions"] if c.get("sentence") == 1]
+    assert caps1, "sentence 1 has no captions"
+    # The tail chunk ends at the sentence's real end, not its first shot's end.
+    assert max(c["end"] for c in caps1) >= seg1["end"] - 0.6
+    assert max(c["end"] for c in caps1) > plan["shots"][0]["end"] + 0.5
+    caps2 = [c for c in plan["captions"] if c.get("sentence") == 2]
+    assert caps2 and min(c["start"] for c in caps2) >= alignment["segments"][1]["start"] - 0.01
