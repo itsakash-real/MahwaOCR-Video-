@@ -786,12 +786,27 @@ def cmd_video(args) -> int:
         return 0
 
     if action == "tts":
+        from .video import sync as sync_mod
         from .video import tts as tts_mod
+        from .video import tts_verify
 
         for c in chapters(default_all=False):
             tts_mod.synthesize_chapter(sess.path, c, cfg, log=_log, force=args.force,
                                        model=args.voice, key_file=args.key_file)
+            if getattr(args, "no_verify", False):
+                _log("  tts-verify: skipped (--no-verify)")
+            elif not sync_mod.available():
+                _log(f"  tts-verify: skipped (pywhispercpp not installed -- {sync_mod.SYNC_HINT})")
+            else:
+                tts_verify.verify_chapter_audio(sess.path, c, log=_log)
             _log(f"  next:  python -m manhwa_ocr video align --chapter {c}{_pin(sess)}")
+        return 0
+
+    if action == "tts-verify":
+        from .video import tts_verify
+
+        for c in chapters(default_all=False):
+            tts_verify.verify_chapter_audio(sess.path, c, log=_log)
         return 0
 
     if action == "pair":
@@ -1110,7 +1125,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "pair", "tts", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
@@ -1140,6 +1155,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--voice", help="tts: Deepgram voice model (default: tts.model config or aura-2-thalia-en)")
     p.add_argument("--key-file", dest="key_file",
                    help="tts: file holding the Deepgram API key (default: DEEPGRAM_API_KEY env, else ~/.config/manhwa/deepgram.key)")
+    p.add_argument("--no-verify", dest="no_verify", action="store_true",
+                   help="tts: skip the automatic whisper-based audio self-check after synthesizing")
     p.add_argument("--script", help="hook/previously: narration script, one sentence per line")
     p.add_argument("--cues", help="hook/previously: cues.json file with the narration sentences (alternative to --script); a sentence may pin its panels with a \"panels\" list of refs like \"ch2:P010-14\"")
     p.add_argument("--auto", action="store_true",

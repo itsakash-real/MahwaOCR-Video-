@@ -47,17 +47,22 @@ duplicate it.
 | 0 | Chapter link → transcript | `prepare`/`assemble`/`finalize` (CLI, deterministic + vision) |
 | 1 | Transcript → recap draft | `recap --prepare`/`--finalize` (agent writes the prose) |
 | 2 | Recap ↔ transcript consistency check | **agent judgment call** — no dedicated command yet |
-| 3 | Narration voice + TTS-readiness pass | **agent judgment call** — no dedicated command yet |
-| 4 | TTS synthesis + audio verification | `video tts` (CLI) + **agent judgment call** for verification |
+| 3 | Narration voice pass | **agent judgment call** (tone/register — no mechanical check can judge this) |
+| 3b | TTS-readiness lint | `video tts` runs this automatically and REFUSES the whole chapter if anything's flagged (digits, dash/ellipsis-as-pause, stacked punctuation, unterminated sentence, unbalanced quotes, run-on >30 words) — see `manhwa_ocr/video/tts_lint.py` |
+| 4 | TTS synthesis | `video tts` (CLI) |
+| 4b | Audio self-check | `video tts` runs this automatically after synthesis (`--no-verify` to skip): re-transcribes the audio with the same whisper engine `video align` uses and flags any sentence whose heard words don't match the script, or whose seconds-per-word is a duration outlier (truncation/corruption) — see `manhwa_ocr/video/tts_verify.py`. Flags are a "go listen to this one" signal, not proof of a bug; whisper mishears real speech sometimes too. |
 | 5 | Audio → finished video | `video pair/align/plan/verify/sync-audit/approve/render` (CLI gates) — see `CHAPTER_BUILD_WORKFLOW.md` |
 
-Stages without a dedicated command are not optional just because there's no
-command to run — they are exactly as mandatory as the CLI-gated ones. Treat
-each as a real gate: do the check, and don't move to the next stage until it
-passes. If you find yourself wanting to skip stage 2 or 3 "because the recap
-looks fine," that instinct is exactly the failure mode this file exists to
-close off — name ONE missing/wrong fact and ONE harsh TTS sentence per
-chapter you've reviewed this way; if you can't, you didn't actually look.
+Stage 2 and Stage 3 (the voice pass) have no dedicated command — they are not
+optional just because there's no command to run. Treat each as a real gate:
+do the check, and don't move to the next stage until it passes. If you find
+yourself wanting to skip stage 2 or 3 "because the recap looks fine," that
+instinct is exactly the failure mode this file exists to close off — name
+ONE missing/wrong fact and ONE harsh-sounding sentence you fixed per chapter
+you've reviewed this way; if you can't, you didn't actually look. Stages 3b
+and 4b ARE mechanical now (lint + whisper re-transcription) precisely because
+"does this sentence have raw digits in it" and "does the audio roughly match
+the script" don't need judgment — only the voice/tone call in Stage 3 does.
 
 ---
 
@@ -126,28 +131,18 @@ sentence that reads flat, overly formal, or mismatched in register from its
 neighbors. Never touch a chapter that already has audio
 (`audio/chapter_N.*`) unless asked.
 
-**TTS-readiness pass** — this is mechanical, not a taste call. Before
-synthesizing, check `recaps/chapter_N.cues.json` (not the `.md` — `cues.json`
-is what `video tts` actually reads) for the specific things that make
-Deepgram mis-read a sentence:
-- Numbers spelled out, not digits (the tool does this for new recaps — just
-  confirm it stuck after any Stage-2/voice edits).
-- No em-dashes/ellipses used as a stand-in for a full sentence break — Aura
-  reads a wandering dash as a stumble or an unnatural pause. Prefer a period
-  or comma.
-- No stray double punctuation, mismatched quote marks, or a sentence that
-  trails off without a terminal mark — each is a concrete, known cause of a
-  garbled or clipped synthesized clip, not a stylistic nicety.
-- No run-on sentence over ~30 words — split it. Long sentences are where
-  Aura's prosody degrades first.
-- Panel tags (`{P003-02}` etc.) are untouched by this pass — you're editing
-  the spoken words only; the finalize step already strips tags before this
-  file is read by `video tts`.
-
-Edit the recap's `.md`/cues source through the normal recap-finalize flow
-(not by hand-patching `cues.json` directly) so the two stay in sync, then
-re-run `recap --finalize` if your edits require it, or edit directly and
-confirm `cues.json` regenerated — check its mtime.
+**TTS-readiness pass** — this is now enforced by `video tts` itself, not a
+manual read-through: it lints `recaps/chapter_N.cues.json` before spending
+any Deepgram call and refuses the WHOLE chapter if anything's flagged
+(raw digits, a dash/ellipsis standing in for a sentence break, stacked
+punctuation, an unterminated sentence, unbalanced quotes, a run-on sentence
+over ~30 words). You'll see every issue at once (same "fix everything, then
+retry once" pattern as the align-failure-loop rule in
+`CHAPTER_BUILD_WORKFLOW.md`), each with the sentence number and a suggested
+fix. Edit the recap's `.md` (not `cues.json` directly) and re-run
+`recap --finalize` so the two stay in sync, then re-run `video tts`.
+Panel tags (`{P003-02}` etc.) are untouched by this pass — the finalize step
+already strips them before `cues.json` is written.
 
 ## Stage 4 — Synthesize narration, then verify the audio
 
@@ -155,26 +150,32 @@ confirm `cues.json` regenerated — check its mtime.
 python -m manhwa_ocr video tts --chapter N --session "<SERIES>"
 ```
 
-This reads `recaps/chapter_N.cues.json` (never `.tts.txt`), synthesizes each
-sentence via Deepgram, and writes `audio/chapter_N.m4a` plus
-`audio/chapter_N.tts.json` (voice used, per-sentence timings). Re-running
-after a Stage-3 edit only re-synthesizes the sentences that changed
-(cache keyed by `model + text`); `--force` redoes everything.
+This reads `recaps/chapter_N.cues.json` (never `.tts.txt`), lints it (Stage
+3b, above), synthesizes each sentence via Deepgram, writes
+`audio/chapter_N.m4a` plus `audio/chapter_N.tts.json` (voice used,
+per-sentence timings), then automatically runs the Stage-4b audio self-check
+and writes `audio/chapter_N.tts_verify.json`. Re-running after a Stage-3 edit
+only re-synthesizes the sentences that changed (cache keyed by
+`model + text`, and a cache entry that fails to decode — e.g. an interrupted
+write — is treated as a miss, never trusted blindly); `--force` redoes
+everything.
 
-**Audio verification**, before moving to Stage 5:
-1. `ffprobe` the output: confirm it decodes cleanly and its duration is in
-   the range you'd expect for the word count (a wildly short duration means
-   truncated/garbled synthesis, not a fast reader).
-2. Listen to the full file (or, at minimum, every sentence boundary) for:
-   mispronounced names (the same names you just confirmed in Stage 2 —
-   Aura sometimes stresses an invented character name oddly), a rushed or
-   clipped sentence, an unnaturally long or short gap between sentences
-   (`gap_seconds` default 0.35s — anything that sounds off is worth an ear).
-3. If something's wrong, the fix is almost always back in Stage 3 (reword
-   the offending sentence so Aura reads it cleanly) — not a code change, and
-   not acceptable to just re-run and hope for a different result, since the
-   per-sentence cache means an unchanged sentence resynthesizes identically.
-4. Only once the audio sounds right, move to Stage 5.
+**If `video tts` reports flagged sentences** (from the automatic self-check,
+or from a standalone `video tts-verify --chapter N` re-check):
+1. Read `audio/chapter_N.tts_verify.json` — each flag names the sentence
+   number, what was expected vs. what whisper actually heard, and why
+   (low word-match ratio, or a seconds-per-word outlier suggesting
+   truncation/corruption).
+2. Listen to just the flagged sentence(s) — this is a targeted check now,
+   not a full-file listen, because the self-check already narrowed it down.
+   A flag CAN be a false positive (whisper mishears real speech sometimes
+   too); confirm before treating it as a defect.
+3. If it's a real defect, the fix is almost always back in Stage 3 (reword
+   the offending sentence so Aura reads it cleanly) — not a code change.
+   Re-run `recap --finalize` then `video tts` (only the changed sentence
+   re-synthesizes).
+4. Zero flags, or every flag confirmed as a whisper false positive: move to
+   Stage 5.
 
 **Code issues:** if you hit a genuine bug in `tts.py` or elsewhere, stop, fix
 it on `video/wide-mode-v2` (or a branch off it), run

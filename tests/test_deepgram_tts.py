@@ -164,3 +164,25 @@ def test_synthesize_chapter_writes_audio_manifest_and_caches(tmp_path, monkeypat
     calls.clear()
     tts.synthesize_chapter(tmp_path, "1", cfg, log=logs.append, speak=fake_speak)
     assert calls == []
+
+
+def test_synthesize_chapter_resynthesizes_a_corrupted_cache_entry(tmp_path, monkeypatch):
+    _write_cues(tmp_path, texts=("One sentence.",))
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "SECRETKEY")
+    monkeypatch.setattr(tts, "encode_m4a",
+                        lambda wav_path, out_path: out_path.write_bytes(b"m4a"))
+    calls = []
+
+    def fake_speak(text, model, key):
+        calls.append(text)
+        return _tiny_wav(0.2)
+
+    cfg = SimpleNamespace(extra={})
+    tts.synthesize_chapter(tmp_path, "1", cfg, log=print, speak=fake_speak)
+    assert len(calls) == 1
+
+    # Simulate an interrupted write leaving a truncated cache entry on disk.
+    (tmp_path / ".work" / "tts" / "ch1" / "s001.wav").write_bytes(b"\x00")
+    calls.clear()
+    tts.synthesize_chapter(tmp_path, "1", cfg, log=print, speak=fake_speak)
+    assert calls == ["One sentence."]  # re-synthesized rather than trusting the corrupt cache

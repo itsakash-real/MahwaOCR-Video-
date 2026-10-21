@@ -312,9 +312,23 @@ recap with one command per chapter:
 python -m manhwa_ocr video tts --chapter N --session "<name>"
 ```
 
-It speaks each sentence of `recaps\chapter_N.cues.json` with a Deepgram Aura
-voice, joins them with a short pause, and writes `audio\chapter_N.m4a` (plus a
-`chapter_N.tts.json` manifest with the voice used and per-sentence timings).
+Before speaking anything, it lints every sentence for the specific patterns
+that cause a bad Aura read -- raw digits, a dash/ellipsis standing in for a
+sentence break, stacked punctuation, a missing terminal mark, unbalanced
+quotes, a run-on sentence over ~30 words -- and refuses the whole chapter if
+anything's flagged, with the sentence number and a suggested fix for each.
+Fix the recap and re-finalize, then re-run.
+
+Once synthesis is clean, it speaks each sentence of
+`recaps\chapter_N.cues.json` with a Deepgram Aura voice, joins them with a
+short pause, and writes `audio\chapter_N.m4a` (plus a `chapter_N.tts.json`
+manifest with the voice used and per-sentence timings). It then
+automatically re-transcribes the result with the same whisper engine
+`video align` uses and flags any sentence whose heard words don't match the
+script, or whose timing looks like truncated/corrupt audio -- written to
+`chapter_N.tts_verify.json`, so you know which specific sentence (if any)
+is worth listening to instead of the whole file. Skip this check with
+`--no-verify`, or re-run it alone with `video tts-verify --chapter N`.
 From there the usual flow applies unchanged: `video pair`, `video align`,
 `video plan`, and so on. Because the audio speaks the script exactly as
 written, align has no rewordings to trip over.

@@ -43,6 +43,7 @@ from typing import Callable
 from ..util import UserError, atomic_write_text, read_agent_json
 from . import ffmpeg
 from .media import audio_dir
+from .tts_lint import format_report, lint_sentences
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/speak"
 DEFAULT_MODEL = "aura-2-thalia-en"
@@ -136,6 +137,15 @@ def _wav_params_and_frames(wav_bytes: bytes) -> tuple[wave._wave_params, bytes]:
         return wf.getparams(), wf.readframes(wf.getnframes())
 
 
+def _is_valid_wav(wav_bytes: bytes) -> bool:
+    """A cache entry can be left truncated by an interrupted write; never trust it blindly."""
+    try:
+        params, frames = _wav_params_and_frames(wav_bytes)
+    except Exception:  # noqa: BLE001 - any decode failure means "not valid"
+        return False
+    return params.nframes > 0 and len(frames) > 0
+
+
 def concat_wavs(wav_list: list[bytes], gap_seconds: float) -> tuple[bytes, list[float]]:
     """Join sentence WAVs with silence. Returns (wav bytes, per-sentence seconds)."""
     if not wav_list:
@@ -180,6 +190,9 @@ def synthesize_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], No
     model = model or cfg_tts.get("model") or DEFAULT_MODEL
     gap = float(cfg_tts.get("gap_seconds", DEFAULT_GAP_SECONDS))
     sentences = load_sentences(root, chapter)
+    issues = lint_sentences(sentences)
+    if issues:
+        raise UserError(format_report(issues))
     api_key = load_api_key(cfg_tts, key_file)
     speak = speak or (lambda text, mdl, key: deepgram_speak(text, mdl, key))
 
@@ -201,8 +214,11 @@ def synthesize_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], No
         cached = cache.get(str(i))
         wav_path = cache_dir / f"s{i:03d}.wav"
         if not force and cached and cached.get("sha") == digest and wav_path.exists():
-            wav_list.append(wav_path.read_bytes())
-            continue
+            cached_bytes = wav_path.read_bytes()
+            if _is_valid_wav(cached_bytes):
+                wav_list.append(cached_bytes)
+                continue
+            log(f"  tts {i}/{len(sentences)}: cached audio is corrupt, re-synthesizing")
         log(f"  tts {i}/{len(sentences)}: {text[:60]}{'...' if len(text) > 60 else ''}")
         wav_bytes = speak(text, model, api_key)
         wav_path.write_bytes(wav_bytes)
