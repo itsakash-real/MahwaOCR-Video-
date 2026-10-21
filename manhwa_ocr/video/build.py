@@ -39,6 +39,11 @@ from .render import output_path, render
 from .storyboard import storyboard_paths, write_review_task, write_storyboard
 
 
+def _shape_label(value: Any) -> str:
+    """Layout-switch shapes are stored as aspect floats or shape names."""
+    return f"{value:g}" if isinstance(value, (int, float)) else str(value)
+
+
 END_TAIL = 1.5   # seconds the video runs on after the last word
 
 
@@ -468,7 +473,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
             f"(mask risk): {', '.join(report['mask_risk'][:12])}")
     if report.get("layout_switches"):
         log(f"  chapter {chapter}: {len(report['layout_switches'])} crop(s) will auto-switch to the pair-safe shape: "
-            + ", ".join(f"{pid} {sw.get('from_shape'):g}->{sw.get('to_shape'):g}"
+            + ", ".join(f"{pid} {_shape_label(sw.get('from_shape'))}->{_shape_label(sw.get('to_shape'))}"
                         for pid, sw in sorted(report["layout_switches"].items())[:12]))
     if report.get("layout_sensitive"):
         log(f"  ! {len(report['layout_sensitive'])} panel(s) clean in a single shot but not in a pair "
@@ -595,7 +600,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     # logged with its fix, and both ride in the QA file for the reviewer.
     if qa.get("layout_switches"):
         log("    layout auto-switches (pair-safe shape): " + "; ".join(
-            f"{sw.get('panel')} {sw.get('from_shape'):g}->{sw.get('to_shape'):g}"
+            f"{sw.get('panel')} {_shape_label(sw.get('from_shape'))}->{_shape_label(sw.get('to_shape'))}"
             for sw in qa["layout_switches"][:12]))
     for w in qa.get("timing_warnings") or []:
         log(f"    ! timing: {w.get('code')}: {w.get('message')} Fix: {w.get('fix')}")
