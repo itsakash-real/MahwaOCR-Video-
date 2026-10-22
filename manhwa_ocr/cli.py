@@ -765,6 +765,29 @@ def cmd_video(args) -> int:
                      f"moved {pr['moved']} -> {[round(v, 3) for v in pr['window']]}")
         return 0
 
+    if action == "ocr-check":
+        # Build 3a: OCR vs the hand transcript - candidate missed lines.
+        from .video.ocrcheck import cross_check
+
+        for c in chapters(default_all=False):
+            rep = cross_check(sess.path, c)
+            _log(f"  chapter {c}: {len(rep['candidates'])} candidate missed line(s) "
+                 f"from {rep['ocr_lines']} OCR lines  ->  .work/video/ch{c}/ocr_check.json")
+            for cand in rep["candidates"][:10]:
+                _log(f"    {cand['panel']}: {cand['text'][:70]}")
+        return 0
+
+    if action == "ocr-draft":
+        # Build 3b: per-panel OCR draft grouped by detector bubble boxes.
+        from .video.ocrcheck import draft_chapter
+
+        for c in chapters(default_all=False):
+            rep = draft_chapter(sess.path, c)
+            dlg = sum(len(v["dialogue"]) for v in rep["panels"].values())
+            _log(f"  chapter {c}: draft for {len(rep['panels'])} panels, {dlg} dialogue "
+                 f"lines  ->  .work/video/ch{c}/ocr_draft.json")
+        return 0
+
     if action in {"plan", "sync"}:
         for c in chapters(default_all=False):
             vb.make_plan(sess, c, cfg, force=args.force or action == "sync",
@@ -1177,7 +1200,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
