@@ -127,6 +127,38 @@ def test_boxes_cache_lifecycle(tmp_path, monkeypatch):
     assert calls["n"] == 3                          # a new threshold is a new cache entry
 
 
+def test_boxes_cache_invalidates_when_model_file_changes(tmp_path, monkeypatch):
+    # A same-named model file whose CONTENT changed (an updated weights
+    # export) must not be served stale boxes: the cache key compared only
+    # the filename, never the file's actual identity.
+    import time
+
+    root, data = _session_with_panels(tmp_path)
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"version-1")
+    panel = data["panels"][0]
+
+    calls = {"n": 0}
+    boxes_v1 = [{"label": "bubble", "score": 0.9, "x0": 0.1, "y0": 0.1, "x1": 0.5, "y1": 0.3}]
+    boxes_v2 = [{"label": "text_free", "score": 0.5, "x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}]
+
+    def stub(img, **kw):
+        calls["n"] += 1
+        return boxes_v2 if calls["n"] > 1 else boxes_v1
+
+    monkeypatch.setattr(detect, "detect_boxes", stub)
+
+    rec1 = detect.boxes_for_panel(root, "1", panel, data["norm_width"], model_path=model_path)
+    assert calls["n"] == 1 and rec1["boxes"] == boxes_v1
+
+    time.sleep(0.01)
+    model_path.write_bytes(b"version-2-totally-different-weights")
+
+    rec2 = detect.boxes_for_panel(root, "1", panel, data["norm_width"], model_path=model_path)
+    assert calls["n"] == 2, "model file content changed under the same name: must recompute"
+    assert rec2["boxes"] == boxes_v2
+
+
 def test_detect_chapter_counts(tmp_path, monkeypatch):
     root, data = _session_with_panels(tmp_path)
     monkeypatch.setattr(detect, "get_session", lambda p: object())

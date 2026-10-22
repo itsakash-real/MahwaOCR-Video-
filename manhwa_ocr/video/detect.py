@@ -117,6 +117,21 @@ def boxes_dir(root: Path, chapter: str) -> Path:
     return work_root(root) / "video" / f"ch{require_chapter(chapter)}" / "boxes"
 
 
+def _model_fingerprint(model_path: Path) -> Dict[str, Any]:
+    """The model file's identity for the cache key: name plus, when the file
+    is readable, its size and mtime. A same-named model file whose CONTENT
+    changed (e.g. an updated weights export) must invalidate every cached
+    box — comparing the filename alone cannot see that."""
+    info: Dict[str, Any] = {"file": model_path.name}
+    try:
+        st = model_path.stat()
+        info["size"] = st.st_size
+        info["mtime"] = st.st_mtime_ns
+    except OSError:
+        pass
+    return info
+
+
 def boxes_for_panel(root: Path, chapter: str, panel: Dict[str, Any], norm_width: int,
                     *, force: bool = False, threshold: float = DEFAULT_THRESHOLD,
                     model_path: Optional[Path] = None,
@@ -138,11 +153,15 @@ def _boxes_for_panel(root: Path, chapter: str, panel: Dict[str, Any], norm_width
     path = boxes_dir(root, chapter) / f"{panel['id']}.json"
     img = panel_image(root, chapter, panel, norm_width)
     key = panel_key(img)
+    model_fp = _model_fingerprint(model_path)
     if not force and path.is_file():
         try:
             cached = json.loads(path.read_text(encoding="utf-8"))
+            cached_model = cached.get("model", {})
             if (cached.get("key") == key
-                    and cached.get("model", {}).get("file") == model_path.name
+                    and cached_model.get("file") == model_fp["file"]
+                    and cached_model.get("size") == model_fp.get("size")
+                    and cached_model.get("mtime") == model_fp.get("mtime")
                     and abs(float(cached.get("threshold", -1)) - threshold) < 1e-9):
                 return cached, False
         except (OSError, ValueError):
@@ -150,7 +169,7 @@ def _boxes_for_panel(root: Path, chapter: str, panel: Dict[str, Any], norm_width
     record = {
         "panel": panel["id"],
         "key": key,
-        "model": {"id": MODEL_ID, "revision": MODEL_REVISION, "file": model_path.name},
+        "model": {"id": MODEL_ID, "revision": MODEL_REVISION, **model_fp},
         "threshold": threshold,
         "boxes": detect_boxes(img, threshold=threshold, session=session,
                               model_path=model_path),
