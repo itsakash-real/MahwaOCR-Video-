@@ -101,6 +101,9 @@ def precheck_chapter(root: Path, chapter: str) -> Dict[str, Any]:
                         "window": [float(v) for v in window],
                         "cut": cut,
                     })
+    if cards and not panels_checked:
+        raise UserError(f"No detector boxes for chapter {chapter}; run video detect first, "
+                        "then precheck. Nothing was checked, so no result is reported.")
     report = {
         "chapter": chapter,
         "shots": len(plan.get("shots", [])),

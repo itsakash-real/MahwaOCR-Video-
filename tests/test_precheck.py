@@ -93,6 +93,14 @@ def test_precheck_needs_a_plan(tmp_path):
         precheck.precheck_chapter(root, "1")
 
 
+def test_precheck_refuses_when_no_panel_has_boxes(tmp_path):
+    root = _session(tmp_path)
+    import shutil
+    shutil.rmtree(detect.boxes_dir(root, "1"))
+    with pytest.raises(UserError, match="video detect"):
+        precheck.precheck_chapter(root, "1")
+
+
 def test_cli_precheck(tmp_path):
     from manhwa_ocr.sessions import SessionStore
 
@@ -101,7 +109,7 @@ def test_cli_precheck(tmp_path):
     src = _session(tmp_path)
     # move the bare layout into the real session folder
     import shutil
-    for name in ("media", "video"):
+    for name in ("media", "video", ".work"):
         shutil.copytree(src / name, sess.path / name)
     code = cli.main(["video", "precheck", "--chapter", "1",
                      "--session", "demo", "--sessions-root", str(tmp_path / "sessions")])
