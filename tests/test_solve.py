@@ -51,6 +51,23 @@ def test_push_in_end_frame_counts():
         assert window_relation(frame, box)[0] != "bisected"
 
 
+def test_pull_out_end_frame_counts():
+    # The real motion name is "pull_out" (see video/frames.py MOTIONS), not
+    # "pull_back". A box that sits just outside the start window must still
+    # be caught if the pull-out extreme frame (which reveals more of the
+    # panel) would bisect it -- a regression for a name mismatch that made
+    # solve_card skip the extreme-frame check entirely for pull_out cards.
+    box = _box(0.26, 0.30, x0=0.3, x1=0.7)
+    window = [0.0, 0.3, 1.0, 0.7]
+    res = solve.solve_card([box], window, "pull_out")
+    assert res["status"] != "already_safe"
+    from manhwa_ocr.video.precheck import window_relation
+    h = window[3] - window[1]
+    w = res["window"] if res["status"] == "solved" else [0.0, 0.0, 1.0, 1.0]
+    frame = [w[0], w[1] - 0.065 * h, w[2], w[3] + 0.065 * h]
+    assert window_relation(frame, box)[0] != "bisected"
+
+
 def test_far_seam_is_not_a_solve():
     # the only seam is > MAX_MOVE away -> unsolved, not a wild reframe
     boxes = [_box(0.02, 0.30), _box(0.28, 0.60), _box(0.58, 0.99)]

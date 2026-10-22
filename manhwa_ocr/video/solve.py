@@ -44,7 +44,7 @@ def _frames(window, motion: Optional[str]) -> List[tuple[float, float]]:
     m = (motion or "static").lower()
     if m == "push_in":
         frames.append((PUSH_INSET * h, h - PUSH_INSET * h))
-    elif m == "pull_back":
+    elif m == "pull_out":
         frames.append((-PUSH_INSET * h, h + PUSH_INSET * h))
     elif m == "pan_down":
         s = min(PAN_OVERSHOOT, max(0.0, 1.0 - y1))
