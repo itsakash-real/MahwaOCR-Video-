@@ -316,23 +316,25 @@ class RecapBuilder:
         """What the writer needs to continue the story: earlier summaries and the last recap's ending."""
         if not chapter.isdigit() or int(chapter) <= 1:
             return ""
-        prev = self.recaps_dir / f"chapter_{int(chapter) - 1}.md"
-        if not prev.exists():
-            return ""
-        from .video.cues import strip_tags
-
-        prev_no = int(chapter) - 1
-        hook = str(self._read_meta(prev).get("hook") or "").strip()
-        words = strip_tags(self._body(prev)).split()
-        ending = " ".join(w for w in words[-PREVIOUS_ENDING_WORDS:] if w)
         story = self._story_so_far(chapter)
         parts = ["PREVIOUS SEGMENT"]
         if story:
             parts.append(f"STORY SO FAR (one summary per earlier chapter, oldest first):\n{story}")
-        parts.append(f"THE END OF THE RECAP FOR CHAPTER {prev_no} (your narration must pick up right here):\n"
-                     f"\"...{ending}\"")
-        if hook:
-            parts.append(f"That recap opened with: \"{hook}\"")
+        prev = self.recaps_dir / f"chapter_{int(chapter) - 1}.md"
+        if prev.exists():
+            from .video.cues import strip_tags
+
+            prev_no = int(chapter) - 1
+            hook = str(self._read_meta(prev).get("hook") or "").strip()
+            words = strip_tags(self._body(prev)).split()
+            ending = " ".join(w for w in words[-PREVIOUS_ENDING_WORDS:] if w)
+            parts.append(f"THE END OF THE RECAP FOR CHAPTER {prev_no} (your narration must pick up right here):\n"
+                         f"\"...{ending}\"")
+            if hook:
+                parts.append(f"That recap opened with: \"{hook}\"")
+        if len(parts) == 1:
+            # No earlier summaries and no previous recap: nothing to hand over.
+            return ""
         parts.append("Do not repeat earlier framing or re-explain what the story so far already covered. "
                      "Carry forward every open thread, promise, and unresolved question from the summaries.")
         return "\n\n".join(parts) + "\n\n---\n\n"
