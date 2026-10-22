@@ -38,6 +38,7 @@ class Ctx:
         self.chapter = chapter
         self.cfg = cfg
         self.log = log
+        self.force = False
 
 
 # ---------------------------------------------------------------- freshness
@@ -96,7 +97,7 @@ def _align(ctx: Ctx):
 def _plan(ctx: Ctx):
     from . import build as vb
 
-    vb.make_plan(ctx.sess, ctx.chapter, ctx.cfg, force=False, log=ctx.log, storyboard=False)
+    vb.make_plan(ctx.sess, ctx.chapter, ctx.cfg, force=ctx.force, log=ctx.log, storyboard=False)
     return "plan written"
 
 
@@ -210,6 +211,7 @@ def run_pipeline(sess, chapter: str, cfg, *, from_stage: Optional[str] = None,
                             "detail": "output is current"})
             log(f"  [{name}] skipped (current)")
             continue
+        ctx.force = forcing
         log(f"  [{name}] running...")
         t0 = time.time()
         try:

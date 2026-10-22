@@ -150,3 +150,17 @@ def test_pipeline_unknown_stage_rejected(tmp_path):
     with pytest.raises(UserError, match="Unknown stage"):
         pipeline.run_pipeline(_sess(tmp_path), "1", None, stages=_fake_stages(tmp_path, []),
                               from_stage="nope", log=lambda *a: None)
+
+
+def test_plan_stage_forwards_the_runner_force_flag(tmp_path, monkeypatch):
+    from manhwa_ocr.video import build
+
+    seen = []
+    monkeypatch.setattr(build, "make_plan",
+                        lambda sess, chapter, cfg, **kw: seen.append(kw["force"]))
+    ctx = pipeline.Ctx(_sess(tmp_path), "6", None, lambda *a: None)
+    ctx.force = True
+    pipeline._plan(ctx)
+    ctx.force = False
+    pipeline._plan(ctx)
+    assert seen == [True, False]
