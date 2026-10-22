@@ -103,6 +103,12 @@ video:
     trim_v1: false          # Build 1 white-space trimmer: blank rows only, gutter colour
                             # detected per panel, caps + review flags recorded in panels.json
     trim_cap: 0.40          # max share of a panel's height cut from one side
+  # Bubble/text detector (ogkalu RT-DETR v2, Apache-2.0, ONNX int8). Boxes are cached
+  # per panel under .work/video/chN/boxes/. Get the model file from
+  # huggingface.co/ogkalu/comic-text-and-bubble-detector (detector_int8.onnx).
+  detector:
+    model: ""               # "" = ~/.config/manhwa/models/ogkalu-detector-int8.onnx (or $MANHWA_DETECTOR_MODEL)
+    threshold: 0.35
   # Card framing: cards keep the panel's full width and slide a vertical window; a panel too wide
   # for any allowed shape is shown whole on blurred padding. false = the old zoomed side-cropping.
   crop:

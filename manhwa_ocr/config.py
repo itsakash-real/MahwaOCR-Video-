@@ -97,6 +97,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "trim_v1": False,       # Build 1: gutter-colour blank-row trim + review flags (opt-in)
             "trim_cap": 0.40,       # max share of a panel's height the v1 trim cuts per side
         },
+        # Bubble/text detector (Build 4/3 shared step): ogkalu RT-DETR, Apache-2.0.
+        # "model": path to the ONNX file ("" = ~/.config/manhwa/models/ or $MANHWA_DETECTOR_MODEL)
+        "detector": {
+            "model": "",
+            "threshold": 0.35,      # min box score kept (the model separates cleanly: junk < 0.05)
+        },
         # Card framing. Cards keep the panel's full width and pick a vertical window.
         # Head detection beyond skin colour, for white/silver hair and gray skin.
         "heads": {

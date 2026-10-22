@@ -724,6 +724,20 @@ def cmd_video(args) -> int:
                  f"{rep['flagged']} flagged for review  ->  .work/video/ch{c}/trim_report.json")
         return 0
 
+    if action == "detect":
+        # Shared step for the pre-checker / solver / OCR: bubble+text boxes
+        # per panel, cached as sidecars. Changes no existing artifact.
+        from .video.detect import DEFAULT_THRESHOLD, detect_chapter
+
+        det = cfg.video.get("detector") or {}
+        for c in chapters(default_all=False):
+            rep = detect_chapter(sess.path, c, force=args.force,
+                                 threshold=float(det.get("threshold") or DEFAULT_THRESHOLD),
+                                 model_path=det.get("model") or None)
+            _log(f"  chapter {c}: {rep['boxes']} boxes over {rep['panels']} panels "
+                 f"({rep['computed']} computed, {rep['cached']} cached)  ->  .work/video/ch{c}/boxes/")
+        return 0
+
     if action in {"plan", "sync"}:
         for c in chapters(default_all=False):
             vb.make_plan(sess, c, cfg, force=args.force or action == "sync",
@@ -1136,7 +1150,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "trim", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "trim", "detect", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
