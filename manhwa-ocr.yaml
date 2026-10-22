@@ -53,7 +53,7 @@ tts:
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
-  mode: classic           # classic | wide | adaptive. wide: every card full frame height (no
+  mode: wide              # classic | wide | adaptive. wide: every card full frame height (no
                           # letterbox), min 6/16 of the frame wide (pairs exactly 8/16), captions
                           # overlay the art (no black bar). adaptive: per shot, a naturally wide
                           # panel (aspect >= adaptive.wide_threshold) gets that same wide
