@@ -1231,9 +1231,46 @@ def cmd_guard(args) -> int:
     return 0
 
 
+def _record_timing(args, started: str, duration_s: float, ok: bool,
+                   exit_code) -> None:
+    """Append one record to the session's timing log (Phase 0). Never raises:
+    the log observes commands, it must never interfere with them."""
+    try:
+        if getattr(args, "func", None) is cmd_guard:
+            return
+        sess = _session(args, required=False)
+        if sess is None:
+            return
+        from .timing import chapter_of, record, stage_name
+
+        record(sess.path, stage=stage_name(args), chapter=chapter_of(args),
+               started=started, duration_s=duration_s, ok=ok,
+               exit_code=exit_code)
+    except Exception:  # noqa: BLE001 - timing is passive instrumentation
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     _setup_console()
     args = build_parser().parse_args(argv)
+    import time
+    from datetime import datetime, timezone
+
+    started = datetime.now(timezone.utc).isoformat()
+    t0 = time.perf_counter()
+    ok, code = False, None
+    try:
+        code = _main_run(args)
+        ok = code == 0
+        return code
+    except BaseException:
+        ok, code = False, None
+        raise
+    finally:
+        _record_timing(args, started, time.perf_counter() - t0, ok, code)
+
+
+def _main_run(args) -> int:
     try:
         if args.func is not cmd_guard:
             from .guard import check
