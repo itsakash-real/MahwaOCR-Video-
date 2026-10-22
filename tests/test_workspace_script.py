@@ -352,6 +352,27 @@ def test_prompt_carries_the_previous_chapters_story_so_far_not_just_its_hook(tmp
     assert "STORY SO FAR" in prompt
 
 
+def test_prompt_keeps_story_so_far_when_the_previous_chapter_is_missing(tmp_path):
+    """A missing chapter N-1 recap must not cost chapter N the whole story so far.
+
+    Regression: _previous_block returned "" whenever the immediately previous
+    recap file was absent, discarding the summaries _story_so_far had already
+    built from the chapters that do exist -- the exact continuity loss the
+    summary field was added to prevent (e.g. resuming after a chapter whose
+    recap is still owed or was written in another session).
+    """
+    cfg, b = _transcripts(tmp_path, ("1", "2", "3"))
+    b.prepare(["1"], 6)
+    parts = {"1": {"narration": "word " * 900, "hook": "hook 1",
+                  "summary": "Ise finally hears Il-chwi speak and the village says goodbye."}}
+    (b.task_dir / "parts.json").write_text(json.dumps(parts), encoding="utf-8")
+    b.finalize()
+    # Chapter 2's recap was never written.
+    prompt = b._prompt_for("3", 6)
+    assert "STORY SO FAR" in prompt
+    assert "Il-chwi speak" in prompt
+
+
 def test_prompt_includes_the_previous_recaps_ending_so_the_writer_continues_from_it(tmp_path):
     cfg, b = _transcripts(tmp_path)
     b.prepare(["1"], 6)
