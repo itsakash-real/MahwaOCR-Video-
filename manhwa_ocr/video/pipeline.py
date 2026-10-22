@@ -171,6 +171,21 @@ STAGES: List[Dict[str, Any]] = [
 
 # ---------------------------------------------------------------- runner
 
+def _previously_failed_stages(root: Path, chapter: str) -> set:
+    """Stage names whose last recorded run in pipeline.json failed. A stage
+    can write its own output file (e.g. the sync-audit report) and THEN
+    raise on a gate failure, so the output can look "fresh" by mtime alone
+    even though the run that produced it did not pass. Without this, a
+    plain re-run (no --force, nothing else changed) would see that
+    fresh-looking file and silently skip straight past a failed gate."""
+    path = work_root(root) / "video" / f"ch{chapter}" / "pipeline.json"
+    try:
+        prev = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {r.get("stage") for r in prev.get("stages", []) if r.get("status") == "failed"}
+
+
 def run_pipeline(sess, chapter: str, cfg, *, from_stage: Optional[str] = None,
                  force: bool = False, log: Callable = print,
                  stages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -181,6 +196,7 @@ def run_pipeline(sess, chapter: str, cfg, *, from_stage: Optional[str] = None,
         raise UserError(f"Unknown stage '{from_stage}'. Stages: {', '.join(names)}")
     ctx = Ctx(sess, chapter, cfg, log)
     forcing = force
+    failed_last = _previously_failed_stages(ctx.root, chapter)
     results: List[Dict[str, Any]] = []
     outcome = "ok"
     for stage in stages:
@@ -188,7 +204,8 @@ def run_pipeline(sess, chapter: str, cfg, *, from_stage: Optional[str] = None,
         if from_stage is not None and name == from_stage:
             forcing = True
         out_path = stage["output"](ctx) if stage["output"] else None
-        if not forcing and out_path is not None and _fresh(out_path, stage["inputs"](ctx)):
+        if (not forcing and name not in failed_last and out_path is not None
+                and _fresh(out_path, stage["inputs"](ctx))):
             results.append({"stage": name, "status": "skipped", "seconds": 0.0,
                             "detail": "output is current"})
             log(f"  [{name}] skipped (current)")

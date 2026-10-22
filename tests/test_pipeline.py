@@ -87,6 +87,52 @@ def test_pipeline_stops_on_failure(tmp_path):
     assert "plan broke" in summary["stages"][-1]["detail"]
 
 
+def test_a_failed_stage_that_wrote_its_own_output_is_rerun_not_skipped(tmp_path):
+    # Mirrors syncaudit.make_report(): it writes its report file
+    # UNCONDITIONALLY, then the caller (pipeline._sync_audit) raises on a
+    # gate failure found INSIDE that already-written report. The failed
+    # stage's output therefore exists and looks "fresh" by mtime alone.
+    # A plain re-run (nothing else touched, no --force) must still
+    # re-attempt that stage -- never silently skip a failed gate and fall
+    # through to the stages after it (e.g. render).
+    calls = []
+
+    def _stages():
+        stages = []
+        for name in pipeline.STAGE_NAMES:
+            out = tmp_path / f"{name}.out"
+            inp = tmp_path / f"{name}.in"
+
+            def make_run(n=name, o=out):
+                def run(ctx):
+                    calls.append(n)
+                    if n == "sync-audit":
+                        o.write_text("gate failed", encoding="utf-8")
+                        raise UserError("sync gate failed")
+                    o.write_text(f"{n} done", encoding="utf-8")
+                    return f"{n} done"
+                return run
+
+            stages.append({"name": name, "inputs": lambda ctx, i=inp: [i],
+                           "output": lambda ctx, o=out: o, "run": make_run()})
+        return stages
+
+    for name in pipeline.STAGE_NAMES:
+        _touch(tmp_path / f"{name}.in")
+
+    summary1 = pipeline.run_pipeline(_sess(tmp_path), "1", None, stages=_stages(),
+                                     log=lambda *a: None)
+    assert summary1["outcome"] == "failed"
+    assert calls == ["panels", "pair", "align", "plan", "verify", "sync-audit"]
+
+    calls.clear()
+    summary2 = pipeline.run_pipeline(_sess(tmp_path), "1", None, stages=_stages(),
+                                     log=lambda *a: None)
+    assert calls == ["sync-audit"], "a previously-failed stage must be re-run, not skipped"
+    assert summary2["outcome"] == "failed"
+    assert "render" not in [s["stage"] for s in summary2["stages"] if s["status"] == "ran"]
+
+
 def test_pipeline_from_stage_forces_rerun(tmp_path):
     calls = []
     stages = _fake_stages(tmp_path, calls)
