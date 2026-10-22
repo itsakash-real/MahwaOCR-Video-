@@ -239,7 +239,7 @@ def test_settings_added_by_this_fix_do_not_change_old_fingerprints(tmp_path):
     p = tmp_path / "a.png"
     Image.new("RGB", (10, 10)).save(p)
     base = panels_mod._settings(None)
-    old_style = {k: v for k, v in base.items() if k not in ("tighten_edges", "white_threshold", "black_threshold")}
+    old_style = {k: v for k, v in base.items() if k not in ("tighten_edges", "white_threshold", "black_threshold", "trim_v1", "trim_cap")}
     import hashlib
     import json
     want = hashlib.sha256(json.dumps({"v": panels_mod.PANELS_VERSION, **old_style}, sort_keys=True).encode())
