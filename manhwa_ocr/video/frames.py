@@ -48,7 +48,7 @@ EFFECTS = ("shake", "punch", "flash", "glitch")
 # impact / reveal beats, and glitch at most once per 60s. Every transition
 # is a pure function of (shot, time): frame-exact, no flicker by design.
 TRANSITIONS = ("cut", "fade", "slide", "zoom", "whip", "glitch")
-TRANSITION_WEIGHTS = [("cut", 90), ("fade", 10)]
+TRANSITION_WEIGHTS = [("cut", 100)]
 TRANSITION_ENTERS = {"cut": "cut", "fade": "fade_in", "slide": "slide_left",
                      "zoom": "zoom_in", "whip": "whip_in", "glitch": "cut"}
 GLITCH_LEN = 0.2          # RGB-split glitch length, seconds (CapCut-style, impact beats only)

@@ -43,7 +43,7 @@ INTRO_CHAPTER = "0"
 MAX_PANELS = 3
 REF = re.compile(r"^ch(?P<ch>[^:\s]+):(?P<pid>\S+)$", re.IGNORECASE)
 DEFAULTS = {"min_hold": 2.0, "pair_ratio": 0.5, "darken": 0.15, "backdrop": "blur",
-            "beat_effects": ["shake", "flash", "fade_out"]}
+            "beat_effects": ["shake", "flash"]}
 SHEET_COLUMNS = 6
 SHEET_PER_IMAGE = 24
 THUMB_W = 190

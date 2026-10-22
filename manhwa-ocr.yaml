@@ -74,7 +74,7 @@ video:
   target_shot: 2.7        # average seconds per shot (recap channels: about 2.7)
   pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
   workers: 0              # parallel renders; 0 = all your CPU cores
-  effects: {shake: true, punch: false, flash: false, end_fade: true}   # calm by default
+  effects: {shake: true, punch: false, flash: false, end_fade: false}   # calm by default
   music: null             # P3: null = use music/bed.mp3 in the series folder when it exists
                           # (drop a royalty-free loop there), else render music-free. Ducks under narration.
   music_volume: 0.22      # 15-25% under narration; sidechain lets it rise toward 60-80% when no narration
@@ -126,7 +126,7 @@ video:
     pair_ratio: 0.5         # share of neighbouring panels shown as a staggered pair
     darken: 0.15            # darker grade, 0 (off) to 0.6
     backdrop: blur          # always the blurred panel behind the cards, never black bars
-    beat_effects: [shake, flash, fade_out]   # on sentences marked "beat": true in intro.json
+    beat_effects: [shake, flash]   # on sentences marked "beat": true in intro.json
   tts:
     spell_numbers: true     # new recaps/chapter_N.tts.txt spell digits out (99 -> ninety nine)
   sync:

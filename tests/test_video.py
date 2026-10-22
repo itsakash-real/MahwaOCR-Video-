@@ -307,11 +307,7 @@ def test_even_plan_covers_audio_exactly():
     shots = plan["shots"]
     assert shots[0]["start"] == 0 and shots[-1]["end"] == 20.0
     assert all(b["start"] == pytest.approx(a["end"], abs=0.002) for a, b in zip(shots, shots[1:]))
-    assert shots[-1]["exit"] == "fade_out"
-    # A fade_out is also allowed right before a shot with a fade transition
-    # (fade-through-black: previous shot fades out, next fades in).
-    assert all(s["exit"] == "cut" or (s["exit"] == "fade_out" and nxt["transition"] == "fade")
-               for s, nxt in zip(shots, shots[1:]))
+    assert all(s["exit"] == "cut" for s in shots)
     assert validate(plan, _ids()) == []
 
 
