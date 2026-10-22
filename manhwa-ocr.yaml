@@ -100,6 +100,9 @@ video:
     tighten_edges: true
     white_threshold: 242
     black_threshold: 13
+    trim_v1: false          # Build 1 white-space trimmer: blank rows only, gutter colour
+                            # detected per panel, caps + review flags recorded in panels.json
+    trim_cap: 0.40          # max share of a panel's height cut from one side
   # Card framing: cards keep the panel's full width and slide a vertical window; a panel too wide
   # for any allowed shape is shown whole on blurred padding. false = the old zoomed side-cropping.
   crop:

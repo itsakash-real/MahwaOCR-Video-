@@ -94,6 +94,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "tighten_edges": True,  # trim white/black gutter rows off a panel's top and bottom
             "white_threshold": 242, # gray above this across a row = white gutter
             "black_threshold": 13,  # gray below this across a row = near-black gutter
+            "trim_v1": False,       # Build 1: gutter-colour blank-row trim + review flags (opt-in)
+            "trim_cap": 0.40,       # max share of a panel's height the v1 trim cuts per side
         },
         # Card framing. Cards keep the panel's full width and pick a vertical window.
         # Head detection beyond skin colour, for white/silver hair and gray skin.

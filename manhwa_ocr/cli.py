@@ -713,6 +713,17 @@ def cmd_video(args) -> int:
                 _log(f"  contact sheet: {s.relative_to(sess.path).as_posix()}")
         return 0
 
+    if action == "trim":
+        # Build 1 bake-off/review instrument: report what the v1 trimmer
+        # WOULD cut from each panel. Read-only; changes nothing.
+        from .video.trim import trim_report
+
+        for c in chapters(default_all=False):
+            rep = trim_report(sess.path, c)
+            _log(f"  chapter {c}: {rep['trimmed']}/{rep['panels']} panels would trim, "
+                 f"{rep['flagged']} flagged for review  ->  .work/video/ch{c}/trim_report.json")
+        return 0
+
     if action in {"plan", "sync"}:
         for c in chapters(default_all=False):
             vb.make_plan(sess, c, cfg, force=args.force or action == "sync",
@@ -1125,7 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "trim", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
