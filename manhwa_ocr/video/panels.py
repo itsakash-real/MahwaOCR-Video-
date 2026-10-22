@@ -51,6 +51,7 @@ class Panel:
     tall: bool = False
     scene: str = ""
     text: str = ""
+    trim: Dict[str, Any] = field(default_factory=dict)  # Build 1 v1 record, when enabled
 
     @property
     def height(self) -> float:
@@ -79,6 +80,11 @@ def _settings(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
         "tighten_edges": bool(cfg.get("tighten_edges", True)),
         "white_threshold": min(255, max(128, int(cfg.get("white_threshold", WHITE_THRESHOLD)))),
         "black_threshold": min(127, max(0, int(cfg.get("black_threshold", BLACK_THRESHOLD)))),
+        # Build 1 (opt-in): gutter-colour-aware blank-row trim on top of the edge
+        # tightening above, with caps/flags recorded per panel. Off by default so
+        # existing panels.json fingerprints (and framing) stay untouched.
+        "trim_v1": bool(cfg.get("trim_v1", False)),
+        "trim_cap": min(0.9, max(0.05, float(cfg.get("trim_cap", 0.40)))),
     }
 
 
@@ -294,6 +300,19 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
                     panel.y0, panel.y1 = float(a + cut_top * scale), float(b - cut_bottom * scale)
                     panel.segments = _segments(panel.y0, panel.y1, pages) or panel.segments
                     strip = strip.crop((0, cut_top, strip.width, strip.height - cut_bottom))
+            if s["trim_v1"]:
+                from .trim import compute_trim
+
+                tres = compute_trim(strip, cap_share=s["trim_cap"])
+                vscale = norm_w / max(1, strip.width)
+                panel.trim = {"top": round(tres.cut_top * vscale, 1),
+                              "bottom": round(tres.cut_bottom * vscale, 1),
+                              "flags": list(tres.flags)}
+                if tres.cut_top or tres.cut_bottom:
+                    panel.y0 = float(panel.y0 + tres.cut_top * vscale)
+                    panel.y1 = float(panel.y1 - tres.cut_bottom * vscale)
+                    panel.segments = _segments(panel.y0, panel.y1, pages) or panel.segments
+                    strip = strip.crop((0, tres.cut_top, strip.width, strip.height - tres.cut_bottom))
             x0, x1 = _trim_x(strip, norm_w)
         except OSError:
             x0, x1 = 0.0, float(norm_w)
@@ -441,7 +460,8 @@ def _fingerprint(pages: List[Path], s: Dict[str, Any]) -> str:
     # panels.json files made before they existed are not silently re-detected (which
     # would shift framing under recordings that already exist). `video panels --force`
     # re-detects with tightening.
-    defaults = {"tighten_edges": True, "white_threshold": WHITE_THRESHOLD, "black_threshold": BLACK_THRESHOLD}
+    defaults = {"tighten_edges": True, "white_threshold": WHITE_THRESHOLD, "black_threshold": BLACK_THRESHOLD,
+                "trim_v1": False, "trim_cap": 0.40}
     keyed = {k: v for k, v in s.items() if defaults.get(k, object()) != v}
     h = hashlib.sha256(json.dumps({"v": PANELS_VERSION, **keyed}, sort_keys=True).encode())
     for p in pages:
@@ -511,6 +531,8 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
     edge_pages = _edge_pages(panels)
     for p in panels:
         row = {**asdict(p), "height": round(p.height, 1), "width": round(p.width, 1)}
+        if not row.get("trim"):
+            row.pop("trim", None)
         try:
             img = panel_image(root, chapter, row, norm_w)
             row["art"], row["crop_art"] = art_score(img), crop_art(img)

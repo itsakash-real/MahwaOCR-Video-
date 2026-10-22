@@ -62,7 +62,7 @@ PAD_LIMIT = 1.5          # a card's pad_y (blurred padding above and below, in p
 # P3 continuous motion (editor.py): the planner never emits `hold`. A reviewer
 # may still hand-set motion="hold" for a deliberate 1-2s post-payoff beat;
 # frames.py keeps the old ease-out-then-hold for exactly that case.
-ENTRANCE_WEIGHTS = [("cut", 90), ("fade_in", 10)]
+ENTRANCE_WEIGHTS = [("cut", 100)]
 MOTION_WEIGHTS = P3_MOTION_WEIGHTS
 
 
@@ -830,16 +830,14 @@ class _Designer:
             e = rng.choice(["blur_in", "fit_in_frame"])
         elif "impact" in cues:
             e = "zoom_in"
-        elif "beat" in cues:
-            e = "fade_in"
         elif layout == "wide":
-            e = rng.choice(["cut", "cut", "fade_in", "slide_left"])
+            e = rng.choice(["cut", "cut", "slide_left"])
         else:
             e = _pick(rng, ENTRANCE_WEIGHTS, avoid=self.prev_enter)
         self.prev_enter = e
         return e
 
-    def shot(self, i: int, unit: Dict[str, Any], last: bool) -> Dict[str, Any]:
+    def shot(self, i: int, unit: Dict[str, Any]) -> Dict[str, Any]:
         rng = _rng(self.chapter, i)
         start, end = unit["start"], unit["end"]
         dur = end - start
@@ -945,10 +943,7 @@ class _Designer:
                 transition = rng.choice(_pool)
             else:
                 transition = _pick(rng, TRANSITION_WEIGHTS)
-            if transition == "fade":
-                self._prev_shot["exit"] = "fade_out"
-                cards[0]["enter"] = "fade_in"
-            elif transition != "cut":
+            if transition != "cut":
                 cards[0]["enter"] = transition_enter(transition)
             if transition == "glitch":
                 effects.append({"type": "glitch", "t": round(start, 3)})
@@ -958,7 +953,7 @@ class _Designer:
         shot = {
             "id": f"S{i + 1:03d}", "start": round(start, 3), "end": round(end, 3),
             "layout": layout, "background": background,
-            "cards": cards, "exit": "fade_out" if last else "cut", "effects": effects,
+            "cards": cards, "exit": "cut", "effects": effects,
             "transition": transition,
             "callouts": callouts,
             "sentence": (unit.get("sentence") or "")[:300] or None,
@@ -1437,7 +1432,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     units = split_system_window_units(units, by_id)
     designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes,
                          root=root, fingerprint=panels_data.get("fingerprint"))
-    shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
+    shots = [designer.shot(i, u) for i, u in enumerate(units)]
     # P3 editor layer: split frozen >8s shots with a punch-in crop change,
     # then attach chapter cards + SFX. Callouts already ride on each shot.
     _pacing_before = pacing_qa(shots)

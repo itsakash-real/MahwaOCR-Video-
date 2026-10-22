@@ -713,6 +713,81 @@ def cmd_video(args) -> int:
                 _log(f"  contact sheet: {s.relative_to(sess.path).as_posix()}")
         return 0
 
+    if action == "trim":
+        # Build 1 bake-off/review instrument: report what the v1 trimmer
+        # WOULD cut from each panel. Read-only; changes nothing.
+        from .video.trim import trim_report
+
+        for c in chapters(default_all=False):
+            rep = trim_report(sess.path, c)
+            _log(f"  chapter {c}: {rep['trimmed']}/{rep['panels']} panels would trim, "
+                 f"{rep['flagged']} flagged for review  ->  .work/video/ch{c}/trim_report.json")
+        return 0
+
+    if action == "detect":
+        # Shared step for the pre-checker / solver / OCR: bubble+text boxes
+        # per panel, cached as sidecars. Changes no existing artifact.
+        from .video.detect import DEFAULT_THRESHOLD, detect_chapter
+
+        det = cfg.video.get("detector") or {}
+        for c in chapters(default_all=False):
+            rep = detect_chapter(sess.path, c, force=args.force,
+                                 threshold=float(det.get("threshold") or DEFAULT_THRESHOLD),
+                                 model_path=det.get("model") or None)
+            _log(f"  chapter {c}: {rep['boxes']} boxes over {rep['panels']} panels "
+                 f"({rep['computed']} computed, {rep['cached']} cached)  ->  .work/video/ch{c}/boxes/")
+        return 0
+
+    if action == "precheck":
+        # Phase 0.2: read-only - plan windows vs detector boxes; lists the
+        # shots whose window bisects a text element, for the auditor.
+        from .video.precheck import precheck_chapter
+
+        for c in chapters(default_all=False):
+            rep = precheck_chapter(sess.path, c)
+            _log(f"  chapter {c}: {len(rep['findings'])} bisected-text finding(s) over "
+                 f"{rep['cards']} cards ({rep['panels_checked']} panels checked)  "
+                 f"->  .work/video/ch{c}/precheck.json")
+            for f in rep["findings"][:10]:
+                _log(f"    {f['shot']} {f['panel']}: {f['label']} cut at {','.join(f['cut'])}")
+        return 0
+
+    if action == "solve":
+        # Build 4: read-only safe-crop proposals for bisected cards.
+        from .video.solve import solve_chapter
+
+        for c in chapters(default_all=False):
+            rep = solve_chapter(sess.path, c)
+            _log(f"  chapter {c}: {len(rep['proposals'])} proposal(s), {rep['already_safe']} "
+                 f"cards already safe  ->  .work/video/ch{c}/solve.json")
+            for pr in rep["proposals"][:10]:
+                _log(f"    {pr['shot']} {pr['panel']}: {pr['status']}/{pr['kind']} "
+                     f"moved {pr['moved']} -> {[round(v, 3) for v in pr['window']]}")
+        return 0
+
+    if action == "ocr-check":
+        # Build 3a: OCR vs the hand transcript - candidate missed lines.
+        from .video.ocrcheck import cross_check
+
+        for c in chapters(default_all=False):
+            rep = cross_check(sess.path, c)
+            _log(f"  chapter {c}: {len(rep['candidates'])} candidate missed line(s) "
+                 f"from {rep['ocr_lines']} OCR lines  ->  .work/video/ch{c}/ocr_check.json")
+            for cand in rep["candidates"][:10]:
+                _log(f"    {cand['panel']}: {cand['text'][:70]}")
+        return 0
+
+    if action == "ocr-draft":
+        # Build 3b: per-panel OCR draft grouped by detector bubble boxes.
+        from .video.ocrcheck import draft_chapter
+
+        for c in chapters(default_all=False):
+            rep = draft_chapter(sess.path, c)
+            dlg = sum(len(v["dialogue"]) for v in rep["panels"].values())
+            _log(f"  chapter {c}: draft for {len(rep['panels'])} panels, {dlg} dialogue "
+                 f"lines  ->  .work/video/ch{c}/ocr_draft.json")
+        return 0
+
     if action in {"plan", "sync"}:
         for c in chapters(default_all=False):
             vb.make_plan(sess, c, cfg, force=args.force or action == "sync",
@@ -962,6 +1037,21 @@ def cmd_video(args) -> int:
             _log(f"  chapter {c}: {_n} caption chunk(s) -> {_ass.relative_to(sess.path).as_posix()}")
         return 0
 
+    if action == "pipeline":
+        # Build 0: the single-chapter pipelining runner (resumable,
+        # stop-on-failure, sync-audit as a gate before render).
+        from .video.pipeline import run_pipeline
+
+        failed = False
+        for c in chapters(default_all=False):
+            _log(f"=== Chapter {c} pipeline ===")
+            summary = run_pipeline(sess, c, cfg, from_stage=args.from_stage,
+                                   force=args.force, log=_log)
+            _log(f"  outcome: {summary['outcome']} in {summary['total_seconds']:.0f}s  "
+                 f"->  .work/video/ch{c}/pipeline.json")
+            failed = failed or summary["outcome"] != "ok"
+        return 2 if failed else 0
+
     if action == "render":
         for c in chapters(default_all=False):
             _log(f"=== Chapter {c} ===")
@@ -1125,7 +1215,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "pipeline", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render", "pipeline",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
@@ -1140,6 +1230,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pages", help="folder of page images to use for this chapter")
     p.add_argument("--from", dest="start", type=float, help="clip start, seconds")
     p.add_argument("--to", dest="end", type=float, help="clip end, seconds")
+    p.add_argument("--from-stage", dest="from_stage",
+                   choices=["panels", "pair", "align", "plan", "verify", "sync-audit", "render"],
+                   help="pipeline: resume at this stage (it and everything after it re-run)")
     p.add_argument("--workers", type=int, default=0, help="parallel renders (default: half your CPU cores)")
     p.add_argument("--count", type=int, default=3, help="shorts: how many Shorts to cut (default 3)")
     p.add_argument("--no-titles", dest="no_titles", action="store_true", help="compile without title cards")
@@ -1231,9 +1324,46 @@ def cmd_guard(args) -> int:
     return 0
 
 
+def _record_timing(args, started: str, duration_s: float, ok: bool,
+                   exit_code) -> None:
+    """Append one record to the session's timing log (Phase 0). Never raises:
+    the log observes commands, it must never interfere with them."""
+    try:
+        if getattr(args, "func", None) is cmd_guard:
+            return
+        sess = _session(args, required=False)
+        if sess is None:
+            return
+        from .timing import chapter_of, record, stage_name
+
+        record(sess.path, stage=stage_name(args), chapter=chapter_of(args),
+               started=started, duration_s=duration_s, ok=ok,
+               exit_code=exit_code)
+    except Exception:  # noqa: BLE001 - timing is passive instrumentation
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     _setup_console()
     args = build_parser().parse_args(argv)
+    import time
+    from datetime import datetime, timezone
+
+    started = datetime.now(timezone.utc).isoformat()
+    t0 = time.perf_counter()
+    ok, code = False, None
+    try:
+        code = _main_run(args)
+        ok = code == 0
+        return code
+    except BaseException:
+        ok, code = False, None
+        raise
+    finally:
+        _record_timing(args, started, time.perf_counter() - t0, ok, code)
+
+
+def _main_run(args) -> int:
     try:
         if args.func is not cmd_guard:
             from .guard import check
