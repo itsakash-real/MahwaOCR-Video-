@@ -91,6 +91,14 @@ tagging. Do not skip the tagging checklist there (≥90% sentences tagged, no
 text-only/credits tags, no 3+ run of sub-6-word sentences, ~7.5+ words per
 drawn panel) — Stage 5's gates assume it was followed.
 
+**Always write the `"summary"` field in `parts.json`**, not just `narration`
+and `hook`. This is the one thing that lets a brand-new session (no memory of
+the chapters built before it) continue the story correctly -- it's read back
+into every later chapter's prompt as the "story so far." A thin or skipped
+summary is exactly how a fresh session loses track of an open thread (a
+reveal, a hidden identity, a promise) from a chapter it never saw being
+written.
+
 ## Stage 2 — Recap ↔ transcript consistency check
 
 Before touching tone or TTS formatting, verify the recap didn't drift from

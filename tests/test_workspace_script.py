@@ -305,6 +305,65 @@ def test_next_recap_prompt_carries_previous_hook(tmp_path):
     assert "hook 1" in b._prompt_for("2", 6)
 
 
+def test_recap_meta_stores_the_summary(tmp_path):
+    cfg, b = _transcripts(tmp_path)
+    b.prepare(["1"], 6)
+    parts = {"1": {"narration": "word " * 900, "hook": "hook 1",
+                  "summary": "Ise leaves the temple and heads to the capital."}}
+    (b.task_dir / "parts.json").write_text(json.dumps(parts), encoding="utf-8")
+    path = b.finalize()[0]
+    assert b._read_meta(path)["summary"] == "Ise leaves the temple and heads to the capital."
+
+
+def test_prompt_falls_back_to_the_recap_body_when_no_summary_was_stored(tmp_path):
+    """Older recaps, written before this field existed, still give the next chapter something."""
+    cfg, b = _transcripts(tmp_path)
+    b.prepare(["1"], 6)
+    _answer(b, ["1"])  # no "summary" key, like a recap written before this feature
+    b.finalize()
+    prompt = b._prompt_for("2", 6)
+    assert "PREVIOUS SEGMENT" in prompt
+    assert "word word word" in prompt  # the narration body, used as a fallback summary
+
+
+def test_prompt_carries_the_previous_chapters_story_so_far_not_just_its_hook(tmp_path):
+    """Regression: chapter N must get what happened in earlier chapters, not a one-line hook.
+
+    This is the exact failure from a real multi-chapter build: chapter 11's recap dropped
+    every thread from chapter 10 (a character's reveal, a goodbye, a hidden identity) because
+    only chapter 10's opening hook reached the writer. The summary field closes that gap.
+    """
+    cfg, b = _transcripts(tmp_path, ("1", "2", "3"))
+    b.prepare(["1"], 6)
+    parts = {"1": {"narration": "word " * 900, "hook": "hook 1",
+                  "summary": "Ise finally hears Il-chwi speak and the village says goodbye."}}
+    (b.task_dir / "parts.json").write_text(json.dumps(parts), encoding="utf-8")
+    b.finalize()
+
+    b.prepare(["2"], 6)
+    parts = {"2": {"narration": "word " * 900, "hook": "hook 2",
+                  "summary": "Ise hides his dokkaebi past and meets a rival, Hae Unchan."}}
+    (b.task_dir / "parts.json").write_text(json.dumps(parts), encoding="utf-8")
+    b.finalize()
+
+    prompt = b._prompt_for("3", 6)
+    assert "Il-chwi speak" in prompt            # chapter 1's thread is still visible
+    assert "Hae Unchan" in prompt               # chapter 2's own summary is included
+    assert "STORY SO FAR" in prompt
+
+
+def test_prompt_includes_the_previous_recaps_ending_so_the_writer_continues_from_it(tmp_path):
+    cfg, b = _transcripts(tmp_path)
+    b.prepare(["1"], 6)
+    narration = ("filler " * 80) + "This is how chapter one closes its final sentence here."
+    parts = {"1": {"narration": narration, "hook": "hook 1"}}
+    (b.task_dir / "parts.json").write_text(json.dumps(parts), encoding="utf-8")
+    b.finalize()
+    prompt = b._prompt_for("2", 6)
+    assert "closes its final sentence here" in prompt
+    assert "pick up right here" in prompt
+
+
 def test_compile_selection(tmp_path):
     cfg, b = _transcripts(tmp_path, ("1", "2", "3", "4", "11"))
     b.prepare(["1", "2", "3", "4", "11"], 6)
