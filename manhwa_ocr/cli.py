@@ -1037,6 +1037,21 @@ def cmd_video(args) -> int:
             _log(f"  chapter {c}: {_n} caption chunk(s) -> {_ass.relative_to(sess.path).as_posix()}")
         return 0
 
+    if action == "pipeline":
+        # Build 0: the single-chapter pipelining runner (resumable,
+        # stop-on-failure, sync-audit as a gate before render).
+        from .video.pipeline import run_pipeline
+
+        failed = False
+        for c in chapters(default_all=False):
+            _log(f"=== Chapter {c} pipeline ===")
+            summary = run_pipeline(sess, c, cfg, from_stage=args.from_stage,
+                                   force=args.force, log=_log)
+            _log(f"  outcome: {summary['outcome']} in {summary['total_seconds']:.0f}s  "
+                 f"->  .work/video/ch{c}/pipeline.json")
+            failed = failed or summary["outcome"] != "ok"
+        return 2 if failed else 0
+
     if action == "render":
         for c in chapters(default_all=False):
             _log(f"=== Chapter {c} ===")
@@ -1200,7 +1215,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "pipeline", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render", "pipeline",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
@@ -1215,6 +1230,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pages", help="folder of page images to use for this chapter")
     p.add_argument("--from", dest="start", type=float, help="clip start, seconds")
     p.add_argument("--to", dest="end", type=float, help="clip end, seconds")
+    p.add_argument("--from-stage", dest="from_stage",
+                   choices=["panels", "pair", "align", "plan", "verify", "sync-audit", "render"],
+                   help="pipeline: resume at this stage (it and everything after it re-run)")
     p.add_argument("--workers", type=int, default=0, help="parallel renders (default: half your CPU cores)")
     p.add_argument("--count", type=int, default=3, help="shorts: how many Shorts to cut (default 3)")
     p.add_argument("--no-titles", dest="no_titles", action="store_true", help="compile without title cards")
