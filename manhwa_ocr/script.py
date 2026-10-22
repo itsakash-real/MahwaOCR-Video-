@@ -48,6 +48,8 @@ from .workspace import work_root
 
 WORDS_PER_MINUTE = 150
 MIN_NARRATION_WORDS = 60
+PREVIOUS_ENDING_WORDS = 150
+STORY_SO_FAR_CHARS = 3000
 META_RE = re.compile(r"<!--\s*recap-meta\s*(\{.*?\})\s*-->", re.DOTALL)
 
 
@@ -101,10 +103,17 @@ Mark emphasis with *asterisks* where the delivery should land.
 
 Stay close to {words} words of spoken narration. Bracketed cues do not count.
 
+Also write a "summary": 3-5 plain sentences for the next chapter's writer. Cover
+what happened in this chapter, where each main character is now, what each
+character wants or fears going forward, and what is still unresolved. Write it
+so someone who has read nothing else can pick the story up from it. No
+[HOOK] or [LOOP] markers and no editing cues in the summary.
+
 Return exactly this shape:
 {{
   "narration": "the full narration segment, as markdown",
-  "hook": "the opening line, repeated on its own"
+  "hook": "the opening line, repeated on its own",
+  "summary": "3-5 sentences: events, where each main character is now, open threads"
 }}"""
 
 
@@ -200,12 +209,13 @@ def _spec_name(chapters: List[str]) -> str:
     return "_".join(p for p in parts if p) or "all"
 
 
-def _parse_part(entry: Any) -> tuple[str, str]:
+def _parse_part(entry: Any) -> tuple[str, str, str]:
     if isinstance(entry, dict):
-        return str(entry.get("narration") or ""), str(entry.get("hook") or "")
+        return (str(entry.get("narration") or ""), str(entry.get("hook") or ""),
+                str(entry.get("summary") or ""))
     if isinstance(entry, str):
-        return entry, ""
-    return "", ""
+        return entry, "", ""
+    return "", "", ""
 
 
 class RecapBuilder:
@@ -271,18 +281,61 @@ class RecapBuilder:
         briefing = self.memory.as_briefing(upto=upto)
         return f"SERIES CONTEXT\n{briefing}\n\n---\n\n" if briefing.strip() else ""
 
+    def _recap_summary(self, path: Path) -> str:
+        """A recap's stored story-so-far summary; older recaps fall back to their opening lines."""
+        summary = str(self._read_meta(path).get("summary") or "").strip()
+        if summary:
+            return summary
+        if not path.exists():
+            return ""
+        # No stored summary (a recap written before this field existed): fall back to its
+        # full body rather than just the opening -- the budget loop in _story_so_far() trims
+        # the oldest chapter first if this runs long, so an open thread set up mid-chapter and
+        # only resolved near the end isn't lost to a short, hook-only slice.
+        from .video.cues import strip_tags
+
+        body = " ".join(l for l in strip_tags(self._body(path)).splitlines()
+                        if l.strip() and not l.strip().startswith("["))
+        return body
+
+    def _story_so_far(self, chapter: str) -> str:
+        """Summaries of every earlier chapter, in order, so the writer knows what has happened."""
+        earlier = [c for c in self.recapped() if chapter_key(c) < chapter_key(chapter)]
+        entries = [(c, self._recap_summary(self.recap_path(c))) for c in earlier]
+        entries = [(c, text) for c, text in entries if text]
+        if not entries:
+            return ""
+        lines = [f"Ch {c}: {text}" for c, text in entries]
+        out = "\n".join(lines)
+        while len(out) > STORY_SO_FAR_CHARS and len(lines) > 1:
+            lines.pop(0)
+            out = "\n".join(lines)
+        return out
+
     def _previous_block(self, chapter: str) -> str:
-        """Hand the writer the previous chapter's hook so segments flow."""
+        """What the writer needs to continue the story: earlier summaries and the last recap's ending."""
         if not chapter.isdigit() or int(chapter) <= 1:
             return ""
         prev = self.recaps_dir / f"chapter_{int(chapter) - 1}.md"
-        hook = self._read_meta(prev).get("hook") if prev.exists() else ""
-        if not hook:
+        if not prev.exists():
             return ""
-        return (
-            f"PREVIOUS SEGMENT\nThe recap for chapter {int(chapter) - 1} opened with: "
-            f"\"{hook}\"\nDon't repeat its framing; pick up where it leaves off.\n\n---\n\n"
-        )
+        from .video.cues import strip_tags
+
+        prev_no = int(chapter) - 1
+        hook = str(self._read_meta(prev).get("hook") or "").strip()
+        words = strip_tags(self._body(prev)).split()
+        ending = " ".join(w for w in words[-PREVIOUS_ENDING_WORDS:] if w)
+        story = self._story_so_far(chapter)
+        parts = ["PREVIOUS SEGMENT"]
+        if story:
+            parts.append(f"STORY SO FAR (one summary per earlier chapter, oldest first):\n{story}")
+        parts.append(f"THE END OF THE RECAP FOR CHAPTER {prev_no} (your narration must pick up right here):\n"
+                     f"\"...{ending}\"")
+        if hook:
+            parts.append(f"That recap opened with: \"{hook}\"")
+        parts.append("Do not repeat earlier framing or re-explain what the story so far already covered. "
+                     "Carry forward every open thread, promise, and unresolved question from the summaries.")
+        return "\n\n".join(parts) + "\n\n---\n\n"
 
     def panels(self, chapter: str) -> List[Dict[str, Any]]:
         """This chapter's panels, detecting them if the pages are on disk."""
@@ -376,7 +429,8 @@ class RecapBuilder:
             return audio
         return None
 
-    def _write_recap(self, chapter: str, narration: str, hook: str, minutes: float) -> Path | None:
+    def _write_recap(self, chapter: str, narration: str, hook: str, minutes: float,
+                     summary: str = "") -> Path | None:
         from .video import cues
 
         audio = self._has_audio(chapter)
@@ -394,6 +448,7 @@ class RecapBuilder:
             "words": words,
             "target_minutes": minutes,
             "hook": cues.strip_tags(hook),
+            "summary": cues.strip_tags(summary).strip(),
             "tagged": parsed["tagged_ratio"] if parsed else 0.0,
             "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
@@ -431,7 +486,7 @@ class RecapBuilder:
 
         provider = build_provider(self.cfg.provider)
         written = []
-        # Sequential on purpose: each recap reads the previous one's hook.
+        # Sequential on purpose: each recap reads the story so far written before it.
         for chapter in todo:
             self.log(f"  chapter {chapter}...")
             sheets = sheet_paths(self.workdir, chapter)[:12] if self.panels(chapter) else []
@@ -439,15 +494,15 @@ class RecapBuilder:
             # With panels, the writer needs to see them to tag sentences well.
             raw = provider.vision(SCRIPT_SYSTEM, prompt, sheets) if sheets else provider.text(SCRIPT_SYSTEM, prompt)
             try:
-                narration, hook = _parse_part(extract_json(raw))
+                narration, hook, summary = _parse_part(extract_json(raw))
             except ValueError:
-                narration, hook = raw, ""
+                narration, hook, summary = raw, "", ""
             if _count_words(strip_tags(narration)) < MIN_NARRATION_WORDS:
                 self.log(f"    ! model returned too little narration; chapter {chapter} not saved")
                 continue
             for msg in self._check(chapter, narration)["warnings"]:
                 self.log(f"    ! chapter {chapter}: {msg}")
-            path = self._write_recap(chapter, narration, hook, minutes)
+            path = self._write_recap(chapter, narration, hook, minutes, summary)
             if path is None:
                 continue
             self.log(f"    {_count_words(narration)} words -> {path.name}")
@@ -576,7 +631,8 @@ Write `{rel(self.task_dir / 'parts.json')}`:
 
 ```json
 {{
-  "{todo[0]}": {{"narration": "...", "hook": "the opening line"}}
+  "{todo[0]}": {{"narration": "...", "hook": "the opening line",
+    "summary": "3-5 sentences: events so far, where each main character is now, open threads"}}
 }}
 ```
 
@@ -622,7 +678,7 @@ covering exactly chapters {', '.join(todo)}.
 
         written, still_owed, rejected = [], [], {}
         for chapter in expected:
-            narration, hook = _parse_part(parts.get(chapter))
+            narration, hook, summary = _parse_part(parts.get(chapter))
             if _count_words(strip_tags(narration)) < MIN_NARRATION_WORDS:
                 still_owed.append(chapter)
                 continue
@@ -632,7 +688,7 @@ covering exactly chapters {', '.join(todo)}.
                 continue
             for msg in report["warnings"]:
                 self.log(f"    ! chapter {chapter}: {msg}")
-            path = self._write_recap(chapter, narration, hook, minutes)
+            path = self._write_recap(chapter, narration, hook, minutes, summary)
             if path is not None:
                 written.append(path)
 

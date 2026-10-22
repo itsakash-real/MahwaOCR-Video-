@@ -200,9 +200,15 @@ saves the chapters you've written and keeps the task open for the rest.
 Each prompt's series context is limited to what was known *by that chapter*,
 so don't add knowledge from later chapters into an early chapter's narration.
 
-The task's prompt files already contain each chapter's transcript and series
-context. Work through them in order; each one is told the previous chapter's
-opening hook so segments flow into each other.
+The task's prompt files already contain each chapter's transcript, series
+context, and a "story so far" built from every earlier chapter's recap, plus
+the end of the immediately previous recap verbatim. Work through chapters in
+order. **Every `parts.json` entry must include a `"summary"`** (3-5 plain
+sentences: what happened, where each main character is now, what is still
+unresolved) alongside `"narration"` and `"hook"` — this is what a NEW session
+reads to pick the story back up, since it has no memory of earlier chapters
+you wrote in a previous session. A missing or thin summary is exactly how a
+new session loses the thread at the next chapter.
 
 To turn recaps into one video script:
 
