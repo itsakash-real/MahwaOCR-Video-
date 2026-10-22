@@ -752,6 +752,19 @@ def cmd_video(args) -> int:
                 _log(f"    {f['shot']} {f['panel']}: {f['label']} cut at {','.join(f['cut'])}")
         return 0
 
+    if action == "solve":
+        # Build 4: read-only safe-crop proposals for bisected cards.
+        from .video.solve import solve_chapter
+
+        for c in chapters(default_all=False):
+            rep = solve_chapter(sess.path, c)
+            _log(f"  chapter {c}: {len(rep['proposals'])} proposal(s), {rep['already_safe']} "
+                 f"cards already safe  ->  .work/video/ch{c}/solve.json")
+            for pr in rep["proposals"][:10]:
+                _log(f"    {pr['shot']} {pr['panel']}: {pr['status']}/{pr['kind']} "
+                     f"moved {pr['moved']} -> {[round(v, 3) for v in pr['window']]}")
+        return 0
+
     if action in {"plan", "sync"}:
         for c in chapters(default_all=False):
             vb.make_plan(sess, c, cfg, force=args.force or action == "sync",
@@ -1164,7 +1177,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
