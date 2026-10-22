@@ -54,6 +54,19 @@ def test_transcript_lines_extraction(tmp_path):
         ocrcheck.transcript_lines(tmp_path, "9")
 
 
+def test_transcript_lines_extraction_speaker_format(tmp_path):
+    # The other house format (prompts.py CHAPTER_PROMPT): `**Speaker:** "line"`
+    # and `**Speaker:** *(thinking)* "line"` for thought bubbles. Missing this
+    # format silently blinds the cross-check for any chapter written this way.
+    (tmp_path / "chapter_4.md").write_text(
+        "## Scene 1 -- intro\n\n"
+        "**Jinwoo:** \"We need to move, now.\"\n\n"
+        "**Cha Hae-In:** *(thinking)* \"Something is wrong here.\"\n\n"
+        "*(A visual description, not dialogue.)*\n", encoding="utf-8")
+    assert ocrcheck.transcript_lines(tmp_path, "4") == [
+        "We need to move, now.", "Something is wrong here."]
+
+
 def _session_with_transcript(tmp_path):
     root = tmp_path / "s"
     (root / "media" / "ch1").mkdir(parents=True)
@@ -63,6 +76,22 @@ def _session_with_transcript(tmp_path):
     (root / "chapter_1.md").write_text(
         "# T\n\n> THE QUICK BROWN FOX JUMPS OVER.\n", encoding="utf-8")
     return root
+
+
+def test_squashed_match_does_not_cross_a_line_boundary():
+    # Two unrelated transcript lines whose ends/starts happen to spell a
+    # third, never-written word when glued together. A genuinely missed
+    # one-word OCR fragment (stylized lettering has no spaces, so it is a
+    # single "word" and skips the windowed fuzzy check entirely) must not
+    # be reported "found" just because its squashed form straddles the
+    # seam between those two lines.
+    norm_lines = [ocrcheck.normalize(t) for t in
+                  ["shadow creature loo", "msgathered nearby quietly"]]
+    blob = " " + " ".join(norm_lines) + " "
+    squashed_blob = "\x00" + "\x00".join(ln.replace(" ", "") for ln in norm_lines) + "\x00"
+    candidate = ocrcheck.normalize("loomsgathered")  # never actually in either line
+    assert candidate.count(" ") == 0                 # single word: squash path only
+    assert not ocrcheck._is_found(candidate, blob, norm_lines, squashed_blob)
 
 
 def test_cross_check_candidates(tmp_path, monkeypatch):

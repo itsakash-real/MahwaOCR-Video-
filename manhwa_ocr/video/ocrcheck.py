@@ -204,7 +204,12 @@ def cross_check(root: Path, chapter: str, engine=None) -> Dict[str, Any]:
     tlines = transcript_lines(root, chapter)
     norm_lines = [normalize(t) for t in tlines]
     blob = " " + " ".join(norm_lines) + " "
-    squashed_blob = blob.replace(" ", "")
+    # NOTE: squash each line on its own, joined by a separator that cannot
+    # appear in a squashed query (normalize() only ever leaves a-z0-9 and
+    # spaces). Squashing the whole blob in one go would erase line
+    # boundaries, letting a genuinely missed OCR line match a substring
+    # that straddles the seam between two unrelated transcript lines.
+    squashed_blob = "\x00" + "\x00".join(ln.replace(" ", "") for ln in norm_lines) + "\x00"
 
     candidates: List[Dict[str, Any]] = []
     total_lines = 0
