@@ -738,6 +738,20 @@ def cmd_video(args) -> int:
                  f"({rep['computed']} computed, {rep['cached']} cached)  ->  .work/video/ch{c}/boxes/")
         return 0
 
+    if action == "precheck":
+        # Phase 0.2: read-only - plan windows vs detector boxes; lists the
+        # shots whose window bisects a text element, for the auditor.
+        from .video.precheck import precheck_chapter
+
+        for c in chapters(default_all=False):
+            rep = precheck_chapter(sess.path, c)
+            _log(f"  chapter {c}: {len(rep['findings'])} bisected-text finding(s) over "
+                 f"{rep['cards']} cards ({rep['panels_checked']} panels checked)  "
+                 f"->  .work/video/ch{c}/precheck.json")
+            for f in rep["findings"][:10]:
+                _log(f"    {f['shot']} {f['panel']}: {f['label']} cut at {','.join(f['cut'])}")
+        return 0
+
     if action in {"plan", "sync"}:
         for c in chapters(default_all=False):
             vb.make_plan(sess, c, cfg, force=args.force or action == "sync",
@@ -1150,7 +1164,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "trim", "detect", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
+    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
