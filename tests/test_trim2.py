@@ -93,7 +93,9 @@ def test_all_blank_asset_left_untouched_and_flagged():
 def test_thresholds_are_the_named_constants():
     assert TRIM2_WHITE_MIN == 242 == panels_mod.WHITE_THRESHOLD
     assert TRIM2_BLACK_MAX == 13 == panels_mod.BLACK_THRESHOLD
-    assert TRIM2_GAP_MIN_PX == 200
+    # B1e: the user's locked gutter rule — any contiguous ~pure row run
+    # over 15px is a panel gutter (the old 200px floor glued panels).
+    assert TRIM2_GAP_MIN_PX == 15
 
 
 # --------------------------------------------------------------- gap slicing
@@ -107,13 +109,23 @@ def _strip(gap_lo, gap_hi, h=600, gap_fill=(255, 255, 255)):
 
 
 def test_two_panel_strip_slices_at_large_white_gap():
-    img = _strip(180, 420)          # a 240px white gap >= the 200px constant
+    img = _strip(180, 420)          # a 240px white gap
     assert slice_gaps(img) == [(0, 180), (420, 600)]
 
 
+def test_thin_white_gutter_slices_too_since_b1e():
+    # The user's second-by-second rulings: stacked panels separated by
+    # an ordinary webtoon gutter (tens of px) were shown glued together
+    # under the old 200px floor. A 40px gutter slices now.
+    img = _strip(200, 240)          # a 40px white gutter
+    assert slice_gaps(img) == [(0, 200), (240, 600)]
+    img = _strip(200, 320)          # 120px slices too
+    assert slice_gaps(img) == [(0, 200), (320, 600)]
+
+
 def test_small_white_gap_does_not_slice():
-    img = _strip(200, 320)          # 120px: a line break, not a panel gap
-    assert slice_gaps(img) == [(0, 600)]
+    img = _strip(200, 210)          # 10px: under the 15px floor — a line
+    assert slice_gaps(img) == [(0, 600)]   # break, not a panel gutter
 
 
 def test_black_gap_never_slices():

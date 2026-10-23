@@ -213,8 +213,11 @@ def trim_report(root: Path, chapter: str, *, cap_share: float = DEFAULT_CAP) -> 
 #
 # - an asset is trimmed exactly to its ink bounding box: every outer row
 #   or column that is (near-)pure white OR (near-)pure black is margin;
-# - a strip holding several panels across a large WHITE gap is sliced at
-#   the gap into separate panel assets (the white is discarded).
+# - a strip holding several panels across a WHITE gap is sliced at the
+#   gap into separate panel assets (the white is discarded). The gap
+#   floor is TRIM2_GAP_MIN_PX (15px since B1e — the user's rule: stacked
+#   panels are ALWAYS separate assets, sequenced with the narration,
+#   never shown glued together).
 #
 # A row/column is blank only when (almost) every pixel is margin — any
 # ink at all, a bubble outline included, stops the trim on that side,
@@ -226,7 +229,12 @@ def trim_report(root: Path, chapter: str, *, cap_share: float = DEFAULT_CAP) -> 
 TRIM2_BLANK_SHARE = BLANK_SHARE  # share of a row/column that must be margin to count as blank
 TRIM2_WHITE_MIN = 242            # a pixel is white margin when its DARKEST channel >= this
 TRIM2_BLACK_MAX = 13             # ... or black margin when its BRIGHTEST channel <= this
-TRIM2_GAP_MIN_PX = 200           # a white gap at least this tall inside a strip slices it
+TRIM2_GAP_MIN_PX = 15            # a white gap at least this tall inside a strip slices it
+                           # (B1e: the user's locked rule — any contiguous
+                           # ~pure row run over 15px is a panel gutter. The
+                           # old 200px floor left stacked panels glued
+                           # together on screen whenever their gutter was
+                           # thinner than 200px, which is most of them.)
 TRIM2_MIN_KEEP_PX = MIN_KEEP_PX  # never trim an asset below this many px on an axis
 
 
