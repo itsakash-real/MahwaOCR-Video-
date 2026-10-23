@@ -31,10 +31,11 @@ from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, r
 from .frames import background, format_from, shapes_for
 from . import fixes as fixes_mod
 from .verify import verify_chapter
-from .plan import map_options
+from .plan import map_options, panelfit_advance_slice
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
-from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, units_from_alignment, validate
+from .plan import (FF_ASPECT, FF_ASPECT_TOL, FF_CONTAIN_TOL, PLAN_VERSION, build_plan, load_plan,
+                    plan_path, save_plan, units_from_alignment, validate)
 from .render import output_path, render
 from .storyboard import storyboard_paths, write_review_task, write_storyboard
 
@@ -89,6 +90,8 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     are warnings for the QA file and the log. Nothing here judges art quality."""
     import math
 
+    from .plan import PF_ASPECT_TOL, PF_DRIFT_HEADROOM, PF_DRIFT_MAX_TRAVEL, PF_FIT_TOL
+
     fmt = format_from(plan.get("format", "16:9"), int(plan.get("fps", 30)))
     dims = {p["id"]: (float(p.get("width") or 1), float(p.get("height") or 1)) for p in panels["panels"]}
     art = [p["id"] for p in panels["panels"] if not p.get("text_only")]
@@ -96,14 +99,77 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     shown = {c["panel"] for s in shots for c in s.get("cards") or []}
     missing = [p for p in art if p not in shown]
     shape_bad = []
+    pf_bad = []
     for s in shots:
         allowed = shapes_for(s.get("layout", "single"), fmt)
         for c in s.get("cards") or []:
             pw, ph = dims.get(c["panel"], (1.0, 1.0))
+            _pf = c.get("panelfit")
+            if isinstance(_pf, dict):
+                # Panel-fit cards are not classic shapes: the foreground
+                # is the WHOLE panel at its native aspect (never
+                # stretched), fitted inside the frame — or, for a strip,
+                # fitted by width and taller than the frame (it
+                # scrolls). The blurred-background flag must be on
+                # exactly when the panel isn't canvas-shaped.
+                try:
+                    _bw, _bh = float(_pf["base_w"]), float(_pf["base_h"])
+                    _ok = abs(math.log((_bw / _bh) / (pw / ph))) <= PF_ASPECT_TOL
+                    _kind = _pf.get("kind")
+                    if _kind in ("scroll", "traverse"):
+                        # Width-fit strip taller than the frame (legacy
+                        # "scroll", or B1e's deliberate traverse).
+                        _ok = _ok and _bh > fmt.height + PF_FIT_TOL and _bw <= fmt.width + PF_FIT_TOL
+                    elif _kind == "duo":
+                        # B1e side-by-side: the panel lives in its half
+                        # cell — never wider than the cell, and no
+                        # taller than the slide oversize band (a
+                        # zoom-out duo sits inside the frame entirely).
+                        _max_over = 1.0 + PF_DRIFT_MAX_TRAVEL + PF_DRIFT_HEADROOM
+                        _ok = _ok and _bw <= fmt.width / 2.0 + PF_FIT_TOL \
+                            and _bh <= fmt.height * _max_over + PF_FIT_TOL
+                    elif _kind == "drift":
+                        # Height-fit pillar oversized by (travel +
+                        # headroom): never wider than the frame, and the
+                        # oversize stays inside the measured band (a
+                        # max-upscale-capped pillar may sit shorter).
+                        _max_over = 1.0 + PF_DRIFT_MAX_TRAVEL + PF_DRIFT_HEADROOM
+                        _ok = _ok and _bw <= fmt.width + PF_FIT_TOL \
+                            and _bh <= fmt.height * _max_over + PF_FIT_TOL
+                    elif _kind == "fill":
+                        # Cover-fill: at least frame-sized both ways,
+                        # with one dimension exactly the frame's.
+                        _ok = _ok and _bw >= fmt.width - PF_FIT_TOL and _bh >= fmt.height - PF_FIT_TOL \
+                            and min(abs(_bw - fmt.width), abs(_bh - fmt.height)) <= PF_FIT_TOL
+                    else:  # zoom: the whole panel fitted inside the frame
+                        _ok = _ok and _bw <= fmt.width + PF_FIT_TOL and _bh <= fmt.height + PF_FIT_TOL
+                    _want_bg = abs(math.log((pw / ph) / (fmt.width / fmt.height))) > PF_ASPECT_TOL
+                    if _kind == "duo":
+                        _want_bg = True   # a duo always shares the blur backdrop
+                    _ok = _ok and bool(_pf.get("bg")) == _want_bg
+                except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                    _ok = False
+                if not _ok:
+                    pf_bad.append(f"{s.get('id')} {c['panel']}")
+                continue
             x0, y0, x1, y1 = (float(v) for v in c["crop"])
             pad = float(c.get("pad_y") or 0.0)          # blurred padding above and below the crop
             aspect = ((x1 - x0) * pw) / max(1e-9, ((y1 - y0) + 2 * pad) * ph)
-            if c.get("wide_display"):
+            if c.get("fullframe"):
+                # Full-frame mode: a card's "shape" is its camera viewport
+                # -- from/to must be exactly 16:9 in panel pixels and lie
+                # inside the window. The crop itself is the window (any
+                # aspect), so the classic shape list does not apply.
+                vp = c.get("viewport") or {}
+                win = vp.get("window") or [0.0, 0.0, 1.0, 1.0]
+                ok = True
+                for _key in ("from", "to"):
+                    r = vp.get(_key) or [0.0, 0.0, 0.0, 0.0]
+                    va = ((r[2] - r[0]) * pw) / max(1e-9, (r[3] - r[1]) * ph)
+                    ok = ok and abs(math.log(va / FF_ASPECT)) <= FF_ASPECT_TOL
+                    ok = ok and r[0] >= win[0] - FF_CONTAIN_TOL and r[1] >= win[1] - FF_CONTAIN_TOL \
+                        and r[2] <= win[2] + FF_CONTAIN_TOL and r[3] <= win[3] + FF_CONTAIN_TOL
+            elif c.get("wide_display"):
                 # A wide-display card (video.mode: wide, or an adaptive-mode
                 # card its own panel earned the wide treatment) doesn't use
                 # the classic layout shapes: full frame height, width >= 6/16
@@ -123,6 +189,9 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     failures = []
     if shape_bad:
         failures.append(f"{len(shape_bad)} card(s) are not one of the allowed shapes: {', '.join(shape_bad[:6])}")
+    if pf_bad:
+        failures.append(f"{len(pf_bad)} card(s) break the panel-fit composition rules "
+                        f"(whole panel, native aspect, blurred background): {', '.join(pf_bad[:6])}")
     if cs.get("bubble"):
         failures.append(f"{len(cs['bubble'])} panel(s) would show a speech bubble or caption in their card: "
                         f"{', '.join(cs['bubble'][:8])}")
@@ -171,8 +240,28 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "wide_caption_risk": list(plan.get("wide_caption_risk") or []),
         "wide_figure_risk": list(plan.get("wide_figure_risk") or []),
         "wide_reviewer_focal_ignored": list(plan.get("wide_reviewer_focal_ignored") or []),
+        # Panel-fit mode only (plan._panelfit_pass): shots that would
+        # render static (must be none — the spec forbids a still image
+        # over 0.5s), panels fitted at the max-upscale cap, and the
+        # impact-FX report. INFO ONLY, like the wide risks above.
+        "panelfit_static": list(plan.get("panelfit_static") or []),
+        "panelfit_hold": list(plan.get("panelfit_hold") or []),
+        "panelfit_over_cap": list(plan.get("panelfit_over_cap") or []),
+        "panelfit_impact": list(plan.get("panelfit_impact") or []),
+        "panelfit_title_cards": list(plan.get("panelfit_title_cards") or []),
+        # B1e: strip traverses, duo side-by-sides, zoom-out hints. INFO ONLY.
+        "panelfit_traverse": list(plan.get("panelfit_traverse") or []),
+        "panelfit_duo": list(plan.get("panelfit_duo") or []),
+        "panelfit_zoom_out": list(plan.get("panelfit_zoom_out") or []),
+        # Full-frame mode only: the same honest-report treatment (see
+        # plan._fullframe_pass). INFO ONLY -- never failures.
+        "fullframe_caption_risk": list(plan.get("fullframe_caption_risk") or []),
+        "fullframe_figure_risk": list(plan.get("fullframe_figure_risk") or []),
+        "fullframe_reviewer_focal_ignored": list(plan.get("fullframe_reviewer_focal_ignored") or []),
+        "fullframe_over_cap": list(plan.get("fullframe_over_cap") or []),
+        "fullframe_static": list(plan.get("fullframe_static") or []),
         "min_shot": round(shortest, 2),
-        "max_shots": max(0, int(duration // 3.0)) if duration else 0,
+        "max_shots": max(0, int(duration // (1.0 if plan.get("mode") == "panelfit" else 3.0))) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
         "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
         "low_confidence_heads": cs.get("low_confidence_heads", []),
@@ -214,6 +303,18 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
                           "black_threshold": 13, "pale_heads": True, "keep_top": 0.25}[k]}
     if crop_opts:
         knobs["crop"] = crop_opts
+    if vcfg.get("mode") == "panelfit":
+        # Panel-fit joins the hash only while the mode is on (the same
+        # discipline as the framing options above): a panelfit plan is
+        # never reused as another mode's plan, or vice versa.
+        knobs["mode"] = "panelfit"
+        knobs["panelfit"] = vcfg.get("panelfit") or {}
+    # Full-frame mode is new (no legacy plans exist in it), so while it is
+    # on, the mode + its knobs always join the hash: switching the mode or
+    # a fullframe knob re-plans, exactly like a framing change should.
+    if str(vcfg.get("mode") or "classic") == "fullframe":
+        knobs["mode"] = "fullframe"
+        knobs["fullframe"] = dict(vcfg.get("fullframe") or {})
     return {
         "panels": panels_fp,
         "audio": [audio.name, st.st_size, int(st.st_mtime)] if st else None,
@@ -401,6 +502,10 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"  chapter {chapter}: imported {len(found)} page images")
     ensure_pages(sess, chapter, cfg.download, log=log)
     panels = build_panels(root, chapter, vcfg.get("panels"), log=log)
+    if vcfg.get("mode") == "panelfit" and not any(p.get("trim2") for p in panels.get("panels") or []):
+        log(f"  chapter {chapter}: ! panelfit mode expects Rule 6 pre-processing "
+            f"(video.panels.trim_v2) at panel build; these panels carry no trim2 record, "
+            f"so white margins may reach the composed frames")
 
     audio = audio_path(root, chapter)
     if duration is None:
@@ -588,6 +693,38 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"    ! wide mode: {len(qa['wide_reviewer_focal_ignored'])} panel(s) where a fixes.json focal "
             f"crop was not used as-is (panel shown whole, or the focal doesn't fit): "
             f"{', '.join(qa['wide_reviewer_focal_ignored'][:8])}")
+    if qa.get("panelfit_static"):
+        log(f"    ! panelfit mode: {len(qa['panelfit_static'])} shot(s) would render static "
+            f"(the spec forbids a still image over 0.5s): {', '.join(qa['panelfit_static'][:8])}")
+    if qa.get("panelfit_hold"):
+        log(f"    panelfit mode: {len(qa['panelfit_hold'])} sub-shot(s) sit in a travel-cap hold "
+            f"(their sentence's drift/zoom reached the measured cap and holds, per the reference): "
+            f"{', '.join(qa['panelfit_hold'][:8])}")
+    if qa.get("panelfit_over_cap"):
+        log(f"    ! panelfit mode: {len(qa['panelfit_over_cap'])} panel(s) fitted at the max-upscale "
+            f"cap (shown smaller, never stretched): {', '.join(qa['panelfit_over_cap'][:8])}")
+    if qa.get("panelfit_impact"):
+        log(f"    panelfit mode: impact fast zoom (+8.8%/s; no shake/flash in this mode) on "
+            f"{len(qa['panelfit_impact'])} shot(s)")
+    if qa.get("panelfit_title_cards"):
+        log(f"    panelfit mode: {len(qa['panelfit_title_cards'])} title card(s) "
+            f"(split-flap, on timeline cues)")
+    if qa.get("fullframe_figure_risk"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_figure_risk'])} panel(s) whose focal cannot fit "
+            f"inside one 16:9 viewport (the camera path traverses it instead): "
+            f"{', '.join(qa['fullframe_figure_risk'][:8])}")
+    if qa.get("fullframe_caption_risk"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_caption_risk'])} panel(s) where the overlaid caption "
+            f"may cover panel text: {', '.join(qa['fullframe_caption_risk'][:8])}")
+    if qa.get("fullframe_over_cap"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_over_cap'])} panel(s) below the upscale floor "
+            f"(panel too small to supply a bigger viewport): {', '.join(qa['fullframe_over_cap'][:8])}")
+    if qa.get("fullframe_static"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_static'])} shot(s) with no camera motion possible "
+            f"on the available pixels: {', '.join(qa['fullframe_static'][:8])}")
+    if qa.get("fullframe_reviewer_focal_ignored"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_reviewer_focal_ignored'])} panel(s) where a fixes.json "
+            f"focal overflows every 16:9 viewport: {', '.join(qa['fullframe_reviewer_focal_ignored'][:8])}")
     if plan.get("chapter_cards"):
         from .editor import chapter_cards_to_timestamps as _ts
         log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))
@@ -790,7 +927,14 @@ def _clip_plan(plan: Dict[str, Any], start: float, end: float, fmt: str) -> Dict
             at = float(c.get("at") or 0) - cut_in
             # A card that already arrived before the clip starts is simply there:
             # replaying its entrance would look like a glitch.
-            cards.append({**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"})
+            card = {**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"}
+            if cut_in > 0 and isinstance(c.get("panelfit"), dict):
+                # Panel-fit span slices are phased from the shot's own start:
+                # skipping the head must advance the slice to the span position
+                # the clip actually opens on, or the motion restarts and jumps
+                # at the next seam (B1d F1).
+                card["panelfit"] = panelfit_advance_slice(c["panelfit"], cut_in)
+            cards.append(card)
         # P3: callouts ride on shots with absolute times — shift them into
         # the clip timeline and drop ones outside the clip.
         clip_callouts = [{"t": round(float(c["t"]) - start, 3), "text": c.get("text"),

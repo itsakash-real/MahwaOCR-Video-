@@ -63,18 +63,108 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
         "format": "16:9",           # 16:9 (1920x1080) or 9:16 (1080x1920, Shorts)
         "fps": 30,
-        "mode": "classic",          # classic | wide | adaptive
+        "mode": "classic",          # classic | wide | adaptive | panelfit | fullframe
                                     #   wide: every card full-height, min 6/16 wide
                                     #   adaptive: per shot, a naturally wide/landscape panel gets
                                     #   the wide treatment; a narrower one keeps its classic
                                     #   crop/shape but without the equal-area shrink (no more
                                     #   stale small cards) -- real per-panel variety in one video
+                                    #   panelfit: the MEASURED reference style (see
+                                    #   reference-video-measured-spec.md) -- every panel
+                                    #   shown WHOLE at its native aspect over its own
+                                    #   full-brightness blurred fill, gentle LINEAR
+                                    #   drift or constant-rate zoom-in, wide panels
+                                    #   full-bleed, NO burned captions, NO shake/flash,
+                                    #   split-flap title cards on timeline cues
+                                    #   (see panelfit: below)
+                                    #   fullframe: no cards at all -- every shot is a full-bleed
+                                    #   16:9 camera viewport travelling over the panel
+                                    #   (pan through tall windows, zoom inside wide ones)
         "wide": {
             "min_width_ratio": 0.375,  # 6/16 of the frame wide; no thin slivers, ever
             "max_upscale": 1.5,         # a panel is never upscaled past this (1080p sharpness)
         },
         "adaptive": {
             "wide_threshold": 1.333,   # a panel's own aspect >= this (4:3) earns the wide treatment
+        },
+        "panelfit": {
+            # Every value below is pinned to the MEASURED reference video
+            # (reference-video-measured-spec.md, 85 shots). Where the older
+            # text descriptions disagreed with the measurements, the
+            # measurements won (user arbitration, 2026-10-23).
+            "bg_blur": 50,             # Gaussian radius (px at 1080p) of the cover-scaled,
+                                       # blurred copy of the panel that fills the frame
+            "bg_opacity": 1.0,         # that background layer's opacity over black:
+                                       # 1.0 = FULL brightness, no dimming (measured;
+                                       # the text specs' 50-60% was wrong)
+            "shadow_dy": 20,           # B1e: the foreground's drop shadow — black,
+            "shadow_blur": 10,         # offset (0, +20px), blur 10px, opacity 40%,
+            "shadow_opacity": 0.40,    # layered between backdrop and panel (the
+                                       # backdrop itself stays at full brightness)
+            "fill_aspect": 1.6,        # panel aspect (w/h) at/above this fills the frame
+                                       # full-bleed; narrower panels are height-fit pillars
+            "drift_aspect_max": 0.72,  # pillars narrower than this (w/h) get a gentle
+                                       # vertical drift; wider pillars get a zoom-in
+            "drift_speed": 0.0658,     # drift speed, frame-heights/second — the
+                                       # invariant (B1d F2): 3.7% of frame WIDTH/s
+                                       # at 16:9 ≈ 71 px/s at 1080p (measured band
+                                       # 3.2-4.3% width/s); travel is derived
+            "drift_min_travel": 0.05,  # a drift SPAN's travel floor, share of frame
+                                       # height (measured totals: 5-13%); motion
+                                       # still runs at drift_speed throughout
+            "drift_max_travel": 0.13,  # ... and never more than this share; at the
+                                       # cap the panel HOLDS (never reverses)
+            "drift_headroom": 0.03,    # extra foreground oversize beyond the travel,
+                                       # so a drift never exposes a panel edge
+            "zoom_rate": 0.05,         # zoom-in rate: +5.0%/s (measured band
+                                       # +3.6-6.5%/s) -- a constant RATE, so the total
+                                       # grows with shot length; never a fixed total,
+                                       # never a zoom-out
+            "zoom_rate_impact": 0.088, # impact shots zoom at +8.8%/s instead (measured
+                                       # on the reference's weapon-clash shot). There is
+                                       # NO shake and NO white flash in this mode --
+                                       # the reference uses neither, on any shot.
+            "zoom_out_fast_rate": 0.176, # B1e: zoom-OUT rate for a blast, used
+                                       # ONLY by the per-sentence motion hint
+                                       # "zoom_out_fast" (the user's detonator ->
+                                       # explosion ruling): exactly 2x the impact
+                                       # zoom-in rate. Default routing never zooms
+                                       # out; a hint is the only way in.
+            "zoom_max_total": 0.50,    # total zoom cap: at +50% the scale holds
+                                       # (measured totals top out at +46%)
+            "max_upscale": 2.4,        # the foreground is never upscaled past this
+                                       # (readability floor for small panels)
+            "still_limit": 0.5,        # seconds: nothing on screen may stay still longer
+                                       # while its span still has travel/scale left
+                                       # (motion is continuous by construction; at
+                                       # the measured travel/zoom caps the position
+                                       # holds, as the reference's own zooms hold)
+            "min_shot": 0.3,           # this mode's shot floor (measured reference
+                                       # minimum 0.30s; classic keeps its own 3.0s floor)
+            "split_above": 3.0,        # sentences longer than this split into two
+                                       # shots (the reference's median shot is ~2s)
+            "split_min_piece": 1.2,    # smallest piece such a split may produce
+            "captions": False,         # NO burned-in captions in this mode (measured:
+                                       # the reference carries none -- platform CC only)
+            "title_cards": True,       # Title Card Generator: timeline cues in the
+                                       # narration ("Age 4" / "Week 6") become split-flap
+                                       # cards (see video/titlecards.py)
+            "tts_gap_seconds": 0.11,   # the mode's recommended narration gap. The
+                                       # reference's MEASURED median gap is 0.214s,
+                                       # but a 0.20 setting rendered as 0.296s median
+                                       # (per-sentence TTS edge padding ≈ +0.09s), so
+                                       # 0.11 lands the measured gap at ≈0.20s (B1d F4).
+                                       # The global TTS default stays 0.35; use this
+                                       # value for tts.gap_seconds for this mode.
+        },
+        "fullframe": {
+            "max_upscale": 2.4,        # zoom guardrail: a viewport's source is never smaller
+                                       # than the frame / this (1080/2.4 = a 450px source-height
+                                       # floor at 900px-wide panels); keeps full-bleed upscaling
+                                       # from cratering on deep punch-ins
+            "zoom_depth": 1.18,        # target push_in/pull_out depth when the window has room
+            "pan_travel": 1.0,         # a pan's window holds this many extra viewport lengths
+                                       # of travel beyond one viewport (1.0 = window is 2 viewports)
         },
         "crf": 20,                  # x264 quality: lower = better and bigger
         "preset": "veryfast",
@@ -96,6 +186,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "black_threshold": 13,  # gray below this across a row = near-black gutter
             "trim_v1": False,       # Build 1: gutter-colour blank-row trim + review flags (opt-in)
             "trim_cap": 0.40,       # max share of a panel's height the v1 trim cuts per side
+            "trim_v2": False,       # Rule 6: full ink-bbox trim (white+black, rows+cols) +
+                                    # white-gap slicing, at panel build (opt-in; panelfit prep)
         },
         # Bubble/text detector (Build 4/3 shared step): ogkalu RT-DETR, Apache-2.0.
         # "model": path to the ONNX file ("" = ~/.config/manhwa/models/ or $MANHWA_DETECTOR_MODEL)
@@ -172,6 +264,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # written. These are the bulk of disk use. Set false while iterating.
         "cleanup": True,
     },
+    "recap": {
+        # Narration voice for recap writing ("default", "speedrun" or "powerfantasy").
+        # "default": calm present-tense voice telling a friend why the chapter matters.
+        # "speedrun": Speedrun Gossip voice — breathless past-tense gossip, role
+        #   labels instead of names, chain-of-consequences sentences with So/But/
+        #   only-to pivots, an editorial aside every few sentences. Full spec:
+        #   docs/RECAP_STYLE_SPEEDRUN.md
+        # "powerfantasy": the Power Fantasy system — in-medias-res hook with the
+        #   "This guy is..." formula, lore drop after the flex, "our guy" lexicon,
+        #   hype-man reactions, gamified vocabulary. A range of chapters is
+        #   recapped only once EVERY transcript in the range exists, so the
+        #   writer holds the whole story. Full spec:
+        #   docs/RECAP_STYLE_POWERFANTASY.md
+        "style": "default",
+    },
 }
 
 
@@ -183,8 +290,9 @@ class Config:
     download: Dict[str, Any] = field(default_factory=dict)
     pipeline: Dict[str, Any] = field(default_factory=dict)
     video: Dict[str, Any] = field(default_factory=dict)
-    # Top-level YAML sections this build doesn't know about (e.g. a `recap:`
-    # section from a sibling branch's config). Kept, not dropped, so a config
+    recap: Dict[str, Any] = field(default_factory=dict)
+    # Top-level YAML sections this build doesn't know about (e.g. a section
+    # written by a newer build's config). Kept, not dropped, so a config
     # file shared between checkouts never crashes load_config -- only code
     # that actually reads a given section needs to know about it.
     extra: Dict[str, Any] = field(default_factory=dict)

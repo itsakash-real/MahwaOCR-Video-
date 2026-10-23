@@ -27,6 +27,17 @@ from ..util import atomic_write_text, require_chapter
 TAG = re.compile(r"\{([^{}\n]{1,120})\}")
 PANEL_ID = re.compile(r"^P\d{3}-\d{2}$")
 CUE_WORDS = {"beat", "impact", "reveal"}
+# Per-sentence MOTION overrides for panel-fit mode (B1e): the pairing
+# surface (a sentence's "motion" in cues.json, or a pairs.json entry's
+# "motion") may overrule the planner's aspect routing for ONE sentence,
+# from the user's shot-by-shot rulings — "zoom_out" for a reveal,
+# "zoom_out_fast" for a blast, "duo" for a two-panel moment shown side
+# by side. A sentence's value is either one of these strings (the whole
+# sentence) or a list parallel to its "panels" (one per tagged panel —
+# a sliced strip's segments can take different motions: the detonator
+# zooms in, the explosion zooms out fast). "duo" is whole-sentence
+# only. Unknown values are refused by validate_cues, never ignored.
+MOTION_HINTS = ("default", "zoom_out", "zoom_out_fast", "duo")
 CUE_LINE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 INLINE_CUE = re.compile(r"\[[^\]\n]*\]")
 # P3 editor cues (never spoken; parse() attaches them to the next sentence):
@@ -390,6 +401,27 @@ def validate_cues(data: Any) -> List[str]:
         if emphasis is not None and (not isinstance(emphasis, list)
                                      or not all(isinstance(e, str) for e in emphasis)):
             problems.append(f"{where}: \"emphasis\" must be a list of strings")
+        # B1e: the per-sentence motion override (optional; old cues.json
+        # files omit it). A string applies to the whole sentence; a list
+        # runs parallel to "panels", one entry per tagged panel.
+        motion = s.get("motion")
+        if motion is not None:
+            if isinstance(motion, str):
+                if motion not in MOTION_HINTS:
+                    problems.append(f"{where}: \"motion\" must be one of "
+                                    f"{', '.join(MOTION_HINTS)} (got {motion!r})")
+            elif isinstance(motion, list):
+                if not all(isinstance(m, str) and m in MOTION_HINTS for m in motion):
+                    problems.append(f"{where}: every \"motion\" list entry must be one of "
+                                    f"{', '.join(MOTION_HINTS)}")
+                elif isinstance(panels, list) and len(motion) != len(panels):
+                    problems.append(f"{where}: \"motion\" list has {len(motion)} entries but "
+                                    f"\"panels\" has {len(panels)} — they run in parallel")
+                elif "duo" in motion:
+                    problems.append(f"{where}: \"duo\" is a whole-sentence motion — "
+                                    f"write it as a plain string, not in a list")
+            else:
+                problems.append(f"{where}: \"motion\" must be a string or a list of strings")
         # P3: hook / loop markers (optional; old cues.json files omit them).
         if "hook" in s and not isinstance(s.get("hook"), bool):
             problems.append(f"{where}: \"hook\" must be true or false")

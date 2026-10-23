@@ -110,7 +110,7 @@ def _inset_card(card: Dict[str, Any], frac: float) -> Dict[str, Any]:
     return out
 
 
-def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
+def split_long_shot(shot: Dict[str, Any], max_hold: float | None = None) -> List[Dict[str, Any]]:
     """Split one >8s shot into <=8s pieces with a punch-in crop change per piece.
 
     Pure geometry: no image access. Every piece keeps the same panels, sentence
@@ -119,15 +119,19 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
     under PACING_MAX_HOLD, shots with no cards, and shots with no crops are
     returned unchanged. Piece ids are suffixed -a/-b/...; the first piece keeps
     the original id when there is only one piece (i.e. no split happened).
+
+    `max_hold` overrides the split threshold (panel-fit mode passes its own
+    3.5s sentence-split rule); None keeps the classic PACING_MAX_HOLD.
     """
+    limit = PACING_MAX_HOLD if max_hold is None else float(max_hold)
     try:
         dur = float(shot["end"]) - float(shot["start"])
     except (KeyError, TypeError, ValueError):
         return [shot]
     cards = shot.get("cards") or []
-    if dur <= PACING_MAX_HOLD or not cards:
+    if dur <= limit or not cards:
         return [shot]
-    n = max(2, int(-(-dur // PACING_MAX_HOLD)))  # ceil -> every piece in (4, 8]s
+    n = max(2, int(-(-dur // limit)))  # ceil -> every piece <= limit
     piece = dur / n
     prev_motions = [c.get("motion") for c in cards]  # motion of the previous piece, per card
     out: List[Dict[str, Any]] = []
@@ -177,12 +181,12 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def split_long_shots(shots: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], int]:
+def split_long_shots(shots: List[Dict[str, Any]], max_hold: float | None = None) -> tuple[List[Dict[str, Any]], int]:
     """Split every over-long shot. Returns (new shots, number of shots split)."""
     out: List[Dict[str, Any]] = []
     split = 0
     for s in shots:
-        parts = split_long_shot(s)
+        parts = split_long_shot(s, max_hold=max_hold)
         if len(parts) > 1:
             split += 1
         out.extend(parts)

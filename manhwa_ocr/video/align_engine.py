@@ -162,6 +162,10 @@ def align_sentences(sentences: List[Dict[str, Any]], panels: List[Dict[str, Any]
         seg: Dict[str, Any] = {
             "sentence": n, "text": text, "narration_type": ntype, "type_reason": reason,
             "tagged_panels": tagged,
+            # B1e: the sentence's motion override rides along (a string,
+            # or a list parallel to the tagged panels); the planner
+            # resolves it per shown panel.
+            "motion": s.get("motion"),
         }
 
         if s.get("same") or ntype in {"INTERNAL", "PURE_AUDIO"}:
