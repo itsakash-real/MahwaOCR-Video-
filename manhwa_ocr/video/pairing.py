@@ -205,7 +205,15 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
     """Sheets + pairs.json (current tags) + PAIRING.md, the instructions."""
     cue_data, _ = _need(root, chapter)
     sheets = write_sheets(root, chapter, log=log)
-    pairs: Dict[str, Any] = {str(n): s.get("panels") or [] for n, s in enumerate(cue_data["sentences"], start=1)}
+
+    def _entry(s: Dict[str, Any]) -> Any:
+        # A sentence carrying a motion override (B1e) is written in the
+        # object form so the field survives the pair round-trip.
+        if s.get("motion") is not None:
+            return {"panels": s.get("panels") or [], "motion": s["motion"]}
+        return s.get("panels") or []
+
+    pairs: Dict[str, Any] = {str(n): _entry(s) for n, s in enumerate(cue_data["sentences"], start=1)}
     grouped = grouped_tags(root, chapter)
     if grouped:
         # Suggestions only: apply ignores keys starting with "_". Copy a "move" into the numbered entries to use it.
@@ -236,6 +244,14 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
         "",
         f"Edit `{pairs_path(root, chapter).as_posix()}`: sentence number -> list of panel ids, e.g.",
         '`"12": ["P006-02"]` or `"13": ["P006-03", "P006-04"]`. Leave sentences that are right as they are.',
+        "",
+        "## Motion (optional, panel-fit mode only)",
+        "",
+        "An entry may instead be an object carrying a per-sentence motion override:",
+        '`"12": {"panels": ["P006-02"], "motion": "zoom_out"}`. Values: `default`, `zoom_out` (a reveal),',
+        "`zoom_out_fast` (a blast), `duo` (the sentence's two panels shown side by side). Or a list parallel",
+        'to the panels — `"13": {"panels": ["P006-03", "P006-04"], "motion": ["default", "zoom_out_fast"]}`',
+        "gives each tagged panel its own motion. Leave it off unless the shot needs it.",
         "",
         f"Then:  python -m manhwa_ocr video pair --chapter {chapter} --apply{sess}",
         f"then:  python -m manhwa_ocr video align --chapter {chapter}{sess}",
@@ -302,18 +318,40 @@ def autofix(root: Path, chapter: str, log=print) -> int:
     return changed
 
 
+def _motion_problems(n: int, motion: Any, panel_count: int) -> List[str]:
+    """Problems with one pairs entry's "motion" (B1e): the same rules
+    cues.validate_cues applies to a cues.json sentence's field."""
+    hints = ", ".join(cues_mod.MOTION_HINTS)
+    if isinstance(motion, str):
+        return [] if motion in cues_mod.MOTION_HINTS else \
+            [f"sentence {n}: \"motion\" must be one of {hints} (got {motion!r})"]
+    if isinstance(motion, list):
+        if not all(isinstance(m, str) and m in cues_mod.MOTION_HINTS for m in motion):
+            return [f"sentence {n}: every \"motion\" entry must be one of {hints}"]
+        if len(motion) != panel_count:
+            return [f"sentence {n}: \"motion\" list has {len(motion)} entries but the "
+                    f"sentence tags {panel_count} panel(s) — they run in parallel"]
+        if "duo" in motion:
+            return [f"sentence {n}: \"duo\" is a whole-sentence motion — write it as a "
+                    f"plain string, not in a list"]
+        return []
+    return [f"sentence {n}: \"motion\" must be a string or a list of strings"]
+
+
 def validate_pairs(pairs: Any, sentence_count: int, by_id: Dict[str, Any]) -> List[str]:
     """Line-level problems in a pairs.json document (P0 safety lock).
 
     Keys starting with "_" are notes (_suggestions, _comment) and are
-    ignored. Returns [] when every numbered entry is usable. Every
-    problem names the sentence number and the exact ids, so a reviewer
-    can fix the file without guessing.
+    ignored. An entry is a list of panel ids, or — to carry the
+    per-sentence motion override (B1e) — an object
+    {"panels": [...], "motion": ...}. Returns [] when every numbered
+    entry is usable. Every problem names the sentence number and the
+    exact ids, so a reviewer can fix the file without guessing.
     """
     errors: List[str] = []
     if not isinstance(pairs, dict):
         return ["pairs.json must be an object: sentence number -> list of panel ids"]
-    for key, ids in pairs.items():
+    for key, entry in pairs.items():
         if str(key).startswith("_"):
             continue
         try:
@@ -324,6 +362,17 @@ def validate_pairs(pairs: Any, sentence_count: int, by_id: Dict[str, Any]) -> Li
         if not 1 <= n <= sentence_count:
             errors.append(f"sentence {n} doesn't exist (there are {sentence_count})")
             continue
+        ids, motion = entry, None
+        if isinstance(entry, dict):
+            extra = set(entry) - {"panels", "motion"}
+            if extra:
+                errors.append(f"sentence {n}: unknown keys {sorted(extra)} — an entry is a list "
+                              f"of panel ids, or {{\"panels\": [...], \"motion\": ...}}")
+                continue
+            if "panels" not in entry:
+                errors.append(f"sentence {n}: the object form needs \"panels\"")
+                continue
+            ids, motion = entry.get("panels"), entry.get("motion")
         ids = [ids] if isinstance(ids, str) else ids
         if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
             errors.append(f"sentence {n}: give a list of panel ids")
@@ -338,6 +387,9 @@ def validate_pairs(pairs: Any, sentence_count: int, by_id: Dict[str, Any]) -> Li
             continue
         if len(set(ids)) != len(ids):
             errors.append(f"sentence {n}: duplicate panel ids in {ids}")
+            continue
+        if motion is not None:
+            errors.extend(_motion_problems(n, motion, len(ids)))
     return errors
 
 
@@ -356,12 +408,28 @@ def apply(root: Path, chapter: str, log=print) -> int:
     errors = validate_pairs(pairs, len(sentences), by_id)
     changed = 0
     if not errors:
-        for key, ids in pairs.items():
+        for key, entry in pairs.items():
             n = int(key)
+            # The object form carries the sentence's motion override
+            # (B1e); the plain list form clears any motion it had.
+            if isinstance(entry, dict):
+                ids = entry.get("panels")
+                has_motion, motion = "motion" in entry, entry.get("motion")
+            else:
+                ids, has_motion, motion = entry, True, None
             ids = [ids] if isinstance(ids, str) else ids
-            if sentences[n - 1].get("panels") != ids:
-                sentences[n - 1]["panels"] = ids
+            s = sentences[n - 1]
+            if s.get("panels") != ids:
+                s["panels"] = ids
                 changed += 1
+            if has_motion:
+                if motion is None:
+                    if "motion" in s:
+                        del s["motion"]
+                        changed += 1
+                elif s.get("motion") != motion:
+                    s["motion"] = motion
+                    changed += 1
     if errors:
         raise UserError("pairs.json has problems, nothing was changed:\n  " + "\n  ".join(errors[:12]))
     tagged = sum(1 for s in sentences if s.get("panels"))

@@ -122,6 +122,16 @@ def _nearest_art(panels: List[Dict[str, Any]], index: int, avoid: set, reach: in
 MIN_PIECE = 1.8   # a panel inside a multi-panel sentence stays at least this long
 
 
+def _motion_for(motion: Any, k: int) -> Any:
+    """The motion override (B1e) for the k-th panel a sentence shows: a
+    string applies to the whole sentence; a list runs parallel to the
+    sentence's tagged panels, so k indexes the shown sequence (which
+    the alignment builds from those tags, in order)."""
+    if isinstance(motion, list):
+        return motion[k] if k < len(motion) else None
+    return motion
+
+
 def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], duration: float,
                  vcfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Panel by panel: every sentence shows the panels it is tagged with, in order.
@@ -150,6 +160,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             if unit["sentence"] and unit["sentence"] != u["sentence"]:
                 u["sentence"] = " ".join(x for x in (u["sentence"], unit["sentence"]) if x)
             u["sentence_starts"] += unit["sentence_starts"]
+            if u.get("motion") is None and unit.get("motion") is not None:
+                u["motion"] = unit["motion"]
             return
         units.append(unit)
 
@@ -165,6 +177,18 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             if p and p not in ids:
                 ids.append(p)
         ids = ids or current
+        motion = s.get("motion")
+        if motion == "duo" and len(ids) == 2:
+            # B1e E3: a duo sentence shows BOTH panels at once for its
+            # whole window — one unit, two panels, never split into
+            # sequential stretches.
+            add({"start": start, "end": end, "panels": list(ids),
+                 "cues": list(s.get("cues") or []),
+                 "emphasis": [e for e in (s.get("emphasis") or []) if start <= e < end],
+                 "sentence": s.get("text"), "sentence_starts": [float(s["start"])],
+                 "motion": "duo"})
+            current = ids[-1:]
+            continue
         # Each tagged panel gets its own stretch of the sentence, as long as
         # every stretch is long enough to take in.
         fits = max(1, min(len(ids), int((end - start) // MIN_PIECE)))
@@ -176,7 +200,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             add({"start": a, "end": b, "panels": [pid],
                  "cues": list(s.get("cues") or []) if k == 0 else [],
                  "emphasis": [e for e in (s.get("emphasis") or []) if a <= e < b],
-                 "sentence": s.get("text"), "sentence_starts": [float(s["start"]) if k == 0 else a]})
+                 "sentence": s.get("text"), "sentence_starts": [float(s["start"]) if k == 0 else a],
+                 "motion": _motion_for(motion, k)})
         current = ids[-1:]
     if not units:
         return even_units(panels, duration, vcfg)
@@ -188,6 +213,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
         nxt["emphasis"] = first["emphasis"] + nxt["emphasis"]
         nxt["sentence"] = " ".join(x for x in (first["sentence"], nxt["sentence"]) if x)
         nxt["sentence_starts"] = first["sentence_starts"] + nxt["sentence_starts"]
+        if nxt.get("motion") is None and first.get("motion") is not None:
+            nxt["motion"] = first["motion"]
     units[0]["start"] = 0.0
     units[-1]["end"] = duration
     return units
@@ -217,6 +244,8 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             if unit["sentence"] and unit["sentence"] != u["sentence"]:
                 u["sentence"] = " ".join(x for x in (u["sentence"], unit["sentence"]) if x)
             u["sentence_starts"] += unit["sentence_starts"]
+            if u.get("motion") is None and unit.get("motion") is not None:
+                u["motion"] = unit["motion"]
             return
         units.append(unit)
 
@@ -240,6 +269,13 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if not seq:
             continue  # nothing has ever been shown yet; nothing to hold either
         start, end = float(seg["start"]), float(seg["end"])
+        motion = seg.get("motion")
+        if motion == "duo" and len(seq) == 2:
+            # B1e E3: both panels at once for the whole sentence — one
+            # two-panel unit, never split by the sequence shares.
+            add({"start": start, "end": end, "panels": list(seq), "cues": [], "emphasis": [],
+                 "sentence": seg.get("text"), "sentence_starts": [start], "motion": "duo"})
+            continue
         # Split on the shares place_impactful() recorded (tagged ~65% +
         # filler ~35% for a long sentence), NOT evenly: an even split
         # would give the filler half the window and break tagged coverage.
@@ -254,7 +290,8 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             cursor_t = b
             add({"start": a, "end": b, "panels": [pid], "cues": [], "emphasis": [],
                  "sentence": seg.get("text") if k == 0 else None,
-                 "sentence_starts": [start] if k == 0 else [a]})
+                 "sentence_starts": [start] if k == 0 else [a],
+                 "motion": _motion_for(motion, k)})
     if units:
         units[0]["start"] = 0.0
     return units
@@ -297,7 +334,15 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     groups: List[List[Dict[str, Any]]] = []
     i = 0
     while i < len(units):
-        if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units):
+        # A multi-panel unit (a B1e duo) never groups with a neighbour:
+        # the pair construction below keeps exactly one panel per unit,
+        # and a duo's two panels must stay together in their own shot.
+        # A unit carrying a motion hint never groups either: its beats
+        # were sequenced deliberately by the pairing surface, and a
+        # grouped pair would show them simultaneously instead.
+        if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units) \
+                and len(units[i]["panels"]) == 1 and len(units[i + 1]["panels"]) == 1 \
+                and units[i].get("motion") is None and units[i + 1].get("motion") is None:
             groups.append([units[i], units[i + 1]])
             i += 2
         else:
@@ -307,7 +352,8 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     # A lone short tail after a pair sometimes fits better as that pair's
     # second card (its first panel becomes the short one): slide the last
     # three units while that lowers the total shortfall.
-    while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2:
+    while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2 \
+            and all(len(u["panels"]) == 1 for g in (groups[-2], groups[-1]) for u in g):
         x, y = groups[-2]
         z = groups[-1][0]
         now = max(0.0, floor - span(groups[-2])) + max(0.0, floor - span(groups[-1]))
@@ -366,11 +412,14 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
             continue
         pairs += 1
         a, c = g
-        shots.append({"start": start, "end": end, "panels": [a["panels"][0], c["panels"][0]],
-                      "cues": a["cues"] + c["cues"], "emphasis": a["emphasis"] + c["emphasis"],
-                      "sentence": " ".join(x for x in (a.get("sentence"), c.get("sentence")) if x) or None,
-                      "sentence_starts": a["sentence_starts"] + c["sentence_starts"],
-                      "second_at": c["start"] - a["start"]})
+        merged = {"start": start, "end": end, "panels": [a["panels"][0], c["panels"][0]],
+                  "cues": a["cues"] + c["cues"], "emphasis": a["emphasis"] + c["emphasis"],
+                  "sentence": " ".join(x for x in (a.get("sentence"), c.get("sentence")) if x) or None,
+                  "sentence_starts": a["sentence_starts"] + c["sentence_starts"],
+                  "second_at": c["start"] - a["start"]}
+        if isinstance(a.get("motion"), str):
+            merged["motion"] = a["motion"]   # the pair keeps its first unit's hint (B1e)
+        shots.append(merged)
     shots[0]["start"] = 0.0
     shots[-1]["end"] = units[-1]["end"]
     stats = {"min_hold": min_hold, "shots": len(shots), "pairs": pairs,
@@ -961,6 +1010,10 @@ class _Designer:
         }
         if self.vcfg.get("grade") == "subtle":
             shot["grade"] = "subtle"  # CapCut grade, off by default (video.grade)
+        if isinstance(unit.get("motion"), str):
+            # B1e: the sentence's motion override rides to the panelfit
+            # pass (other modes ignore the key).
+            shot["motion_hint"] = unit["motion"]
         self._prev_shot = shot
         if bg_panel:
             shot["bg_panel"] = bg_panel
@@ -997,6 +1050,7 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
             solo_cues = set(u.get("cues") or []) | set(v.get("cues") or [])
             same_sentence = (u.get("sentence") or "") == (v.get("sentence") or "") and bool(u.get("sentence"))
             if (long_enough and len(u["panels"]) == 1 and len(v["panels"]) == 1
+                    and u.get("motion") is None and v.get("motion") is None
                     and u["panels"][0] != v["panels"][0] and not wide(a) and not wide(b)
                     and story_close and (same_sentence or not (solo_cues & {"impact", "reveal"}))
                     and (2.8 <= (v["end"] - u["start"]) <= MAX_PAIR_SHOT)

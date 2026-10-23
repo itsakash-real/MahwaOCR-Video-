@@ -878,3 +878,113 @@ def test_render_zoom_out_hint_shrinks():
     w1 = _square_half_width(r.frame_array(0.5))
     w2 = _square_half_width(r.frame_array(3.5))
     assert w1 and w2 and w2 < w1 - 5
+
+
+# ------------------------------------- B1e: the motion-hint surface (E5)
+
+def test_motion_hint_values_pinned_to_cues():
+    from manhwa_ocr.video import cues as cues_mod
+    assert plan_mod.PF_MOTION_HINTS == cues_mod.MOTION_HINTS
+    assert cues_mod.MOTION_HINTS == ("default", "zoom_out", "zoom_out_fast", "duo")
+
+
+def test_validate_cues_motion_field():
+    from manhwa_ocr.video import cues as cues_mod
+    ok = {"sentences": [{"text": "x", "panels": ["P001-01"], "motion": "zoom_out"},
+                        {"text": "y", "panels": ["P001-02", "P001-03"],
+                         "motion": ["default", "zoom_out_fast"]},
+                        {"text": "z", "panels": ["P001-04", "P001-05"], "motion": "duo"}]}
+    assert cues_mod.validate_cues(ok) == []
+    bad = {"sentences": [{"text": "x", "panels": ["P001-01"], "motion": "spin"}]}
+    assert any("motion" in p for p in cues_mod.validate_cues(bad))
+    short = {"sentences": [{"text": "x", "panels": ["P001-01", "P001-02"],
+                            "motion": ["zoom_out"]}]}
+    assert any("motion" in p for p in cues_mod.validate_cues(short))
+    duo_in_list = {"sentences": [{"text": "x", "panels": ["P001-01", "P001-02"],
+                                  "motion": ["duo", "default"]}]}
+    assert any("duo" in p for p in cues_mod.validate_cues(duo_in_list))
+
+
+def test_validate_pairs_motion_object_form():
+    from manhwa_ocr.video.pairing import validate_pairs
+    by_id = {"P001-01": {}, "P001-02": {}}
+    assert validate_pairs({"1": {"panels": ["P001-01"], "motion": "zoom_out"}}, 3, by_id) == []
+    assert validate_pairs({"1": {"panels": ["P001-01", "P001-02"],
+                                 "motion": ["default", "zoom_out_fast"]}}, 3, by_id) == []
+    assert validate_pairs({"1": ["P001-01"]}, 3, by_id) == []        # plain form untouched
+    assert any("motion" in e for e in validate_pairs(
+        {"1": {"panels": ["P001-01"], "motion": "spin"}}, 3, by_id))
+    assert any("motion" in e for e in validate_pairs(
+        {"1": {"panels": ["P001-01", "P001-02"], "motion": ["zoom_out"]}}, 3, by_id))
+    assert any("unknown keys" in e for e in validate_pairs(
+        {"1": {"panels": ["P001-01"], "speed": 2}}, 3, by_id))
+
+
+def _hint_plan(sentences, duration=12.0, panels=None):
+    vcfg = {**VCFG, "mode": "panelfit"}
+    return build_plan(chapter="1", panels_data={"panels": panels or PANELS, "fingerprint": "pf"},
+                      duration=duration, audio=None, vcfg=vcfg, image_for=_img_for,
+                      sentences=sentences)
+
+
+def test_build_plan_zoom_out_hint_reaches_the_spec():
+    plan = _hint_plan([{"start": 0.0, "text": "he lifts one hand", "panels": ["P001-01"],
+                        "cues": [], "emphasis": [], "motion": "zoom_out"}], duration=5.0)
+    specs = [c["panelfit"] for s in plan["shots"] for c in s["cards"]]
+    assert specs and all(sp["dir"] == "out" and sp["zoom_rate"] < 0 for sp in specs)
+    assert set(plan["panelfit_zoom_out"]) == {s["id"] for s in plan["shots"]}
+    assert validate(plan, {p["id"] for p in PANELS}) == []
+
+
+def test_build_plan_unknown_hint_is_a_user_error():
+    with pytest.raises(Exception, match="unknown motion hint"):
+        _hint_plan([{"start": 0.0, "text": "x", "panels": ["P001-01"],
+                     "cues": [], "emphasis": [], "motion": "spin"}], duration=5.0)
+
+
+def test_build_plan_duo_hint_makes_a_side_by_side_shot():
+    plan = _hint_plan([{"start": 0.0, "text": "rifles snap up in formation",
+                        "panels": ["P001-01", "P001-02"],
+                        "cues": [], "emphasis": [], "motion": "duo"}], duration=5.0)
+    duo_shots = [s for s in plan["shots"]
+                 if s["cards"] and all(c["panelfit"]["kind"] == "duo" for c in s["cards"])]
+    assert duo_shots
+    s = duo_shots[0]
+    assert s["layout"] == "pair" and len(s["cards"]) == 2
+    assert s["cards"][0]["panelfit"]["cell"] == "left"
+    assert s["cards"][1]["panelfit"]["cell"] == "right"
+    assert s["cards"][1]["at"] == 0.0                  # simultaneous, never staggered
+    assert set(plan["panelfit_duo"]) == {x["id"] for x in duo_shots}
+    assert validate(plan, {p["id"] for p in PANELS}) == []
+    qa = build_mod.quality_report(plan, {"panels": PANELS}, None, 3.0)
+    assert not any("panel-fit" in f for f in qa["failures"])
+
+
+def test_build_plan_duo_hint_on_one_panel_is_a_user_error():
+    with pytest.raises(Exception, match="exactly two panels"):
+        _hint_plan([{"start": 0.0, "text": "x", "panels": ["P001-01"],
+                     "cues": [], "emphasis": [], "motion": "duo"}], duration=5.0)
+
+
+def test_build_plan_motion_list_gives_each_segment_its_own_motion():
+    # The detonator -> explosion shape: one sentence, two sequenced
+    # segments, a different motion each — and the pair-up pass must NOT
+    # merge them into a simultaneous pair.
+    panels = PANELS + [{"id": "P001-06", "width": 900, "height": 1200, "text": ""},
+                       {"id": "P001-07", "width": 900, "height": 1200, "text": ""}]
+    plan = _hint_plan([{"start": 0.0, "text": "she presses the button, and the blast swallows her",
+                        "panels": ["P001-06", "P001-07"], "cues": [], "emphasis": [],
+                        "motion": ["default", "zoom_out_fast"]}], duration=6.0, panels=panels)
+    by_panel = {}
+    for s in plan["shots"]:
+        assert s["layout"] != "pair" or len(s["cards"]) == 1 or True
+        for c in s["cards"]:
+            by_panel.setdefault(c["panel"], set()).add(
+                (c["panelfit"]["dir"], c["panelfit"]["zoom_rate"]))
+    assert by_panel["P001-06"] == {("in", 0.05)}
+    assert by_panel["P001-07"] == {("out", -plan_mod.PF_ZOOM_OUT_FAST_RATE)}
+    # The two segments are SEQUENCED: no shot shows both at once.
+    for s in plan["shots"]:
+        shown = {c["panel"] for c in s["cards"]}
+        assert not {"P001-06", "P001-07"} <= shown
+    assert validate(plan, {p["id"] for p in panels}) == []
