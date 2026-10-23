@@ -149,12 +149,20 @@ python -m manhwa_ocr prepare --next        # or --chapter N, or --folder ./image
 
 That downloads, slices, and writes `<session>/chN/TASK.md`. Read that file. It
 contains the tile list, the exact prompt to apply, and where to write results.
+Chapters are auto-sharded (`TASK_1.md`...`TASK_K.md`, sized from
+`pipeline.agent_shard_tiles`): run the shard tasks **in parallel** (sub-agents,
+up to the cap the index names) — each writes its own
+`tile_results_shard_K.json` and rewrites it after every tile it reads, so an
+interrupted worker loses at most one tile and finished shards are never redone.
 Then, for that chapter:
 
-1. Read the tile images (batch a few at a time) and write `chN/tile_results.json`.
+1. Read the tile images (batch a few at a time) and write the shard results
+   files (or `chN/tile_results.json` on a single-shard chapter).
 2. `python -m manhwa_ocr assemble --chapter N` → writes `ASSEMBLE.md`.
 3. Answer that prompt into `chN/assembled.json`.
-4. `python -m manhwa_ocr finalize --chapter N` → writes the chapter, updates memory.
+4. `python -m manhwa_ocr finalize --chapter N` → writes the chapter, updates
+   memory, and prints the per-chapter timing report
+   (`.work/timing/chapter_N.json`).
 
 Then run `status` again and repeat for the next pending chapter. Process **in
 order** so series memory accumulates correctly.
