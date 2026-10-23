@@ -235,9 +235,42 @@ deterministic (same inputs → identical JSON).
 | `grade` | `null` (off) | `"subtle"` = contrast +5%, saturation +5% |
 | `beats` | `null` (off) | Beat times (seconds) to snap cuts to, ±0.15s; or `music/beats.json` |
 | `crop.full_width` | `true` | Cards keep full width, slide vertical window |
+| `mode: fullframe` | off | No cards/backdrop: every shot is a full-bleed 16:9 camera viewport (pan/zoom through the panel); see "Full-frame mode" below |
+| `fullframe.max_upscale` | 2.4 | Viewport source floor = frame / this (800×450 px at 1080p); zoom depth caps at the floor |
+| `fullframe.zoom_depth` | 1.18 | Target push_in/pull_out depth inside the window |
+| `fullframe.pan_travel` | 1.0 | Pan window = viewport × (1 + this) along the pan axis |
 | `whisper_model` | `base.en` | Use `small` for Hindi narration |
 | `require_review` | `false` | If true, render refuses unless plan approved |
 | `sync.gate_wrong` / `gate_window` / `gate_grace` | 0.05 / 0.25 / 0.2 | Sync-gate thresholds (plus: any shot <3s fails, any sentence under its tagged-coverage threshold fails, any filler failing the impact test counts as wrong-picture) |
+
+## Full-frame mode (`video.mode: fullframe`)
+
+No cards, no backdrop, no borders: every shot fills the 1920×1080 frame with a
+16:9 camera viewport that pans or zooms through the panel. The planner still
+solves each shot's crop exactly as in the other modes (focals, `fixes.json`
+crops, bubble avoidance all apply); the crop then becomes the *window* and each
+card gains a `viewport` — `{window, from, to}` in panel fractions — whose start
+and end rectangles are exactly 16:9 and inside the window. Tall windows pan
+vertically, wide windows pan horizontally, tight windows zoom
+(`push_in`/`pull_out`), and a window that is already 16:9 holds. Pairs show
+their two panels as sequential full-frame views with a hard cut at the second
+panel's `at`. Captions overlay the art's bottom band (no caption bar), and the
+storyboard draws each shot's start and end viewport frames side by side.
+
+Every style parameter is a named constant, not a convention: the knobs live in
+`video.fullframe.*` (defaults in `config.py`, mirrored by the `FF_*` constants
+in `video/plan.py` — a test fails if the two drift apart). `max_upscale` is the
+zoom guardrail: the smallest viewport a shot may use is the frame divided by
+it (800×450 source px at 1080p by default), and zoom depth is capped so a
+viewport never sources from less. The invariants are enforced, not hoped for:
+`plan.validate()` rejects a plan whose viewports leave their window, and the
+build QA gate fails any full-frame card whose viewport is not exactly 16:9 —
+a plan that drifted back toward card-style output cannot reach render. The
+plan records `fullframe_caption_risk`, `fullframe_figure_risk`,
+`fullframe_reviewer_focal_ignored`, `fullframe_over_cap` and
+`fullframe_static` shot-id lists in the QA file for review. Timing, panels and
+the sync audit are untouched by the mode: a full-frame plan has exactly the
+classic plan's shot skeleton.
 
 ## `fixes.json` overrides (all in one file, `video/chapter_N.fixes.json`)
 

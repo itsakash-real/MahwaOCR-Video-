@@ -1,7 +1,10 @@
 """Storyboard and review task, so an agent (or you) can check a plan before rendering.
 
 The storyboard draws each shot's middle frame with the same renderer the video
-uses, labelled with its time, panel id and the sentence being spoken. A vision
+uses, labelled with its time, panel id and the sentence being spoken. A
+full-frame-mode shot (video.mode: fullframe) draws its START and END viewports
+side by side instead -- those are the two frames that define its camera path,
+and the pair a reviewer has to judge. A vision
 agent can look at it and spot "the narration says the sword breaks but the
 panel shows a forest", then fix that one shot in the plan.
 """
@@ -72,10 +75,18 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
                         while len(cache) > 32:
                             cache.popitem(last=False)
                     images[pid] = cache[pid]
-                # 85% through: entrances done and a pair's second card has arrived.
-                when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))
-                frame = ShotRenderer(shot, images, fmt, {"punch": False, "shake": False, "flash": False}).frame(when)
-                sheet.paste(frame.resize((thumb_w, thumb_h)), (x, y))
+                renderer = ShotRenderer(shot, images, fmt, {"punch": False, "shake": False, "flash": False})
+                if shot.get("fullframe"):
+                    span = float(shot["end"]) - float(shot["start"])
+                    half = (thumb_w - 4) // 2
+                    for k, frac in enumerate((0.04, 0.96)):
+                        fr = renderer.frame(float(shot["start"]) + frac * span)
+                        sheet.paste(fr.resize((half, thumb_h)), (x + k * (half + 4), y))
+                    draw.line((x + half + 1, y, x + half + 1, y + thumb_h), fill=(90, 90, 90), width=2)
+                else:
+                    # 85% through: entrances done and a pair's second card has arrived.
+                    when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))
+                    sheet.paste(renderer.frame(when).resize((thumb_w, thumb_h)), (x, y))
                 wordy = [pid for pid in dict.fromkeys(ids) if panels[pid].get("text_only")]
                 if wordy:
                     # Hand-picked bubble/lettering/credits panels: flag them for the reviewer.
