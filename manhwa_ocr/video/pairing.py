@@ -214,6 +214,15 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
         return s.get("panels") or []
 
     pairs: Dict[str, Any] = {str(n): _entry(s) for n, s in enumerate(cue_data["sentences"], start=1)}
+    # B1f: the chapter's landmark slice hints ride along as a note key
+    # (like _suggestions) so the editor can adjust them in the same
+    # file; unlike _suggestions, --apply DOES write this one back into
+    # cues.json (see apply()).
+    from .cues import slice_hints_of
+
+    _slice_hints = slice_hints_of(cue_data)
+    if _slice_hints:
+        pairs["_slice_hints"] = _slice_hints
     grouped = grouped_tags(root, chapter)
     if grouped:
         # Suggestions only: apply ignores keys starting with "_". Copy a "move" into the numbered entries to use it.
@@ -248,10 +257,21 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
         "## Motion (optional, panel-fit mode only)",
         "",
         "An entry may instead be an object carrying a per-sentence motion override:",
-        '`"12": {"panels": ["P006-02"], "motion": "zoom_out"}`. Values: `default`, `zoom_out` (a reveal),',
+        '`"12": {"panels": ["P006-02"], "motion": "zoom_out"}`. Values: `default`, `zoom_in` (a push-in',
+        "at the standard rate, even on a panel that would normally drift), `zoom_out` (a reveal),",
         "`zoom_out_fast` (a blast), `duo` (the sentence's two panels shown side by side). Or a list parallel",
         'to the panels — `"13": {"panels": ["P006-03", "P006-04"], "motion": ["default", "zoom_out_fast"]}`',
         "gives each tagged panel its own motion. Leave it off unless the shot needs it.",
+        "",
+        "## Slice hints (optional, panel-fit mode only)",
+        "",
+        "A panel whose real cut is a landmark — a diagonal band, a continuous piece of art, a separator",
+        "thinner than a gutter — can be cut by hand with a top-level `\"_slice_hints\"` entry in pairs.json:",
+        '``"_slice_hints": {"P006-02": {"slice": [0.52], "discard": [[0.0, 0.06]]}}``. `slice` lists cut',
+        "positions as fractions of the panel's height (the panel becomes independent sub-panels there,",
+        "shown in story order as P006-02#a, #b, ...); `discard` lists [start, end] fraction bands removed",
+        "entirely. `--apply` writes `_slice_hints` into cues.json, where the planner reads it. Leave it",
+        "off unless a panel needs it.",
         "",
         f"Then:  python -m manhwa_ocr video pair --chapter {chapter} --apply{sess}",
         f"then:  python -m manhwa_ocr video align --chapter {chapter}{sess}",
@@ -342,7 +362,9 @@ def validate_pairs(pairs: Any, sentence_count: int, by_id: Dict[str, Any]) -> Li
     """Line-level problems in a pairs.json document (P0 safety lock).
 
     Keys starting with "_" are notes (_suggestions, _comment) and are
-    ignored. An entry is a list of panel ids, or — to carry the
+    ignored — except "_slice_hints" (B1f), the one note key --apply
+    acts on, which is validated here (format + panel existence). An
+    entry is a list of panel ids, or — to carry the
     per-sentence motion override (B1e) — an object
     {"panels": [...], "motion": ...}. Returns [] when every numbered
     entry is usable. Every problem names the sentence number and the
@@ -353,6 +375,18 @@ def validate_pairs(pairs: Any, sentence_count: int, by_id: Dict[str, Any]) -> Li
         return ["pairs.json must be an object: sentence number -> list of panel ids"]
     for key, entry in pairs.items():
         if str(key).startswith("_"):
+            if str(key) == "_slice_hints" and entry is not None:
+                # B1f: the one note key --apply acts on, so it is
+                # validated like the rest of the file (other "_" keys
+                # stay pure notes). Panel existence is checked against
+                # by_id here because the hints key panels, not sentences.
+                from .slicehints import parse_slice_hints
+
+                _hints, _problems = parse_slice_hints(entry)
+                errors.extend(f"_slice_hints: {p}" for p in _problems)
+                if isinstance(entry, dict):
+                    errors.extend(f"_slice_hints: {pid} doesn't exist"
+                                  for pid in entry if pid not in by_id)
             continue
         try:
             n = int(key)
@@ -402,12 +436,29 @@ def apply(root: Path, chapter: str, log=print) -> int:
     pairs = read_agent_json(path, "pairs.json")
     if not isinstance(pairs, dict):
         raise UserError(f"{path} must be an object: sentence number -> list of panel ids.")
+    # B1f: "_slice_hints" is extracted BEFORE the note keys are stripped
+    # — it is the one "_" key --apply acts on (it lands in cues.json,
+    # next to the motion hints it was modelled on). The raw document
+    # (notes included) is what validate_pairs checks.
+    raw_pairs = pairs
+    slice_hints_raw = raw_pairs.get("_slice_hints")
     pairs = {k: v for k, v in pairs.items() if not str(k).startswith("_")}      # _suggestions, _comment: notes only
     by_id = {p["id"]: p for p in panels["panels"]}
     sentences = cue_data["sentences"]
-    errors = validate_pairs(pairs, len(sentences), by_id)
+    errors = validate_pairs(raw_pairs, len(sentences), by_id)
     changed = 0
     if not errors:
+        if slice_hints_raw is not None:
+            from .slicehints import parse_slice_hints
+
+            new_hints, _ = parse_slice_hints(slice_hints_raw)
+            if new_hints:
+                if cue_data.get("slice_hints") != new_hints:
+                    cue_data["slice_hints"] = new_hints
+                    changed += 1
+            elif "slice_hints" in cue_data:
+                del cue_data["slice_hints"]
+                changed += 1
         for key, entry in pairs.items():
             n = int(key)
             # The object form carries the sentence's motion override

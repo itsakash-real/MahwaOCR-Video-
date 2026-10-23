@@ -885,7 +885,9 @@ def test_render_zoom_out_hint_shrinks():
 def test_motion_hint_values_pinned_to_cues():
     from manhwa_ocr.video import cues as cues_mod
     assert plan_mod.PF_MOTION_HINTS == cues_mod.MOTION_HINTS
-    assert cues_mod.MOTION_HINTS == ("default", "zoom_out", "zoom_out_fast", "duo")
+    # B1f: "zoom_in" joined the vocabulary (a forced push-in at the
+    # standard rate) — the tuple is pinned WITH it now.
+    assert cues_mod.MOTION_HINTS == ("default", "zoom_in", "zoom_out", "zoom_out_fast", "duo")
 
 
 def test_validate_cues_motion_field():

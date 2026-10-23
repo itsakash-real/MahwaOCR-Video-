@@ -37,7 +37,10 @@ CUE_WORDS = {"beat", "impact", "reveal"}
 # a sliced strip's segments can take different motions: the detonator
 # zooms in, the explosion zooms out fast). "duo" is whole-sentence
 # only. Unknown values are refused by validate_cues, never ignored.
-MOTION_HINTS = ("default", "zoom_out", "zoom_out_fast", "duo")
+# B1f adds "zoom_in": the foreground zooms IN at the standard panelfit
+# rate (plan.PF_ZOOM_RATE) even on a panel whose aspect would normally
+# route it to a drift or a strip traverse — the mirror of "zoom_out".
+MOTION_HINTS = ("default", "zoom_in", "zoom_out", "zoom_out_fast", "duo")
 CUE_LINE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 INLINE_CUE = re.compile(r"\[[^\]\n]*\]")
 # P3 editor cues (never spoken; parse() attaches them to the next sentence):
@@ -376,6 +379,15 @@ def validate_cues(data: Any) -> List[str]:
     problems: List[str] = []
     if not isinstance(data, dict):
         return ["cues.json must be a JSON object (sentence -> panels, cues, emphasis)"]
+    # B1f: per-panel landmark slice hints (optional top-level key; old
+    # cues.json files omit it). The format is slicehints.py's docstring;
+    # validation is shared with the pairs.json surface so the two can
+    # never drift apart.
+    if data.get("slice_hints") is not None:
+        from .slicehints import parse_slice_hints
+
+        _hints, _problems = parse_slice_hints(data.get("slice_hints"))
+        problems.extend(f"cues.json: {p}" for p in _problems)
     sentences = data.get("sentences")
     if not isinstance(sentences, list) or not sentences:
         return ["cues.json: \"sentences\" must be a non-empty list"]
@@ -469,3 +481,18 @@ def load_cues_strict(root: Path, chapter: str) -> Dict[str, Any] | None:
             f"{path.name} has problems (nothing from it was used):\n  - "
             + "\n  - ".join(problems[:12]))
     return data
+
+
+def slice_hints_of(cue_data: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:
+    """The chapter's normalised B1f slice hints from a cues document:
+    {panel id: {"slice": [...], "discard": [[a, b], ...]}}. {} when the
+    document carries none (the inert case). The document is expected to
+    have passed validate_cues (load_cues_strict); a malformed value
+    yields {} here rather than raising, because this helper also runs
+    on read-only status paths — the strict loader is the gate."""
+    if not isinstance(cue_data, dict) or cue_data.get("slice_hints") is None:
+        return {}
+    from .slicehints import parse_slice_hints
+
+    hints, problems = parse_slice_hints(cue_data.get("slice_hints"))
+    return hints if not problems else {}

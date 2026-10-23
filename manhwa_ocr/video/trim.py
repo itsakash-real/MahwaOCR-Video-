@@ -213,11 +213,15 @@ def trim_report(root: Path, chapter: str, *, cap_share: float = DEFAULT_CAP) -> 
 #
 # - an asset is trimmed exactly to its ink bounding box: every outer row
 #   or column that is (near-)pure white OR (near-)pure black is margin;
-# - a strip holding several panels across a WHITE gap is sliced at the
-#   gap into separate panel assets (the white is discarded). The gap
-#   floor is TRIM2_GAP_MIN_PX (15px since B1e — the user's rule: stacked
-#   panels are ALWAYS separate assets, sequenced with the narration,
-#   never shown glued together).
+# - a strip holding several panels across a WHITE or BLACK gap is
+#   sliced at the gap into separate panel assets (the gap is discarded).
+#   The gap floor is TRIM2_GAP_MIN_PX (15px since B1e — the user's rule:
+#   stacked panels are ALWAYS separate assets, sequenced with the
+#   narration, never shown glued together). Black gaps slice too since
+#   B1f — the user's rule is "white or black": a black separator over
+#   the floor is an editorial panel cut, not artwork. (One UNDER the
+#   floor — Solo ch1's ~4px detonator/explosion separator — stays a
+#   landmark for a hand-written slice hint; see slicehints.py.)
 #
 # A row/column is blank only when (almost) every pixel is margin — any
 # ink at all, a bubble outline included, stops the trim on that side,
@@ -229,7 +233,7 @@ def trim_report(root: Path, chapter: str, *, cap_share: float = DEFAULT_CAP) -> 
 TRIM2_BLANK_SHARE = BLANK_SHARE  # share of a row/column that must be margin to count as blank
 TRIM2_WHITE_MIN = 242            # a pixel is white margin when its DARKEST channel >= this
 TRIM2_BLACK_MAX = 13             # ... or black margin when its BRIGHTEST channel <= this
-TRIM2_GAP_MIN_PX = 15            # a white gap at least this tall inside a strip slices it
+TRIM2_GAP_MIN_PX = 15            # a white OR black gap at least this tall inside a strip slices it
                            # (B1e: the user's locked rule — any contiguous
                            # ~pure row run over 15px is a panel gutter. The
                            # old 200px floor left stacked panels glued
@@ -311,22 +315,27 @@ def _true_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
 
 
 def slice_gaps(img: Image.Image, *, gap_min_px: int = TRIM2_GAP_MIN_PX,
-               white_min: int = TRIM2_WHITE_MIN) -> List[Tuple[int, int]]:
-    """(y0, y1) pieces of a strip after slicing at large WHITE gaps.
+               white_min: int = TRIM2_WHITE_MIN,
+               black_max: int = TRIM2_BLACK_MAX) -> List[Tuple[int, int]]:
+    """(y0, y1) pieces of a strip after slicing at large WHITE or BLACK gaps.
 
-    A gap is a run of >= gap_min_px rows that are (near-)pure white
-    across the whole strip. Rule 6 point 3 names white gaps: black bands
-    are margins for the bbox trim, never slice points (a long black run
-    can be a deliberate night panel). Gaps touching an edge are margins,
-    not slice points — the bbox trim owns those. Returns [(0, h)] when
-    there is nothing to slice.
+    A gap is a run of >= gap_min_px rows that are (near-)pure white OR
+    (near-)pure black across the whole strip — the user's rule is
+    "white or black" (B1f supersedes the white-only reading of Rule 6
+    point 3: a black separator over the floor is an editorial panel
+    cut, not artwork). A row that mixes white
+    and black pixels is NOT a gap row (neither share is near-pure), so a
+    checkerboard/noise band never slices. Gaps touching an edge are
+    margins, not slice points — the bbox trim owns those. Returns
+    [(0, h)] when there is nothing to slice.
     """
     arr = np.asarray(img.convert("RGB"))
     h = arr.shape[0]
     if h == 0 or arr.shape[1] == 0:
         return []
     white = (arr.min(axis=2) >= white_min).mean(axis=1) >= TRIM2_BLANK_SHARE
-    cuts = [(a, b) for a, b in _true_runs(white)
+    black = (arr.max(axis=2) <= black_max).mean(axis=1) >= TRIM2_BLANK_SHARE
+    cuts = [(a, b) for a, b in _true_runs(white | black)
             if b - a >= gap_min_px and a > 0 and b < h]
     if not cuts:
         return [(0, h)]

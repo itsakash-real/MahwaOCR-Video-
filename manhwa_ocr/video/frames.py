@@ -935,6 +935,17 @@ class PanelFitView:
             self.zoom_rate = max(0.0, self.zoom_end - 1.0) / max(0.01, self.end - self.appear)
         self.enter = card.get("enter") if card.get("enter") in ENTRANCES else "cut"
         self.enter_dur = ENTER_DUR[self.enter]
+        # B1f: a landmark-slice card shows ONE band of its panel: crop
+        # the image to the band (panel-height fractions) before either
+        # layer is built, so the slice composes exactly like a panel of
+        # the band's own dimensions — its own blur backdrop included.
+        _band = card.get("slice")
+        if isinstance(_band, (list, tuple)) and len(_band) == 2:
+            _f0, _f1 = float(_band[0]), float(_band[1])
+            _y0 = int(round(_f0 * panel.height))
+            _y1 = int(round(_f1 * panel.height))
+            if 0 <= _y0 < _y1 <= panel.height:
+                panel = panel.crop((0, _y0, panel.width, _y1))
         pw, ph = panel.size
         # Background layer: the same panel, cover-scaled to the frame,
         # blurred, at FULL brightness (opacity 1.0 = no blend over

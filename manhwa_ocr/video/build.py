@@ -104,6 +104,11 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         allowed = shapes_for(s.get("layout", "single"), fmt)
         for c in s.get("cards") or []:
             pw, ph = dims.get(c["panel"], (1.0, 1.0))
+            if isinstance(c.get("slice"), list) and len(c["slice"]) == 2:
+                # B1f: a slice card's spec is built on the BAND's
+                # dimensions (panel width x band height), not the whole
+                # panel's — judge its aspect against those.
+                ph = ph * max(0.0, float(c["slice"][1]) - float(c["slice"][0]))
             _pf = c.get("panelfit")
             if isinstance(_pf, dict):
                 # Panel-fit cards are not classic shapes: the foreground
@@ -253,6 +258,9 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "panelfit_traverse": list(plan.get("panelfit_traverse") or []),
         "panelfit_duo": list(plan.get("panelfit_duo") or []),
         "panelfit_zoom_out": list(plan.get("panelfit_zoom_out") or []),
+        # B1f: zoom-in hints + landmark slices placed. INFO ONLY.
+        "panelfit_zoom_in": list(plan.get("panelfit_zoom_in") or []),
+        "panelfit_slices": list(plan.get("panelfit_slices") or []),
         # Full-frame mode only: the same honest-report treatment (see
         # plan._fullframe_pass). INFO ONLY -- never failures.
         "fullframe_caption_risk": list(plan.get("fullframe_caption_risk") or []),
@@ -527,6 +535,14 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     inputs = _inputs(root, chapter, panels.get("fingerprint", ""), audio, fmt, vcfg, duration)
     fp = fixes_mod.fixes_path(root, chapter)
     inputs["fixes"] = hashlib.sha256(fp.read_bytes()).hexdigest()[:16] if fp.exists() else None
+    # B1f: slice hints live in cues.json (not in the alignment the inputs
+    # hash otherwise keys on), so a hint edit must invalidate a cached
+    # plan on its own. Only when hints exist — hint-free chapters keep
+    # byte-identical inputs.
+    _peek_hints = cues_mod.slice_hints_of(cues_mod.load_cues(root, chapter))
+    if _peek_hints:
+        inputs["slice_hints"] = hashlib.sha256(
+            json.dumps(_peek_hints, sort_keys=True).encode()).hexdigest()[:12]
 
     existing_file = plan_path(root, chapter)
     if existing_file.exists() and not force:
@@ -651,6 +667,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         _caption_sentences = None
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
+                      slice_hints=cues_mod.slice_hints_of(cues_data),
                       caption_sentences=_caption_sentences,
                       image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True,
                                                       fingerprint=panels.get("fingerprint")),
@@ -706,6 +723,12 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if qa.get("panelfit_impact"):
         log(f"    panelfit mode: impact fast zoom (+8.8%/s; no shake/flash in this mode) on "
             f"{len(qa['panelfit_impact'])} shot(s)")
+    if qa.get("panelfit_zoom_in"):
+        log(f"    panelfit mode: zoom-in hint (standard +5%/s push-in) on "
+            f"{len(qa['panelfit_zoom_in'])} shot(s)")
+    if qa.get("panelfit_slices"):
+        log(f"    panelfit mode: {len(qa['panelfit_slices'])} landmark slice(s) placed "
+            f"from cues.json slice_hints: {', '.join(qa['panelfit_slices'][:8])}")
     if qa.get("panelfit_title_cards"):
         log(f"    panelfit mode: {len(qa['panelfit_title_cards'])} title card(s) "
             f"(split-flap, on timeline cues)")

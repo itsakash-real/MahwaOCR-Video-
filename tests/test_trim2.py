@@ -1,7 +1,8 @@
 """Rule 6 (user's rendering spec): pre-processing white-space eradication
 — manhwa_ocr/video/trim.py v2: full ink-bounding-box trim (pure-white OR
 pure-black rows/columns are margins) plus slicing strips at large white
-gaps. Extends the v1 trimmer (tests/test_trim.py); applied at panel build
+gaps (black gaps too, since B1f — the user's rule is "white or black").
+Extends the v1 trimmer (tests/test_trim.py); applied at panel build
 via the opt-in `trim_v2` panel setting, after the recap exists and before
 pairing/plan — raw page assets are never modified.
 """
@@ -128,11 +129,15 @@ def test_small_white_gap_does_not_slice():
     assert slice_gaps(img) == [(0, 600)]   # break, not a panel gutter
 
 
-def test_black_gap_never_slices():
-    # Rule 6 point 3 names WHITE gaps; a long black run can be a
-    # deliberate night panel, so it is margin for the trim, never a cut.
+def test_black_gap_slices_since_b1f():
+    # B1f supersedes the white-only reading: the user's rule is "white
+    # or black" — a pure-black run over the floor is an editorial
+    # separator (the detonator/explosion class), so it slices exactly
+    # like a white gap. (Under-floor black bands still do not slice.)
     img = _strip(180, 420, gap_fill=(0, 0, 0))
-    assert slice_gaps(img) == [(0, 600)]
+    assert slice_gaps(img) == [(0, 180), (420, 600)]
+    thin = _strip(200, 210, gap_fill=(0, 0, 0))   # 10px: under the floor
+    assert slice_gaps(thin) == [(0, 600)]
 
 
 def test_edge_gap_is_margin_not_a_slice_point():

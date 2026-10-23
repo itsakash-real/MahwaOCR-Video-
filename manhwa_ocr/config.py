@@ -130,6 +130,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # explosion ruling): exactly 2x the impact
                                        # zoom-in rate. Default routing never zooms
                                        # out; a hint is the only way in.
+                                       # B1f: the "zoom_in" hint needs no rate of
+                                       # its own — it forces the zoom geometry at
+                                       # "zoom_rate" above, on panels that would
+                                       # otherwise drift or traverse.
             "zoom_max_total": 0.50,    # total zoom cap: at +50% the scale holds
                                        # (measured totals top out at +46%)
             "max_upscale": 2.4,        # the foreground is never upscaled past this
@@ -187,7 +191,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "trim_v1": False,       # Build 1: gutter-colour blank-row trim + review flags (opt-in)
             "trim_cap": 0.40,       # max share of a panel's height the v1 trim cuts per side
             "trim_v2": False,       # Rule 6: full ink-bbox trim (white+black, rows+cols) +
-                                    # white-gap slicing, at panel build (opt-in; panelfit prep)
+                                    # white/black-gap slicing, at panel build (opt-in; panelfit prep)
         },
         # Bubble/text detector (Build 4/3 shared step): ogkalu RT-DETR, Apache-2.0.
         # "model": path to the ONNX file ("" = ~/.config/manhwa/models/ or $MANHWA_DETECTOR_MODEL)

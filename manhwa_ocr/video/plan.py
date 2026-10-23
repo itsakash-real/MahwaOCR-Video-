@@ -340,10 +340,13 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
         # and a duo's two panels must stay together in their own shot.
         # A unit carrying a motion hint never groups either: its beats
         # were sequenced deliberately by the pairing surface, and a
-        # grouped pair would show them simultaneously instead.
+        # grouped pair would show them simultaneously instead. The same
+        # holds for a B1f slice unit: its band was cut deliberately by
+        # the editor, and grouping would show two bands at once.
         if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units) \
                 and len(units[i]["panels"]) == 1 and len(units[i + 1]["panels"]) == 1 \
-                and units[i].get("motion") is None and units[i + 1].get("motion") is None:
+                and units[i].get("motion") is None and units[i + 1].get("motion") is None \
+                and "slice" not in units[i] and "slice" not in units[i + 1]:
             groups.append([units[i], units[i + 1]])
             i += 2
         else:
@@ -354,7 +357,8 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     # second card (its first panel becomes the short one): slide the last
     # three units while that lowers the total shortfall.
     while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2 \
-            and all(len(u["panels"]) == 1 for g in (groups[-2], groups[-1]) for u in g):
+            and all(len(u["panels"]) == 1 for g in (groups[-2], groups[-1]) for u in g) \
+            and all("slice" not in u for g in (groups[-2], groups[-1]) for u in g):
         x, y = groups[-2]
         z = groups[-1][0]
         now = max(0.0, floor - span(groups[-2])) + max(0.0, floor - span(groups[-1]))
@@ -949,6 +953,16 @@ class _Designer:
                     motion = self.motion(rng, crop)
             enter = (self.fixes["shot"].get(pid) or {}).get("enter", enter)   # fixes.json "shot" override
             card = {"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion}
+            if len(ids) == 1 and isinstance(unit.get("slice"), list):
+                # B1f: this unit is ONE landmark slice of its panel. The
+                # card keeps the base panel id (image lookup, validate,
+                # sync audit all resolve by it) and carries the band:
+                # the crop IS the band, and the panelfit pass fits the
+                # band's own dimensions (see _panelfit_pass).
+                _f0, _f1 = (float(v) for v in unit["slice"])
+                card["slice"] = [_f0, _f1]
+                card["slice_id"] = unit.get("slice_id")
+                card["crop"] = [0.0, _f0, 1.0, _f1]
             if len(card_ids) == 1 and is_system_window(self.by_id.get(pid) or {}):
                 card["wide_fill"] = True  # fill >=90% of the frame width, never a small square
             pad = self.pad(pid, layout)
@@ -1052,6 +1066,7 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
             same_sentence = (u.get("sentence") or "") == (v.get("sentence") or "") and bool(u.get("sentence"))
             if (long_enough and len(u["panels"]) == 1 and len(v["panels"]) == 1
                     and u.get("motion") is None and v.get("motion") is None
+                    and "slice" not in u and "slice" not in v
                     and u["panels"][0] != v["panels"][0] and not wide(a) and not wide(b)
                     and story_close and (same_sentence or not (solo_cues & {"impact", "reveal"}))
                     and (2.8 <= (v["end"] - u["start"]) <= MAX_PAIR_SHOT)
@@ -1579,7 +1594,9 @@ PF_IMPACT_WORDS = ("slams", "crashes", "explodes", "strikes", "smashes", "blasts
 # reveal (the hand), "zoom_out_fast" for a blast (the explosion),
 # "duo" for a two-panel moment shown side by side. "default" (or no
 # hint) keeps the measured grammar. Pinned to cues.MOTION_HINTS by test.
-PF_MOTION_HINTS = ("default", "zoom_out", "zoom_out_fast", "duo")
+# B1f adds "zoom_in": a push-in at the standard rate (PF_ZOOM_RATE),
+# forcing the zoom geometry even on a panel that would drift/traverse.
+PF_MOTION_HINTS = ("default", "zoom_in", "zoom_out", "zoom_out_fast", "duo")
 
 
 def panelfit_drift_travel(dur: float, pcfg: Dict[str, Any] | None = None) -> float:
@@ -1690,7 +1707,7 @@ def panelfit_spec(pw: float, ph: float, motion: str, fmt: Format,
     dur = max(0.0, float(dur))
     span = max(dur, float(span_dur)) if span_dur is not None else dur
     elapsed = min(max(0.0, float(elapsed)), span)
-    force = "zoom" if hint in ("zoom_out", "zoom_out_fast") else None
+    force = "zoom" if hint in ("zoom_in", "zoom_out", "zoom_out_fast") else None
     kind, bw, bh, _s = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg, force=force)
     rate = 0.0
     if kind in ("zoom", "fill"):
@@ -1705,7 +1722,18 @@ def panelfit_spec(pw: float, ph: float, motion: str, fmt: Format,
                             "zoom_rate": round(rate, 4),
                             "zoom_end": round(min(1.0 + rate * span, zoom_cap), 4),
                             "drift_frac": 0.0, "impact": bool(impact)}
-    if hint in ("zoom_out", "zoom_out_fast"):
+    if hint == "zoom_in":
+        # B1f: the editor's push-in — the zoom geometry (panelfit_fit
+        # already skipped the drift/traverse routing via force="zoom")
+        # at the STANDARD zoom-in rate, sliced over the span like every
+        # other zoom: this slice opens at zoom_start (the scale the
+        # span has reached) and grows at zoom_rate. An impact's faster
+        # rate does not override an explicit hint.
+        rate_in = float(pcfg.get("zoom_rate", PF_ZOOM_RATE))
+        spec.update({"dir": "in", "zoom_rate": round(rate_in, 4),
+                     "zoom_end": round(min(1.0 + rate_in * span, zoom_cap), 4),
+                     "zoom_start": round(min(1.0 + rate_in * elapsed, zoom_cap), 4)})
+    elif hint in ("zoom_out", "zoom_out_fast"):
         # The user's per-shot rulings (hand reveal, the blast): the span
         # OPENS enlarged and settles to the exact fit — a zoom OUT at a
         # constant rate, sliced like every other span motion. The rate
@@ -1933,7 +1961,7 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     immediately following sentence keeps the direction it already has.
 
     Returns {"static", "hold", "over_cap", "impact", "traverse",
-    "duo", "zoom_out"} — shot ids whose whole span carries no motion
+    "duo", "zoom_out", "zoom_in"} — shot ids whose whole span carries no motion
     (none by construction; computed honestly from the specs, not
     asserted), shot ids that sit entirely in a travel-cap hold (the
     span's motion finished before they open — the F2 hold, reported,
@@ -1942,10 +1970,10 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     an honest quality note, never a stretch), the impact report (which
     shots earned the fast zoom rate, and by which rule), and — B1e —
     the shot ids shown as strip traverses, duo side-by-sides, and
-    per-sentence zoom-out hints.
+    per-sentence zoom-out hints (B1f: zoom-in hints likewise).
     """
     report: Dict[str, Any] = {"static": [], "hold": [], "over_cap": [], "impact": [],
-                              "traverse": [], "duo": [], "zoom_out": []}
+                              "traverse": [], "duo": [], "zoom_out": [], "zoom_in": []}
     if fmt.width <= fmt.height:
         return report
     pcfg = pcfg or {}
@@ -1962,10 +1990,13 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
         s["cards"] = cards
     # Group the split pieces: same sentence text AND same panel list,
     # back to back. Shots without a sentence (fillers) never group.
+    # B1f: the panel list keys on slice ids where a card carries one —
+    # two slices of the SAME panel under one sentence are independent
+    # placeable units with their own fits, never one shared span.
     grouped: List[Tuple[Any, List[Dict[str, Any]]]] = []
     for s in shots:
         text = str(s.get("sentence") or "")
-        panels = tuple(c.get("panel") for c in (s.get("cards") or []))
+        panels = tuple(c.get("slice_id") or c.get("panel") for c in (s.get("cards") or []))
         key = (text, panels) if text and panels and all(panels) else None
         if key is not None and grouped and grouped[-1][0] == key:
             grouped[-1][1].append(s)
@@ -2000,8 +2031,13 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                 pid = c.get("panel")
                 p = designer.by_id.get(pid) or {}
                 pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+                if isinstance(c.get("slice"), list) and len(c["slice"]) == 2:
+                    # B1f: a slice is fitted on its OWN dimensions —
+                    # the panel's width, the band's height — through
+                    # the same fit/spec logic as any whole panel.
+                    ph = ph * max(0.0, float(c["slice"][1]) - float(c["slice"][0]))
                 if pw > 0 and ph > 0:
-                    force = "zoom" if hint in ("zoom_out", "zoom_out_fast") else None
+                    force = "zoom" if hint in ("zoom_in", "zoom_out", "zoom_out_fast") else None
                     kind = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg, force=force)[0]
                     direction = None
                     if kind == "drift":
@@ -2047,6 +2083,8 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                     moving = True
             if hint in ("zoom_out", "zoom_out_fast") and s.get("id") not in report["zoom_out"]:
                 report["zoom_out"].append(s.get("id"))
+            if hint == "zoom_in" and s.get("id") not in report["zoom_in"]:
+                report["zoom_in"].append(s.get("id"))
             if moving:
                 group_moving = True
             else:
@@ -2514,7 +2552,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                alignment_meta: Dict[str, Any] | None = None,
                settings: Dict[str, float] | None = None,
                root: Path | None = None,
-               caption_sentences: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+               caption_sentences: List[Dict[str, Any]] | None = None,
+               slice_hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
     this function makes no panel decisions of its own - it only lays out,
@@ -2539,6 +2578,28 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     st = settings or sync_mod.effective_settings(vcfg, log=lambda _msg: None)
     _pf_mode = str(vcfg.get("mode") or "classic") == "panelfit"
     _pcfg = vcfg.get("panelfit") or {}
+    # B1f landmark slice hints (cues.json "slice_hints", via
+    # slicehints.py): panel-fit mode only — the mode whose prep they
+    # extend. Normalised here so a malformed spec fails the plan loudly
+    # instead of slicing wrong; with no hints the expansion below is
+    # never called and the plan is exactly the pre-B1f plan.
+    _slice_hints: Dict[str, Any] = {}
+    if slice_hints:
+        from .slicehints import parse_slice_hints as _parse_slice_hints
+
+        _slice_hints, _sh_problems = _parse_slice_hints(slice_hints)
+        if _sh_problems:
+            raise UserError("slice_hints have problems (nothing was planned):\n  - "
+                            + "\n  - ".join(_sh_problems[:8]))
+        if not _pf_mode:
+            _slice_hints = {}
+
+    def _expand(units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not _slice_hints:
+            return units
+        from .slicehints import expand_units as _expand_units
+
+        return _expand_units(units, _slice_hints)
     if _pf_mode:
         # Panel-fit (measured reference) rhythm: the mode's own shot
         # floor replaces the classic 3.0s hold floor everywhere the
@@ -2546,7 +2607,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         st = {**st, "min_hold": float(_pcfg.get("min_shot", PF_MIN_SHOT))}
     timing = None
     if alignment_units is not None:
-        shots_units, timing = hold_groups(alignment_units, st["min_hold"], lead=st["lead"],
+        shots_units, timing = hold_groups(_expand(alignment_units), st["min_hold"], lead=st["lead"],
                                           max_late=st["max_late"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
@@ -2554,11 +2615,11 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         # "estimated" plan must keep working exactly as it did before this.
         mode = (alignment_meta or {}).get("sync_mode") or "aligned"
     elif sentences:
-        units = _pair_up(synced_units(panels, sentences, duration, vcfg), chapter,
+        units = _pair_up(_expand(synced_units(panels, sentences, duration, vcfg)), chapter,
                          float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         mode = "synced"
     else:
-        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), st["min_hold"],
+        shots_units, timing = hold_groups(_expand(even_units(panels, duration, vcfg)), st["min_hold"],
                                           lead=st["lead"], max_late=st["max_late"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
@@ -2635,7 +2696,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     _mode = str(vcfg.get("mode") or "classic")
     _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [], "unusable": []}
     _pf_report = {"static": [], "hold": [], "over_cap": [], "impact": [],
-                  "traverse": [], "duo": [], "zoom_out": []}
+                  "traverse": [], "duo": [], "zoom_out": [], "zoom_in": []}
     _ff_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [],
                 "over_cap": [], "static": []}
     if _mode == "wide":
@@ -2662,6 +2723,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
             if _w["end"] is None:
                 _w["end"] = float(_wins[_i + 1]["start"]) if _i + 1 < len(_wins) else float(duration)
         shots, _pf_title_cards = insert_title_cards(shots, _wins, vcfg.get("panelfit") or {})
+    # B1f: the slice ids actually placed (empty unless slice hints ran).
+    _slices_applied = [c["slice_id"] for s in shots for c in (s.get("cards") or [])
+                       if c.get("slice_id")]
     return {
         "version": PLAN_VERSION,
         "mode": _mode,
@@ -2676,6 +2740,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "panelfit_traverse": _pf_report.get("traverse", []),
         "panelfit_duo": _pf_report.get("duo", []),
         "panelfit_zoom_out": _pf_report.get("zoom_out", []),
+        "panelfit_zoom_in": _pf_report.get("zoom_in", []),
+        "panelfit_slices": _slices_applied,
         "panelfit_title_cards": _pf_title_cards,
         "fullframe_caption_risk": _ff_risk["caption_risk"],
         "fullframe_figure_risk": _ff_risk["figure_risk"],
@@ -2801,6 +2867,19 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     raise ValueError
             except (TypeError, ValueError):
                 errs.append(f"{cw}: crop must be [x0, y0, x1, y1] fractions of the panel, e.g. [0, 0.2, 1, 0.7]")
+            _slice = c.get("slice")
+            if _slice is not None:
+                # B1f: a landmark-slice card's band (panel-height
+                # fractions), written by the planner from cues.json
+                # "slice_hints" — never hand-edited like a crop.
+                try:
+                    _sf0, _sf1 = (float(v) for v in _slice)
+                    if not 0.0 <= _sf0 < _sf1 <= 1.0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errs.append(f"{cw}: slice must be [f0, f1] panel-height fractions with "
+                                f"0 <= f0 < f1 <= 1 (cues.json \"slice_hints\" writes it; "
+                                f"rebuild the plan with --force)")
             try:
                 if not 0.0 <= float(c.get("pad_y") or 0.0) <= PAD_LIMIT:
                     raise ValueError
