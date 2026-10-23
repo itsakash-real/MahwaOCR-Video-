@@ -14,8 +14,10 @@ from PIL import Image, ImageDraw
 
 from manhwa_ocr.video import panels as panels_mod
 from manhwa_ocr.video import trim as trim_mod
-from manhwa_ocr.video.trim import (TRIM2_BLACK_MAX, TRIM2_GAP_MIN_PX, TRIM2_WHITE_MIN,
-                                   apply_trim_v2, compute_trim_v2, slice_gaps)
+from manhwa_ocr.video.trim import (TRIM2_BLACK_MAX, TRIM2_GAP_MIN_PX,
+                                   TRIM2_GUTTER_MIN_PX, TRIM2_WHITE_MIN,
+                                   apply_trim_v2, compute_trim_v2, gutter_segments,
+                                   slice_gaps)
 
 W = 200
 
@@ -129,6 +131,40 @@ def test_edge_gap_is_margin_not_a_slice_point():
     assert slice_gaps(_pil(arr)) == [(0, 500)]
 
 
+# ------------------------------------------------- gutter segments (fix 1)
+
+def test_gutter_threshold_is_the_users_15px():
+    # The user's analysis: a white/black strip over 15px high between
+    # two images is a slice point, not part of either picture.
+    assert TRIM2_GUTTER_MIN_PX == 15
+
+
+def test_gutter_segments_slice_a_white_gap_over_15px():
+    img = _strip(200, 300)          # 100px white gap: invisible to
+    assert slice_gaps(img) == [(0, 600)]        # slice_gaps (>= 200px)…
+    assert gutter_segments(img) == [(0, 200), (300, 600)]   # …seen here
+
+
+def test_gutter_segments_slice_a_black_gap_too():
+    # Fix 1 names pure black as well as pure white (unlike slice_gaps,
+    # whose white-only rule guards whole-strip slicing decisions).
+    img = _strip(200, 300, gap_fill=(0, 0, 0))
+    assert gutter_segments(img) == [(0, 200), (300, 600)]
+
+
+def test_gutter_gap_of_exactly_15px_does_not_slice():
+    img = _strip(200, 215)          # 15px: "over 15px" is the rule
+    assert gutter_segments(img) == [(0, 600)]
+    img = _strip(200, 216)          # 16px slices
+    assert gutter_segments(img) == [(0, 200), (216, 600)]
+
+
+def test_gutter_edge_runs_are_margins_not_segments():
+    arr = _blank(500, w=60)
+    _art(arr, 260, 500, 0, 60)      # white only at the very top edge
+    assert gutter_segments(_pil(arr)) == [(0, 500)]
+
+
 # --------------------------------------------------------------- wiring
 
 def test_fingerprint_stable_when_trim_v2_off(tmp_path):
@@ -178,6 +214,27 @@ def test_detect_slicing_wiring_with_stubs(tmp_path, monkeypatch):
     assert (on[0].y0, on[0].y1) == (off[0].y0, off[0].y0 + 100)
     assert (on[1].y0, on[1].y1) == (off[0].y0 + 150, off[0].y1)
     assert (on[2].y0, on[3].y1) == (off[1].y0, off[1].y1)
+
+
+def test_detect_records_gutter_segments_as_metadata_only(tmp_path, monkeypatch):
+    # Analysis fix 1 wiring: gutter segments land on the panel as
+    # METADATA (fractions of the piece height) — panel ids and geometry
+    # are untouched, so recap tags and sync can never break on them;
+    # the planner turns the metadata into segment sub-shots.
+    page = _two_panel_page(tmp_path / "page_001.png")
+    monkeypatch.setattr(trim_mod, "compute_trim_v2",
+                        lambda img, white_min=242, black_max=13: trim_mod.Trim2Result())
+    monkeypatch.setattr(trim_mod, "slice_gaps",
+                        lambda img, gap_min_px=200, white_min=242: [(0, img.height)])
+    monkeypatch.setattr(trim_mod, "gutter_segments",
+                        lambda img, min_px=15, white_min=242, black_max=13:
+                        [(0, 100), (150, img.height)])
+    on, _ = panels_mod.detect([page], {"trim_v2": True})
+    assert [p.id for p in on] == ["P001-01", "P001-02"]     # no renumbering
+    for p in on:
+        assert len(p.gutter_segments) == 2
+        (a0, a1), (b0, b1) = p.gutter_segments
+        assert a0 == 0.0 and b1 == 1.0 and 0.0 < a1 < b0 < 1.0
 
 
 def test_detect_bbox_wiring_with_stub(tmp_path, monkeypatch):

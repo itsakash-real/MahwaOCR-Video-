@@ -302,6 +302,52 @@ def _true_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
     return out
 
 
+TRIM2_GUTTER_MIN_PX = 15         # user rule (2026-10-23 second-by-second analysis,
+                                 # engine fix 1): an interior run of (near-)pure white
+                                 # OR pure black rows TALLER than this is a gutter
+                                 # between two stacked images — the panel slices
+                                 # there and each segment is an independent asset
+
+
+def gutter_segments(img: Image.Image, *, min_px: int = TRIM2_GUTTER_MIN_PX,
+                    white_min: int = TRIM2_WHITE_MIN,
+                    black_max: int = TRIM2_BLACK_MAX) -> List[Tuple[int, int]]:
+    """(y0, y1) segments of ONE panel image after slicing at interior
+    gutters (the user's "double panel" fix, 2026-10-23).
+
+    A gutter is a run of MORE than `min_px` consecutive rows that are
+    (near-)pure white or (near-)pure black across the whole width —
+    the blank strip baked between two images the detector merged into
+    one panel. This deliberately differs from slice_gaps below in two
+    ways, both per the user's explicit ruling: the threshold is the
+    user's 15px (not the 200px strip rule), and BLACK runs slice too
+    (the strip rule keeps black bands unsliced because a long black
+    run can be a night panel; a run that is >= 99.5% pure black across
+    the full width inside an already-detected panel is a separator,
+    and the user named it one). Gutters touching an edge are margins,
+    not slice points — the bbox trim owns those. Returns [(0, h)] when
+    there is nothing to slice; the gutter rows themselves belong to
+    no segment.
+    """
+    arr = np.asarray(img.convert("RGB"))
+    h = arr.shape[0]
+    if h == 0 or arr.shape[1] == 0:
+        return []
+    rows, _cols = _margin_shares(arr, white_min=white_min, black_max=black_max)
+    blank = rows >= TRIM2_BLANK_SHARE
+    cuts = [(a, b) for a, b in _true_runs(blank)
+            if b - a > min_px and a > 0 and b < h]
+    if not cuts:
+        return [(0, h)]
+    pieces: List[Tuple[int, int]] = []
+    start = 0
+    for a, b in cuts:
+        pieces.append((start, a))
+        start = b
+    pieces.append((start, h))
+    return [(a, b) for a, b in pieces if b - a > 0]
+
+
 def slice_gaps(img: Image.Image, *, gap_min_px: int = TRIM2_GAP_MIN_PX,
                white_min: int = TRIM2_WHITE_MIN) -> List[Tuple[int, int]]:
     """(y0, y1) pieces of a strip after slicing at large WHITE gaps.

@@ -254,6 +254,22 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
     def seg_at(t: float) -> int:
         return max(0, bisect_right(seg_starts, t + 1e-6) - 1)
 
+    overlays = [o for o in (plan.get("title_card_overlays") or [])
+                if isinstance(o, dict)]
+
+    def overlay_at(t: float) -> Dict[str, Any] | None:
+        """The title-card overlay covering t, or None. Samples under
+        an overlay are covered by design (analysis fix 3), exactly
+        like the card shots the overlays replaced."""
+        for o in overlays:
+            try:
+                a, d = float(o["at"]), float(o["duration"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if a - 1e-9 <= t < a + d - 1e-9:
+                return o
+        return None
+
     exp_sets = _expected_sets(segments, text_only)
     anchors = sync_mod.sentence_anchors(segments, words)
     interpolated = {i for i, a in enumerate(anchors) if a is None}
@@ -288,11 +304,12 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         vis = _visible(shots[sh], t)
         exp = exp_sets[si]
         judged = bool(exp)
-        if shots[sh].get("title_card"):
-            # A title-card shot is the plan's designed visual for its
-            # cue sentence (and for the head of the next one it eats
+        if shots[sh].get("title_card") or overlay_at(t) is not None:
+            # A title card is the plan's designed visual for its cue
+            # sentence (and for the head of the next one it runs
             # into): it COVERS the samples it spans — never a match
-            # failure, never wrong-picture.
+            # failure, never wrong-picture. (Legacy card shots and,
+            # since analysis fix 3, timed overlays alike.)
             match = judged
             wrong = False
         else:
@@ -356,6 +373,12 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
                 # The sentence opens under a title card by design; its
                 # first panel is due when the card ends, not before.
                 off = max(0.0, off - (float(_sh["end"]) - float(seg["start"])))
+            _ov = overlay_at(float(seg["start"]))
+            if _ov is not None:
+                # Same rule for a title-card overlay (analysis fix 3):
+                # the panel is due when the overlay ends.
+                off = max(0.0, off - ((float(_ov["at"]) + float(_ov["duration"]))
+                                      - float(seg["start"])))
         if off is not None and off > st["max_late"] + st["gate_grace"] + 1e-6:
             late.append({"sentence": seg.get("sentence"), "panel": first[0], "offset": round(off, 3)})
 

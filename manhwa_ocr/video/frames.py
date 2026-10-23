@@ -840,6 +840,13 @@ def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) ->
 
 PFR_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
 PFR_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+# Foreground drop shadow (analysis fix 4 — the user's numbers, 2026-10-23):
+# solid black under the sharp foreground, Y-offset 20px, blur 10px, 40%
+# opacity (all at 1080p). This — never a dimmed background — is what
+# separates the foreground's edges from the full-brightness blur.
+PFR_SHADOW_DY = 20          # shadow Y offset, px at 1080p
+PFR_SHADOW_BLUR = 10        # shadow blur radius, px at 1080p
+PFR_SHADOW_OPACITY = 0.40   # shadow opacity
 
 
 class PanelFitView:
@@ -865,6 +872,16 @@ class PanelFitView:
     enters the frame (dir "down": the art moves downward).
     kind "scroll": LEGACY (pre-measurement plans only): a tall strip
     fitted by width and scrolled across the view's window.
+
+    Span slices (B1d): when a sentence split into sub-shots, each
+    sub-shot's spec is a slice of ONE span motion — a zoom carries
+    `zoom_start` (the scale the span had reached when this sub-shot
+    opens), a drift carries `drift_from`/`drift_to`/`drift_rate`
+    (signed offsets and the span's constant speed). The view replays
+    the slice in absolute time, so the seam between sub-shots is
+    position-exact and the motion never reverses; at the travel cap
+    the position HOLDS. Specs without these keys are pre-B1d plans
+    and keep the old per-shot centred math.
     """
 
     def __init__(self, panel: Image.Image, spec: Dict[str, Any], card: Dict[str, Any],
@@ -876,8 +893,25 @@ class PanelFitView:
         self.base_h = float(spec.get("base_h") or fmt.height)
         self.zoom_end = float(spec.get("zoom_end") or 1.08)
         self.zoom_rate = float(spec.get("zoom_rate") or 0.0)
+        self.zoom_start = float(spec.get("zoom_start") or 1.0)
         self.drift_frac = float(spec.get("drift_frac") or 0.0)
+        # Span-slice keys (B1d); absent on pre-B1d plans.
+        self.drift_from = spec.get("drift_from")
+        self.drift_to = spec.get("drift_to")
+        self.drift_rate = float(spec.get("drift_rate") or 0.0)
+        if self.drift_from is not None:
+            self.drift_from = float(self.drift_from)
+            self.drift_to = float(self.drift_to if self.drift_to is not None
+                                  else self.drift_from)
         self.appear = shot_start + max(0.0, float(card.get("at") or 0.0))
+        # Half a frame of slack on the appear edge: plan times are
+        # rounded to 3 decimals while frames are drawn on the f/fps
+        # grid, so a sub-shot's first frame can land a hair BEFORE
+        # its appear time — with a strict comparison that frame
+        # rendered as the background alone: one blurred frame at
+        # the seam (B1d F5). Progress clamps to 0, so the tolerance
+        # only ever shows the slice's true first position.
+        self.tol = 0.5 / max(1.0, float(fmt.fps or 30))
         self.end = shot_end
         if self.zoom_rate <= 0 and self.kind in ("zoom", "fill"):
             # Legacy specs (pre-measurement plans) carry only zoom_end:
@@ -906,15 +940,35 @@ class PanelFitView:
         src = panel if (fw, fh) == (pw, ph) else panel.resize((fw, fh), Image.LANCZOS)
         self.src = src.convert("RGBA")
         self.src_w, self.src_h = self.src.size
+        # Foreground drop shadow (analysis fix 4): built once from the
+        # foreground source — solid black, the source's alpha scaled to
+        # PFR_SHADOW_OPACITY, pre-blurred in source space (the display
+        # blur divided by the display/source scale), so each frame it
+        # costs one affine transform, exactly like the foreground.
+        # Composited in frame() BETWEEN the full-brightness background
+        # and the sharp foreground. On height-covering views it lands
+        # off-frame (invisible); on a wide "fill" panel floating over
+        # its blur it is the dark line under the panel's bottom edge.
+        self.shadow_src: Image.Image | None = None
+        if PFR_SHADOW_OPACITY > 0:
+            _sh = Image.new("RGBA", self.src.size, (0, 0, 0, 0))
+            _sh.putalpha(self.src.getchannel("A").point(
+                lambda v: int(v * PFR_SHADOW_OPACITY)))
+            _radius = PFR_SHADOW_BLUR * (fmt.height / 1080.0) \
+                * (self.src_w / max(1.0, self.base_w))
+            if _radius >= 0.5:
+                _sh = _sh.filter(ImageFilter.GaussianBlur(_radius))
+            self.shadow_src = _sh
+        self.shadow_dy = PFR_SHADOW_DY * fmt.height / 1080.0
 
     def visible(self, t: float) -> bool:
-        return t >= self.appear - 1e-9
+        return t >= self.appear - self.tol
 
     def frame(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
         fmt = self.fmt
         W, H = fmt.width, fmt.height
         img = self.bg.convert("RGBA")
-        if t < self.appear - 1e-9:
+        if t < self.appear - self.tol:
             return img.convert("RGB")
         dur = max(0.01, self.end - self.appear)
         p = min(1.0, max(0.0, (t - self.appear) / dur))
@@ -927,8 +981,20 @@ class PanelFitView:
             dx = (W - disp_w) / 2.0
         elif self.kind == "drift":
             disp_w, disp_h = self.base_w, self.base_h
-            travel = self.drift_frac * H
-            off = (p - 0.5) * travel if self.dir == "down" else (0.5 - p) * travel
+            if self.drift_from is not None:
+                # Span slice (B1d): absolute offset in frame heights,
+                # moving at the span's constant rate toward drift_to,
+                # then HOLDING there — continuous at seams, never a
+                # reversal, never a slow-mo stretch.
+                off = self.drift_from + self.drift_rate * max(0.0, t - self.appear)
+                if self.drift_rate > 0:
+                    off = min(off, self.drift_to)
+                elif self.drift_rate < 0:
+                    off = max(off, self.drift_to)
+                off *= H
+            else:  # legacy centred drift (pre-B1d plans)
+                travel = self.drift_frac * H
+                off = (p - 0.5) * travel if self.dir == "down" else (0.5 - p) * travel
             dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0 + off
         else:  # zoom / fill: constant-RATE zoom-in, capped at zoom_end
             z = self.zoom_end
@@ -937,7 +1003,7 @@ class PanelFitView:
                 # at zoom_end (the planner caps zoom_end at +50%
                 # total: past the cap the scale stays, it does not
                 # slow down and stretch the rate over the shot).
-                s = min(1.0 + self.zoom_rate * max(0.0, t - self.appear), z)
+                s = min(self.zoom_start + self.zoom_rate * max(0.0, t - self.appear), z)
             else:  # legacy zoom-out (pre-measurement plans only)
                 s = z - (z - 1.0) * p
             s *= 1.0 + extra_zoom
@@ -945,6 +1011,14 @@ class PanelFitView:
             dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0
         a = self.src_w / max(1.0, disp_w)
         e = self.src_h / max(1.0, disp_h)
+        if self.shadow_src is not None:
+            # The drop shadow rides the same affine as the foreground,
+            # offset PFR_SHADOW_DY further down (analysis fix 4).
+            shadow = self.shadow_src.transform((W, H), Image.AFFINE,
+                                               (a, 0.0, -dx * a, 0.0, e,
+                                                -(dy + self.shadow_dy) * e),
+                                               resample=Image.BILINEAR, fill=0)
+            img = Image.alpha_composite(img, shadow)
         layer = self.src.transform((W, H), Image.AFFINE,
                                    (a, 0.0, -dx * a, 0.0, e, -dy * e),
                                    resample=Image.BILINEAR, fill=0)
@@ -961,6 +1035,20 @@ class PanelFitView:
 # ------------------------------------------------------------------ shot
 
 
+def _pf_slice_image(img: Image.Image, card: Dict[str, Any]) -> Image.Image:
+    """The panel band a gutter-segment card shows (analysis fix 1):
+    the panel image cropped to the card's `slice` height fractions.
+    Cards without a slice show the whole panel, exactly as before."""
+    sl = card.get("slice")
+    if isinstance(sl, (list, tuple)) and len(sl) == 2:
+        h = img.height
+        y0 = int(round(float(sl[0]) * h))
+        y1 = int(round(float(sl[1]) * h))
+        if 0 <= y0 < y1 <= h and (y0, y1) != (0, h):
+            return img.crop((0, y0, img.width, y1))
+    return img
+
+
 def _mix(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
     """(1-k)*a + k*b in integer math; far faster than float on 1080p frames."""
     w = int(round(max(0.0, min(1.0, k)) * 256))
@@ -972,7 +1060,8 @@ class ShotRenderer:
 
     def __init__(self, shot: Dict[str, Any], images: Dict[str, Image.Image], fmt: Format,
                  effects_on: Dict[str, bool] | None = None, video_end: float | None = None,
-                 end_fade: bool = False, chapter_cards: List[Dict[str, Any]] | None = None):
+                 end_fade: bool = False, chapter_cards: List[Dict[str, Any]] | None = None,
+                 title_overlays: List[Dict[str, Any]] | None = None):
         # P3: shot-level callouts ride on the shot dict; plan-level chapter
         # cards are passed in (render.py) so a clip can shift them with the shot.
         self.caption_bar = bool(shot.get("caption_bar"))
@@ -1020,7 +1109,8 @@ class ShotRenderer:
         if shot.get("panelfit") and fmt.width > fmt.height and cards:
             _specs = [c.get("panelfit") for c in cards]
             if all(isinstance(_sp, dict) for _sp in _specs):
-                self.pf_views = [PanelFitView(images[c["panel"]], _sp, c, self.start, self.end, fmt)
+                self.pf_views = [PanelFitView(_pf_slice_image(images[c["panel"]], c), _sp, c,
+                                              self.start, self.end, fmt)
                                  for c, _sp in zip(cards, _specs)]
         # Title-card shots (Title Card Generator): no panels at all --
         # the whole shot is the split-flap card, drawn once here.
@@ -1032,6 +1122,24 @@ class ShotRenderer:
                                              str(_tc_spec.get("label") or ""),
                                              int(_tc_spec.get("number") or 0),
                                              str(_tc_spec.get("line") or ""))
+        # Title-card OVERLAYS (analysis fix 3): plan-level timed cards
+        # passed in like chapter cards (render.py shifts them into clip
+        # time). While an overlay covers t, frame_array returns the
+        # card INSTEAD of the running shot — the shot's own timing,
+        # motion phase and the master audio are never touched.
+        self.title_overlays: List[Tuple[float, float, Image.Image]] = []
+        for _ov in title_overlays or []:
+            if not isinstance(_ov, dict):
+                continue
+            try:
+                _oa, _od = float(_ov["at"]), float(_ov["duration"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if _oa < self.end and _oa + _od > self.start:
+                from .titlecards import render_title_card as _render_tco
+                self.title_overlays.append((_oa, _oa + _od, _render_tco(
+                    fmt.width, fmt.height, str(_ov.get("label") or ""),
+                    int(_ov.get("number") or 0), str(_ov.get("line") or ""))))
 
         bg_kind = shot.get("background") if shot.get("background") in BACKGROUNDS else "blur"
         bg_panel = shot.get("bg_panel") if shot.get("bg_panel") in images else (cards[0]["panel"] if cards else None)
@@ -1087,6 +1195,9 @@ class ShotRenderer:
             self._can_freeze = all(v.is_static() for v in self.views)
         else:
             self._can_freeze = all(c.motion == "hold" for c in self.cards) and not self.pf_views
+        if self.title_overlays:
+            # An overlay changes the picture mid-shot: never freeze.
+            self._can_freeze = False
         self._static: np.ndarray | None = None
 
     def is_static(self, t: float) -> bool:
@@ -1130,6 +1241,9 @@ class ShotRenderer:
             return self._static
         if self.title_card_img is not None:
             return self._title_frame_array(t)
+        for _oa, _ob, _oimg in self.title_overlays:
+            if _oa <= t < _ob:
+                return self._overlay_frame_array(_oimg, t)
         if self.pf_views:
             return self._pf_frame_array(t)
         extra = punch_amount(t, self.punches)
@@ -1215,6 +1329,16 @@ class ShotRenderer:
 
     def _title_frame_array(self, t: float) -> np.ndarray:
         out = np.asarray(self.title_card_img, dtype=np.uint8)
+        if self.fade_from is not None and t > self.fade_from:
+            span = max(1e-3, self.end - self.fade_from)
+            out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
+        return out
+
+    def _overlay_frame_array(self, img: Image.Image, t: float) -> np.ndarray:
+        """A title-card overlay frame (analysis fix 3): the card full
+        screen over the running shot, with the same end-fade handling
+        as a legacy card shot."""
+        out = np.asarray(img, dtype=np.uint8)
         if self.fade_from is not None and t > self.fade_from:
             span = max(1e-3, self.end - self.fade_from)
             out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))

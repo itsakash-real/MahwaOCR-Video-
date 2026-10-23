@@ -53,6 +53,13 @@ class Panel:
     text: str = ""
     trim: Dict[str, Any] = field(default_factory=dict)  # Build 1 v1 record, when enabled
     trim2: Dict[str, Any] = field(default_factory=dict)  # Rule 6 v2 record, when enabled
+    # Analysis fix 1 (2026-10-23): interior gutter segments of this panel
+    # as [y0, y1] fractions of the panel's own height, when trim_v2 found
+    # the panel holds stacked images across a >15px white/black gutter.
+    # Empty = one solid image. The panel asset itself is NOT split (ids
+    # must stay stable for recap tags); the planner splits the SHOT into
+    # one sub-shot per segment — the segments are the plan-level assets.
+    gutter_segments: List[List[float]] = field(default_factory=list)
 
     @property
     def height(self) -> float:
@@ -87,6 +94,10 @@ def _settings(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
         "trim_v1": bool(cfg.get("trim_v1", False)),
         "trim_cap": min(0.9, max(0.05, float(cfg.get("trim_cap", 0.40)))),
         "trim_v2": bool(cfg.get("trim_v2", False)),
+        # Analysis fix 1: interior gutters TALLER than this (px, in the
+        # panel image's own pixels) mark stacked-image segments. The
+        # user's number: 15. Only recorded when trim_v2 is on.
+        "gutter_slice_min": max(1, int(cfg.get("gutter_slice_min", 15))),
     }
 
 
@@ -294,6 +305,7 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
         panel = Panel(id=f"P{start_page:03d}-{per_page[start_page]:02d}", index=idx,
                       y0=float(a), y1=float(b), x0=0.0, x1=float(norm_w), segments=segs)
         v2_pieces = None
+        v2_gutter: List[List[List[float]]] = []
         v2_col = (0.0, 0.0)
         v2_vs = 1.0
         try:
@@ -320,7 +332,7 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
                     panel.segments = _segments(panel.y0, panel.y1, pages) or panel.segments
                     strip = strip.crop((0, tres.cut_top, strip.width, strip.height - tres.cut_bottom))
             if s["trim_v2"]:
-                from .trim import compute_trim_v2, slice_gaps
+                from .trim import compute_trim_v2, gutter_segments, slice_gaps
 
                 t2 = compute_trim_v2(strip, white_min=s["white_threshold"],
                                      black_max=s["black_threshold"])
@@ -340,6 +352,20 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
                 gaps = slice_gaps(strip)
                 if len(gaps) > 1:
                     v2_pieces = gaps
+                # Analysis fix 1: record each piece's interior gutter
+                # segments (stacked images across a >15px white/black
+                # strip) as fractions of the piece's height. Metadata
+                # only — assets and panel ids are untouched; the
+                # planner splits the shot per segment.
+                for gy0, gy1 in (v2_pieces or [(0, strip.height)]):
+                    seg_img = strip if (gy0, gy1) == (0, strip.height) \
+                        else strip.crop((0, gy0, strip.width, gy1))
+                    segs = gutter_segments(seg_img, min_px=s["gutter_slice_min"],
+                                           white_min=s["white_threshold"],
+                                           black_max=s["black_threshold"])
+                    hh = max(1, seg_img.height)
+                    v2_gutter.append([[round(a / hh, 4), round(b / hh, 4)]
+                                       for a, b in segs] if len(segs) > 1 else [])
             x0, x1 = _trim_x(strip, norm_w)
         except OSError:
             x0, x1 = 0.0, float(norm_w)
@@ -359,10 +385,12 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
                             x0=panel.x0, x1=panel.x1,
                             segments=_segments(py0, py1, pages) or panel.segments)
                 sub.trim2 = {**panel.trim2, "piece": pi, "pieces": n_pieces}
+                sub.gutter_segments = v2_gutter[pi] if pi < len(v2_gutter) else []
                 sub.tall = bool(sub.height / max(1.0, sub.width) > TALL_RATIO)
                 panels.append(sub)
             sliced_any = True
         else:
+            panel.gutter_segments = v2_gutter[0] if v2_gutter else []
             panels.append(panel)
     if sliced_any:
         # Slicing inserted panels: renumber ids canonically (per start
@@ -514,7 +542,7 @@ def _fingerprint(pages: List[Path], s: Dict[str, Any]) -> str:
     # would shift framing under recordings that already exist). `video panels --force`
     # re-detects with tightening.
     defaults = {"tighten_edges": True, "white_threshold": WHITE_THRESHOLD, "black_threshold": BLACK_THRESHOLD,
-                "trim_v1": False, "trim_cap": 0.40, "trim_v2": False}
+                "trim_v1": False, "trim_cap": 0.40, "trim_v2": False, "gutter_slice_min": 15}
     keyed = {k: v for k, v in s.items() if defaults.get(k, object()) != v}
     h = hashlib.sha256(json.dumps({"v": PANELS_VERSION, **keyed}, sort_keys=True).encode())
     for p in pages:

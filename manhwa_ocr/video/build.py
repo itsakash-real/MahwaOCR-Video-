@@ -31,7 +31,7 @@ from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, r
 from .frames import background, format_from, shapes_for
 from . import fixes as fixes_mod
 from .verify import verify_chapter
-from .plan import map_options
+from .plan import map_options, panelfit_advance_slice
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
 from .plan import (FF_ASPECT, FF_ASPECT_TOL, FF_CONTAIN_TOL, PLAN_VERSION, build_plan, load_plan,
@@ -223,9 +223,11 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         # over 0.5s), panels fitted at the max-upscale cap, and the
         # impact-FX report. INFO ONLY, like the wide risks above.
         "panelfit_static": list(plan.get("panelfit_static") or []),
+        "panelfit_hold": list(plan.get("panelfit_hold") or []),
         "panelfit_over_cap": list(plan.get("panelfit_over_cap") or []),
         "panelfit_impact": list(plan.get("panelfit_impact") or []),
         "panelfit_title_cards": list(plan.get("panelfit_title_cards") or []),
+        "panelfit_segments": list(plan.get("panelfit_segments") or []),
         # Full-frame mode only: the same honest-report treatment (see
         # plan._fullframe_pass). INFO ONLY -- never failures.
         "fullframe_caption_risk": list(plan.get("fullframe_caption_risk") or []),
@@ -669,6 +671,10 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if qa.get("panelfit_static"):
         log(f"    ! panelfit mode: {len(qa['panelfit_static'])} shot(s) would render static "
             f"(the spec forbids a still image over 0.5s): {', '.join(qa['panelfit_static'][:8])}")
+    if qa.get("panelfit_hold"):
+        log(f"    panelfit mode: {len(qa['panelfit_hold'])} sub-shot(s) sit in a travel-cap hold "
+            f"(their sentence's drift/zoom reached the measured cap and holds, per the reference): "
+            f"{', '.join(qa['panelfit_hold'][:8])}")
     if qa.get("panelfit_over_cap"):
         log(f"    ! panelfit mode: {len(qa['panelfit_over_cap'])} panel(s) fitted at the max-upscale "
             f"cap (shown smaller, never stretched): {', '.join(qa['panelfit_over_cap'][:8])}")
@@ -676,8 +682,12 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"    panelfit mode: impact fast zoom (+8.8%/s; no shake/flash in this mode) on "
             f"{len(qa['panelfit_impact'])} shot(s)")
     if qa.get("panelfit_title_cards"):
-        log(f"    panelfit mode: {len(qa['panelfit_title_cards'])} title card(s) "
-            f"(split-flap, on timeline cues)")
+        log(f"    panelfit mode: {len(qa['panelfit_title_cards'])} title card overlay(s) "
+            f"(split-flap, drawn over the running shot; audio never split)")
+    if qa.get("panelfit_segments"):
+        log(f"    panelfit mode: gutter-segment split on "
+            f"{len(qa['panelfit_segments'])} panel(s): "
+            f"{', '.join(qa['panelfit_segments'][:8])}")
     if qa.get("fullframe_figure_risk"):
         log(f"    ! fullframe mode: {len(qa['fullframe_figure_risk'])} panel(s) whose focal cannot fit "
             f"inside one 16:9 viewport (the camera path traverses it instead): "
@@ -896,7 +906,14 @@ def _clip_plan(plan: Dict[str, Any], start: float, end: float, fmt: str) -> Dict
             at = float(c.get("at") or 0) - cut_in
             # A card that already arrived before the clip starts is simply there:
             # replaying its entrance would look like a glitch.
-            cards.append({**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"})
+            card = {**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"}
+            if cut_in > 0 and isinstance(c.get("panelfit"), dict):
+                # Panel-fit span slices are phased from the shot's own start:
+                # skipping the head must advance the slice to the span position
+                # the clip actually opens on, or the motion restarts and jumps
+                # at the next seam (B1d F1).
+                card["panelfit"] = panelfit_advance_slice(c["panelfit"], cut_in)
+            cards.append(card)
         # P3: callouts ride on shots with absolute times — shift them into
         # the clip timeline and drop ones outside the clip.
         clip_callouts = [{"t": round(float(c["t"]) - start, 3), "text": c.get("text"),
@@ -928,8 +945,19 @@ def _clip_plan(plan: Dict[str, Any], start: float, end: float, fmt: str) -> Dict
     clip_sfx = [{**e, "t": round(float(e["t"]) - start, 3)}
                 for e in (plan.get("sfx") or [])
                 if isinstance(e, dict) and start <= float(e.get("t") or -1) < end]
+    # Title-card overlays (analysis fix 3) shift like chapter cards: an
+    # overlay overlapping the clip stays, its `at` moves into clip time
+    # and its tail is clamped to the clip end.
+    clip_overlays = [{**o, "at": round(max(0.0, float(o["at"]) - start), 3),
+                      "duration": round(min(float(o["at"]) + float(o["duration"]), end)
+                                        - max(float(o["at"]), start), 3)}
+                     for o in (plan.get("title_card_overlays") or [])
+                     if isinstance(o, dict)
+                     and float(o.get("at") or 0) < end
+                     and float(o.get("at") or 0) + float(o.get("duration") or 0) > start]
     clip = {**plan, "format": fmt, "shots": shots, "duration": round(end - start, 3), "audio_offset": start,
-            "chapter_cards": clip_cards, "sfx": clip_sfx}
+            "chapter_cards": clip_cards, "sfx": clip_sfx,
+            "title_card_overlays": clip_overlays, "panelfit_title_cards": clip_overlays}
     return clip
 
 

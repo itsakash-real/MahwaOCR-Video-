@@ -272,13 +272,21 @@ stretch — ever:
 - **Motion.** Zero static, all LINEAR and sub-pixel (LANCZOS source +
   float AFFINE sampling; ease curves and integer rounding are banned —
   they read as jerk). Narrow pillars (aspect < `panelfit.drift_aspect_max`,
-  0.72) get a gentle vertical DRIFT: constant ~6.8% of frame height per
-  second, total travel clamped to 5-13% of frame height, direction
-  alternating shot by shot, the foreground oversized by travel +
-  headroom so no panel edge ever shows. Wider pillars and full-bleed
-  shots get a zoom-IN at a constant RATE (+5.0%/s; the total grows with
-  shot length, capped at +50% — `panelfit.zoom_max_total` — where the
-  scale holds). There is no full strip traversal and no zoom-out.
+  0.72) get a gentle vertical DRIFT at a constant SPEED of 3.7% of
+  frame width per second (≈71 px/s at 1080p; the reference fixes the
+  speed, travel varies), total travel clamped to 5-13% of frame
+  height — at the cap the panel HOLDS, never reverses, never slows.
+  Motion is planned over the whole SENTENCE: when a sentence splits
+  into sub-shots on one panel, the sub-shots slice one continuous
+  motion (position-exact at the seams, one direction throughout), and
+  a panel reused by the next sentence keeps its drift direction.
+  Direction otherwise alternates sentence by sentence. The foreground
+  is oversized by travel + headroom so no panel edge ever shows.
+  Wider pillars and full-bleed shots get a zoom-IN at a constant RATE
+  (+5.0%/s; the total grows with shot length, capped at +50% —
+  `panelfit.zoom_max_total` — where the scale holds), sliced across
+  sub-shots the same way. There is no full strip traversal, no
+  zoom-out, and no horizontal motion of any kind.
 - **Impact.** Shots flagged by `{impact}`/`{reveal}` markers (fallback:
   a VISUAL_ACTION sentence with an impact verb) zoom at +8.8%/s
   instead. There is NO screen shake and NO white flash in this mode —
@@ -288,37 +296,58 @@ stretch — ever:
   captions — platform CC only).
 - **Rhythm.** The mode's own shot floor is `panelfit.min_shot` (0.3s,
   the measured minimum; the sync gate honours it for these plans) and
-  sentences over `panelfit.split_above` (3.5s) split into two shots.
+  sentences over `panelfit.split_above` (3.0s) split into two shots.
   Narration for this mode should be synthesized with
-  `tts.gap_seconds = panelfit.tts_gap_seconds` (0.20s; measured median
-  gap 0.214s).
+  `tts.gap_seconds = panelfit.tts_gap_seconds` (0.11s — the SETTING,
+  chosen because per-sentence TTS edge padding adds ≈0.09s: the
+  measured silence lands at ≈0.20s, on the reference's 0.214s median).
 - **Title cards.** Timeline cues in the narration ("Age 4", "Week 6 of
   possession", "3 years later") become split-flap title cards: solid
   black, a small serif label over two beige flap tiles (zero-padded
   digits, block = 33% of frame height), one bold condensed ALL-CAPS
-  line in Anton below. A card starts at its cue sentence's aligned
-  start and lasts clamp(cue span, 2.0, 3.0)s, consuming the plan time
-  it overlaps; the sync audit counts card time as covering its cue.
+  line in Anton below (rendered ink ≈12.2% of frame height). Since
+  the 2026-10-23 analysis fixes, a card is a timed OVERLAY
+  (`title_card_overlays` on the plan), drawn over whatever shot is
+  running at its cue sentence's aligned start for
+  clamp(cue span, 1.4, 2.1)s — it consumes no plan time, splits no
+  shot, and the master audio is never paused or split under it; the
+  sync audit counts overlay time as covering its cue.
   See `video/titlecards.py`.
+- **Gutter segments.** With `panels.trim_v2` on, panel detection
+  records each panel's interior gutter segments (stacked images
+  across a pure white/black strip over 15px high —
+  `panels.gutter_slice_min`) as metadata; a single-card shot on such
+  a panel splits into one sub-shot per segment, sequenced inside the
+  shot's own time with durations proportional to segment heights
+  (floor `panelfit.min_shot` per piece), each fitted as a picture of
+  the segment's own height. Panel ids and assets never change.
+- **Drop shadow.** The sharp foreground carries a black drop shadow
+  (`panelfit.shadow_dy` 20px, `shadow_blur` 10px, `shadow_opacity`
+  0.40, all at 1080p) composited between the full-brightness blurred
+  background and the foreground — the background is never dimmed.
 - **Sync.** Shots anchor to sentence boundaries via the alignment, as
   in every mode; keyframe endpoints are the shot boundaries.
 - **Parallax** is deferred (build B11): the detector yields boxes, not
   character segmentations, so cut-outs aren't cheap yet.
 - **QA.** `chapter_N.qa.json` carries `panelfit_static` (must be
-  empty), `panelfit_over_cap` (panels fitted at the upscale cap —
+  empty), `panelfit_hold` (sub-shots sitting in a travel-cap hold —
+  info only), `panelfit_over_cap` (panels fitted at the upscale cap —
   shown smaller, never stretched), `panelfit_impact` (which shots got
-  the fast zoom rate, and by which rule) and `panelfit_title_cards`.
-  A card breaking the composition invariants fails the build.
+  the fast zoom rate, and by which rule), `panelfit_title_cards`
+  (the card overlays) and `panelfit_segments` (panels whose shots
+  split at gutter segments). A card breaking the composition
+  invariants fails the build.
 - **Storyboard** shows the composed frame at shot start and end, side
   by side. Landscape only; portrait formats stay classic.
 
 Knobs (`video.panelfit.*`, defaults pinned in code): `bg_blur` 50,
 `bg_opacity` 1.0, `fill_aspect` 1.6, `drift_aspect_max` 0.72,
-`drift_speed` 0.068, `drift_min_travel` 0.05, `drift_max_travel` 0.13,
+`drift_speed` 0.0658, `drift_min_travel` 0.05, `drift_max_travel` 0.13,
 `drift_headroom` 0.03, `zoom_rate` 0.05, `zoom_rate_impact` 0.088,
 `max_upscale` 2.4, `still_limit` 0.5, `min_shot` 0.3, `split_above`
-3.5, `split_min_piece` 1.2, `captions` false, `title_cards` true,
-`tts_gap_seconds` 0.20.
+3.0, `split_min_piece` 1.2, `captions` false, `title_cards` true,
+`shadow_dy` 20, `shadow_blur` 10, `shadow_opacity` 0.40,
+`gutter_segments` true, `tts_gap_seconds` 0.11.
 ## Full-frame mode (`video.mode: fullframe`)
 
 No cards, no backdrop, no borders: every shot fills the 1920×1080 frame with a

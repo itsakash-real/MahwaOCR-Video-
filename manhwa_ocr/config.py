@@ -101,11 +101,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # full-bleed; narrower panels are height-fit pillars
             "drift_aspect_max": 0.72,  # pillars narrower than this (w/h) get a gentle
                                        # vertical drift; wider pillars get a zoom-in
-            "drift_speed": 0.068,      # drift speed, frame-heights/second (measured
-                                       # cluster 20.7-27.6 px/s at 360p = 5.8-7.7%/s)
-            "drift_min_travel": 0.05,  # a drift always travels at least this share of
-                                       # the frame height (measured totals: 5-13%)
-            "drift_max_travel": 0.13,  # ... and never more than this share
+            "drift_speed": 0.0658,     # drift speed, frame-heights/second — the
+                                       # invariant (B1d F2): 3.7% of frame WIDTH/s
+                                       # at 16:9 ≈ 71 px/s at 1080p (measured band
+                                       # 3.2-4.3% width/s); travel is derived
+            "drift_min_travel": 0.05,  # a drift SPAN's travel floor, share of frame
+                                       # height (measured totals: 5-13%); motion
+                                       # still runs at drift_speed throughout
+            "drift_max_travel": 0.13,  # ... and never more than this share; at the
+                                       # cap the panel HOLDS (never reverses)
             "drift_headroom": 0.03,    # extra foreground oversize beyond the travel,
                                        # so a drift never exposes a panel edge
             "zoom_rate": 0.05,         # zoom-in rate: +5.0%/s (measured band
@@ -121,22 +125,46 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "max_upscale": 2.4,        # the foreground is never upscaled past this
                                        # (readability floor for small panels)
             "still_limit": 0.5,        # seconds: nothing on screen may stay still longer
-                                       # (zero-static rule; motion is continuous by
-                                       # construction, tests pin the invariant)
+                                       # while its span still has travel/scale left
+                                       # (motion is continuous by construction; at
+                                       # the measured travel/zoom caps the position
+                                       # holds, as the reference's own zooms hold)
             "min_shot": 0.3,           # this mode's shot floor (measured reference
                                        # minimum 0.30s; classic keeps its own 3.0s floor)
-            "split_above": 3.5,        # sentences longer than this split into two
+            "split_above": 3.0,        # sentences longer than this split into two
                                        # shots (the reference's median shot is ~2s)
             "split_min_piece": 1.2,    # smallest piece such a split may produce
             "captions": False,         # NO burned-in captions in this mode (measured:
                                        # the reference carries none -- platform CC only)
             "title_cards": True,       # Title Card Generator: timeline cues in the
                                        # narration ("Age 4" / "Week 6") become split-flap
-                                       # cards (see video/titlecards.py)
-            "tts_gap_seconds": 0.20,   # the mode's recommended narration gap (measured
-                                       # median 0.214s, max 0.364s). The global TTS
-                                       # default stays 0.35; use this value for
-                                       # tts.gap_seconds when synthesizing for this mode.
+                                       # cards (see video/titlecards.py). Analysis
+                                       # fix 3 (2026-10-23): cards render as timed
+                                       # OVERLAYS over the running shot at the cue's
+                                       # start — shots are never consumed or split
+                                       # for a card, and the master audio (muxed
+                                       # whole at render) never pauses for one.
+            "shadow_dy": 20,           # Analysis fix 4 (user's spec, 2026-10-23):
+                                       # black drop shadow under the sharp
+                                       # foreground layer — Y offset, px at 1080p.
+            "shadow_blur": 10,         # ... its blur radius, px at 1080p.
+            "shadow_opacity": 0.40,    # ... at 40% opacity. The background blur
+                                       # stays at FULL brightness (bg_opacity 1.0);
+                                       # contrast comes from this shadow, never
+                                       # from dimming the background.
+            "gutter_segments": True,   # Analysis fix 1: a shot whose panel holds
+                                       # stacked images across a >15px white/black
+                                       # gutter (panels.gutter_segments, recorded
+                                       # at panel build under trim_v2) splits into
+                                       # one sub-shot per segment, sequenced
+                                       # with the narration.
+            "tts_gap_seconds": 0.11,   # the mode's recommended narration gap. The
+                                       # reference's MEASURED median gap is 0.214s,
+                                       # but a 0.20 setting rendered as 0.296s median
+                                       # (per-sentence TTS edge padding ≈ +0.09s), so
+                                       # 0.11 lands the measured gap at ≈0.20s (B1d F4).
+                                       # The global TTS default stays 0.35; use this
+                                       # value for tts.gap_seconds for this mode.
         },
         "fullframe": {
             "max_upscale": 2.4,        # zoom guardrail: a viewport's source is never smaller
@@ -169,6 +197,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "trim_cap": 0.40,       # max share of a panel's height the v1 trim cuts per side
             "trim_v2": False,       # Rule 6: full ink-bbox trim (white+black, rows+cols) +
                                     # white-gap slicing, at panel build (opt-in; panelfit prep)
+            "gutter_slice_min": 15, # Analysis fix 1: interior white/black gutters
+                                    # TALLER than this (px) mark stacked-image
+                                    # segments inside a panel (recorded as
+                                    # panels.gutter_segments when trim_v2 is on)
         },
         # Bubble/text detector (Build 4/3 shared step): ogkalu RT-DETR, Apache-2.0.
         # "model": path to the ONNX file ("" = ~/.config/manhwa/models/ or $MANHWA_DETECTOR_MODEL)
