@@ -1,0 +1,4 @@
+Anton-Regular.ttf
+Copyright 2020 The Anton Project Authors (https://github.com/googlefonts/anton).
+Licensed under the SIL Open Font License, Version 1.1: https://scripts.sil.org/OFL
+Bundled for the Title Card Generator (manhwa_ocr/video/titlecards.py).
