@@ -161,10 +161,35 @@ def _shard_count(work: Path) -> int:
 
 
 def _shard_progress(work: Path) -> tuple[int, int]:
-    """(shard result files present, shard tasks) — cheap completeness signal."""
-    total = _shard_count(work)
-    present = len(list(work.glob("tile_results_shard_*.json")))
-    return present, total
+    """(shard tasks whose results file covers ALL their tiles, shard tasks)."""
+    try:
+        manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+        shards = max(1, int((manifest.get("shards") or {}).get("count", 1)))
+        ids = [t["id"] for t in manifest["tiles"]]
+    except (OSError, ValueError, TypeError, KeyError):
+        return 0, 1
+    if shards <= 1:
+        return 0, 1
+    from .util import read_agent_json
+
+    chunk = (len(ids) + shards - 1) // shards
+    complete = 0
+    for k in range(1, shards + 1):
+        want = set(ids[(k - 1) * chunk: k * chunk])
+        if not want:
+            complete += 1  # an empty shard is trivially done
+            continue
+        try:
+            data = read_agent_json(work / f"tile_results_shard_{k}.json", "")
+        except Exception:  # noqa: BLE001 - missing/unparseable = not done
+            continue
+        if isinstance(data, dict):
+            lists = [v for v in data.values() if isinstance(v, list)]
+            data = lists[0] if len(lists) == 1 else []
+        have = {str(e.get("id")) for e in data if isinstance(e, dict)} if isinstance(data, list) else set()
+        if want <= have:
+            complete += 1
+    return complete, shards
 
 
 def _staleness_line(work: Path, stale_minutes: float | None) -> str:
@@ -294,7 +319,7 @@ def stage_instruction(
         if not parses:
             state = "a tile results file exists but is not valid JSON; fix it, keeping what is already there"
         elif shards > 1:
-            state = f"{got} of {total} tiles read ({done_shards}/{total_shards} shard files done)"
+            state = f"{got} of {total} tiles read (shards complete: {done_shards}/{total_shards})"
         elif got:
             state = f"{got} of {total} tiles read so far; read the remaining ones and add them"
         else:
