@@ -34,7 +34,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 LAYOUTS = ("single", "pair", "inset", "wide")
 BACKGROUNDS = ("blur", "black", "white")
@@ -48,7 +48,7 @@ EFFECTS = ("shake", "punch", "flash", "glitch")
 # impact / reveal beats, and glitch at most once per 60s. Every transition
 # is a pure function of (shot, time): frame-exact, no flicker by design.
 TRANSITIONS = ("cut", "fade", "slide", "zoom", "whip", "glitch")
-TRANSITION_WEIGHTS = [("cut", 90), ("fade", 10)]
+TRANSITION_WEIGHTS = [("cut", 100)]
 TRANSITION_ENTERS = {"cut": "cut", "fade": "fade_in", "slide": "slide_left",
                      "zoom": "zoom_in", "whip": "whip_in", "glitch": "cut"}
 GLITCH_LEN = 0.2          # RGB-split glitch length, seconds (CapCut-style, impact beats only)
@@ -222,27 +222,30 @@ def slot_centres(layout: str, fmt: Format, size: Tuple[int, int], index: int) ->
 
 
 @lru_cache(maxsize=8)
-def _vignette_grid(width: int, height: int) -> np.ndarray:
+def _vignette_grid(width: int, height: int, strength: float = 0.45) -> np.ndarray:
     ys, xs = np.ogrid[0:height, 0:width]
     nx = (xs - width / 2) / (width / 2)
     ny = (ys - height / 2) / (height / 2)
     d = np.sqrt(nx ** 2 + ny ** 2) / math.sqrt(2)
-    return (1.0 - 0.45 * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
+    return (1.0 - strength * np.clip(d, 0, 1) ** 2).astype(np.float32)[..., None]
 
 
-def _vignette(fmt: Format) -> np.ndarray:
+def _vignette(fmt: Format, strength: float = 0.45) -> np.ndarray:
     # The vignette depends only on the frame size: identical for every shot
     # in a chapter, so build it once. Callers must not mutate the result
     # (background() only multiplies by it).
-    return _vignette_grid(fmt.width, fmt.height)
+    return _vignette_grid(fmt.width, fmt.height, strength)
 
 
-def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
+def background(kind: str, panel: Image.Image | None, fmt: Format, light: bool = False) -> np.ndarray:
     if kind == "black" or (kind == "blur" and panel is None):
         return np.zeros((fmt.height, fmt.width, 3), np.uint8)
     if kind == "white":
         return np.full((fmt.height, fmt.width, 3), 255, np.uint8)
     # Blur: the panel scaled to cover the frame, blurred, darkened, vignetted.
+    # Wide mode (`light=True`): the side fill stays bright (0.90 + a soft
+    # 0.18 vignette) -- the classic dark pillars (0.72 + 0.45) look too
+    # heavy next to a full-height card.
     sw, sh = max(4, fmt.width // 8), max(4, fmt.height // 8)
     k = max(sw / panel.width, sh / panel.height)
     small = panel.convert("RGB").resize((max(4, int(panel.width * k) + 1), max(4, int(panel.height * k) + 1)),
@@ -250,7 +253,9 @@ def background(kind: str, panel: Image.Image | None, fmt: Format) -> np.ndarray:
     left, top = (small.width - sw) // 2, (small.height - sh) // 2
     small = small.crop((left, top, left + sw, top + sh)).filter(ImageFilter.GaussianBlur(4.5))
     big = np.asarray(small.resize((fmt.width, fmt.height), Image.BICUBIC), dtype=np.float32)
-    return np.clip(big * 0.72 * _vignette(fmt), 0, 255).astype(np.uint8)
+    factor = 0.90 if light else 0.72
+    vig = _vignette(fmt, 0.18) if light else _vignette(fmt)
+    return np.clip(big * factor * vig, 0, 255).astype(np.uint8)
 
 
 # ------------------------------------------------------------------ P4 caches
@@ -266,7 +271,7 @@ _SRC_CACHE_MAX = 32
 
 
 def _cached_background(kind: str, panel: Image.Image | None, fmt: Format,
-                       bg_panel_id: str | None) -> np.ndarray:
+                       bg_panel_id: str | None, light: bool = False) -> np.ndarray:
     """background() with a cross-shot cache. Consecutive shots usually
     share a bg_panel (same panel across sentences); rebuilding the
     blurred + vignetted 1080p backdrop per shot re-pays the upscale +
@@ -274,20 +279,20 @@ def _cached_background(kind: str, panel: Image.Image | None, fmt: Format,
     different image under the same panel id can never hit a stale entry.
     Solid (black/white) backgrounds are cached by kind + frame size."""
     if panel is None:
-        key = (kind, fmt.width, fmt.height, None, None)
+        key = (kind, fmt.width, fmt.height, None, None, light)
         hit = _BG_CACHE.get(key)
         if hit is not None:
             _BG_CACHE.move_to_end(key)
             return hit[1]
-        arr = background(kind, None, fmt)
+        arr = background(kind, None, fmt, light=light)
         _BG_CACHE[key] = (None, arr)
     else:
-        key = (kind, fmt.width, fmt.height, bg_panel_id, id(panel))
+        key = (kind, fmt.width, fmt.height, bg_panel_id, id(panel), light)
         hit = _BG_CACHE.get(key)
         if hit is not None and hit[0] is panel:
             _BG_CACHE.move_to_end(key)
             return hit[1]
-        arr = background(kind, panel, fmt)
+        arr = background(kind, panel, fmt, light=light)
         _BG_CACHE[key] = (panel, arr)
     while len(_BG_CACHE) > _BG_CACHE_MAX:
         _BG_CACHE.popitem(last=False)
@@ -374,6 +379,24 @@ class Card:
             self.cw, self.ch = fit(aspect, card_box(layout, fmt), None)
         else:
             self.cw, self.ch = fit(aspect, card_box(layout, fmt), layout_area(layout, fmt))
+        # Wide mode ("video.mode: wide"): the card is full frame height and
+        # at least 6/16 of the frame wide -- no thin slivers, ever. Pairs
+        # split the frame exactly in two. Portrait formats keep classic sizing.
+        self.wide_display = bool(spec.get("wide_display")) and fmt.width > fmt.height
+        self.wide_zoom_scale = float(spec.get("wide_zoom_scale", 0.5))
+        if self.wide_display:
+            # Every wide card touches BOTH the top and bottom of the frame,
+            # no exception -- a panel wider than 16:9 is never "shown whole"
+            # with the sides full-bleed and top/bottom filled instead (that
+            # was tried and rejected: it reads as a gap, not a wide shot).
+            # wide_crop() already keeps a windowed crop's width within the
+            # 6/16-16/9 range, so aspect here is never above 1.777.
+            H, W = fmt.height, fmt.width
+            if layout == "pair":
+                self.cw, self.ch = W // 2, H  # 8/16 each: two panels fill the frame
+            else:
+                self.ch = H
+                self.cw = max(round(0.375 * W), min(W, round(H * aspect)))
         self.border = max(1, round(3 * u))
         self.radius = max(2, round(12 * u))
         self.margin = max(6, round(46 * u))
@@ -381,6 +404,10 @@ class Card:
         self.iw, self.ih = iw, ih
         # P4: cache the LANCZOS resize; same panel + crop + target size reuses it.
         self.src = _cached_src(panel, region, (x0, y0, x1, y1, pad_y), iw, ih)
+        if self.wide_display and region.width < iw:
+            # Wide mode often upscales a narrow window: a gentle unsharp
+            # mask after the Lanczos resize keeps it from reading soft.
+            self.src = self.src.filter(ImageFilter.UnsharpMask(radius=2.0, percent=60, threshold=3))
 
         # Static parts of the sprite, built once: shadow + white rounded border.
         m = self.margin
@@ -408,6 +435,16 @@ class Card:
         else:
             self.kb_dur = max(0.01, shot_end - self.appear)
         self.start_c, self.rest_c = slot_centres(layout, fmt, (self.cw, self.ch), index)
+        if self.wide_display:
+            # Full frame height, no caption-bar offset: cards sit on the
+            # frame's true vertical centre, not the classic top-92% centre.
+            cy = fmt.height / 2.0
+            if layout == "pair":
+                lx, rx = self.cw / 2.0, fmt.width - self.cw / 2.0
+                self.rest_c = (lx, cy) if index == 0 else (rx, cy)
+                self.start_c = (fmt.width / 2.0, cy) if index == 0 else self.rest_c
+            else:
+                self.start_c = self.rest_c = (fmt.width / 2.0, cy)
         self.pair_move_at = pair_move_at if (layout == "pair" and index == 0) else None
 
     # -------------------------------------------------- time-varying parts
@@ -428,6 +465,12 @@ class Card:
         # motion); `hold` keeps ease-out-then-hold.
         p = ease_out((t - self.appear) / self.kb_dur) if m == "hold" else ease_in_out((t - self.appear) / self.kb_dur)
         zoom = {"push_in": 1.0 + 0.15 * p, "pull_out": 1.18 - 0.18 * p, "hold": 1.01 + 0.02 * p}.get(m, 1.08)
+        if self.wide_display:
+            # Wide cards touch the frame edges on every side: full-amplitude
+            # zoom eats the art (bubbles, faces at the crop edge). Scaled
+            # down to the headroom actually built into the window (half by
+            # default; further for a whole panel with edge-adjacent text).
+            zoom = 1.0 + (zoom - 1.0) * self.wide_zoom_scale
         zoom *= 1 + extra_zoom
         # The source is the whole crop (at extra resolution, so zoomed views stay
         # sharp); zoom 1 shows all of it, zoom 1.1 shows the middle 1/1.1.
@@ -465,7 +508,14 @@ class Card:
         d = self.enter_dur
         p = ease_out(u / d)
         W, H, e = self.fmt.width, self.fmt.height, self.enter
-        fade = min(1.0, u / (0.55 * d))
+        # Opacity ramps across the FULL entrance duration, not just the
+        # first 55% of it: that mismatch meant a card became fully opaque
+        # while it was still 90%+ through a fast ease-out slide (both
+        # changing fastest in the same early window), reading as a pop/snap
+        # into place rather than a smooth entrance -- most visible on a
+        # pair's second card arriving mid-shot. Matches the same curve
+        # fade_in/zoom_in/swing_right already use for alpha.
+        fade = ease_in_out(u / d)
         if e == "fade_in":
             out["alpha"] = ease_in_out(u / d)
         elif e == "slide_left":       # comes in from the right
@@ -498,6 +548,120 @@ class Card:
         off = self.margin + self.border
         spr.paste(content, (off, off), self.inner_mask)
         return spr
+
+
+class FullFrameView:
+    """One panel shown full-bleed (video.mode: fullframe): a 16:9 viewport
+    travelling the camera path the planner resolved (card["viewport"] =
+    {window, from, to} in panel fractions). The viewport IS the frame --
+    no card, no border, no backdrop. The from/to rects already encode the
+    pan or zoom, eased in-out over the whole shot like every non-hold
+    Card motion (a hand-set `hold` keeps the old ease-out)."""
+
+    # The prepared source is the window grown by this share of itself on
+    # each side (clamped to the panel) purely as camera-shake headroom: a
+    # shake shifts the sampling rect by a few output pixels, and the pad
+    # guarantees it never samples outside the prepared source.
+    SHAKE_PAD = 0.012
+    SHAKE_PAD_MIN = 0.002   # absolute floor of the pad, in panel fractions
+    UNSHARP_MIN_SCALE = 1.3  # sources upscaled past this get the gentle unsharp
+
+    def __init__(self, panel: Image.Image, spec: Dict[str, Any], shot_start: float,
+                 shot_end: float, fmt: Format):
+        self.fmt = fmt
+        vp = spec.get("viewport") or {}
+        whole = [float(v) for v in (spec.get("crop") or [0, 0, 1, 1])]
+        self.window = [float(v) for v in (vp.get("window") or whole)]
+        self.v_from = [float(v) for v in (vp.get("from") or self.window)]
+        self.v_to = [float(v) for v in (vp.get("to") or self.window)]
+        self.motion = spec.get("motion") if spec.get("motion") in MOTIONS else "push_in"
+        self.appear = shot_start + max(0.0, float(spec.get("at") or 0.0))
+        self.enter = spec.get("enter") if spec.get("enter") in ENTRANCES else "cut"
+        self.enter_dur = ENTER_DUR[self.enter]
+        if self.motion == "hold":
+            self.kb_dur = max(0.01, min(shot_end - self.appear, KB_MAX))
+        else:
+            self.kb_dur = max(0.01, shot_end - self.appear)
+        pw, ph = panel.size
+        self.pw, self.ph = pw, ph
+        # Source: the window (+ shake pad), LANCZOS-scaled so the LARGEST
+        # viewport maps to at least the frame size. A deeper zoom samples a
+        # smaller part of it -- the same trade Card makes with SRC_HEADROOM,
+        # and the reason the planner caps zoom depth (the upscale floor).
+        pad_x = self.SHAKE_PAD * (self.window[2] - self.window[0]) + self.SHAKE_PAD_MIN
+        pad_y = self.SHAKE_PAD * (self.window[3] - self.window[1]) + self.SHAKE_PAD_MIN
+        rx0 = max(0.0, self.window[0] - pad_x)
+        ry0 = max(0.0, self.window[1] - pad_y)
+        rx1 = min(1.0, self.window[2] + pad_x)
+        ry1 = min(1.0, self.window[3] + pad_y)
+        self.region = (rx0, ry0, rx1, ry1)
+        region = panel.convert("RGB").crop((int(rx0 * pw), int(ry0 * ph),
+                                            max(int(rx0 * pw) + 2, int(rx1 * pw)),
+                                            max(int(ry0 * ph) + 2, int(ry1 * ph))))
+        big_w = max(self.v_from[2] - self.v_from[0], self.v_to[2] - self.v_to[0]) * pw
+        big_h = max(self.v_from[3] - self.v_from[1], self.v_to[3] - self.v_to[1]) * ph
+        scale = max(fmt.width / max(1.0, big_w), fmt.height / max(1.0, big_h))
+        self.scale = scale
+        self.src = region.resize((max(2, round(region.width * scale)),
+                                  max(2, round(region.height * scale))), Image.LANCZOS)
+        if scale > self.UNSHARP_MIN_SCALE:
+            # Full-bleed upscaling is this mode's known cost: the same
+            # gentle unsharp wide mode applies to upscaled windows.
+            self.src = self.src.filter(ImageFilter.UnsharpMask(radius=2.0, percent=60, threshold=3))
+
+    def visible(self, t: float) -> bool:
+        return t >= self.appear - 1e-9
+
+    def settled_at(self) -> float:
+        return max(self.appear + self.enter_dur, self.appear + self.kb_dur)
+
+    def is_static(self) -> bool:
+        return all(abs(a - b) < 1e-4 for a, b in zip(self.v_from, self.v_to))
+
+    def alpha(self, t: float) -> float:
+        """Entrance opacity. Only a fade is meaningful on a full-bleed
+        frame (a slide/zoom entrance would expose a backdrop that does
+        not exist in this mode); every other entrance is a cut."""
+        if self.enter != "fade_in" or t >= self.appear + self.enter_dur:
+            return 1.0
+        return ease_in_out((t - self.appear) / self.enter_dur)
+
+    def _rect(self, t: float, extra_zoom: float,
+              shake: Tuple[float, float]) -> Tuple[float, float, float, float]:
+        p = ease_out((t - self.appear) / self.kb_dur) if self.motion == "hold" \
+            else ease_in_out((t - self.appear) / self.kb_dur)
+        x0 = self.v_from[0] + (self.v_to[0] - self.v_from[0]) * p
+        y0 = self.v_from[1] + (self.v_to[1] - self.v_from[1]) * p
+        x1 = self.v_from[2] + (self.v_to[2] - self.v_from[2]) * p
+        y1 = self.v_from[3] + (self.v_to[3] - self.v_from[3]) * p
+        if extra_zoom > 0:   # punch effect: tighten on the viewport's centre
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            w, h = (x1 - x0) / (1 + extra_zoom), (y1 - y0) / (1 + extra_zoom)
+            x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+        if shake[0] or shake[1]:
+            # Shift the CAMERA, not the frame: the same output-pixel
+            # offset expressed in panel fractions of this viewport,
+            # clamped so the rect stays inside the padded source region.
+            w, h = x1 - x0, y1 - y0
+            dx = shake[0] / self.fmt.width * w
+            dy = shake[1] / self.fmt.height * h
+            rx0, ry0, rx1, ry1 = self.region
+            x0 = max(rx0, min(rx1 - w, x0 + dx))
+            y0 = max(ry0, min(ry1 - h, y0 + dy))
+            x1, y1 = x0 + w, y0 + h
+        return x0, y0, x1, y1
+
+    def sprite(self, t: float, extra_zoom: float = 0.0,
+               shake: Tuple[float, float] = (0.0, 0.0)) -> Image.Image:
+        x0, y0, x1, y1 = self._rect(t, extra_zoom, shake)
+        s = self.scale
+        sx = (x0 - self.region[0]) * self.pw * s
+        sy = (y0 - self.region[1]) * self.ph * s
+        vw = (x1 - x0) * self.pw * s
+        vh = (y1 - y0) * self.ph * s
+        return self.src.transform((self.fmt.width, self.fmt.height), Image.AFFINE,
+                                  (vw / self.fmt.width, 0.0, sx, 0.0, vh / self.fmt.height, sy),
+                                  resample=Image.BILINEAR)
 
 
 # ------------------------------------------------------------------ effects
@@ -668,6 +832,289 @@ def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) ->
     return True
 
 
+# ------------------------------------------------------------------ panel-fit views
+#
+# Panel-fit mode (video.mode: panelfit): the renderer half of the
+# MEASURED reference style. Mirror constants of the planner's (plan.PF_*);
+# config pins all of them to the same numbers and tests fail on drift.
+
+PFR_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
+PFR_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+PFR_SHADOW_DY = 20          # foreground drop shadow (B1e E8): black, offset
+PFR_SHADOW_BLUR = 10        # (0, +20px), blur 10px, opacity 40% — layered
+PFR_SHADOW_OPACITY = 0.40   # between the blur backdrop and the foreground
+
+
+class PanelFitView:
+    """One panel composed per the measured reference style: the panel
+    shown WHOLE at its native aspect — sharp, centred — over the same
+    panel cover-scaled, heavily blurred, at FULL brightness (the
+    measured reference has no dimming layer). Assets arrive already
+    white-space-eradicated (Rule 6: panels.trim_v2), so neither layer
+    ever contains a white margin.
+
+    Motion is LINEAR and sub-pixel: the foreground source is LANCZOS-
+    resized once to the largest size the motion reaches, and each frame
+    samples it with a float AFFINE transform — no per-frame integer
+    rounding (the ffmpeg-zoompan jitter), no ease curves.
+
+    kind "zoom": a height-fit pillar zooming IN at a constant rate
+    (the spec's zoom_end = 1 + rate x shot duration; dir "out" exists
+    only on pre-measurement plans — the measured style never zooms out).
+    kind "fill": a wide panel cover-filling the whole frame, same zoom.
+    kind "drift": a narrow pillar, height-fit and oversized by
+    (drift_frac + headroom); across the shot it drifts vertically by
+    drift_frac of the frame height, centred, so no panel edge ever
+    enters the frame (dir "down": the art moves downward).
+    kind "scroll": LEGACY (pre-measurement plans only): a tall strip
+    fitted by width and scrolled across the view's window.
+    kind "traverse" (B1e): a strip fitted by width, sliding linearly
+    from its top anchor to its bottom anchor across the sentence span
+    (traverse_from/to/rate — the drift slice's sibling fields).
+    kind "duo" (B1e): one of two panels shown side by side, each in its
+    own half-frame cell over the pair's shared blur — sliding
+    vertically (duo_mode "slide", the drift fields) or zooming out
+    (duo_mode "zoom_out", the signed zoom fields).
+
+    Span slices (B1d): when a sentence split into sub-shots, each
+    sub-shot's spec is a slice of ONE span motion — a zoom carries
+    `zoom_start` (the scale the span had reached when this sub-shot
+    opens), a drift carries `drift_from`/`drift_to`/`drift_rate`
+    (signed offsets and the span's constant speed). The view replays
+    the slice in absolute time, so the seam between sub-shots is
+    position-exact and the motion never reverses; at the travel cap
+    the position HOLDS. Specs without these keys are pre-B1d plans
+    and keep the old per-shot centred math.
+    """
+
+    def __init__(self, panel: Image.Image, spec: Dict[str, Any], card: Dict[str, Any],
+                 shot_start: float, shot_end: float, fmt: Format):
+        self.fmt = fmt
+        self.kind = spec.get("kind") if spec.get("kind") in ("zoom", "drift", "fill", "scroll", "traverse", "duo") else "zoom"
+        self.dir = spec.get("dir") or ("down" if self.kind in ("scroll", "drift") else "in")
+        self.base_w = float(spec.get("base_w") or fmt.width)
+        self.base_h = float(spec.get("base_h") or fmt.height)
+        self.zoom_end = float(spec.get("zoom_end") or 1.08)
+        self.zoom_rate = float(spec.get("zoom_rate") or 0.0)
+        self.zoom_start = float(spec.get("zoom_start") or 1.0)
+        self.drift_frac = float(spec.get("drift_frac") or 0.0)
+        # B1e: a traverse slice carries its span position like a drift
+        # slice does (offsets in frame heights from the top anchor).
+        self.traverse_from = float(spec["traverse_from"]) if spec.get("traverse_from") is not None else None
+        self.traverse_to = float(spec.get("traverse_to") or 0.0)
+        self.traverse_rate = float(spec.get("traverse_rate") or 0.0)
+        # B1e: a duo card lives in one half-frame cell.
+        self.duo_mode = spec.get("duo_mode") if self.kind == "duo" else None
+        self.cell = spec.get("cell") if self.kind == "duo" else None
+        self.cell_w = fmt.width / 2.0
+        self.cell_x0 = self.cell_w if self.cell == "right" else 0.0
+        # Span-slice keys (B1d); absent on pre-B1d plans.
+        self.drift_from = spec.get("drift_from")
+        self.drift_to = spec.get("drift_to")
+        self.drift_rate = float(spec.get("drift_rate") or 0.0)
+        if self.drift_from is not None:
+            self.drift_from = float(self.drift_from)
+            self.drift_to = float(self.drift_to if self.drift_to is not None
+                                  else self.drift_from)
+        self.appear = shot_start + max(0.0, float(card.get("at") or 0.0))
+        # Half a frame of slack on the appear edge: plan times are
+        # rounded to 3 decimals while frames are drawn on the f/fps
+        # grid, so a sub-shot's first frame can land a hair BEFORE
+        # its appear time — with a strict comparison that frame
+        # rendered as the background alone: one blurred frame at
+        # the seam (B1d F5). Progress clamps to 0, so the tolerance
+        # only ever shows the slice's true first position.
+        self.tol = 0.5 / max(1.0, float(fmt.fps or 30))
+        self.end = shot_end
+        self.sliced = spec.get("zoom_start") is not None
+        if self.zoom_rate <= 0 and self.kind in ("zoom", "fill") and not self.sliced:
+            # Legacy specs (pre-measurement plans) carry only zoom_end:
+            # derive the constant rate that reaches it across the view.
+            # A SLICED spec's rate is signed on purpose (B1e zoom-out
+            # hints store it negative) — never "derive" over it.
+            self.zoom_rate = max(0.0, self.zoom_end - 1.0) / max(0.01, self.end - self.appear)
+        self.enter = card.get("enter") if card.get("enter") in ENTRANCES else "cut"
+        self.enter_dur = ENTER_DUR[self.enter]
+        # B1f: a landmark-slice card shows ONE band of its panel: crop
+        # the image to the band (panel-height fractions) before either
+        # layer is built, so the slice composes exactly like a panel of
+        # the band's own dimensions — its own blur backdrop included.
+        _band = card.get("slice")
+        if isinstance(_band, (list, tuple)) and len(_band) == 2:
+            _f0, _f1 = float(_band[0]), float(_band[1])
+            _y0 = int(round(_f0 * panel.height))
+            _y1 = int(round(_f1 * panel.height))
+            if 0 <= _y0 < _y1 <= panel.height:
+                panel = panel.crop((0, _y0, panel.width, _y1))
+        pw, ph = panel.size
+        # Background layer: the same panel, cover-scaled to the frame,
+        # blurred, at FULL brightness (opacity 1.0 = no blend over
+        # black). Built once; static for the whole shot.
+        cover = max(fmt.width / max(1, pw), fmt.height / max(1, ph))
+        bw, bh = max(1, round(pw * cover)), max(1, round(ph * cover))
+        bg = panel.resize((bw, bh), Image.LANCZOS)
+        bx, by = (bw - fmt.width) // 2, (bh - fmt.height) // 2
+        bg = bg.crop((bx, by, bx + fmt.width, by + fmt.height))
+        bg = bg.filter(ImageFilter.GaussianBlur(PFR_BG_BLUR * bg.height / 1080.0))
+        if PFR_BG_OPACITY < 0.999:
+            bg = Image.blend(Image.new("RGB", bg.size, (0, 0, 0)), bg, PFR_BG_OPACITY)
+        self.bg = bg
+        # Foreground source: the whole panel at the largest size the
+        # motion reaches (base * zoom_end for zooms, base otherwise —
+        # a drift's base is already oversized by the planner). A
+        # zoom-OUT reaches its largest size at zoom_START (B1e).
+        top = max(self.zoom_start, self.zoom_end) \
+            if self.kind in ("zoom", "fill") \
+            or (self.kind == "duo" and self.duo_mode == "zoom_out") else 1.0
+        fw, fh = max(2, round(self.base_w * top)), max(2, round(self.base_h * top))
+        src = panel if (fw, fh) == (pw, ph) else panel.resize((fw, fh), Image.LANCZOS)
+        self.src = src.convert("RGBA")
+        self.src_w, self.src_h = self.src.size
+
+    def visible(self, t: float) -> bool:
+        return t >= self.appear - self.tol
+
+    def _place(self, t: float, extra_zoom: float = 0.0):
+        """(dx, dy, disp_w, disp_h): where the foreground sits at t.
+
+        Placement anchors CENTRE (B1e E6): the foreground is centred on
+        the frame — or, for a duo card, on its cell — so a cover-crop's
+        overflow splits equally on both sides. The traverse is the one
+        exception: it anchors the art's TOP at the span's start and its
+        BOTTOM at the span's end. LINEAR progress everywhere in this
+        mode — constant velocity is the measured style's headline
+        smoothness property.
+        """
+        fmt = self.fmt
+        W, H = fmt.width, fmt.height
+        dur = max(0.01, self.end - self.appear)
+        p = min(1.0, max(0.0, (t - self.appear) / dur))
+        dt = max(0.0, t - self.appear)
+        if self.kind == "scroll":
+            disp_w, disp_h = self.base_w, self.base_h
+            span = H - disp_h  # <= 0 for a strip taller than the frame
+            dy = span * p if self.dir == "down" else span * (1.0 - p)
+            return (W - disp_w) / 2.0, dy, disp_w, disp_h
+        if self.kind == "traverse":
+            disp_w, disp_h = self.base_w, self.base_h
+            if self.traverse_from is not None:
+                # Span slice (B1e): the offset walks from traverse_from
+                # (0 = the art's top at the frame's top) down to
+                # traverse_to (the art's bottom at the frame's bottom),
+                # arriving exactly at the span's end — clamped to the
+                # slice's own window, continuous at seams.
+                off = self.traverse_from + self.traverse_rate * dt
+                off = min(self.traverse_from, max(self.traverse_to, off))
+                return (W - disp_w) / 2.0, off * H, disp_w, disp_h
+            span = H - disp_h  # legacy per-shot traverse (no slice keys)
+            dy = span * p if self.dir == "down" else span * (1.0 - p)
+            return (W - disp_w) / 2.0, dy, disp_w, disp_h
+        if self.kind == "drift" or (self.kind == "duo" and self.duo_mode == "slide"):
+            disp_w, disp_h = self.base_w, self.base_h
+            if self.drift_from is not None:
+                # Span slice (B1d): absolute offset in frame heights,
+                # moving at the span's constant rate toward drift_to,
+                # then HOLDING there — continuous at seams, never a
+                # reversal, never a slow-mo stretch.
+                off = self.drift_from + self.drift_rate * dt
+                if self.drift_rate > 0:
+                    off = min(off, self.drift_to)
+                elif self.drift_rate < 0:
+                    off = max(off, self.drift_to)
+                off *= H
+            else:  # legacy centred drift (pre-B1d plans)
+                travel = self.drift_frac * H
+                off = (p - 0.5) * travel if self.dir == "down" else (0.5 - p) * travel
+            if self.cell is not None:  # a duo slide stays inside its cell
+                return self.cell_x0 + (self.cell_w - disp_w) / 2.0, \
+                    (H - disp_h) / 2.0 + off, disp_w, disp_h
+            return (W - disp_w) / 2.0, (H - disp_h) / 2.0 + off, disp_w, disp_h
+        # zoom / fill / duo zoom-out: constant-RATE zoom, capped at zoom_end
+        z = self.zoom_end
+        if self.kind == "duo" or (self.dir == "out" and self.sliced):
+            # B1e: a sliced zoom-OUT (a per-sentence hint, or the duo
+            # fallback) — walk from zoom_start DOWN to zoom_end at the
+            # signed rate, clamped to the slice's own window.
+            s = max(z, min(self.zoom_start, self.zoom_start + self.zoom_rate * dt))
+        elif self.dir == "in":
+            # Grow at zoom_rate per second of screen time and HOLD
+            # at zoom_end (the planner caps zoom_end at +50%
+            # total: past the cap the scale stays, it does not
+            # slow down and stretch the rate over the shot).
+            s = min(self.zoom_start + self.zoom_rate * dt, z)
+        else:  # legacy zoom-out (pre-measurement plans only)
+            s = z - (z - 1.0) * p
+        s *= 1.0 + extra_zoom
+        disp_w, disp_h = self.base_w * s, self.base_h * s
+        if self.cell is not None:
+            return self.cell_x0 + (self.cell_w - disp_w) / 2.0, \
+                (H - disp_h) / 2.0, disp_w, disp_h
+        return (W - disp_w) / 2.0, (H - disp_h) / 2.0, disp_w, disp_h
+
+    def fg_layer(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+        """The foreground alone, as a full-frame transparent layer: the
+        panel source affine-sampled at its placed rect, clipped to its
+        duo cell when it has one (B1e E3 — a sliding panel must never
+        bleed across the centre line into its partner's cell)."""
+        fmt = self.fmt
+        W, H = fmt.width, fmt.height
+        dx, dy, disp_w, disp_h = self._place(t, extra_zoom)
+        a = self.src_w / max(1.0, disp_w)
+        e = self.src_h / max(1.0, disp_h)
+        layer = self.src.transform((W, H), Image.AFFINE,
+                                   (a, 0.0, -dx * a, 0.0, e, -dy * e),
+                                   resample=Image.BILINEAR, fill=0)
+        if self.cell is not None:
+            mask = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(mask).rectangle(
+                [self.cell_x0, 0, self.cell_x0 + self.cell_w - 1, H - 1], fill=255)
+            layer.putalpha(ImageChops.multiply(layer.getchannel("A"), mask))
+        return layer
+
+    def shadow_layer(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+        """The foreground's drop shadow (B1e E8): the placed panel's
+        silhouette in black at PFR_SHADOW_OPACITY, offset (0, +DY) and
+        blurred — composited BETWEEN the full-brightness blur backdrop
+        and the foreground, so the panel's edge gains contrast while
+        the backdrop itself is never dimmed. A duo panel's shadow is
+        clipped to its own cell, like its foreground."""
+        fmt = self.fmt
+        W, H = fmt.width, fmt.height
+        if PFR_SHADOW_OPACITY <= 0:
+            return Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        alpha = self.fg_layer(t, extra_zoom).getchannel("A")
+        if self.cell is not None:
+            mask = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(mask).rectangle(
+                [self.cell_x0, 0, self.cell_x0 + self.cell_w - 1, H - 1], fill=255)
+            alpha = ImageChops.multiply(alpha, mask)
+        scale = H / 1080.0
+        shifted = Image.new("L", (W, H), 0)
+        shifted.paste(alpha, (0, round(PFR_SHADOW_DY * scale)))
+        if PFR_SHADOW_OPACITY < 0.999:
+            op = PFR_SHADOW_OPACITY
+            shifted = shifted.point(lambda v: int(v * op))
+        shifted = shifted.filter(ImageFilter.GaussianBlur(max(0.1, PFR_SHADOW_BLUR * scale)))
+        out = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+        out.putalpha(shifted)
+        return out
+
+    def frame(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+        fmt = self.fmt
+        img = self.bg.convert("RGBA")
+        if t < self.appear - self.tol:
+            return img.convert("RGB")
+        out = Image.alpha_composite(img, self.shadow_layer(t, extra_zoom))
+        out = Image.alpha_composite(out, self.fg_layer(t, extra_zoom))
+        if self.enter == "fade_in" and t < self.appear + self.enter_dur:
+            # The only blended entrance in this mode: fade in from the
+            # blurred background alone. Every other entrance is a cut —
+            # no cross-dissolves anywhere near action.
+            k = ease_in_out((t - self.appear) / max(1e-6, self.enter_dur))
+            out = Image.blend(img, out, k)
+        return out.convert("RGB")
+
+
 # ------------------------------------------------------------------ shot
 
 
@@ -708,18 +1155,54 @@ class ShotRenderer:
         # starts with the first card already in place -- the slide never re-triggers.
         if shot.get("pair_move_done"):
             pair_move_at = self.start - PAIR_MOVE
-        self.cards = [Card(images[c["panel"]], c, layout, i, self.start, self.end, fmt, pair_move_at)
-                      for i, c in enumerate(cards)]
+        # Full-frame mode ("video.mode: fullframe"): no cards, no backdrop
+        # -- each card's viewport path is drawn full-bleed instead (see
+        # FullFrameView). Landscape only; the planner never emits it for
+        # portrait formats, and a card without a viewport spec falls the
+        # whole shot back to the classic card path.
+        self.fullframe = bool(shot.get("fullframe")) and fmt.width > fmt.height \
+            and bool(cards) and all(c.get("viewport") for c in cards)
+        self.views: List[FullFrameView] = []
+        if self.fullframe:
+            self.views = [FullFrameView(images[c["panel"]], c, self.start, self.end, fmt)
+                          for c in cards]
+            self.cards = []
+        else:
+            self.cards = [Card(images[c["panel"]], c, layout, i, self.start, self.end, fmt, pair_move_at)
+                          for i, c in enumerate(cards)]
+        # Panel-fit mode: when the shot carries a panelfit spec on every
+        # card, the shot is composed from PanelFitViews instead of cards
+        # (the cards stay built as the fallback if a spec is missing).
+        self.pf_views: List[PanelFitView] = []
+        if shot.get("panelfit") and fmt.width > fmt.height and cards:
+            _specs = [c.get("panelfit") for c in cards]
+            if all(isinstance(_sp, dict) for _sp in _specs):
+                self.pf_views = [PanelFitView(images[c["panel"]], _sp, c, self.start, self.end, fmt)
+                                 for c, _sp in zip(cards, _specs)]
+        # Title-card shots (Title Card Generator): no panels at all --
+        # the whole shot is the split-flap card, drawn once here.
+        self.title_card_img: Image.Image | None = None
+        _tc_spec = shot.get("title_card")
+        if isinstance(_tc_spec, dict):
+            from .titlecards import render_title_card as _render_tc
+            self.title_card_img = _render_tc(fmt.width, fmt.height,
+                                             str(_tc_spec.get("label") or ""),
+                                             int(_tc_spec.get("number") or 0),
+                                             str(_tc_spec.get("line") or ""))
 
         bg_kind = shot.get("background") if shot.get("background") in BACKGROUNDS else "blur"
         bg_panel = shot.get("bg_panel") if shot.get("bg_panel") in images else (cards[0]["panel"] if cards else None)
         # P4: cross-shot bg cache; bg_panel id is the shot's panel id (None
         # keeps the old behaviour for shots without one).
-        self.bg = _cached_background(bg_kind, images.get(bg_panel) if bg_panel else None,
-                                     fmt, bg_panel)
-        # P4: Image.fromarray(self.bg) per frame re-validates + copies the 6MB
-        # backdrop; one PIL copy per frame from a cached PIL image is cheaper.
-        self._bg_pil = Image.fromarray(self.bg)
+        if self.fullframe:
+            self.bg = np.zeros((fmt.height, fmt.width, 3), np.uint8)
+            self._bg_pil = Image.fromarray(self.bg)
+        else:
+            self.bg = _cached_background(bg_kind, images.get(bg_panel) if bg_panel else None,
+                                         fmt, bg_panel, light=bool(shot.get("wide")))
+            # P4: Image.fromarray(self.bg) per frame re-validates + copies the 6MB
+            # backdrop; one PIL copy per frame from a cached PIL image is cheaper.
+            self._bg_pil = Image.fromarray(self.bg)
 
         on = {"shake": True, "punch": False, "flash": False}
         on.update({k: bool(v) for k, v in (effects_on or {}).items()})
@@ -744,15 +1227,23 @@ class ShotRenderer:
             self.fade_from = max(self.start, self.fade_from)  # a short last shot must not start dark
 
         # From this moment until any exit fade, every frame is identical.
-        settle = max([c.settled_at() for c in self.cards] + [self.start])
+        if self.fullframe:
+            settle = max([v.settled_at() for v in self.views] + [self.start])
+        else:
+            settle = max([c.settled_at() for c in self.cards] + [self.start])
         for times, length in ((self.shakes, SHAKE_LEN), (self.punches, PUNCH_LEN),
                                 (self.flashes, FLASH_LEN), (self.glitches, GLITCH_LEN)):
             for te in times:
                 settle = max(settle, te + length)
+        if self.pf_views:
+            settle = self.end  # panel-fit views move for the whole shot; nothing settles early
         self.static_from = settle
         # Defect 1: only a shot whose every card is a hand-set `hold` may
         # freeze. Continuous-motion shots must be re-drawn every frame.
-        self._can_freeze = all(c.motion == "hold" for c in self.cards)
+        if self.fullframe:
+            self._can_freeze = all(v.is_static() for v in self.views)
+        else:
+            self._can_freeze = all(c.motion == "hold" for c in self.cards) and not self.pf_views
         self._static: np.ndarray | None = None
 
     def is_static(self, t: float) -> bool:
@@ -760,40 +1251,79 @@ class ShotRenderer:
 
     def pair_move_done(self, t: float) -> bool:
         """True once every card's pair slide has finished (pair_move fires once)."""
+        if self.fullframe:
+            # No slide in this mode: the "move" is the hard cut to the
+            # second view, done once its `at` has passed.
+            return bool(self.views) and t >= self.views[-1].appear
         return all(c.pair_move_done(t) for c in self.cards)
+
+    def _ff_active(self, t: float) -> int:
+        """The full-frame view on screen at t: a pair shows its views one
+        after another (hard cut at the second view's `at`); a clip that
+        starts after the pair move (pair_move_done) opens on the last."""
+        idx = 0
+        for i, v in enumerate(self.views):
+            if v.visible(t):
+                idx = i
+        if self.shot.get("pair_move_done") and len(self.views) > 1:
+            idx = len(self.views) - 1
+        return idx
+
+    def _ff_frame(self, t: float, extra_zoom: float) -> Image.Image:
+        """The full-bleed frame at t: the active view's viewport, nothing
+        else. Shake is applied inside the view (it shifts the camera, so
+        no frame edge is ever exposed); a fade entrance blends from black,
+        there being no backdrop to fade over."""
+        shake = shake_offset(t, self.shakes, self.fmt.unit)
+        view = self.views[self._ff_active(t)]
+        img = view.sprite(t, extra_zoom, shake)
+        alpha = view.alpha(t)
+        if alpha < 0.999:
+            img = Image.blend(Image.new("RGB", img.size, (0, 0, 0)), img, alpha)
+        return img
 
     def frame_array(self, t: float) -> np.ndarray:
         if self.is_static(t) and self._static is not None:
             return self._static
-        img = self._bg_pil.copy()
-        if self.caption_bar:
-            # Dedicated caption bar: solid black below the cards, so
-            # captions (burned in later by ffmpeg) sit on black, never
-            # over panel art.
-            _bar_top = int(self.fmt.height * CAPTION_BAR_TOP_FRACTION)
-            ImageDraw.Draw(img).rectangle((0, _bar_top, self.fmt.width, self.fmt.height), fill=(0, 0, 0))
-        dx_s, dy_s = shake_offset(t, self.shakes, self.fmt.unit)
+        if self.title_card_img is not None:
+            return self._title_frame_array(t)
+        if self.pf_views:
+            return self._pf_frame_array(t)
         extra = punch_amount(t, self.punches)
-        for card in self.cards:
-            if not card.visible(t):
-                continue
-            spr = card.sprite(t, extra)
-            ent = card.entrance(t)
-            if ent["blur"] > 0.3:
-                spr = spr.filter(ImageFilter.GaussianBlur(ent["blur"]))
-            if abs(ent["scale"] - 1) > 1e-3:
-                spr = spr.resize((max(2, int(spr.width * ent["scale"])), max(2, int(spr.height * ent["scale"]))),
-                                 Image.BILINEAR)
-            if abs(ent["rot"]) > 0.05:
-                spr = spr.rotate(ent["rot"], resample=Image.BILINEAR, expand=True)
-            alpha = spr.getchannel("A")
-            if ent["alpha"] < 0.999:
-                a = ent["alpha"]
-                alpha = alpha.point(lambda v, a=a: int(v * a))
-            cx, cy = card.centre(t)
-            x = int(round(cx + ent["dx"] + dx_s - spr.width / 2))
-            y = int(round(cy + ent["dy"] + dy_s - spr.height / 2))
-            img.paste(spr.convert("RGB"), (x, y), alpha)
+        if self.fullframe:
+            img = self._ff_frame(t, extra)
+            if self.caption_bar:
+                _bar_top = int(self.fmt.height * CAPTION_BAR_TOP_FRACTION)
+                ImageDraw.Draw(img).rectangle((0, _bar_top, self.fmt.width, self.fmt.height), fill=(0, 0, 0))
+        else:
+            img = self._bg_pil.copy()
+            if self.caption_bar:
+                # Dedicated caption bar: solid black below the cards, so
+                # captions (burned in later by ffmpeg) sit on black, never
+                # over panel art.
+                _bar_top = int(self.fmt.height * CAPTION_BAR_TOP_FRACTION)
+                ImageDraw.Draw(img).rectangle((0, _bar_top, self.fmt.width, self.fmt.height), fill=(0, 0, 0))
+            dx_s, dy_s = shake_offset(t, self.shakes, self.fmt.unit)
+            for card in self.cards:
+                if not card.visible(t):
+                    continue
+                spr = card.sprite(t, extra)
+                ent = card.entrance(t)
+                if ent["blur"] > 0.3:
+                    spr = spr.filter(ImageFilter.GaussianBlur(ent["blur"]))
+                if abs(ent["scale"] - 1) > 1e-3:
+                    spr = spr.resize((max(2, int(spr.width * ent["scale"])), max(2, int(spr.height * ent["scale"]))),
+                                     Image.BILINEAR)
+                if abs(ent["rot"]) > 0.05:
+                    spr = spr.rotate(ent["rot"], resample=Image.BILINEAR, expand=True)
+                alpha = spr.getchannel("A")
+                if ent["alpha"] < 0.999:
+                    a = ent["alpha"]
+                    alpha = alpha.point(lambda v, a=a: int(v * a))
+                cx, cy = card.centre(t)
+                x = int(round(cx + ent["dx"] + dx_s - spr.width / 2))
+                y = int(round(cy + ent["dy"] + dy_s - spr.height / 2))
+                img.paste(spr.convert("RGB"), (x, y), alpha)
         for _co in self.callouts:
             _draw_callout(img, _co, self.fmt, t, caption_bar=self.caption_bar)
         for _cc in self.chapter_cards:
@@ -814,6 +1344,47 @@ class ShotRenderer:
             out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
         if self.is_static(t):
             self._static = out
+        return out
+
+    def _pf_frame_array(self, t: float) -> np.ndarray:
+        # Measured reference style: hard cuts and the panel's own motion
+        # only -- no shake, no white flash, no glitch on this path (the
+        # reference uses none of them, on any shot).
+        extra = punch_amount(t, self.punches)
+        if len(self.pf_views) == 2 and all(v.kind == "duo" for v in self.pf_views):
+            # B1e E3: a duo shows BOTH panels at once, side by side over
+            # their shared blur (the first/left panel's — one backdrop
+            # for the whole moment, never two different blurs stitched).
+            img = self.pf_views[0].bg.convert("RGBA")
+            for v in self.pf_views:
+                img = Image.alpha_composite(img, v.shadow_layer(t, extra))
+                img = Image.alpha_composite(img, v.fg_layer(t, extra))
+            img = img.convert("RGB")
+        else:
+            view = self.pf_views[0]
+            for v in self.pf_views:
+                if v.visible(t):
+                    view = v
+            img = view.frame(t, extra_zoom=extra)
+        for _co in self.callouts:
+            _draw_callout(img, _co, self.fmt, t, caption_bar=self.caption_bar)
+        for _cc in self.chapter_cards:
+            _draw_chapter_card(img, _cc, self.fmt, t)
+        out = np.asarray(img, dtype=np.uint8)
+        if self.darken > 0:
+            out = (out.astype(np.float32) * (1.0 - self.darken)).astype(np.uint8)
+        if self.grade == "subtle":
+            out = grade_subtle(out)
+        if self.fade_from is not None and t > self.fade_from:
+            span = max(1e-3, self.end - self.fade_from)
+            out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
+        return out
+
+    def _title_frame_array(self, t: float) -> np.ndarray:
+        out = np.asarray(self.title_card_img, dtype=np.uint8)
+        if self.fade_from is not None and t > self.fade_from:
+            span = max(1e-3, self.end - self.fade_from)
+            out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
         return out
 
     def frame(self, t: float) -> Image.Image:

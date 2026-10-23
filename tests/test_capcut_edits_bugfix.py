@@ -275,9 +275,13 @@ def test_mask_risk_panel_dropped_not_painted(monkeypatch):
     assert "mask" in report["dropped"][0]["reason"]
 
 
-def test_bubble_panel_with_no_clean_crop_dropped_not_painted(monkeypatch):
+def test_bubble_panel_with_no_clean_crop_kept_not_painted_when_figure_present(monkeypatch):
     # Painting removed: a panel whose best crop still shows an ordinary
-    # (non-mask-risk) bubble is dropped and re-paired, not painted.
+    # (non-mask-risk) bubble is never painted. F2 hardening: when a figure
+    # is confidently present, it is KEPT (flagged for review), not dropped
+    # -- a bubble beside a drawn character is normal paneling. A bubble
+    # overlapping the face specifically still drops (probs=["face_bubble"],
+    # see the mask-risk test above).
     def fake_maps(img, options=None):
         return {"_head": {"top": 0.1, "bottom": 0.4, "source": "skin", "confident": True,
                           "figure": True, "keep_top": None},
@@ -294,9 +298,9 @@ def test_bubble_panel_with_no_clean_crop_dropped_not_painted(monkeypatch):
     panels = [{"id": "P001-01", "width": 300, "height": 400, "text": ""}]
     report = verify_mod.verify_chapter(panels, lambda p: Image.new("RGB", (300, 400)),
                                        [0.75], root=None, chapter=None, log=lambda *a: None)
-    assert report["panels"]["P001-01"]["action"] == "dropped"
-    assert report["dropped"][0]["panel"] == "P001-01"
-    assert "re-pair" in report["dropped"][0]["reason"]
+    assert report["panels"]["P001-01"]["action"] == "kept (check lettering)"
+    assert report["dropped"] == []
+    assert report["bubble_beside_figure"] == ["P001-01"]
 
 
 # ------------------------------------------------------------------ transitions

@@ -35,7 +35,8 @@ from typing import Any, Callable, Dict, List, Tuple
 from PIL import Image
 
 from .crops import (BUBBLE_OK, FIGURE_MIN, PATCH_VISIBLE, _panel_maps,
-                    face_bubble_boxes, head_of, is_mask_risk, patch_visibility, shape_candidates)
+                    face_bubble_boxes, head_of, is_mask_risk, patch_visibility, shape_candidates,
+                    trim_blank_edges)
 from .cropcache import crop_key, load_crop, store_crop
 from ..util import atomic_write_text, require_chapter
 from .media import video_dir
@@ -196,6 +197,7 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
     needs_eyes: List[str] = []
     recropped: List[str] = []
     low_confidence: List[Dict[str, Any]] = []
+    bubble_beside_figure: List[str] = []
     mask_risk: List[str] = []
     layout_sensitive: List[str] = []
     layout_problems: Dict[str, Dict[str, List[str]]] = {}
@@ -208,6 +210,7 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
         card = head = None
         ckey = None
         cached_risk = None
+        cached_has_art = None
         panel_layout_problems: Dict[str, List[str]] = {}
         panel_patch = 0.0
         panel_switch: Dict[str, Any] | None = None
@@ -221,6 +224,12 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
                 # then re-stored with the flag) so drop decisions stay
                 # stable across cached runs.
                 cached_risk = cached.get("mask_risk")
+                # has_art: cache entries written before this check lack it;
+                # missing means "unknown", recomputed below on the fresh
+                # path (same one-time upgrade idiom as mask_risk above) so a
+                # panel that is really just a bubble/blank with no character
+                # can't hide behind a stale cache entry forever.
+                cached_has_art = cached.get("has_art")
                 # P2: cache entries written before P2 lack "layout_switch";
                 # missing key means "unknown", recomputed below on the
                 # fresh path only when the image is already being loaded.
@@ -235,13 +244,20 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
                     if not any(abs(math.log(_to / a)) <= 0.02
                                for a in layout_shapes["single"]):
                         panel_switch = None
-        if card is None or cached_risk is None:
+        if card is None or cached_risk is None or cached_has_art is None:
             img = image_for(p)
             maps = _panel_maps(img, options)
             if card is None:
                 card = pick_card(img, shapes, maps)
                 head = head_of(maps)
             cached_risk = bool(is_mask_risk(maps))
+            # A panel can be "clean" (no bubble, no lettering, not flat
+            # white) purely because its best window sits on empty/dark
+            # background with no character in it at all -- clean never
+            # meant "has real art," only "doesn't have these specific
+            # problems." trim_blank_edges is the one already-trusted check
+            # for "is there actually something here," reused as-is.
+            cached_has_art = bool(head["figure"]) or trim_blank_edges(img, card["box"]) is not None
             if layout_shapes is not None:
                 panel_layout_problems = layout_crop_problems(img, maps, layout_shapes)
                 # P2: the planner applies this switch (pair-safe shape);
@@ -251,9 +267,11 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             if ckey is not None:
                 store_crop(root, chapter, ckey,
                            {"pick": card, "head": head, "edge_rows": list(maps["edge_rows"]),
-                            "mask_risk": cached_risk, "layout_switch": panel_switch})
+                            "mask_risk": cached_risk, "layout_switch": panel_switch,
+                            "has_art": cached_has_art})
         shape, box, probs, clean = card["shape"], card["box"], card["problems"], card["clean"]
         figure = bool(head["figure"])           # skin colour, or a pale/gray head blob
+        has_art = bool(cached_has_art)
         if not head["confident"] and (head["source"] == "pale" or head["keep_top"]):
             low_confidence.append({"panel": p["id"], "reason": (
                 "head found by shape and brightness, not skin colour (white/silver hair or gray skin): "
@@ -279,7 +297,17 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             layout_switches[p["id"]] = {**panel_switch, "layout": "single"}
         if panel_patch > PATCH_VISIBLE:
             visible_patches.append({"panel": p["id"], "visibility": panel_patch})
-        if clean:
+        if not has_art and not figure:
+            # "clean" only means none of {bubble, flat white, painted,
+            # head_cut} -- a panel with no character and nothing else drawn
+            # in its best window (empty/dark background, decorative only)
+            # can still pass that bar. Never show it: drop it the same way
+            # as any other panel with no character and no clean crop, so
+            # it's re-paired automatically instead of shipping blank.
+            action = "dropped"
+            dropped.append({"panel": p["id"],
+                            "reason": "no character and no real art in the best crop; drop and re-pair"})
+        elif clean:
             action = "ok"
         elif panel_risk and "mask_risk" in probs:
             # P1: shouting face + dominant bubble with no clean crop.
@@ -290,21 +318,41 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
             dropped.append({"panel": p["id"],
                             "reason": "shouting face + dominant bubble would mask the face "
                                       "(no clean crop); drop and re-pair"})
-        elif "lettering" in probs or "face_bubble" in probs:
+        elif "face_bubble" in probs:
+            # The best window's bubble overlaps the face range specifically
+            # (CapCut bugfix defect 3) -- the same masking risk as the
+            # mask_risk branch above, just caught per-crop instead of by the
+            # panel-wide heuristic. Never show it, figure or not: this is a
+            # drop-and-re-pair case like mask_risk, not ordinary lettering.
+            action = "dropped"
+            dropped.append({"panel": p["id"],
+                            "reason": "best crop's bubble overlaps the face range; drop and re-pair"})
+        elif "lettering" in probs and not figure:
             # Bubble painting is removed: a panel whose best crop still
             # shows a bubble can no longer be painted clean. Crops already
             # tried to exclude it (pick_card prefers clean windows); with
             # no clean crop, drop the panel and let build.py re-pair its
             # time to a neighbour -- the P1 mask-risk rule, now applied to
-            # every bubble that would have been painted.
+            # every bubble that would have been painted. A panel with no
+            # drawn figure at all (pure lettering/caption/logo) has nothing
+            # else worth showing, so this is the right call here.
             action = "dropped"
             dropped.append({"panel": p["id"],
                             "reason": "best crop still shows a speech bubble or caption and bubble painting "
                                       "is removed; drop and re-pair"})
         elif figure:
-            action = "needs eyes" if "head_cut" in probs else "kept (check)"
+            # A drawn figure beside some ordinary bubble/caption lettering
+            # (not over the face -- that's the face_bubble branch above) is
+            # normal webtoon paneling, not a masking problem. Dropping every
+            # panel with ANY lettering in its best window (ch4: heavy speech
+            # lettering fooled this into dropping genuinely drawn panels)
+            # throws good panels away; keep it and flag it for review instead.
+            bubbly = "lettering" in probs
+            action = "needs eyes" if "head_cut" in probs else ("kept (check lettering)" if bubbly else "kept (check)")
             if "head_cut" in probs:
                 needs_eyes.append(p["id"])
+            if bubbly:
+                bubble_beside_figure.append(p["id"])
         else:
             action = "dropped"
             dropped.append({"panel": p["id"], "reason": ", ".join(probs) or "no character"})
@@ -325,7 +373,12 @@ def verify_chapter(panels: List[Dict[str, Any]], image_for: Callable[[Dict[str, 
               "layout_problems": layout_problems, "layout_switches": layout_switches,
               "visible_patches": visible_patches,
               # Heads the heuristic is not sure of (it cannot be): where a reviewer should look first.
-              "low_confidence_heads": low_confidence}
+              "low_confidence_heads": low_confidence,
+              # Panels kept (not dropped) despite a bubble/caption in their best
+              # window, because a drawn figure is also confidently present --
+              # check the bubble doesn't sit over the face (mask_risk catches
+              # that already; this is the milder "beside the figure" case).
+              "bubble_beside_figure": bubble_beside_figure}
     if root is not None and chapter is not None:
         atomic_write_text(video_dir(root) / f"chapter_{require_chapter(chapter)}.verify.json",
                           json.dumps(report, indent=1, ensure_ascii=False))

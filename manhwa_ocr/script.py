@@ -48,6 +48,8 @@ from .workspace import work_root
 
 WORDS_PER_MINUTE = 150
 MIN_NARRATION_WORDS = 60
+PREVIOUS_ENDING_WORDS = 150
+STORY_SO_FAR_CHARS = 3000
 META_RE = re.compile(r"<!--\s*recap-meta\s*(\{.*?\})\s*-->", re.DOTALL)
 
 
@@ -64,6 +66,107 @@ no more. Never reproduce long stretches of dialogue.
 - Never invent events, characters or dialogue that are not in the transcript.
 - No filler, no "in this chapter we see", no restating what you just said.
 
+Return only valid JSON. No preamble, no markdown fences."""
+
+
+SPEEDRUN_SYSTEM = """You write narration for manhwa/manhua recap videos in the Speedrun Gossip style.
+
+Your voice: a friend spilling unbelievable gossip at 2x speed. Breathless, irreverent, past tense.
+
+Hard rules:
+- Open on the inciting incident. No greeting, no setup, no "in this chapter".
+- Pack 2-4 story beats into every sentence: commas, who/where/which clauses, participles ("having finally had enough").
+- Pivot constantly: start sentences with "So," to keep momentum, use "But" to reverse, use "only to" / "only for" when the payoff gets snatched away. Nearly every sentence contains a reversal.
+- Refer to characters by role ("his boss", "the commander", "her"), never by proper name unless the name itself is the plot point.
+- Add one editorial aside every few sentences: a judgment, a joke, or a motive read ("having finally had enough", "got what he deserved").
+- Past tense, always. Never address the viewer, never moralize.
+- Drop [music] on its own line at energy shifts (kills, reveals, chases). It is an editing cue and is never read aloud.
+- End the chapter on a new problem, never a resolution.
+- Write ORIGINAL narration in your own words. You are commenting on the chapter, not reciting it.
+- Quote the source sparingly: at most one short punchline quote per chapter. Never reproduce long stretches of dialogue.
+- Never invent events, characters or dialogue that are not in the transcript. Speed comes from compression, never fabrication.
+- No filler, no restating what you just said.
+
+Return only valid JSON. No preamble, no markdown fences."""
+
+
+# The user's Power Fantasy system, VERBATIM (supplied 2026-10-23; the template
+# body is never rewritten — pipeline adaptations live in POWERFANTASY_PROMPT and
+# docs/RECAP_STYLE_POWERFANTASY.md). Only the marked pipeline tail is added, the
+# same way SPEEDRUN_SYSTEM carries the tool's hard rules and JSON contract.
+POWERFANTASY_SYSTEM = """You are an elite YouTube Manhwa/Webtoon recap scriptwriter. Your goal is to write high-retention, fast-paced, "power fantasy" scripts designed to keep viewers addicted.
+
+Follow these strict structural rules for the script:
+
+1. THE HOOK (First 60 seconds):
+- DO NOT start with the main character's past, reincarnation, or childhood.
+- Start IN MEDIAS RES (in the middle of the action). Introduce the MC in their current "undercover" or "low status" disguise facing down an arrogant enemy.
+- Within the first 30 seconds, the MC must effortlessly humiliate or defeat this enemy.
+- Use the opening formula: "This guy is [Name], a [low status role] at [prestigious place], but..."
+
+2. THE LORE DROP (Minute 2):
+- ONLY after the initial satisfying flex, use the phrase: "But what none of them know is..."
+- Briefly summarize their past life, reincarnation, or system awakening. Use rapid-fire time skips to compress boring training arcs (e.g., "By week 1...", "At age 15...").
+
+3. NARRATION TONE & LEXICON:
+- Write in a highly informal, fast-paced, conversational tone.
+- Refer to the main character as "Our guy," "Our boy," or "Our protagonist."
+- When enemies are about to lose, refer to them condescendingly as "the poor guy" or "this absolute amateur."
+- Use action-heavy adverbs: "casually destroys," "effortlessly dodges," "brutally shuts down."
+- DO NOT use filler words or long exposition. Keep sentences flowing with conjunctions ("but", "so", "and then").
+
+4. THE "HYPE MAN" RULE:
+- Power fantasy works best through the eyes of others. Dedicate heavy focus to describing the absolute shock, terror, and awe of the side characters and enemies when the MC reveals their true power.
+
+5. GAMIFIED VOCABULARY:
+- Use terms natural to the anime/gaming community: "OP," "Status window," "Aggro," "Tutorial boss," "Plot armor," "Line of sight," and "Stats."
+
+Format the output entirely as a spoken voiceover script. Do not include camera directions or visual notes—only the exact words the narrator will speak.
+
+Pipeline contract (this style runs inside the recap tool, which adds the rest):
+- Write ORIGINAL narration in your own words. Never invent events, characters or dialogue that are not in the transcript, and quote the source only sparingly, for lines that genuinely land.
+- The recap file also carries panel tags and bracketed editing cues, exactly as the chapter prompt describes. They are stripped before the script reaches the narrator, are never spoken, and are not camera directions.
+Return only valid JSON. No preamble, no markdown fences."""
+
+
+# The "Manhwa Bro" system: a sarcastic, hype-the-protagonist fan narrator,
+# reverse-engineered from a recap-channel sample (docs/RECAP_STYLE_MANHWABRO.md).
+# Additive lane: nothing above is changed by it; it is selected only by
+# recap.style: manhwabro.
+MANHWABRO_SYSTEM = """You are a sarcastic, hype-man manhwa recap narrator, a fan telling a friend about a chapter you love. You are a bro first and a storyteller second, but you never get a fact wrong.
+
+THE INPUT. Your transcript is the full chapter: every line of dialogue and narration from the OCR, plus the written descriptions of who each character is, what they look like, and what is happening in each panel. Treat it as the single source of truth. Use the character descriptions to know who is who (hair, clothing, role, relationships) and the panel descriptions to know what actually happens, so you can narrate action the speech bubbles never spell out. Use each character's name exactly as the transcript and series context give it, and spell it the same way every time.
+
+VOICE AND PERSONA:
+- Present tense for the action and for framing; past tense only inside a flashback.
+- Conversational and judgmental, like an online friend, never a formal narrator.
+- Hype the protagonist: \"our boy\", \"this brat\", \"bro\", \"this man\", \"our cool, epic protagonist\". Use at least a few of these per chapter.
+- Mock everyone else: a bad hero is a \"clown\", an annoying servant an \"old fart\", a beaten enemy \"the poor bastard\". Mock-sympathy for the victim (\"poor guy\") is a staple.
+- Slip into the protagonist's head now and then (\"thinks it must be some kind of...\", \"questioning how low his self-esteem really was\").
+- Roast character decisions out loud, with a short aside, then keep moving.
+
+STRUCTURE (a range of chapters is one continuous film):
+- The first chapter opens IN THE MIDDLE OF THE ACTION, in the strongest fight or confrontation the chapter has, with no backstory first. Right after the first payoff, pivot with a rhetorical question to the viewer, \"So, why is [protagonist] so [strong / ruthless / calm]?\", and only then explain the past or the lore.
+- Every later chapter opens mid-flow on its strongest beat. No restart language and no re-explaining what came before.
+- Never end a chapter on finale or closing language. End mid-escalation, on the beat that pulls into the next chapter, ideally on the protagonist's resolve or a fresh threat.
+
+RHYTHM:
+- Short punchy sentences (about 8 to 15 words), then one long run-on that builds momentum, then a short one to land the joke.
+- Pivot with \"But\", \"Then\", \"And before X can recover...\", \"Well, of course...\", \"Unfortunately...\". Set up an expectation, then flip it at the end of the beat.
+- Use fragments for sarcasm, rhetorical questions to steer the viewer, ironic understatement (\"casually holding one of the fire lances\" when it is huge), and deadpan stacking: a plot fact, an insult, the next fact.
+- Intensifiers on action beats: completely, absolutely, desperately, immediately, hastily, even.
+- Power language: endless storm, completely overwhelms, defenses collapse, crushes it like it's nothing.
+
+HUMOR (use sparingly, one or two moves per beat, never at the cost of clarity):
+- Modern internet slang dropped into the fantasy (\"mogged\", \"Chad\", \"incel\", \"chilling\", \"has the balls to\", \"ain't no\").
+- One pop-culture comparison per chapter at most.
+- Hyperbole about the protagonist's power.
+
+Format the output as a spoken voiceover script: only the words the narrator speaks. No camera directions, no visual notes.
+
+Pipeline contract (this style runs inside the recap tool, which adds the rest):
+- Write ORIGINAL narration in your own words. Never invent events, characters, powers or dialogue that are not in the transcript. The jokes and insults are your commentary, never new plot. Quote the source only sparingly, for lines that genuinely land.
+- The recap file also carries panel tags and bracketed editing cues, exactly as the chapter prompt describes. They are stripped before the script reaches the narrator, are never spoken, and are not camera directions.
 Return only valid JSON. No preamble, no markdown fences."""
 
 
@@ -101,10 +204,149 @@ Mark emphasis with *asterisks* where the delivery should land.
 
 Stay close to {words} words of spoken narration. Bracketed cues do not count.
 
+Also write a "summary": 3-5 plain sentences for the next chapter's writer. Cover
+what happened in this chapter, where each main character is now, what each
+character wants or fears going forward, and what is still unresolved. Write it
+so someone who has read nothing else can pick the story up from it. No
+[HOOK] or [LOOP] markers and no editing cues in the summary.
+
 Return exactly this shape:
 {{
   "narration": "the full narration segment, as markdown",
-  "hook": "the opening line, repeated on its own"
+  "hook": "the opening line, repeated on its own",
+  "summary": "3-5 sentences: events, where each main character is now, open threads"
+}}"""
+
+
+_PF_OPENER_NOTE = """SCOPE FOR THIS CHAPTER: this chapter OPENS the range (chapters {first}-{last}).
+Run the system's full structure: the in-medias-res Hook with the "This guy is
+[Name], a [low status role] at [prestigious place], but..." formula and the
+effortless payoff inside the first 30 seconds — and only after that flex, the
+Lore Drop opening with "But what none of them know is...". Do NOT start with
+the main character's past, reincarnation or childhood."""
+
+_PF_CONTINUATION_NOTE = """SCOPE FOR THIS CHAPTER: this chapter CONTINUES the range (chapters {first}-{last});
+the range opener already ran the Hook and the Lore Drop. Open mid-flow on
+this chapter's strongest beat (a mini-hook). Do NOT repeat the lore drop, do
+NOT re-run the "This guy is..." introduction, and use no restart language —
+the film flows straight from the previous chapter into this one."""
+
+
+# The Power Fantasy chapter prompt: the verbatim system (POWERFANTASY_SYSTEM)
+# carries the creative rules; this template carries only the pipeline framing,
+# kept clearly separate from the system's text.
+POWERFANTASY_PROMPT = """{briefing_block}{range_block}{previous_block}{panel_block}
+Series: "{series}"
+Chapter: {chapter}
+Target length: about {words} words (~{minutes} minutes read aloud)
+
+{scope_note}
+
+FRAMING — how the Power Fantasy system runs inside this pipeline:
+- SCOPE. The full Hook + Lore Drop structure belongs to the FIRST chapter of
+  a range. A later chapter opens mid-flow on its strongest beat (a mini-hook),
+  never re-drops the lore and never uses restart language: the chapter videos
+  are joined into one continuous film, so each chapter is a segment of it,
+  not an episode.
+- CONTINUITY. Never end a chapter on finale or closing language, and never
+  open one with a restart ("welcome back", "previously on", ...). End
+  mid-escalation, on the beat that pulls into the next chapter.
+- TAG LAYER. The narration text itself stays pure voiceover — only the exact
+  words the narrator speaks. The panel tags and bracketed editing cues the
+  panel block above describes still go into the recap file exactly as it
+  says; they are stripped before the script reaches the narrator and are not
+  camera directions.
+- TITLE-CARD CUES. When this chapter's story genuinely skips time, write the
+  skip as its own standalone sentence in one of these forms, so the video's
+  title-card generator can pick it up: "Age fifteen." / "Week six of
+  possession." / "Year four of possession." / "Three years later." The
+  montage sentences around the cue carry the detail; do not bury a time skip
+  inside a longer sentence.
+
+Here is the chapter transcript to work from:
+
+<transcript>
+{transcript}
+</transcript>
+
+Write the narration segment for this chapter.
+
+Also write a "summary": 3-5 plain sentences for the next chapter's writer. Cover
+what happened in this chapter, where each main character is now, what each
+character wants or fears going forward, and what is still unresolved. Write it
+so someone who has read nothing else can pick the story up from it. No
+[HOOK] or [LOOP] markers and no editing cues in the summary.
+
+Return exactly this shape:
+{{
+  "narration": "the full narration segment, as markdown",
+  "hook": "the opening line, repeated on its own",
+  "summary": "3-5 sentences: events, where each main character is now, open threads"
+}}"""
+
+
+_MB_OPENER_NOTE = """SCOPE FOR THIS CHAPTER: this chapter OPENS the range (chapters {first}-{last}).
+Open in the middle of the chapter's strongest fight or confrontation, with no
+backstory first. Right after that first payoff, pivot with a rhetorical
+question to the viewer ("So, why is [protagonist] so strong?") and only then
+explain the past or the lore. Do NOT start with the protagonist's past,
+reincarnation or childhood."""
+
+_MB_CONTINUATION_NOTE = """SCOPE FOR THIS CHAPTER: this chapter CONTINUES the range (chapters {first}-{last});
+the range opener already ran the cold open and the "So, why is...?" pivot.
+Open mid-flow on this chapter's strongest beat. Do NOT repeat the pivot
+question, do NOT re-explain the setup, and use no restart language: the film
+flows straight from the previous chapter into this one."""
+
+
+# The Manhwa Bro chapter prompt. The system (MANHWABRO_SYSTEM) carries the
+# voice; this template carries the pipeline framing and hands the writer the
+# WHOLE transcript (OCR text + character and panel descriptions) as source.
+MANHWABRO_PROMPT = """{briefing_block}{previous_block}{panel_block}
+Series: "{series}"
+Chapter: {chapter}
+Target length: about {words} words (~{minutes} minutes read aloud)
+
+{scope_note}
+
+FRAMING — how the Manhwa Bro system runs inside this pipeline:
+- SOURCE OF TRUTH. The transcript below is the complete chapter: OCR dialogue
+  and narration, plus the written descriptions of each character and each
+  panel's situation. Read ALL of it before writing. Name characters as the
+  transcript and series context do, keep every name spelled one way, and
+  take appearance, emotion and action from the descriptions. A joke may
+  exaggerate a reaction, but it never changes what happened or who did it.
+- CONTINUITY. Never end a chapter on finale or closing language, and never
+  open one with a restart ("welcome back", "previously on", ...). End
+  mid-escalation, on the beat that pulls into the next chapter.
+- TAG LAYER. The narration text itself stays pure voiceover. The panel tags
+  and bracketed editing cues the panel block above describes still go into
+  the recap file exactly as it says; they are stripped before the script
+  reaches the narrator and are not camera directions.
+- TITLE-CARD CUES. When the chapter genuinely skips time, write the skip as
+  its own standalone sentence ("Three years later." / "Age fifteen."), so the
+  video's title-card generator can pick it up.
+
+Here is the full chapter transcript to work from:
+
+<transcript>
+{transcript}
+</transcript>
+
+Write the narration segment for this chapter.
+
+Also write a "summary": 3-5 plain sentences for the next chapter's writer. Cover
+what happened in this chapter, where each main character is now, what each
+character wants or fears going forward, and what is still unresolved. Write it
+in plain neutral language, no slang and no jokes, so someone who has read
+nothing else can pick the story up from it. No [HOOK] or [LOOP] markers and no
+editing cues in the summary.
+
+Return exactly this shape:
+{{
+  "narration": "the full narration segment, as markdown",
+  "hook": "the opening line, repeated on its own",
+  "summary": "3-5 sentences: events, where each main character is now, open threads"
 }}"""
 
 
@@ -200,12 +442,62 @@ def _spec_name(chapters: List[str]) -> str:
     return "_".join(p for p in parts if p) or "all"
 
 
-def _parse_part(entry: Any) -> tuple[str, str]:
+def _parse_part(entry: Any) -> tuple[str, str, str]:
     if isinstance(entry, dict):
-        return str(entry.get("narration") or ""), str(entry.get("hook") or "")
+        return (str(entry.get("narration") or ""), str(entry.get("hook") or ""),
+                str(entry.get("summary") or ""))
     if isinstance(entry, str):
-        return entry, ""
-    return "", ""
+        return entry, "", ""
+    return "", "", ""
+
+
+# ---- Power Fantasy ranges -------------------------------------------------
+# The user's workflow rule: for a target range (chapters 1-10), transcripts for
+# ALL chapters in the range come first; only then are recaps written, with the
+# whole story in hand. These helpers define the range and compress the other
+# chapters' transcripts into prompt-sized context.
+
+RANGE_DIGEST_CHARS = 700    # per-chapter beat digest inside the range block
+RANGE_CONTEXT_CHARS = 6000  # total budget for all digests in one prompt
+
+
+def _range_span(chapters: List[str]) -> List[str]:
+    """The contiguous range a chapter request covers: ['2', '4'] -> ['2', '3', '4'].
+
+    Non-numeric labels can't be spanned, so for those the request itself is
+    the range.
+    """
+    chapters = sort_chapters(require_chapter(c) for c in chapters)
+    if chapters and all(c.isdigit() for c in chapters):
+        return [str(i) for i in range(int(chapters[0]), int(chapters[-1]) + 1)]
+    return chapters
+
+
+def _transcript_digest(text: str, max_chars: int = RANGE_DIGEST_CHARS) -> str:
+    """One chapter's transcript compressed to its beat outline: every scene
+    heading with the first line of its body. Enough for the writer to know
+    what happens in a chapter they are not currently writing, at a fraction
+    of the full transcript's size. A transcript with no scene headings falls
+    back to its opening text."""
+    beats: List[str] = []
+    awaiting_body = False
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("<!--"):
+            continue
+        if line.startswith("##"):
+            beats.append(line.lstrip("#").strip())
+            awaiting_body = True
+        elif line.startswith("#"):
+            continue  # the chapter title line
+        elif awaiting_body and beats:
+            beats[-1] = f"{beats[-1]} — {line[:160]}"
+            awaiting_body = False
+    out = "\n".join(f"- {b}" for b in beats if b)
+    if not out:
+        body = " ".join(l.strip() for l in (text or "").splitlines() if l.strip())
+        out = body[:max_chars]
+    return out[:max_chars] + ("…" if len(out) > max_chars else "")
 
 
 class RecapBuilder:
@@ -271,18 +563,63 @@ class RecapBuilder:
         briefing = self.memory.as_briefing(upto=upto)
         return f"SERIES CONTEXT\n{briefing}\n\n---\n\n" if briefing.strip() else ""
 
+    def _recap_summary(self, path: Path) -> str:
+        """A recap's stored story-so-far summary; older recaps fall back to their opening lines."""
+        summary = str(self._read_meta(path).get("summary") or "").strip()
+        if summary:
+            return summary
+        if not path.exists():
+            return ""
+        # No stored summary (a recap written before this field existed): fall back to its
+        # full body rather than just the opening -- the budget loop in _story_so_far() trims
+        # the oldest chapter first if this runs long, so an open thread set up mid-chapter and
+        # only resolved near the end isn't lost to a short, hook-only slice.
+        from .video.cues import strip_tags
+
+        body = " ".join(l for l in strip_tags(self._body(path)).splitlines()
+                        if l.strip() and not l.strip().startswith("["))
+        return body
+
+    def _story_so_far(self, chapter: str) -> str:
+        """Summaries of every earlier chapter, in order, so the writer knows what has happened."""
+        earlier = [c for c in self.recapped() if chapter_key(c) < chapter_key(chapter)]
+        entries = [(c, self._recap_summary(self.recap_path(c))) for c in earlier]
+        entries = [(c, text) for c, text in entries if text]
+        if not entries:
+            return ""
+        lines = [f"Ch {c}: {text}" for c, text in entries]
+        out = "\n".join(lines)
+        while len(out) > STORY_SO_FAR_CHARS and len(lines) > 1:
+            lines.pop(0)
+            out = "\n".join(lines)
+        return out
+
     def _previous_block(self, chapter: str) -> str:
-        """Hand the writer the previous chapter's hook so segments flow."""
+        """What the writer needs to continue the story: earlier summaries and the last recap's ending."""
         if not chapter.isdigit() or int(chapter) <= 1:
             return ""
+        story = self._story_so_far(chapter)
+        parts = ["PREVIOUS SEGMENT"]
+        if story:
+            parts.append(f"STORY SO FAR (one summary per earlier chapter, oldest first):\n{story}")
         prev = self.recaps_dir / f"chapter_{int(chapter) - 1}.md"
-        hook = self._read_meta(prev).get("hook") if prev.exists() else ""
-        if not hook:
+        if prev.exists():
+            from .video.cues import strip_tags
+
+            prev_no = int(chapter) - 1
+            hook = str(self._read_meta(prev).get("hook") or "").strip()
+            words = strip_tags(self._body(prev)).split()
+            ending = " ".join(w for w in words[-PREVIOUS_ENDING_WORDS:] if w)
+            parts.append(f"THE END OF THE RECAP FOR CHAPTER {prev_no} (your narration must pick up right here):\n"
+                         f"\"...{ending}\"")
+            if hook:
+                parts.append(f"That recap opened with: \"{hook}\"")
+        if len(parts) == 1:
+            # No earlier summaries and no previous recap: nothing to hand over.
             return ""
-        return (
-            f"PREVIOUS SEGMENT\nThe recap for chapter {int(chapter) - 1} opened with: "
-            f"\"{hook}\"\nDon't repeat its framing; pick up where it leaves off.\n\n---\n\n"
-        )
+        parts.append("Do not repeat earlier framing or re-explain what the story so far already covered. "
+                     "Carry forward every open thread, promise, and unresolved question from the summaries.")
+        return "\n\n".join(parts) + "\n\n---\n\n"
 
     def panels(self, chapter: str) -> List[Dict[str, Any]]:
         """This chapter's panels, detecting them if the pages are on disk."""
@@ -309,8 +646,115 @@ class RecapBuilder:
             note = f" Look at the contact sheets ({rel}) to see each panel; ids are printed on them."
         return PANEL_BLOCK.format(sheet_note=note, listing=_panel_listing(panels))
 
-    def _prompt_for(self, chapter: str, minutes: float, *, sheets: List[Path] | None = None) -> str:
+    def _style(self) -> str:
+        """The series' narration style: config `recap.style`."""
+        return str((self.cfg.recap or {}).get("style", "default") or "default").lower()
+
+    def _system_prompt(self) -> str:
+        """Narration voice: the default calm present-tense voice, the Speedrun
+        Gossip voice (recap.style: speedrun), or the Power Fantasy system
+        (recap.style: powerfantasy). Unknown values fall back to default."""
+        style = self._style()
+        if style == "speedrun":
+            return SPEEDRUN_SYSTEM
+        if style == "powerfantasy":
+            return POWERFANTASY_SYSTEM
+        if style == "manhwabro":
+            return MANHWABRO_SYSTEM
+        return SCRIPT_SYSTEM
+
+    def _range_block(self, chapter: str, range_chapters: List[str] | None) -> str:
+        """Power Fantasy prompt input: the whole range's story, so the writer
+        of chapter N already knows how the arc ends. The full-range series
+        bible rides in the briefing block (no `upto` cut-off for this style);
+        this block adds a per-chapter beat digest of every OTHER chapter in
+        the range, compressed from its transcript — full transcripts of the
+        whole range would drown the chapter being written."""
+        span = _range_span(range_chapters or [chapter])
+        lines = [
+            f"RANGE CONTEXT — THE WHOLE STORY (chapters {span[0]}-{span[-1]})",
+            "This series is recapped a whole range at a time: every transcript in the range "
+            "was finished before any recap was written, so you DO know how the whole arc goes. "
+            "Use that knowledge to pick this chapter's strongest beats and to plant payoffs — "
+            "but narrate only this chapter's own events in this chapter's segment.",
+            "",
+            "Per-chapter beat digests for the range (this chapter's own full transcript "
+            "follows below):",
+        ]
+        digests = []
+        for c in span:
+            if c == chapter:
+                continue
+            try:
+                digests.append(f"Ch {c}:\n{_transcript_digest(self._transcript(c))}")
+            except UserError:
+                continue  # the range gate refuses first in the real flow; a direct call just skips it
+        while digests and len("\n\n".join(digests)) > RANGE_CONTEXT_CHARS:
+            digests.pop(0)  # same convention as _story_so_far: the oldest digest goes first
+        lines.append("\n\n".join(digests) if digests else "(no other chapters in this range)")
+        return "\n".join(lines) + "\n\n---\n\n"
+
+    def _scope_note(self, chapter: str, range_chapters: List[str] | None) -> str:
+        span = _range_span(range_chapters or [chapter])
+        if self._style() == "manhwabro":
+            note = _MB_OPENER_NOTE if chapter == span[0] else _MB_CONTINUATION_NOTE
+        else:
+            note = _PF_OPENER_NOTE if chapter == span[0] else _PF_CONTINUATION_NOTE
+        return note.format(first=span[0], last=span[-1])
+
+    def _is_range_opener(self, chapter: str, task_chapters: List[str]) -> bool:
+        """The first chapter of the range this task covers, with no earlier
+        recap already on disk: the one chapter that runs the full Hook +
+        Lore Drop (and the one the script lint holds to it)."""
+        if not task_chapters or chapter != min(task_chapters, key=chapter_key):
+            return False
+        return not any(chapter_key(c) < chapter_key(chapter) for c in self.recapped())
+
+    def _lint_errors(self, chapter: str, narration: str, task_chapters: List[str]) -> List[str]:
+        """Power Fantasy script-lint failures for a finished chapter (empty
+        for other styles). A failing chapter is not saved, like a tag error."""
+        if self._style() == "manhwabro":
+            from .script_lint import lint_manhwabro
+
+            issues = lint_manhwabro(narration, range_opener=self._is_range_opener(chapter, task_chapters))
+            return [f"[manhwa-bro lint] {i.message} Fix: {i.fix}" for i in issues]
+        if self._style() != "powerfantasy":
+            return []
+        from .script_lint import lint_powerfantasy
+
+        issues = lint_powerfantasy(narration, range_opener=self._is_range_opener(chapter, task_chapters))
+        return [f"[power-fantasy lint] {i.message} Fix: {i.fix}" for i in issues]
+
+    def _prompt_for(self, chapter: str, minutes: float, *, sheets: List[Path] | None = None,
+                    range_chapters: List[str] | None = None) -> str:
         chapter = require_chapter(chapter)
+        if self._style() == "powerfantasy":
+            return POWERFANTASY_PROMPT.format(
+                briefing_block=self._briefing_block(),
+                range_block=self._range_block(chapter, range_chapters),
+                previous_block=self._previous_block(chapter),
+                panel_block=self._panel_block(chapter, sheets),
+                series=self.cfg.series_name,
+                chapter=chapter,
+                words=_target_words(minutes),
+                minutes=minutes,
+                scope_note=self._scope_note(chapter, range_chapters),
+                transcript=self._transcript(chapter),
+            )
+        if self._style() == "manhwabro":
+            # Per-chapter series bible (no later reveals), the chapter's FULL
+            # transcript, and the same range-aware scope note as Power Fantasy.
+            return MANHWABRO_PROMPT.format(
+                briefing_block=self._briefing_block(upto=chapter),
+                previous_block=self._previous_block(chapter),
+                panel_block=self._panel_block(chapter, sheets),
+                series=self.cfg.series_name,
+                chapter=chapter,
+                words=_target_words(minutes),
+                minutes=minutes,
+                scope_note=self._scope_note(chapter, range_chapters),
+                transcript=self._transcript(chapter),
+            )
         return SCRIPT_PROMPT.format(
             briefing_block=self._briefing_block(upto=chapter),
             previous_block=self._previous_block(chapter),
@@ -325,6 +769,22 @@ class RecapBuilder:
     def _select(self, chapters: List[str], force: bool) -> tuple[List[str], List[str]]:
         """Split a request into (to_write, skipped_existing). Validates input."""
         chapters = sort_chapters(require_chapter(c) for c in chapters)
+        if self._style() == "powerfantasy":
+            # The user's range rule, enforced rather than documented: a Power
+            # Fantasy range is recapped only once EVERY transcript in the
+            # range exists, so the writer holds the whole story before
+            # chapter one is written. Never recap a range piecemeal.
+            span = _range_span(chapters)
+            have = set(self.transcribed())
+            missing = [c for c in span if c not in have]
+            if missing:
+                raise UserError(
+                    f"Power Fantasy recaps are written for a whole range at once, with the full "
+                    f"story in hand — transcribe every chapter in the range first. "
+                    f"Missing transcript(s) for chapter(s) {', '.join(missing)} "
+                    f"(range {span[0]}-{span[-1]}). "
+                    f"Transcribed so far: {', '.join(self.transcribed()) or 'none'}."
+                )
         have = set(self.transcribed())
         missing = [c for c in chapters if c not in have]
         if missing:
@@ -376,7 +836,8 @@ class RecapBuilder:
             return audio
         return None
 
-    def _write_recap(self, chapter: str, narration: str, hook: str, minutes: float) -> Path | None:
+    def _write_recap(self, chapter: str, narration: str, hook: str, minutes: float,
+                     summary: str = "") -> Path | None:
         from .video import cues
 
         audio = self._has_audio(chapter)
@@ -394,6 +855,7 @@ class RecapBuilder:
             "words": words,
             "target_minutes": minutes,
             "hook": cues.strip_tags(hook),
+            "summary": cues.strip_tags(summary).strip(),
             "tagged": parsed["tagged_ratio"] if parsed else 0.0,
             "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
@@ -431,23 +893,30 @@ class RecapBuilder:
 
         provider = build_provider(self.cfg.provider)
         written = []
-        # Sequential on purpose: each recap reads the previous one's hook.
+        # Sequential on purpose: each recap reads the story so far written before it.
         for chapter in todo:
             self.log(f"  chapter {chapter}...")
             sheets = sheet_paths(self.workdir, chapter)[:12] if self.panels(chapter) else []
-            prompt = self._prompt_for(chapter, minutes, sheets=sheets)
+            prompt = self._prompt_for(chapter, minutes, sheets=sheets, range_chapters=chapters)
             # With panels, the writer needs to see them to tag sentences well.
-            raw = provider.vision(SCRIPT_SYSTEM, prompt, sheets) if sheets else provider.text(SCRIPT_SYSTEM, prompt)
+            raw = provider.vision(self._system_prompt(), prompt, sheets) if sheets \
+                else provider.text(self._system_prompt(), prompt)
             try:
-                narration, hook = _parse_part(extract_json(raw))
+                narration, hook, summary = _parse_part(extract_json(raw))
             except ValueError:
-                narration, hook = raw, ""
+                narration, hook, summary = raw, "", ""
             if _count_words(strip_tags(narration)) < MIN_NARRATION_WORDS:
                 self.log(f"    ! model returned too little narration; chapter {chapter} not saved")
                 continue
+            lint = self._lint_errors(chapter, narration, chapters)
+            if lint:
+                for msg in lint:
+                    self.log(f"    ! chapter {chapter}: {msg}")
+                self.log(f"    ! chapter {chapter}: power-fantasy lint failed; chapter not saved")
+                continue
             for msg in self._check(chapter, narration)["warnings"]:
                 self.log(f"    ! chapter {chapter}: {msg}")
-            path = self._write_recap(chapter, narration, hook, minutes)
+            path = self._write_recap(chapter, narration, hook, minutes, summary)
             if path is None:
                 continue
             self.log(f"    {_count_words(narration)} words -> {path.name}")
@@ -468,7 +937,7 @@ class RecapBuilder:
             last=chapters[-1],
             hooks=hooks,
         )
-        data = extract_json(provider.text(SCRIPT_SYSTEM, prompt))
+        data = extract_json(provider.text(self._system_prompt(), prompt))
         if isinstance(data, dict):
             self._write_bookends(chapters, str(data.get("intro") or ""), str(data.get("outro") or ""))
 
@@ -527,7 +996,8 @@ class RecapBuilder:
             sheets = sheet_paths(self.workdir, chapter) if self.panels(chapter) else []
             if sheets:
                 tagged.append(chapter)
-            atomic_write_text(prompts_dir / f"ch{chapter}.md", self._prompt_for(chapter, minutes, sheets=sheets))
+            atomic_write_text(prompts_dir / f"ch{chapter}.md",
+                              self._prompt_for(chapter, minutes, sheets=sheets, range_chapters=chapters))
 
         rel = lambda p: str(p.relative_to(self.workdir)).replace("\\", "/")  # noqa: E731
         listing = "\n".join(
@@ -550,7 +1020,7 @@ About {_target_words(minutes)} words each (~{minutes:g} minutes read aloud).
 
 ## System instruction
 
-{SCRIPT_SYSTEM}
+{self._system_prompt()}
 
 ---
 
@@ -576,7 +1046,8 @@ Write `{rel(self.task_dir / 'parts.json')}`:
 
 ```json
 {{
-  "{todo[0]}": {{"narration": "...", "hook": "the opening line"}}
+  "{todo[0]}": {{"narration": "...", "hook": "the opening line",
+    "summary": "3-5 sentences: events so far, where each main character is now, open threads"}}
 }}
 ```
 
@@ -622,17 +1093,18 @@ covering exactly chapters {', '.join(todo)}.
 
         written, still_owed, rejected = [], [], {}
         for chapter in expected:
-            narration, hook = _parse_part(parts.get(chapter))
+            narration, hook, summary = _parse_part(parts.get(chapter))
             if _count_words(strip_tags(narration)) < MIN_NARRATION_WORDS:
                 still_owed.append(chapter)
                 continue
             report = self._check(chapter, narration)
-            if report["errors"]:
-                rejected[chapter] = report["errors"]      # not saved: the writer must retag
+            errors = list(report["errors"]) + self._lint_errors(chapter, narration, expected)
+            if errors:
+                rejected[chapter] = errors      # not saved: the writer must fix and re-finalize
                 continue
             for msg in report["warnings"]:
                 self.log(f"    ! chapter {chapter}: {msg}")
-            path = self._write_recap(chapter, narration, hook, minutes)
+            path = self._write_recap(chapter, narration, hook, minutes, summary)
             if path is not None:
                 written.append(path)
 

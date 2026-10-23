@@ -200,9 +200,15 @@ saves the chapters you've written and keeps the task open for the rest.
 Each prompt's series context is limited to what was known *by that chapter*,
 so don't add knowledge from later chapters into an early chapter's narration.
 
-The task's prompt files already contain each chapter's transcript and series
-context. Work through them in order; each one is told the previous chapter's
-opening hook so segments flow into each other.
+The task's prompt files already contain each chapter's transcript, series
+context, and a "story so far" built from every earlier chapter's recap, plus
+the end of the immediately previous recap verbatim. Work through chapters in
+order. **Every `parts.json` entry must include a `"summary"`** (3-5 plain
+sentences: what happened, where each main character is now, what is still
+unresolved) alongside `"narration"` and `"hook"` — this is what a NEW session
+reads to pick the story back up, since it has no memory of earlier chapters
+you wrote in a previous session. A missing or thin summary is exactly how a
+new session loses the thread at the next chapter.
 
 To turn recaps into one video script:
 
@@ -232,6 +238,22 @@ that genuinely land. This is both the house style and the correct way to handle
 someone else's script. Do not paste transcript dialogue in bulk.
 
 ## Making videos
+
+Taking a chapter all the way from its link to a finished video with
+Deepgram doing the narration (no human recording involved): read
+`docs/FULL_PIPELINE_WORKFLOW.md` in full before starting, and read it again
+before starting each NEW chapter in the same session. It covers the
+transcript/recap/consistency-check/voice/TTS-readiness/audio-verification
+stages, then hands off to the file below for the video itself. The
+`/make-recap-video` skill does this automatically.
+
+Building or continuing a `video.mode: wide`/`adaptive` chapter video (any
+multi-chapter continuation, e.g. chapter 1 then 2 then 3 in one session):
+read `docs/CHAPTER_BUILD_WORKFLOW.md` in full before starting, and read it
+again before starting each NEW chapter in the same session -- never rely on
+memory of it from earlier in the conversation, even if you built an earlier
+chapter a few messages ago. The `/build-chapter` skill does this
+automatically; if asked directly instead, go read that file now.
 
 Once the user has recorded `audio/chapter_N.mp3` (or `.wav`, `.m4a`), make the video
 with these commands. Use the routine in this order, one chapter at a time:

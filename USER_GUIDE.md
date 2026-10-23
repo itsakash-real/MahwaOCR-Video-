@@ -20,6 +20,7 @@ common rules, and they all come from one file, `manhwa_ocr/agent_prompts.py`, so
 | Check a storyboard shot by shot | D: review | Step 5b, Way A (also in `.work/video/chN/REVIEW.md`) |
 | Make the intro (chapter 0) | E: intro | The intro section |
 | Fix one chapter after an error or a wrong shot | F: fix chapter | Step 6 |
+| Build/continue a wide or adaptive-mode chapter video | I: build workflow (`/build-chapter`, or `docs/CHAPTER_BUILD_WORKFLOW.md`) | Step 5, `docs/AGENT_WAY.md` |
 
 ---
 
@@ -227,6 +228,20 @@ Ask me before running anything with --force that discards edits.
 2. Write original narration: commentary, not a re-read of the dialogue.
    Quote the source only briefly, for lines that land.
    Do not add knowledge from later chapters.
+   Narration voice: the default calm present-tense voice, unless the series
+   config sets `recap.style: speedrun` — then use the Speedrun Gossip voice
+   (docs/RECAP_STYLE_SPEEDRUN.md): past tense, role labels instead of names,
+   chain-of-consequences sentences with So/But/only-to pivots, an editorial
+   aside every few sentences, open on the inciting incident, end mid-escalation.
+   Or `recap.style: powerfantasy` — then use the Power Fantasy system
+   (docs/RECAP_STYLE_POWERFANTASY.md): a range is recapped only after every
+   transcript in it exists; the range opener hooks in medias res with the
+   "This guy is..." formula and drops the lore after the flex; later chapters
+   open mid-flow; no chapter ends on finale language or opens with a restart.
+   Or `recap.style: manhwabro` — then use the Manhwa Bro voice
+   (docs/RECAP_STYLE_MANHWABRO.md): cold open in the fight, a "So, why is he so
+   strong?" pivot into the lore, "our boy / this brat / bro" for the protagonist,
+   roasts for everyone else; write from the whole transcript, descriptions included.
 3. Tagging rules. Check each one before you finalize.
    - Tag EVERY sentence. Target a tagged ratio of 95% or higher.
    - Use only drawn panels. Never tag a panel marked text-only, credits or watermark.
@@ -301,6 +316,46 @@ For each chapter:
 
 One audio file per chapter. Uploading again replaces the old one, and the video
 is marked as needing a rebuild.
+
+### Or generate the narration with Deepgram TTS
+
+Instead of recording, you can synthesize the narration from the finalized
+recap with one command per chapter:
+
+```
+python -m manhwa_ocr video tts --chapter N --session "<name>"
+```
+
+Before speaking anything, it lints every sentence for the specific patterns
+that cause a bad Aura read -- raw digits, a dash/ellipsis standing in for a
+sentence break, stacked punctuation, a missing terminal mark, unbalanced
+quotes, a run-on sentence over ~30 words -- and refuses the whole chapter if
+anything's flagged, with the sentence number and a suggested fix for each.
+Fix the recap and re-finalize, then re-run.
+
+Once synthesis is clean, it speaks each sentence of
+`recaps\chapter_N.cues.json` with a Deepgram Aura voice, joins them with a
+short pause, and writes `audio\chapter_N.m4a` (plus a `chapter_N.tts.json`
+manifest with the voice used and per-sentence timings). It then
+automatically re-transcribes the result with the same whisper engine
+`video align` uses and flags any sentence whose heard words don't match the
+script, or whose timing looks like truncated/corrupt audio -- written to
+`chapter_N.tts_verify.json`, so you know which specific sentence (if any)
+is worth listening to instead of the whole file. Skip this check with
+`--no-verify`, or re-run it alone with `video tts-verify --chapter N`.
+From there the usual flow applies unchanged: `video pair`, `video align`,
+`video plan`, and so on. Because the audio speaks the script exactly as
+written, align has no rewordings to trip over.
+
+The Deepgram API key is read from the `DEEPGRAM_API_KEY` environment variable,
+or from a key file (default `~/.config/manhwa/deepgram.key`, one line, the key
+only). Keep the key on your own machine: it is never written into the series
+folder or the repo. Pick the voice with `--voice aura-2-orion-en` or a `tts:`
+section in the config (`model`, `gap_seconds`, `key_file`, `speed`).
+Playback speed defaults to `1.23` (Aura-2 models only, range 0.7-1.5) --
+a touch faster reads less like a performance, more like a narrator moving
+the story along; override per command with `--speed 1.1`. Re-running the
+command reuses cached sentences; `--force` re-synthesizes everything.
 
 **Important:** record from the *current* script. If a recap is rewritten later,
 record it again, or the pictures won't line up with your words.

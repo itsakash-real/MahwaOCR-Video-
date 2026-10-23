@@ -165,7 +165,12 @@ def parse_script(text: str) -> List[Dict[str, Any]]:
 
 
 def parse_cues_data(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Sentences from a cues.json file: {sentences: [{text, hook, loops, ...}]}."""
+    """Sentences from a cues.json file: {sentences: [{text, hook, loops, ...}]}.
+
+    A sentence may also carry "panels": a list of panel refs like
+    "ch2:P010-14" that pins exactly which panels illustrate it (see
+    pinned_picks). No "panels" key -> the sentence is auto-picked.
+    """
     raw = data.get("sentences") if isinstance(data, dict) else None
     if not isinstance(raw, list) or not raw:
         raise UserError("The cues file needs a non-empty \"sentences\" list.")
@@ -176,9 +181,13 @@ def parse_cues_data(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         loops = entry.get("loops") or []
         if isinstance(loops, str):
             loops = [loops]
+        panels = entry.get("panels") or []
+        if isinstance(panels, str):
+            panels = [panels]
         out.append({"text": str(entry["text"]).strip(), "hook": bool(entry.get("hook")),
                     "loops": [str(x) for x in loops], "reuse": bool(entry.get("reuse")),
-                    "beat": bool(entry.get("beat"))})
+                    "beat": bool(entry.get("beat")),
+                    "panels": [str(x).strip() for x in panels if str(x).strip()]})
     if not out:
         raise UserError("The cues file has no usable sentences.")
     return out
@@ -358,6 +367,48 @@ def auto_pick(sentences: List[Dict[str, Any]], pool: List[Dict[str, Any]], *,
                       "loops": list(sent.get("loops") or []),
                       "reason": "; ".join(reasons) or "first drawable panel in story order",
                       "score": round(score, 2)})
+    return picks
+
+
+def pinned_picks(sentences: List[Dict[str, Any]], pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Picks taken verbatim from cues "panels" pins. Pure: no I/O.
+
+    The manual override for hook / previously, mirroring the manual intro:
+    when a cues file pins panels, EVERY sentence must pin 1-3 of them (the
+    shape the manual intro accepts), each pin must name a drawable panel of
+    the pool, and no panel may be pinned twice. Anything else is a UserError
+    -- a half-pinned script never silently falls back to auto-pick for the
+    remaining sentences, because the two picking modes read very differently
+    on screen.
+    """
+    by_ref = {p["ref"]: p for p in pool}
+    picks: List[Dict[str, Any]] = []
+    seen: set = set()
+    for i, sent in enumerate(sentences):
+        refs = [str(r).strip() for r in (sent.get("panels") or []) if str(r).strip()]
+        if not refs:
+            raise UserError(
+                f"Sentence {i + 1} pins no panels ({sent['text'][:60]!r}): when any sentence "
+                "of a cues file pins its panels, every sentence must pin 1-3 refs "
+                "like \"ch2:P010-14\".")
+        if len(refs) > 3:
+            raise UserError(f"Sentence {i + 1} pins {len(refs)} panels; the maximum is 3.")
+        for ref in refs:
+            panel = by_ref.get(ref)
+            if panel is None:
+                raise UserError(
+                    f"Sentence {i + 1} pins {ref}, which is not a panel of the given chapters.")
+            if panel.get("text_only") or panel.get("credits"):
+                raise UserError(
+                    f"Sentence {i + 1} pins {ref}, a text-only / credits panel, which cannot be shown.")
+            if ref in seen:
+                raise UserError(f"{ref} is pinned more than once (sentence {i + 1}); "
+                                "a panel may appear only once in the video.")
+            seen.add(ref)
+        picks.append({"text": sent["text"], "refs": list(refs), "panels": list(refs),
+                      "beat": bool(sent.get("beat")), "hook": bool(sent.get("hook")),
+                      "loops": list(sent.get("loops") or []),
+                      "reason": "pinned in cues file", "score": 0.0})
     return picks
 
 
@@ -636,14 +687,19 @@ def build_hook(sess, cfg, *, chapters: List[str] | None = None, audio: str | Non
                           key=lambda c: intro_mod._chapter_key(c))
     pool = build_pool(root, chapters)
     mem = load_memory(root)
-    used = set() if allow_reuse else used_refs(mem)
-    picks = auto_pick(sentences, pool, used_refs=used, seed=seed)
+    if any(s.get("panels") for s in sentences):
+        picks = pinned_picks(sentences, pool)
+        source = "panels pinned in cues file"
+    else:
+        used = set() if allow_reuse else used_refs(mem)
+        picks = auto_pick(sentences, pool, used_refs=used, seed=seed)
+        source = "auto-pick (edit panels, then re-run)"
     for w in memory_warnings(mem, [r for p in picks for r in p["panels"]]):
         log(f"  ! memory: {w}")
     auto_path = _auto_file(root, "intro.auto.json")
     auto_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(auto_path, json.dumps(
-        {"version": 1, "kind": "hook", "source": "auto-pick (edit panels, then re-run)",
+        {"version": 1, "kind": "hook", "source": source,
          "chapters": chapters, "seed": seed, "sentences": picks},
         indent=1, ensure_ascii=False))
     log(f"  wrote {auto_path.relative_to(root).as_posix()} (review / edit it, then re-run)")
@@ -667,7 +723,8 @@ def previously_chapter(chapters: List[str], audio: Path) -> str:
 
 
 def build_previously(sess, cfg, *, chapters: List[str], audio: str | None = None,
-                     script: str | None = None, target_seconds: float | None = None,
+                     script: str | None = None, cues: str | None = None,
+                     target_seconds: float | None = None,
                      seed: int | None = None, sync: str = "auto", fmt: str | None = None,
                      plan_only: bool = False, workers: int = 0,
                      allow_reuse: bool = False, log=print
@@ -687,7 +744,8 @@ def build_previously(sess, cfg, *, chapters: List[str], audio: str | None = None
     part_no = out_chapter[4:] if out_chapter.startswith("prev") else out_chapter
     default_script = root / "previously" / f"previously_{part_no}.txt"
     sentences = load_script_sentences(
-        script_path=Path(script) if script else None, cues_path=None, default_path=default_script)
+        script_path=Path(script) if script else None,
+        cues_path=Path(cues) if cues else None, default_path=default_script)
     # Beats come from the previous part's recaps (never its transcripts, never
     # the next part): they steer panel picking toward what the recap called out.
     series = read_series_memory(root)
@@ -708,16 +766,21 @@ def build_previously(sess, cfg, *, chapters: List[str], audio: str | None = None
     beats = select_beats(recap_all, count=PREVIOUSLY_BEATS, open_threads=threads)
     pool = build_pool(root, chapters)  # ONLY previous chapters: no next-part leak, by construction
     mem = load_memory(root)
-    used = set() if allow_reuse else used_refs(mem)
-    picks = auto_pick(sentences, pool, used_refs=used, seed=seed,
-                      prefer_prior_video=True,
-                      extra_texts=[b["text"] for b in beats])
+    if any(s.get("panels") for s in sentences):
+        picks = pinned_picks(sentences, pool)
+        source = "panels pinned in cues file"
+    else:
+        used = set() if allow_reuse else used_refs(mem)
+        picks = auto_pick(sentences, pool, used_refs=used, seed=seed,
+                          prefer_prior_video=True,
+                          extra_texts=[b["text"] for b in beats])
+        source = "auto-pick from previous part recaps"
     for w in memory_warnings(mem, [r for p in picks for r in p["panels"]]):
         log(f"  ! memory: {w}")
     auto_path = root / "previously" / f"previously_{out_chapter}.auto.json"
     auto_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(auto_path, json.dumps(
-        {"version": 1, "kind": "previously", "source": "auto-pick from previous part recaps",
+        {"version": 1, "kind": "previously", "source": source,
          "chapters": chapters, "seed": seed,
          "beats": [b["text"] for b in beats],
          "sentences": picks}, indent=1, ensure_ascii=False))

@@ -40,19 +40,63 @@ download:
   headers:
     User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36
 
+tts:
+  # Deepgram Aura voice for `video tts`. aura-2-orion-en: calm, approachable
+  # American male -- picked for a gentle recap narrator, not a trailer/news
+  # voice. Override per command with --voice.
+  model: aura-2-orion-en
+  # A touch faster than natural reads less like a performance, more like a
+  # narrator moving the story along. Chosen after comparing 1.2/1.23/1.25/1.3
+  # by ear. Aura-2 models only (0.7-1.5). Override per command with --speed.
+  speed: 1.23
+
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
+  mode: wide              # classic | wide | adaptive | panelfit | fullframe. wide: every card full frame
+                          # height (no letterbox), min 6/16 of the frame wide (pairs exactly
+                          # 8/16), captions overlay the art (no black bar). adaptive: per shot, a
+                          # naturally wide panel (aspect >= adaptive.wide_threshold) gets that
+                          # same wide treatment; a narrower panel keeps its classic shape but
+                          # without the equal-area shrink, so it isn't forced to the same small
+                          # size as every other shape. panelfit: no cards, no cropping -- every
+                          # panel WHOLE at its native aspect over a blurred 60% self-fill,
+                          # slow-zoom 100->108% or a LINEAR top->bottom scroll for tall
+                          # strips (see panelfit: below). fullframe: NO cards at all -- every
+                          # shot is a full-bleed 16:9 camera viewport panning/zooming through
+                          # the panel (see fullframe: below). Landscape only; portrait stays
+                          # classic in both.
+  wide:
+    min_width_ratio: 0.375  # 6/16 of the frame wide; no thin slivers, ever
+    max_upscale: 1.5        # a panel is never upscaled past this (keeps 1080p sharp)
+  adaptive:
+    wide_threshold: 1.333   # a panel's own aspect >= this (4:3) earns the wide treatment
+  panelfit:
+    bg_blur: 50             # Gaussian radius (px at 1080p) of the blurred self-fill background
+    bg_opacity: 0.60        # background layer opacity over black
+    zoom_end: 1.08          # slow zoom end scale (100% -> 108%; pull_out reverses)
+    strip_aspect: 1.9       # panel height/width >= this = vertical strip (fit by width + scroll)
+    max_upscale: 2.4        # foreground is never upscaled past this
+    still_limit: 0.5        # seconds: nothing stays still longer (zero-static rule)
+    fx: true                # impact FX (0.2s shake + white flash) on flagged shots
+    shake_seconds: 0.2      # screen-shake duration on an impact beat
+    shake_amplitude: 10.0   # screen-shake amplitude, px at 1080p
+    flash_frames: 3         # white-flash length at impact cuts, frames (spec: 2-4)
+  fullframe:
+    max_upscale: 2.4        # viewport source floor = frame / this (1920x1080 / 2.4 = 800x450 px);
+                            # zoom depth is capped so no viewport ever sources from less
+    zoom_depth: 1.18        # target push_in / pull_out depth inside the window
+    pan_travel: 1.0         # pan window = viewport * (1 + this) along the pan axis
   crf: 20                 # quality: lower = better and bigger files
   preset: veryfast
   lead: 0.15              # panel appears this long before its sentence
   min_shot: 1.0           # recap pacing: ~2.7s average shot, 1-5s range
   max_shot: 5.0
-  min_hold: 3.0           # no picture stays up for less than this (seconds)
+  min_hold: 1.5           # no picture stays up for less than this (seconds)
   target_shot: 2.7        # average seconds per shot (recap channels: about 2.7)
   pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
   workers: 0              # parallel renders; 0 = all your CPU cores
-  effects: {shake: true, punch: false, flash: false, end_fade: true}   # calm by default
+  effects: {shake: true, punch: false, flash: false, end_fade: false}   # calm by default
   music: null             # P3: null = use music/bed.mp3 in the series folder when it exists
                           # (drop a royalty-free loop there), else render music-free. Ducks under narration.
   music_volume: 0.22      # 15-25% under narration; sidechain lets it rise toward 60-80% when no narration
@@ -78,6 +122,18 @@ video:
     tighten_edges: true
     white_threshold: 242
     black_threshold: 13
+    trim_v1: false          # Build 1 white-space trimmer: blank rows only, gutter colour
+                            # detected per panel, caps + review flags recorded in panels.json
+    trim_cap: 0.40          # max share of a panel's height cut from one side
+    trim_v2: false          # Rule 6 white-space eradication: full ink-bbox trim (white+black,
+                            # rows+cols) + slicing strips at large white gaps, at panel build.
+                            # The panelfit prep step (after the recap, before pair/plan).
+  # Bubble/text detector (ogkalu RT-DETR v2, Apache-2.0, ONNX int8). Boxes are cached
+  # per panel under .work/video/chN/boxes/. Get the model file from
+  # huggingface.co/ogkalu/comic-text-and-bubble-detector (detector_int8.onnx).
+  detector:
+    model: ""               # "" = ~/.config/manhwa/models/ogkalu-detector-int8.onnx (or $MANHWA_DETECTOR_MODEL)
+    threshold: 0.35
   # Card framing: cards keep the panel's full width and slide a vertical window; a panel too wide
   # for any allowed shape is shown whole on blurred padding. false = the old zoomed side-cropping.
   crop:
@@ -95,7 +151,7 @@ video:
     pair_ratio: 0.5         # share of neighbouring panels shown as a staggered pair
     darken: 0.15            # darker grade, 0 (off) to 0.6
     backdrop: blur          # always the blurred panel behind the cards, never black bars
-    beat_effects: [shake, flash, fade_out]   # on sentences marked "beat": true in intro.json
+    beat_effects: [shake, flash]   # on sentences marked "beat": true in intro.json
   tts:
     spell_numbers: true     # new recaps/chapter_N.tts.txt spell digits out (99 -> ninety nine)
   sync:

@@ -20,10 +20,11 @@ sources, never from memory:
 - `USER_GUIDE.md` — section "Which prompt do I use?" lists them verbatim.
 
 Letters: A = transcribe, B = recaps, C = build, D = review, E = intro,
-F = fix. Prompt G (Shorts + end-screen + publish checklist) and Prompt H
-(Full review + rebuild with new fixes) are docs-level prompts defined
-below in full — they are NOT in `agent_prompts.py`, because they are
-checklists / rebuild procedures, not base prompts.
+F = fix. Prompt G (Shorts + end-screen + publish checklist), Prompt H
+(Full review + rebuild with new fixes) and Prompt I (build/continue a wide
+or adaptive-mode chapter video) are docs-level prompts defined below in
+full — they are NOT in `agent_prompts.py`, because they are checklists /
+rebuild / workflow-trigger procedures, not base prompts.
 
 ## Before you start (applies to every prompt)
 
@@ -84,6 +85,7 @@ RULES:
 - No intro/outro. Exact plot / order / details from the transcript. Never invent events, numbers, dialogue.
 - Names exactly as in SERIES CONTEXT. Third person only. The player is called "the streamer" / "KukuruppingPpong". Never I / my / me / we in narration, even if the source is first person.
 - Casual, conversational, like telling a friend. Engaging, not boring. Just the script.
+- Narration voice: default calm present-tense, unless the series config sets `recap.style: speedrun` — then use the Speedrun Gossip voice (docs/RECAP_STYLE_SPEEDRUN.md); or `recap.style: powerfantasy` — then use the Power Fantasy system (docs/RECAP_STYLE_POWERFANTASY.md): whole-range workflow, all transcripts in the range first, then recaps; or `recap.style: manhwabro` — the Manhwa Bro voice (docs/RECAP_STYLE_MANHWABRO.md).
 - Tag EVERY sentence with its panel ({P003-02}, {same}, {impact}). Target 95%+ tagged. Never tag a text-only, bubble-only, blank, or credits panel.
 - Hook/open loops: open with a hook — first 30 seconds give proof (exact rank/number/beat the title promises), stakes, one-line roadmap. Mark it [HOOK] on its own line before the sentence. Open a loop every 2-3 min: [LOOP: the question] on its own line. End on an open question/cliffhanger. [HOOK] / [LOOP: ...] are editing cues, never spoken, never in tts.txt.
 - Never rewrite a recap whose chapter already has audio unless the user asks.
@@ -113,6 +115,9 @@ RULES (current editor, all in main):
 - Faces: never mask a face, never paint a bubble, never cut a face at edges. Crop to exclude bubbles, else drop + re-pair. System-window panels get wide fill (>=90% frame width, >=1.33 aspect), never a small square.
 - Panel diversity: never 3 identical cards in a row. Third showing must use a different panel or a different (punched-tighter) crop.
 - P2 switch: never switch to square 1.0 in a wide layout.
+- Wide mode (video.mode: wide, opt-in, landscape only): every card is full frame height (no letterbox above/below), >=6/16 of the frame wide (no thin slivers, pairs exactly 8/16 each), captions OVERLAY the art (no black bar), upscale capped at 1.5x. The motion zoom eats ~4% of the window height at its extremes (push_in end / pull_out start) -- a crop is only safe if heads, horns and bubble text clear the window edge by MORE than that at the worst moment. Measure reviewer crops from the actual panel pixels, never from thumbnails.
+  The window is built to contain the whole figure (head AND the rest of the body connected to it -- wings, tail, legs), not just the head: a confident head detection does not by itself mean the body below it is included. Three self-check signals ride in the plan and the QA file, never silently: `wide_figure_risk` (a figure taller than any window the panel's width/upscale cap allows to fully contain -- still a valid window, just flagged), `wide_caption_risk` (the overlaid caption may cover panel text at the window's bottom), and `wide_reviewer_focal_ignored` (a `fixes.json` focal crop you set was NOT used as-is -- either the panel's own aspect is >= 6/16 so it is shown whole, or the focal itself is taller than any legal window and was re-anchored). Treat all three as review items, not failures -- if any lists a panel you are about to ship, look at that panel's rendered frame before approving.
+- Adaptive mode (video.mode: adaptive, opt-in, landscape only): per SHOT, not the whole video -- a naturally wide/landscape panel (its own aspect >= video.adaptive.wide_threshold, default 4:3) gets the exact same wide-mode treatment as above (full frame height, edge-safe window, the same `wide_figure_risk`/`wide_caption_risk`/`wide_reviewer_focal_ignored` signals apply to it); a narrower panel keeps its classic crop/shape, just without the equal-area shrink that otherwise forces every shape onto the same small on-screen size regardless of how much visual weight its content actually carries. Pairs are always classic-style (pairing already excludes landscape panels). Captions always overlay the art for every shot in an adaptive video, never a bar -- that stays constant even though the card treatment itself changes shot to shot, so the two different presentation styles never visually fight each other.
 - SFX/music: render mixes SFX from video.sfx_dir and music from music/bed.mp3 if present. Missing files -> warning, render without, never fail, never invent audio.
 ACCEPTANCE: video/chapter_N.mp4 exists (1080p), sync gate PASS, spot-checks clean (see Prompt F). Report duration, file size, every shot changed + why, every dropped panel + reason, every pairs.json change.
 ```
@@ -249,6 +254,7 @@ STORYBOARD REVIEW — check every shot for ALL of these (this is the review we f
 - Panel diversity: never 3 identical cards in a row. Third showing must use a different panel or a different (punched-tighter) crop.
 - P2 switch: never switch to square 1.0 in a wide layout.
 - System windows: system-notification / status-window panels get wide fill (>=90% frame width, >=1.33 aspect), never a small centred square. Check ~34s-style banner shots.
+- Wide mode (video.mode: wide): same framing rule as Prompt C -- full frame height, >=6/16 wide, captions overlay the art. Final-render check: view the FIRST and LAST frame of EVERY shot plus a 1fps pass. Sampled timestamps are NOT a pass -- a spot-check can look clean while faces/bubbles are cut elsewhere in the same shot's zoom extremes.
 - Transitions: hard cut default, fade 10%, slide/zoom/whip/glitch only on impact/reveal beats (glitch max 1 per 60s). No transition may cause a flicker. No effect may cover a face.
 - SFX/music: plan SFX events, but render without SFX/music if files are missing (warning, never fail, never invent audio). Grade OFF by default.
 
@@ -262,6 +268,24 @@ REPORT:
 15. Report ONLY facts you verified (ffprobe + sync-audit JSON + frames you viewed). Be honest: if something still breaks, say so. Do not claim perfection.
 16. Deliver: test output path, duration, bytes, shots, sentences, sync-gate PASS/FAIL + wrong-picture %, drops list, captions status, SFX/music status, spot-check table (timestamp + result), old-vs-new comparison table, fixed / still-broken / new-issues lists.
 ```
+
+## Prompt I — Build/continue a wide or adaptive-mode chapter video (NEW)
+
+Prompt I is a docs-level prompt, like G and H: not in `agent_prompts.py`. Use
+it for a `video/wide-mode-v2`-style build (or any multi-chapter continuation
+session) instead of Prompt C, which assumes classic mode. The workflow
+itself is canonical in `docs/CHAPTER_BUILD_WORKFLOW.md`; this entry is just
+the trigger.
+
+```
+Build (or continue) the chapter video for chapter <N> of <SERIES>. My narration audio is at audio/chapter_<N>.<ext> in the session folder.
+Read docs/CHAPTER_BUILD_WORKFLOW.md in full and follow it exactly, phase by phase. Re-read it again before starting any further chapter in this same session, even if you already built one a moment ago.
+```
+
+Or just invoke the `/build-chapter` skill with the series name, chapter
+number(s), and audio file (if it isn't the default `audio/chapter_N.*`) —
+it parses those and reads the workflow file for you, every time, so this
+never depends on what's still "remembered" from earlier in a long session.
 
 ## After the agent finishes
 

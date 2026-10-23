@@ -51,7 +51,7 @@ from .align_engine import LONG_SENTENCE, TAGGED_COVERAGE_LONG, TAGGED_COVERAGE_S
 from .ffmpeg import audio_timing
 from .media import audio_path, video_dir
 from .panels import load_panels
-from .plan import MIN_SHOT, plan_path
+from .plan import MIN_SHOT, PF_MIN_SHOT, plan_path
 
 SAMPLE_STEP = 0.5     # the plan is sampled every half second
 WINDOW_MIN = 3.0      # mismatches shorter than this are noise, not reported windows
@@ -170,7 +170,8 @@ def _window_record(samples: List[Dict[str, Any]], i: int, j: int, segments: List
 
 def evaluate_gate(wrong: Dict[str, Any], over: List[Dict[str, Any]], late: List[Dict[str, Any]],
                     st: Dict[str, Any], *, short_shots: List[Dict[str, Any]] | None = None,
-                    coverage_failures: List[Dict[str, Any]] | None = None) -> List[str]:
+                    coverage_failures: List[Dict[str, Any]] | None = None,
+                    min_shot: float | None = None) -> List[str]:
     """The ONE gate decision (P2). audit() computes the numbers and calls this;
     render_chapter re-evaluates a cached report through gate_from_report, which
     calls this with the same code path — the two gates cannot drift apart.
@@ -197,7 +198,7 @@ def evaluate_gate(wrong: Dict[str, Any], over: List[Dict[str, Any]], late: List[
                         f"sentence starts (worst {worst_late['offset']:.1f}s, sentence {worst_late['sentence']})")
     if short_shots:
         shortest = min(float(s.get("duration") or 0.0) for s in short_shots)
-        failures.append(f"{len(short_shots)} shot(s) under the {MIN_SHOT:.1f}s minimum shot "
+        failures.append(f"{len(short_shots)} shot(s) under the {(MIN_SHOT if min_shot is None else min_shot):.1f}s minimum shot "
                         f"(shortest {shortest:.2f}s, shot {(min(short_shots, key=lambda s: float(s.get('duration') or 0.0)).get('shot'))})")
     if coverage_failures:
         worst_cov = min(coverage_failures, key=lambda c: float(c.get("coverage") or 0.0))
@@ -222,7 +223,8 @@ def gate_from_report(report: Dict[str, Any], st: Dict[str, Any] | None = None) -
                              (report.get("five_second") or {}).get("over_gate") or [],
                              report.get("late_cuts") or [], settings,
                              short_shots=report.get("short_shots") or [],
-                             coverage_failures=coverage_failures)
+                             coverage_failures=coverage_failures,
+                             min_shot=report.get("min_shot"))
     return {"pass": not failures, "failures": failures}
 
 
@@ -286,9 +288,17 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         vis = _visible(shots[sh], t)
         exp = exp_sets[si]
         judged = bool(exp)
-        match = judged and bool(set(vis) & set(exp))
-        wrong = (not match and any((p in all_owned and si not in owners[p]) or p in filler_fail[si]
-                                   for p in vis))
+        if shots[sh].get("title_card"):
+            # A title-card shot is the plan's designed visual for its
+            # cue sentence (and for the head of the next one it eats
+            # into): it COVERS the samples it spans — never a match
+            # failure, never wrong-picture.
+            match = judged
+            wrong = False
+        else:
+            match = judged and bool(set(vis) & set(exp))
+            wrong = (not match and any((p in all_owned and si not in owners[p]) or p in filler_fail[si]
+                                       for p in vis))
         samples.append({"t": t, "seg": si, "shot": sh, "shown": vis, "judged": judged,
                         "match": match, "wrong": wrong})
 
@@ -340,6 +350,12 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         if not first:
             continue
         off = _cut_offset(shots, first, float(seg["start"]))
+        if off is not None:
+            _sh = shots[shot_at(float(seg["start"]))]
+            if _sh.get("title_card"):
+                # The sentence opens under a title card by design; its
+                # first panel is due when the card ends, not before.
+                off = max(0.0, off - (float(_sh["end"]) - float(seg["start"])))
         if off is not None and off > st["max_late"] + st["gate_grace"] + 1e-6:
             late.append({"sentence": seg.get("sentence"), "panel": first[0], "offset": round(off, 3)})
 
@@ -391,10 +407,13 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
 
     # P2: the gate decision lives in evaluate_gate() — audit() and the render
     # gate (gate_from_report) share it, so the two gates cannot drift apart.
-    # Rule 2: any plan shot under the MIN_SHOT floor fails the gate.
+    # Rule 2: any plan shot under the floor fails the gate. The floor is
+    # the mode's own: panel-fit (measured reference) plans run PF_MIN_SHOT,
+    # every other mode keeps MIN_SHOT.
+    _floor = PF_MIN_SHOT if plan.get("mode") == "panelfit" else MIN_SHOT
     short_shots = [{"shot": s.get("id"), "duration": round(float(s["end"]) - float(s["start"]), 3)}
                    for s in shots
-                   if float(s["end"]) - float(s["start"]) < MIN_SHOT - 1e-6]
+                   if float(s["end"]) - float(s["start"]) < _floor - 1e-6]
     # Rule 7: tagged coverage per sentence — the share of the sentence's
     # judged samples where a tagged panel is on screen. <=8s sentences
     # need >=80% (trivially 100% when the tagged panel holds the window);
@@ -414,7 +433,7 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
                                 "pass": cov + 1e-9 >= thr})
     coverage_failures = [c for c in tagged_coverage if not c["pass"]]
     failures = evaluate_gate(wrong, over, late, st, short_shots=short_shots,
-                             coverage_failures=coverage_failures)
+                             coverage_failures=coverage_failures, min_shot=_floor)
 
     # Interpolated sentences, grouped into runs.
     runs: List[Dict[str, Any]] = []
@@ -472,6 +491,7 @@ def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str,
         "windows": windows, "worst_windows": worst_windows,
         "late_cuts": late,
         "short_shots": short_shots,
+        "min_shot": _floor,
         "tagged_coverage": tagged_coverage,
         "five_second": {"over_gate": over, "worst": worst_window},
         "minute_curve": minute_curve,
@@ -505,7 +525,7 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
     if report.get("short_shots"):
         ss = report["short_shots"]
         shortest = min(s["duration"] for s in ss)
-        out.append(f"  shots under the {MIN_SHOT:.1f}s minimum shot: {len(ss)} (shortest {shortest:.2f}s)")
+        out.append(f"  shots under the {float(report.get('min_shot', MIN_SHOT)):.1f}s minimum shot: {len(ss)} (shortest {shortest:.2f}s)")
     cov_fail = [c for c in (report.get("tagged_coverage") or []) if not c.get("pass")]
     if cov_fail:
         shown_cov = ", ".join(f"{c['sentence']} ({c['coverage']:.0%} vs {c['threshold']:.0%})"

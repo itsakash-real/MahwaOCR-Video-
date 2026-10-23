@@ -31,6 +31,34 @@ python -m manhwa_ocr video previously --chapters 1-6 --audio audio/previously_7.
 Defaults (no `--script` / `--audio`): script
 `previously/previously_7.txt`, audio `audio/previously_7.mp3`.
 
+## Pin the panels yourself (cues file)
+
+Auto-pick is a heuristic: one panel per sentence, chosen by OCR overlap.
+When a bridge has to land specific pictures — the character's face in the
+sentence that names them — pass a cues file instead of a script. Each
+sentence may pin 1–3 panels with refs exactly as in the manual intro
+(`ch2:P010-14`):
+
+```bash
+cat > previously/previously_7.cues.json <<'EOF'
+{"sentences": [
+  {"text": "Welcome back to part two of this episode.",
+   "panels": ["ch2:P002-01"], "hook": true},
+  {"text": "So the ancient monsters adopted it in chat: a slime queen, a lich, and a wolf.",
+   "panels": ["ch1:P012-09", "ch2:P002-04", "ch2:P026-08"]}
+]}
+EOF
+python -m manhwa_ocr video previously --chapters 1-6 --audio audio/previously_7.mp3 \
+    --cues previously/previously_7.cues.json --session "Your Series Name"
+```
+
+Pinning is all-or-nothing: if any sentence pins panels, every sentence
+must pin 1–3, each pin must be a drawable panel of the `--chapters` pool,
+and no panel may be pinned twice — anything else is an error, never a
+silent fall-back to auto-pick for the rest. The `.auto.json` review file
+is still written, with `"source": "panels pinned in cues file"`. The same
+pins work for `video hook --cues`.
+
 ## Where the panels come from
 
 - **Beats come from the previous part's recaps** (`recaps/chapter_N.md`

@@ -32,6 +32,16 @@ def test_pure_sound_with_no_actor_is_pure_audio():
 
 def test_visible_action_is_visual_even_when_it_makes_a_sound():
     assert classify("The monster roars.")[0] == "VISUAL_ACTION"
+
+
+def test_retrospective_thought_it_was_is_not_internal():
+    # "she thought it was" is a common past-tense comparison about something
+    # VISIBLE ("not the argument she thought it was"), not a description of
+    # an unspoken thought -- misclassifying it held the previous panel ~15s.
+    assert classify("Not the argument she thought it was.")[0] == "VISUAL_ACTION"
+    assert classify("That wasn't the plan they thought it would be.")[0] == "VISUAL_ACTION"
+    # a genuine internal thought still classifies correctly
+    assert classify("He thought about the plan all night, alone in the dark.")[0] == "INTERNAL"
     assert classify("The monster roars and charges toward him.")[0] == "VISUAL_ACTION"
     assert classify("Across the room, the television blares breaking news.")[0] == "VISUAL_ACTION"
 

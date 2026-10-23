@@ -318,18 +318,21 @@ def _ass_text(caption: Dict[str, Any]) -> str:
     return text[:idx] + "{\\c" + KEY_COLOUR + "}" + word + "{\\c" + TEXT_COLOUR + "}" + text[idx + len(key):]
 
 
-def write_ass(captions: List[Dict[str, Any]], path: Path, fmt=None) -> Path:
+def write_ass(captions: List[Dict[str, Any]], path: Path, fmt=None,
+             margin_v: int | None = None) -> Path:
     """Write captions as an .ass subtitle file. Returns the path.
 
     Alignment 2 (bottom centre) with MarginV inside the dedicated bottom
     bar (see CAPTION_BAR_FRACTION): the text sits on the black bar below
-    the cards, never over panel art.
+    the cards, never over panel art. `margin_v` overrides that (px at
+    1080p) -- wide mode has no bar, so captions overlay the art and need
+    more clearance off the bottom edge.
     """
     height = int(getattr(fmt, "height", 1080) or 1080)
     width = int(getattr(fmt, "width", 1920) or 1920)
     scale = height / 1080.0
     font_size = max(12, int(round(CAPTION_FONT_SIZE * scale)))
-    margin_v = max(16, int(round(CAPTION_MARGIN_V * scale)))
+    margin_v = max(16, int(round((CAPTION_MARGIN_V if margin_v is None else margin_v) * scale)))
     lines = [
         "[Script Info]",
         "Title: Manhwa recap auto-captions",

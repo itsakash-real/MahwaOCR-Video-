@@ -27,6 +27,20 @@ from ..util import atomic_write_text, require_chapter
 TAG = re.compile(r"\{([^{}\n]{1,120})\}")
 PANEL_ID = re.compile(r"^P\d{3}-\d{2}$")
 CUE_WORDS = {"beat", "impact", "reveal"}
+# Per-sentence MOTION overrides for panel-fit mode (B1e): the pairing
+# surface (a sentence's "motion" in cues.json, or a pairs.json entry's
+# "motion") may overrule the planner's aspect routing for ONE sentence,
+# from the user's shot-by-shot rulings — "zoom_out" for a reveal,
+# "zoom_out_fast" for a blast, "duo" for a two-panel moment shown side
+# by side. A sentence's value is either one of these strings (the whole
+# sentence) or a list parallel to its "panels" (one per tagged panel —
+# a sliced strip's segments can take different motions: the detonator
+# zooms in, the explosion zooms out fast). "duo" is whole-sentence
+# only. Unknown values are refused by validate_cues, never ignored.
+# B1f adds "zoom_in": the foreground zooms IN at the standard panelfit
+# rate (plan.PF_ZOOM_RATE) even on a panel whose aspect would normally
+# route it to a drift or a strip traverse — the mirror of "zoom_out".
+MOTION_HINTS = ("default", "zoom_in", "zoom_out", "zoom_out_fast", "duo")
 CUE_LINE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 INLINE_CUE = re.compile(r"\[[^\]\n]*\]")
 # P3 editor cues (never spoken; parse() attaches them to the next sentence):
@@ -111,6 +125,26 @@ def _restore_abbrev(text: str) -> str:
     return text.replace(_DOT, ".")
 
 
+# A quoted question/exclamation whose quote closes and is followed by a
+# lowercase word is a sub-clause inside a larger sentence ('she asked,
+# "is it over?" but no one answered'), not the end of one -- SENTENCE_END
+# otherwise splits right after the closing quote, orphaning the fragment
+# from the tag/panel that opened the sentence. Protect the terminator the
+# same way _protect_abbrev protects a dot, then restore it once the split
+# is done.
+_QUOTE_BANG, _QUOTE_Q = "\u0002", "\u0003"
+_QUOTE_CONTINUATION = re.compile(r'(["“][^"”\n]{1,200}?)([?!])(["”])(?=\s+[a-z])')
+
+
+def _protect_quoted_continuation(text: str) -> str:
+    return _QUOTE_CONTINUATION.sub(
+        lambda m: m.group(1) + (_QUOTE_BANG if m.group(2) == "!" else _QUOTE_Q) + m.group(3), text)
+
+
+def _restore_quoted_continuation(text: str) -> str:
+    return text.replace(_QUOTE_BANG, "!").replace(_QUOTE_Q, "?")
+
+
 def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = False) -> Dict[str, Any]:
     """Split tagged narration into spoken sentences with their panels and cues.
     With spell, each sentence's text is the spelled-out-numbers text that tts.txt holds.
@@ -141,6 +175,7 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
     body = "\n".join(kept_lines)
     body = re.sub(r"\s+", " ", body).strip()
     body = _protect_abbrev(body)
+    body = _protect_quoted_continuation(body)
     sentences: List[Dict[str, Any]] = []
     unknown: List[str] = []
     tagged = 0
@@ -175,12 +210,13 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
                         panels.append(pid)
                     else:
                         unknown.append(pid)
-        emphasis = [_spoken(_restore_abbrev(m)) for m in re.findall(r"\*{1,2}([^*\n]{1,60})\*{1,2}", chunk)]
-        text = _restore_abbrev(_spoken(chunk))
+        emphasis = [_spoken(_restore_quoted_continuation(_restore_abbrev(m)))
+                   for m in re.findall(r"\*{1,2}([^*\n]{1,60})\*{1,2}", chunk)]
+        text = _restore_quoted_continuation(_restore_abbrev(_spoken(chunk)))
         if spell:
             emphasis = [spell_numbers(e) for e in emphasis]
             text = spell_numbers(text)
-        chunk = _restore_abbrev(chunk)
+        chunk = _restore_quoted_continuation(_restore_abbrev(chunk))
         if not text:
             # A tag-only fragment: carry its tags onto the next sentence.
             if sentences is not None and (panels or cues or chunk_hook or chunk_loops):
@@ -343,6 +379,15 @@ def validate_cues(data: Any) -> List[str]:
     problems: List[str] = []
     if not isinstance(data, dict):
         return ["cues.json must be a JSON object (sentence -> panels, cues, emphasis)"]
+    # B1f: per-panel landmark slice hints (optional top-level key; old
+    # cues.json files omit it). The format is slicehints.py's docstring;
+    # validation is shared with the pairs.json surface so the two can
+    # never drift apart.
+    if data.get("slice_hints") is not None:
+        from .slicehints import parse_slice_hints
+
+        _hints, _problems = parse_slice_hints(data.get("slice_hints"))
+        problems.extend(f"cues.json: {p}" for p in _problems)
     sentences = data.get("sentences")
     if not isinstance(sentences, list) or not sentences:
         return ["cues.json: \"sentences\" must be a non-empty list"]
@@ -368,6 +413,27 @@ def validate_cues(data: Any) -> List[str]:
         if emphasis is not None and (not isinstance(emphasis, list)
                                      or not all(isinstance(e, str) for e in emphasis)):
             problems.append(f"{where}: \"emphasis\" must be a list of strings")
+        # B1e: the per-sentence motion override (optional; old cues.json
+        # files omit it). A string applies to the whole sentence; a list
+        # runs parallel to "panels", one entry per tagged panel.
+        motion = s.get("motion")
+        if motion is not None:
+            if isinstance(motion, str):
+                if motion not in MOTION_HINTS:
+                    problems.append(f"{where}: \"motion\" must be one of "
+                                    f"{', '.join(MOTION_HINTS)} (got {motion!r})")
+            elif isinstance(motion, list):
+                if not all(isinstance(m, str) and m in MOTION_HINTS for m in motion):
+                    problems.append(f"{where}: every \"motion\" list entry must be one of "
+                                    f"{', '.join(MOTION_HINTS)}")
+                elif isinstance(panels, list) and len(motion) != len(panels):
+                    problems.append(f"{where}: \"motion\" list has {len(motion)} entries but "
+                                    f"\"panels\" has {len(panels)} — they run in parallel")
+                elif "duo" in motion:
+                    problems.append(f"{where}: \"duo\" is a whole-sentence motion — "
+                                    f"write it as a plain string, not in a list")
+            else:
+                problems.append(f"{where}: \"motion\" must be a string or a list of strings")
         # P3: hook / loop markers (optional; old cues.json files omit them).
         if "hook" in s and not isinstance(s.get("hook"), bool):
             problems.append(f"{where}: \"hook\" must be true or false")
@@ -415,3 +481,18 @@ def load_cues_strict(root: Path, chapter: str) -> Dict[str, Any] | None:
             f"{path.name} has problems (nothing from it was used):\n  - "
             + "\n  - ".join(problems[:12]))
     return data
+
+
+def slice_hints_of(cue_data: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:
+    """The chapter's normalised B1f slice hints from a cues document:
+    {panel id: {"slice": [...], "discard": [[a, b], ...]}}. {} when the
+    document carries none (the inert case). The document is expected to
+    have passed validate_cues (load_cues_strict); a malformed value
+    yields {} here rather than raising, because this helper also runs
+    on read-only status paths — the strict loader is the gate."""
+    if not isinstance(cue_data, dict) or cue_data.get("slice_hints") is None:
+        return {}
+    from .slicehints import parse_slice_hints
+
+    hints, problems = parse_slice_hints(cue_data.get("slice_hints"))
+    return hints if not problems else {}

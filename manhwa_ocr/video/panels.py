@@ -51,6 +51,8 @@ class Panel:
     tall: bool = False
     scene: str = ""
     text: str = ""
+    trim: Dict[str, Any] = field(default_factory=dict)  # Build 1 v1 record, when enabled
+    trim2: Dict[str, Any] = field(default_factory=dict)  # Rule 6 v2 record, when enabled
 
     @property
     def height(self) -> float:
@@ -79,6 +81,12 @@ def _settings(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
         "tighten_edges": bool(cfg.get("tighten_edges", True)),
         "white_threshold": min(255, max(128, int(cfg.get("white_threshold", WHITE_THRESHOLD)))),
         "black_threshold": min(127, max(0, int(cfg.get("black_threshold", BLACK_THRESHOLD)))),
+        # Build 1 (opt-in): gutter-colour-aware blank-row trim on top of the edge
+        # tightening above, with caps/flags recorded per panel. Off by default so
+        # existing panels.json fingerprints (and framing) stay untouched.
+        "trim_v1": bool(cfg.get("trim_v1", False)),
+        "trim_cap": min(0.9, max(0.05, float(cfg.get("trim_cap", 0.40)))),
+        "trim_v2": bool(cfg.get("trim_v2", False)),
     }
 
 
@@ -276,6 +284,7 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
 
     panels: List[Panel] = []
     per_page: Dict[int, int] = {}
+    sliced_any = False
     for idx, (a, b) in enumerate(cands, start=1):
         segs = _segments(a, b, pages)
         if not segs:
@@ -284,6 +293,9 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
         per_page[start_page] = per_page.get(start_page, 0) + 1
         panel = Panel(id=f"P{start_page:03d}-{per_page[start_page]:02d}", index=idx,
                       y0=float(a), y1=float(b), x0=0.0, x1=float(norm_w), segments=segs)
+        v2_pieces = None
+        v2_col = (0.0, 0.0)
+        v2_vs = 1.0
         try:
             strip = _stitch(panel, {p.path.name: p.path for p in pages})
             if s["tighten_edges"]:
@@ -294,12 +306,72 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
                     panel.y0, panel.y1 = float(a + cut_top * scale), float(b - cut_bottom * scale)
                     panel.segments = _segments(panel.y0, panel.y1, pages) or panel.segments
                     strip = strip.crop((0, cut_top, strip.width, strip.height - cut_bottom))
+            if s["trim_v1"]:
+                from .trim import compute_trim
+
+                tres = compute_trim(strip, cap_share=s["trim_cap"])
+                vscale = norm_w / max(1, strip.width)
+                panel.trim = {"top": round(tres.cut_top * vscale, 1),
+                              "bottom": round(tres.cut_bottom * vscale, 1),
+                              "flags": list(tres.flags)}
+                if tres.cut_top or tres.cut_bottom:
+                    panel.y0 = float(panel.y0 + tres.cut_top * vscale)
+                    panel.y1 = float(panel.y1 - tres.cut_bottom * vscale)
+                    panel.segments = _segments(panel.y0, panel.y1, pages) or panel.segments
+                    strip = strip.crop((0, tres.cut_top, strip.width, strip.height - tres.cut_bottom))
+            if s["trim_v2"]:
+                from .trim import compute_trim_v2, slice_gaps
+
+                t2 = compute_trim_v2(strip, white_min=s["white_threshold"],
+                                     black_max=s["black_threshold"])
+                v2_vs = norm_w / max(1, strip.width)
+                panel.trim2 = {"top": round(t2.cut_top * v2_vs, 1),
+                               "bottom": round(t2.cut_bottom * v2_vs, 1),
+                               "left": round(t2.cut_left * v2_vs, 1),
+                               "right": round(t2.cut_right * v2_vs, 1),
+                               "flags": list(t2.flags),
+                               "purity": round(t2.purity, 4)}
+                if t2.cut_top or t2.cut_bottom:
+                    panel.y0 = float(panel.y0 + t2.cut_top * v2_vs)
+                    panel.y1 = float(panel.y1 - t2.cut_bottom * v2_vs)
+                    panel.segments = _segments(panel.y0, panel.y1, pages) or panel.segments
+                    strip = strip.crop((0, t2.cut_top, strip.width, strip.height - t2.cut_bottom))
+                v2_col = (t2.cut_left * v2_vs, t2.cut_right * v2_vs)
+                gaps = slice_gaps(strip)
+                if len(gaps) > 1:
+                    v2_pieces = gaps
             x0, x1 = _trim_x(strip, norm_w)
         except OSError:
             x0, x1 = 0.0, float(norm_w)
+        if v2_col[0] or v2_col[1]:
+            cx0 = max(x0, v2_col[0])
+            cx1 = min(x1, float(norm_w) - v2_col[1])
+            if cx1 - cx0 >= 0.05 * norm_w:
+                x0, x1 = cx0, cx1
         panel.x0, panel.x1 = x0, x1
         panel.tall = bool(panel.height / max(1.0, panel.width) > TALL_RATIO)
-        panels.append(panel)
+        if v2_pieces:
+            base_y, n_pieces = panel.y0, len(v2_pieces)
+            for pi, (gy0, gy1) in enumerate(v2_pieces):
+                py0 = float(base_y + gy0 * v2_vs)
+                py1 = float(base_y + gy1 * v2_vs)
+                sub = Panel(id=panel.id, index=panel.index, y0=py0, y1=py1,
+                            x0=panel.x0, x1=panel.x1,
+                            segments=_segments(py0, py1, pages) or panel.segments)
+                sub.trim2 = {**panel.trim2, "piece": pi, "pieces": n_pieces}
+                sub.tall = bool(sub.height / max(1.0, sub.width) > TALL_RATIO)
+                panels.append(sub)
+            sliced_any = True
+        else:
+            panels.append(panel)
+    if sliced_any:
+        # Slicing inserted panels: renumber ids canonically (per start
+        # page, in story order) so every id still matches P<page>-<nn>.
+        counts: Dict[int, int] = {}
+        for panel in panels:
+            sp = panel.segments[0]["page"] if panel.segments else 1
+            counts[sp] = counts.get(sp, 0) + 1
+            panel.id = f"P{sp:03d}-{counts[sp]:02d}"
     for i, panel in enumerate(panels, start=1):
         panel.index = i
     return panels, norm_w
@@ -441,7 +513,8 @@ def _fingerprint(pages: List[Path], s: Dict[str, Any]) -> str:
     # panels.json files made before they existed are not silently re-detected (which
     # would shift framing under recordings that already exist). `video panels --force`
     # re-detects with tightening.
-    defaults = {"tighten_edges": True, "white_threshold": WHITE_THRESHOLD, "black_threshold": BLACK_THRESHOLD}
+    defaults = {"tighten_edges": True, "white_threshold": WHITE_THRESHOLD, "black_threshold": BLACK_THRESHOLD,
+                "trim_v1": False, "trim_cap": 0.40, "trim_v2": False}
     keyed = {k: v for k, v in s.items() if defaults.get(k, object()) != v}
     h = hashlib.sha256(json.dumps({"v": PANELS_VERSION, **keyed}, sort_keys=True).encode())
     for p in pages:
@@ -511,6 +584,10 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
     edge_pages = _edge_pages(panels)
     for p in panels:
         row = {**asdict(p), "height": round(p.height, 1), "width": round(p.width, 1)}
+        if not row.get("trim"):
+            row.pop("trim", None)
+        if not row.get("trim2"):
+            row.pop("trim2", None)
         try:
             img = panel_image(root, chapter, row, norm_w)
             row["art"], row["crop_art"] = art_score(img), crop_art(img)

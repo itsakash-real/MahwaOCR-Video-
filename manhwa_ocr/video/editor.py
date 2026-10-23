@@ -68,18 +68,49 @@ def _inset_crop(box: List[float], frac: float) -> List[float]:
     """Shrink a crop box toward its centre by `frac` of each side (punch-in).
 
     Clamped so the box never gets smaller than 30% wide / 30% tall: a punch-in
-    must stay readable, never zoom into a postage stamp.
+    must stay readable, never zoom into a postage stamp. The SAME fraction is
+    used on both axes (whichever the 30% floor allows is more restrictive),
+    never an independent clamp per axis: clamping width and height separately
+    could stop one axis earlier than the other and skew the box's pixel
+    aspect into one no allowed card shape matches, failing QA's shape check
+    on exactly the punched-in piece (a split's second showing).
     """
     x0, y0, x1, y1 = (float(v) for v in box)
     w, h = x1 - x0, y1 - y0
-    dx = min(w * frac, (w - 0.30) / 2)
-    dy = min(h * frac, (h - 0.30) / 2)
-    dx = max(0.0, dx)
-    dy = max(0.0, dy)
+    max_frac_w = (1.0 - 0.30 / w) / 2 if w > 1e-9 else frac
+    max_frac_h = (1.0 - 0.30 / h) / 2 if h > 1e-9 else frac
+    f = max(0.0, min(frac, max_frac_w, max_frac_h))
+    dx, dy = w * f, h * f
     return [round(x0 + dx, 4), round(y0 + dy, 4), round(x1 - dx, 4), round(y1 - dy, 4)]
 
 
-def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _inset_card(card: Dict[str, Any], frac: float) -> Dict[str, Any]:
+    """Punch a card's crop in by `frac` (toward centre, see _inset_crop) and
+    scale its pad_y (blurred padding, in panel heights) by the SAME factor
+    the crop's own height actually shrank by.
+
+    A card with pad_y > 0 is a wide panel shown whole with blurred padding
+    added above/below so the padded TOTAL (crop height + 2*pad) matches an
+    allowed shape; the crop box alone is not the card's effective shape.
+    Insetting only the crop (the old behaviour) left pad_y as a growing
+    share of a shrinking crop, skewing that effective aspect into one no
+    allowed shape matches -- QA then failed on exactly the punched-in piece
+    (a split shot's second showing, or a diversity punch-in). Returns a new
+    card dict; the input is never mutated.
+    """
+    crop = list(card.get("crop") or [0, 0, 1, 1])
+    new_crop = _inset_crop(crop, frac)
+    out = dict(card, crop=new_crop)
+    pad = float(card.get("pad_y") or 0.0)
+    if pad > 0:
+        old_h = crop[3] - crop[1]
+        new_h = new_crop[3] - new_crop[1]
+        shrink = (new_h / old_h) if old_h > 1e-9 else 1.0
+        out["pad_y"] = round(pad * shrink, 4)
+    return out
+
+
+def split_long_shot(shot: Dict[str, Any], max_hold: float | None = None) -> List[Dict[str, Any]]:
     """Split one >8s shot into <=8s pieces with a punch-in crop change per piece.
 
     Pure geometry: no image access. Every piece keeps the same panels, sentence
@@ -88,15 +119,19 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
     under PACING_MAX_HOLD, shots with no cards, and shots with no crops are
     returned unchanged. Piece ids are suffixed -a/-b/...; the first piece keeps
     the original id when there is only one piece (i.e. no split happened).
+
+    `max_hold` overrides the split threshold (panel-fit mode passes its own
+    3.5s sentence-split rule); None keeps the classic PACING_MAX_HOLD.
     """
+    limit = PACING_MAX_HOLD if max_hold is None else float(max_hold)
     try:
         dur = float(shot["end"]) - float(shot["start"])
     except (KeyError, TypeError, ValueError):
         return [shot]
     cards = shot.get("cards") or []
-    if dur <= PACING_MAX_HOLD or not cards:
+    if dur <= limit or not cards:
         return [shot]
-    n = max(2, int(-(-dur // PACING_MAX_HOLD)))  # ceil -> every piece in (4, 8]s
+    n = max(2, int(-(-dur // limit)))  # ceil -> every piece <= limit
     piece = dur / n
     prev_motions = [c.get("motion") for c in cards]  # motion of the previous piece, per card
     out: List[Dict[str, Any]] = []
@@ -116,10 +151,8 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
             part["id"] = f"{shot.get('id', 'S?')}-{chr(ord('a') + k)}"
         new_cards = []
         for ci, c in enumerate(cards):
-            cc = dict(c)
             crop = c.get("crop")
-            if crop and k > 0:
-                cc["crop"] = _inset_crop(list(crop), 0.08 * k)
+            cc = _inset_card(c, 0.08 * k) if (crop and k > 0) else dict(c)
             # A later-arriving card keeps its arrival offset inside its piece.
             at = float(c.get("at") or 0)
             cc["at"] = round(max(0.0, at - k * piece), 3)
@@ -148,12 +181,12 @@ def split_long_shot(shot: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def split_long_shots(shots: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], int]:
+def split_long_shots(shots: List[Dict[str, Any]], max_hold: float | None = None) -> tuple[List[Dict[str, Any]], int]:
     """Split every over-long shot. Returns (new shots, number of shots split)."""
     out: List[Dict[str, Any]] = []
     split = 0
     for s in shots:
-        parts = split_long_shot(s)
+        parts = split_long_shot(s, max_hold=max_hold)
         if len(parts) > 1:
             split += 1
         out.extend(parts)

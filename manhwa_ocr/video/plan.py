@@ -33,13 +33,16 @@ from PIL import Image
 
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
 from . import sync as sync_mod
-from .crops import _panel_maps, head_of, is_mask_risk, is_system_window, tone
+from .crops import (_panel_maps, content_bands, extend_figure_range, head_of, is_mask_risk,
+                    text_bands, trim_blank_edges,
+                    is_system_window, safe_span, tone)
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
-from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_crop, build_chapter_cards, extract_callout, pacing_qa,
-                     plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
+from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_card, _inset_crop, build_chapter_cards, extract_callout,
+                     pacing_qa, plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
 from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
 from .captions import build_captions, build_captions_from_sentences, validate_captions
+from .classify import classify as _classify_sentence
 from .frames import (BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, GLITCH_MIN_GAP, LAYOUTS, MOTIONS,
                      TRANSITION_WEIGHTS, TRANSITIONS, Format, format_from, shapes_for, transition_enter)
 from .media import video_dir
@@ -61,7 +64,7 @@ PAD_LIMIT = 1.5          # a card's pad_y (blurred padding above and below, in p
 # P3 continuous motion (editor.py): the planner never emits `hold`. A reviewer
 # may still hand-set motion="hold" for a deliberate 1-2s post-payoff beat;
 # frames.py keeps the old ease-out-then-hold for exactly that case.
-ENTRANCE_WEIGHTS = [("cut", 90), ("fade_in", 10)]
+ENTRANCE_WEIGHTS = [("cut", 100)]
 MOTION_WEIGHTS = P3_MOTION_WEIGHTS
 
 
@@ -120,6 +123,16 @@ def _nearest_art(panels: List[Dict[str, Any]], index: int, avoid: set, reach: in
 MIN_PIECE = 1.8   # a panel inside a multi-panel sentence stays at least this long
 
 
+def _motion_for(motion: Any, k: int) -> Any:
+    """The motion override (B1e) for the k-th panel a sentence shows: a
+    string applies to the whole sentence; a list runs parallel to the
+    sentence's tagged panels, so k indexes the shown sequence (which
+    the alignment builds from those tags, in order)."""
+    if isinstance(motion, list):
+        return motion[k] if k < len(motion) else None
+    return motion
+
+
 def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], duration: float,
                  vcfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Panel by panel: every sentence shows the panels it is tagged with, in order.
@@ -148,6 +161,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             if unit["sentence"] and unit["sentence"] != u["sentence"]:
                 u["sentence"] = " ".join(x for x in (u["sentence"], unit["sentence"]) if x)
             u["sentence_starts"] += unit["sentence_starts"]
+            if u.get("motion") is None and unit.get("motion") is not None:
+                u["motion"] = unit["motion"]
             return
         units.append(unit)
 
@@ -163,6 +178,18 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             if p and p not in ids:
                 ids.append(p)
         ids = ids or current
+        motion = s.get("motion")
+        if motion == "duo" and len(ids) == 2:
+            # B1e E3: a duo sentence shows BOTH panels at once for its
+            # whole window — one unit, two panels, never split into
+            # sequential stretches.
+            add({"start": start, "end": end, "panels": list(ids),
+                 "cues": list(s.get("cues") or []),
+                 "emphasis": [e for e in (s.get("emphasis") or []) if start <= e < end],
+                 "sentence": s.get("text"), "sentence_starts": [float(s["start"])],
+                 "motion": "duo"})
+            current = ids[-1:]
+            continue
         # Each tagged panel gets its own stretch of the sentence, as long as
         # every stretch is long enough to take in.
         fits = max(1, min(len(ids), int((end - start) // MIN_PIECE)))
@@ -174,7 +201,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             add({"start": a, "end": b, "panels": [pid],
                  "cues": list(s.get("cues") or []) if k == 0 else [],
                  "emphasis": [e for e in (s.get("emphasis") or []) if a <= e < b],
-                 "sentence": s.get("text"), "sentence_starts": [float(s["start"]) if k == 0 else a]})
+                 "sentence": s.get("text"), "sentence_starts": [float(s["start"]) if k == 0 else a],
+                 "motion": _motion_for(motion, k)})
         current = ids[-1:]
     if not units:
         return even_units(panels, duration, vcfg)
@@ -186,6 +214,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
         nxt["emphasis"] = first["emphasis"] + nxt["emphasis"]
         nxt["sentence"] = " ".join(x for x in (first["sentence"], nxt["sentence"]) if x)
         nxt["sentence_starts"] = first["sentence_starts"] + nxt["sentence_starts"]
+        if nxt.get("motion") is None and first.get("motion") is not None:
+            nxt["motion"] = first["motion"]
     units[0]["start"] = 0.0
     units[-1]["end"] = duration
     return units
@@ -215,6 +245,8 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             if unit["sentence"] and unit["sentence"] != u["sentence"]:
                 u["sentence"] = " ".join(x for x in (u["sentence"], unit["sentence"]) if x)
             u["sentence_starts"] += unit["sentence_starts"]
+            if u.get("motion") is None and unit.get("motion") is not None:
+                u["motion"] = unit["motion"]
             return
         units.append(unit)
 
@@ -238,6 +270,13 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if not seq:
             continue  # nothing has ever been shown yet; nothing to hold either
         start, end = float(seg["start"]), float(seg["end"])
+        motion = seg.get("motion")
+        if motion == "duo" and len(seq) == 2:
+            # B1e E3: both panels at once for the whole sentence — one
+            # two-panel unit, never split by the sequence shares.
+            add({"start": start, "end": end, "panels": list(seq), "cues": [], "emphasis": [],
+                 "sentence": seg.get("text"), "sentence_starts": [start], "motion": "duo"})
+            continue
         # Split on the shares place_impactful() recorded (tagged ~65% +
         # filler ~35% for a long sentence), NOT evenly: an even split
         # would give the filler half the window and break tagged coverage.
@@ -252,7 +291,8 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             cursor_t = b
             add({"start": a, "end": b, "panels": [pid], "cues": [], "emphasis": [],
                  "sentence": seg.get("text") if k == 0 else None,
-                 "sentence_starts": [start] if k == 0 else [a]})
+                 "sentence_starts": [start] if k == 0 else [a],
+                 "motion": _motion_for(motion, k)})
     if units:
         units[0]["start"] = 0.0
     return units
@@ -295,7 +335,18 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     groups: List[List[Dict[str, Any]]] = []
     i = 0
     while i < len(units):
-        if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units):
+        # A multi-panel unit (a B1e duo) never groups with a neighbour:
+        # the pair construction below keeps exactly one panel per unit,
+        # and a duo's two panels must stay together in their own shot.
+        # A unit carrying a motion hint never groups either: its beats
+        # were sequenced deliberately by the pairing surface, and a
+        # grouped pair would show them simultaneously instead. The same
+        # holds for a B1f slice unit: its band was cut deliberately by
+        # the editor, and grouping would show two bands at once.
+        if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units) \
+                and len(units[i]["panels"]) == 1 and len(units[i + 1]["panels"]) == 1 \
+                and units[i].get("motion") is None and units[i + 1].get("motion") is None \
+                and "slice" not in units[i] and "slice" not in units[i + 1]:
             groups.append([units[i], units[i + 1]])
             i += 2
         else:
@@ -305,7 +356,9 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     # A lone short tail after a pair sometimes fits better as that pair's
     # second card (its first panel becomes the short one): slide the last
     # three units while that lowers the total shortfall.
-    while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2:
+    while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2 \
+            and all(len(u["panels"]) == 1 for g in (groups[-2], groups[-1]) for u in g) \
+            and all("slice" not in u for g in (groups[-2], groups[-1]) for u in g):
         x, y = groups[-2]
         z = groups[-1][0]
         now = max(0.0, floor - span(groups[-2])) + max(0.0, floor - span(groups[-1]))
@@ -364,11 +417,14 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
             continue
         pairs += 1
         a, c = g
-        shots.append({"start": start, "end": end, "panels": [a["panels"][0], c["panels"][0]],
-                      "cues": a["cues"] + c["cues"], "emphasis": a["emphasis"] + c["emphasis"],
-                      "sentence": " ".join(x for x in (a.get("sentence"), c.get("sentence")) if x) or None,
-                      "sentence_starts": a["sentence_starts"] + c["sentence_starts"],
-                      "second_at": c["start"] - a["start"]})
+        merged = {"start": start, "end": end, "panels": [a["panels"][0], c["panels"][0]],
+                  "cues": a["cues"] + c["cues"], "emphasis": a["emphasis"] + c["emphasis"],
+                  "sentence": " ".join(x for x in (a.get("sentence"), c.get("sentence")) if x) or None,
+                  "sentence_starts": a["sentence_starts"] + c["sentence_starts"],
+                  "second_at": c["start"] - a["start"]}
+        if isinstance(a.get("motion"), str):
+            merged["motion"] = a["motion"]   # the pair keeps its first unit's hint (B1e)
+        shots.append(merged)
     shots[0]["start"] = 0.0
     shots[-1]["end"] = units[-1]["end"]
     stats = {"min_hold": min_hold, "shots": len(shots), "pairs": pairs,
@@ -422,7 +478,7 @@ def ensure_split_crop_change(shots):
         new_crop = _inset_crop(cur_crop, 0.08)
         if new_crop == cur_crop:
             continue  # already at the minimum readable crop: nothing more to punch into
-        cur = dict(cur_cards[0], crop=new_crop)
+        cur = _inset_card(cur_cards[0], 0.08)
         if cur.get("motion") in PAN_DIRECTIONS:
             cur["motion"] = "push_in"  # a pan would restart q -1 -> +1 on the new shot
         shots[k] = {**shots[k], "cards": [cur]}
@@ -496,14 +552,15 @@ def ensure_panel_diversity(shots):
         if _differs(cur_crop):
             continue  # already a different crop from both predecessors
         new_crop = None
+        new_frac = None
         for frac in (0.08, 0.16, 0.24, 0.32):
             cand = _inset_crop(cur_crop, frac)
             if cand != cur_crop and _differs(cand):
-                new_crop = cand
+                new_crop, new_frac = cand, frac
                 break
         if new_crop is None:
             continue  # already at the minimum readable crop: nothing more to punch into
-        cur = dict(cards[0], crop=new_crop)
+        cur = _inset_card(cards[0], new_frac)
         if cur.get("motion") in PAN_DIRECTIONS:
             cur["motion"] = "push_in"  # a pan would restart q -1 -> +1 on the new shot
         shots[k] = {**shots[k], "cards": [cur, *cards[1:]]}
@@ -828,16 +885,14 @@ class _Designer:
             e = rng.choice(["blur_in", "fit_in_frame"])
         elif "impact" in cues:
             e = "zoom_in"
-        elif "beat" in cues:
-            e = "fade_in"
         elif layout == "wide":
-            e = rng.choice(["cut", "cut", "fade_in", "slide_left"])
+            e = rng.choice(["cut", "cut", "slide_left"])
         else:
             e = _pick(rng, ENTRANCE_WEIGHTS, avoid=self.prev_enter)
         self.prev_enter = e
         return e
 
-    def shot(self, i: int, unit: Dict[str, Any], last: bool) -> Dict[str, Any]:
+    def shot(self, i: int, unit: Dict[str, Any]) -> Dict[str, Any]:
         rng = _rng(self.chapter, i)
         start, end = unit["start"], unit["end"]
         dur = end - start
@@ -898,6 +953,16 @@ class _Designer:
                     motion = self.motion(rng, crop)
             enter = (self.fixes["shot"].get(pid) or {}).get("enter", enter)   # fixes.json "shot" override
             card = {"panel": pid, "crop": crop, "enter": enter, "at": at, "motion": motion}
+            if len(ids) == 1 and isinstance(unit.get("slice"), list):
+                # B1f: this unit is ONE landmark slice of its panel. The
+                # card keeps the base panel id (image lookup, validate,
+                # sync audit all resolve by it) and carries the band:
+                # the crop IS the band, and the panelfit pass fits the
+                # band's own dimensions (see _panelfit_pass).
+                _f0, _f1 = (float(v) for v in unit["slice"])
+                card["slice"] = [_f0, _f1]
+                card["slice_id"] = unit.get("slice_id")
+                card["crop"] = [0.0, _f0, 1.0, _f1]
             if len(card_ids) == 1 and is_system_window(self.by_id.get(pid) or {}):
                 card["wide_fill"] = True  # fill >=90% of the frame width, never a small square
             pad = self.pad(pid, layout)
@@ -943,10 +1008,7 @@ class _Designer:
                 transition = rng.choice(_pool)
             else:
                 transition = _pick(rng, TRANSITION_WEIGHTS)
-            if transition == "fade":
-                self._prev_shot["exit"] = "fade_out"
-                cards[0]["enter"] = "fade_in"
-            elif transition != "cut":
+            if transition != "cut":
                 cards[0]["enter"] = transition_enter(transition)
             if transition == "glitch":
                 effects.append({"type": "glitch", "t": round(start, 3)})
@@ -956,13 +1018,17 @@ class _Designer:
         shot = {
             "id": f"S{i + 1:03d}", "start": round(start, 3), "end": round(end, 3),
             "layout": layout, "background": background,
-            "cards": cards, "exit": "fade_out" if last else "cut", "effects": effects,
+            "cards": cards, "exit": "cut", "effects": effects,
             "transition": transition,
             "callouts": callouts,
             "sentence": (unit.get("sentence") or "")[:300] or None,
         }
         if self.vcfg.get("grade") == "subtle":
             shot["grade"] = "subtle"  # CapCut grade, off by default (video.grade)
+        if isinstance(unit.get("motion"), str):
+            # B1e: the sentence's motion override rides to the panelfit
+            # pass (other modes ignore the key).
+            shot["motion_hint"] = unit["motion"]
         self._prev_shot = shot
         if bg_panel:
             shot["bg_panel"] = bg_panel
@@ -999,6 +1065,8 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
             solo_cues = set(u.get("cues") or []) | set(v.get("cues") or [])
             same_sentence = (u.get("sentence") or "") == (v.get("sentence") or "") and bool(u.get("sentence"))
             if (long_enough and len(u["panels"]) == 1 and len(v["panels"]) == 1
+                    and u.get("motion") is None and v.get("motion") is None
+                    and "slice" not in u and "slice" not in v
                     and u["panels"][0] != v["panels"][0] and not wide(a) and not wide(b)
                     and story_close and (same_sentence or not (solo_cues & {"impact", "reveal"}))
                     and (2.8 <= (v["end"] - u["start"]) <= MAX_PAIR_SHOT)
@@ -1016,6 +1084,1465 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
     return out
 
 
+# ------------------------------------------------------------------ wide mode
+
+# Wide mode ("video.mode: wide") is classic editing with wide panels: every
+# card touches the top and bottom of the frame and is at least 6/16 of the
+# frame wide (pairs exactly 8/16); no thin slivers ever. The window CONTAINS
+# the classic focal crop (the head-aware, bubble-avoiding crop the classic
+# planner already computed), grown by headroom on each end, top-anchored to
+# that crop's own top, then nudged so its edges never land mid-bubble or
+# mid-caption (crops.content_bands / crops.safe_span). Centring the window
+# on the subject was tried first and rejected: the overflow split both ways
+# and landed edges mid-bubble, mid-horns (wide_mode_v3_all_issues.md).
+WIDE_MIN_ASPECT = 0.667    # 6/16 of the frame at full height (720px @1080p)
+WIDE_HEADROOM = 0.08       # window grows this much past the focal crop per end
+WIDE_CAPTION_ZONE = 0.12   # bottom share of the window captions overlay (no bar in wide mode)
+WIDE_EDGE_MARGIN = 0.06    # whole-panel: text within this of an edge needs zoom protection
+
+
+def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
+             pair_aspect: float | None = None, img: Image.Image | None = None
+             ) -> Tuple[List[float], Dict[str, Any]]:
+    """A wide-mode window over one panel, in panel fractions, plus diagnostics
+    {"whole", "edge_text", "caption_risk"} (all bool).
+
+    `box` is the classic focal crop for the panel. `img`, when given, lets
+    the window edges avoid landing mid-bubble/mid-caption/mid-SFX and warns
+    about a whole panel's own edge text (zoom would clip it) or a window
+    whose bottom share collides with the overlaid captions.
+    """
+    try:
+        bx0, by0, bx1, by1 = (float(v) for v in box[:4])
+    except (TypeError, ValueError, IndexError):
+        bx0, by0, bx1, by1 = 0.0, 0.0, 1.0, 1.0
+    bx0 = max(0.0, min(1.0, bx0)); by0 = max(0.0, min(1.0, by0))
+    bx1 = max(bx0, min(1.0, bx1)); by1 = max(by0, min(1.0, by1))
+    panel_aspect = pw / max(ph, 1e-9)
+    info: Dict[str, Any] = {"whole": False, "edge_text": False, "caption_risk": False, "figure_risk": False}
+    # A panel whose own aspect already fits the 6/16-16/9 single-card range
+    # is shown whole: the full figure stays visible, nothing is cropped, and
+    # it still touches the top AND bottom of the frame at this aspect. A
+    # panel WIDER than 16/9 is never "shown whole" with top/bottom fill
+    # instead -- every card touches both top and bottom, no exception --
+    # so it falls through to the windowed branch below, which already caps
+    # the width to the 16/9 shape (cropping the sides, centred) while
+    # keeping the full panel height.
+    if pair_aspect is None and WIDE_MIN_ASPECT <= panel_aspect <= 1.777:
+        info["whole"] = True
+        top, bottom = 0.0, 1.0
+        if img is not None:
+            # "Whole panel" must still touch both walls with real art, not a
+            # caption box or blank margin: trim any such band off the top/
+            # bottom edges first (trim_blank_edges refuses to trim past the
+            # point where too little art would remain, flagging "unusable"
+            # instead), THEN flag whatever edge risk is left in what's kept.
+            trimmed = trim_blank_edges(img, (0.0, 0.0, 1.0, 1.0))
+            if trimmed is None:
+                info["unusable"] = True
+                return [0.0, 0.0, 1.0, 1.0], info
+            _, top, _, bottom = trimmed
+            bands = (content_bands(img, axis="y", exclude=[(by0, by1)])
+                    + content_bands(img, axis="x", exclude=[(bx0, bx1)]))
+            info["edge_text"] = any(
+                (b0 <= WIDE_EDGE_MARGIN or b1 >= 1 - WIDE_EDGE_MARGIN)
+                and max(b0, top) < min(b1, bottom)
+                for b0, b1 in bands)
+        return [0.0, top, 1.0, bottom], info
+    subj_w, subj_h = (bx1 - bx0) * pw, (by1 - by0) * ph
+    grow = 1.0 + 2.0 * WIDE_HEADROOM
+    if pair_aspect is not None:
+        win_h = min(ph, max(subj_h * grow, min(min_win_h, ph)))
+        win_w = win_h * pair_aspect
+        if win_w > pw:                       # panel narrower than the window
+            win_w, win_h = pw, pw / pair_aspect
+    else:
+        win_h = min(ph, pw / WIDE_MIN_ASPECT, max(subj_h * grow, min(min_win_h, ph)))
+        win_w = min(pw, win_h * 1.777)
+        if win_w / max(win_h, 1e-9) < WIDE_MIN_ASPECT:
+            win_h = win_w / WIDE_MIN_ASPECT
+
+    # Vertical: top-anchored to the focal crop's own top, clamped so the
+    # window still contains the whole subject and stays inside the panel.
+    lo_y = max(0.0, by1 * ph - win_h)
+    hi_y = min(by0 * ph, max(0.0, ph - win_h))
+    if hi_y < lo_y:
+        # The subject is taller than any window this layout/upscale cap
+        # allows: it cannot be fully contained. Flagged, not silently cut --
+        # see plan["wide_figure_risk"] / qa["wide_figure_risk"].
+        info["figure_risk"] = True
+        lo_y, hi_y = 0.0, max(0.0, ph - win_h)
+    y0 = max(lo_y, min(hi_y, by0 * ph))
+    # Horizontal: centred on the focal crop, same containment clamp.
+    cx = (bx0 + bx1) / 2.0 * pw
+    lo_x = max(0.0, bx1 * pw - win_w)
+    hi_x = min(bx0 * pw, max(0.0, pw - win_w))
+    if hi_x < lo_x:
+        lo_x, hi_x = 0.0, max(0.0, pw - win_w)
+    x0 = max(lo_x, min(hi_x, cx - win_w / 2.0))
+
+    if img is not None:
+        yb = content_bands(img, axis="y", exclude=[(by0, by1)])
+        xb = content_bands(img, axis="x", exclude=[(bx0, bx1)])
+        y0 = safe_span(ph, win_h, lo_y, hi_y, yb, y0)
+        x0 = safe_span(pw, win_w, lo_x, hi_x, xb, x0)
+
+        # Captions overlay the art in wide mode: a band inside the window's
+        # bottom share collides with the caption zone. First try pushing
+        # the window down (more panel below the text); a single (not a
+        # pair -- its aspect is fixed) may also grow taller, which shrinks
+        # the band's share of the window. If neither clears it, flag it.
+        def _collides(y0v: float, h: float) -> bool:
+            zone = h * WIDE_CAPTION_ZONE
+            return any(b0 * ph < y0v + h and b1 * ph > y0v + h - zone for b0, b1 in yb)
+
+        if _collides(y0, win_h):
+            pushed = safe_span(ph, win_h, y0, hi_y, yb, hi_y)
+            if not _collides(pushed, win_h):
+                y0 = pushed
+            elif pair_aspect is None:
+                max_h = min(ph, win_w / WIDE_MIN_ASPECT)
+                step = max(ph * 0.02, 4.0)
+                grown_h, found = win_h, False
+                while grown_h < max_h - 1e-6:
+                    grown_h = min(max_h, grown_h + step)
+                    grown_y0 = max(0.0, min(by0 * ph, ph - grown_h))
+                    if not _collides(grown_y0, grown_h):
+                        win_h, y0, found = grown_h, grown_y0, True
+                        break
+                if not found:
+                    info["caption_risk"] = True
+            else:
+                info["caption_risk"] = True
+
+        # The containment clamp (lo_y/hi_y above) can force this window to
+        # start right at a caption/bubble band that safe_span had no room to
+        # dodge -- the subject pinned the legal range. Re-validate and
+        # re-trim the FINAL window itself, not just its anchor position,
+        # before accepting it.
+        frac_box = (x0 / pw, y0 / ph, (x0 + win_w) / pw, (y0 + win_h) / ph)
+        trimmed = trim_blank_edges(img, frac_box)
+        if trimmed is None:
+            info["unusable"] = True
+        else:
+            nx0, ny0, nx1, ny1 = trimmed
+            x0, y0 = nx0 * pw, ny0 * ph
+            win_w, win_h = (nx1 - nx0) * pw, (ny1 - ny0) * ph
+
+    return [round(x0 / pw, 4), round(y0 / ph, 4), round((x0 + win_w) / pw, 4),
+           round((y0 + win_h) / ph, 4)], info
+
+
+def _wide_style_card(c: Dict[str, Any], designer: "_Designer", pw: float, ph: float,
+                     min_win_h: float, pair_aspect: float | None) -> Dict[str, bool]:
+    """Rewrite one card's crop/motion/sizing fields in place for the wide-mode
+    treatment (full frame height, edge-safe window, halved/capped Ken Burns,
+    dead pans swapped for zooms). Shared by _wide_pass (every card) and
+    _adaptive_pass (only the cards a naturally wide/landscape panel picks
+    for this treatment), so the two never drift out of sync.
+
+    Returns {"caption_risk", "figure_risk", "reviewer_focal_ignored", "unusable"}
+    (bool) for THIS card -- the caller appends its panel id to its own risk lists.
+    """
+    pid = c.get("panel")
+    flags = {"caption_risk": False, "figure_risk": False, "reviewer_focal_ignored": False,
+             "unusable": False}
+    img = designer.img(pid) if pid in designer.by_id else None
+    box = list(c.get("crop") or [0, 0, 1, 1])
+    if img is not None:
+        # The classic focal crop can itself exclude the figure (a narrow
+        # landscape/portrait shape outscores a window that includes the
+        # head, or the pick lands on a different detail) -- it is still
+        # flagged head_cut, but classic mode's own card just shows that
+        # strip. Wide-style windows must not inherit that miss: grow the
+        # subject to also cover the detected head AND the rest of the
+        # figure's own body (wings, tail, legs) connected to it, before
+        # anchoring to it. A head/face detector only answers "where is the
+        # head", never "where does the figure end" -- that is a separate,
+        # full-body cutoff a confident head alone cannot catch (see
+        # wide_mode_v3_all_issues.md: dragons cut mid-body even where the
+        # head detector was right).
+        head = head_of(_panel_maps(img, designer.map_options))
+        if (head.get("figure") and head.get("top") is not None
+                and head.get("bottom") is not None
+                and pid not in (designer.fixes.get("crop") or {})):
+            # Cap the extension at exactly the span this panel's own legal
+            # window can hold (pre-grow), instead of a flat default: an
+            # all-or-nothing guard against an over-tall "figure" used to
+            # discard the WHOLE union on a narrow panel (pw/WIDE_MIN_ASPECT
+            # too small for even a 75%-of-panel span), reverting to the
+            # un-extended focal crop and reintroducing the same full-body
+            # cutoff this hardening exists to fix. A legal-but-partial
+            # extension, centred on the figure, is always better than none.
+            grow = 1.0 + 2.0 * WIDE_HEADROOM
+            max_h_px = ph if pair_aspect is not None else min(ph, pw / WIDE_MIN_ASPECT)
+            max_span = max_h_px / grow / ph
+            top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]),
+                                              max_span=max_span)
+            box[1] = min(box[1], top)
+            box[3] = max(box[3], bottom)
+    crop, info = wide_crop(pw, ph, box, min_win_h, pair_aspect, img=img)
+    c["crop"] = crop
+    flags["caption_risk"] = bool(info.get("caption_risk"))
+    flags["figure_risk"] = bool(info.get("figure_risk"))
+    flags["unusable"] = bool(info.get("unusable"))
+    has_reviewer_crop = pid in (designer.fixes.get("crop") or {})
+    if has_reviewer_crop and (info.get("whole") or info.get("figure_risk")):
+        # The reviewer's own focal is either discarded (panel shown whole)
+        # or taller than any window this panel's width/upscale cap can
+        # fully contain: wide_crop still shows something (top-anchored
+        # fallback), but not the exact box the reviewer set.
+        flags["reviewer_focal_ignored"] = True
+    # Whole-panel windows have zero margin: the Ken Burns zoom would clip
+    # text sitting at the panel's own edge. Cut the zoom amplitude further
+    # for just this card instead of the mode-wide 0.5 factor.
+    c["wide_zoom_scale"] = 0.12 if info.get("edge_text") else 0.5
+    # A pan across a window that already spans the panel's full width (or
+    # full height) has nowhere to travel: the card renders as a frozen
+    # still while only the captions change, which reads as the picture
+    # "refreshing" every couple of seconds. Swap dead pans for a zoom,
+    # which always moves.
+    _m = c.get("motion")
+    if _m in ("pan_left", "pan_right") and crop[2] - crop[0] >= 0.999:
+        c["motion"] = "push_in" if _m == "pan_right" else "pull_out"
+    elif _m in ("pan_up", "pan_down") and crop[3] - crop[1] >= 0.999:
+        c["motion"] = "push_in" if _m == "pan_down" else "pull_out"
+    c["pad_y"] = 0.0
+    c["wide_display"] = True
+    return flags
+
+
+def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+               wcfg: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Rewrite a classic plan for wide mode: single + pair layouts only
+    (inset/classic-wide become full-height singles), crops become wide
+    focal windows, caption_bar is off so panels touch the bottom edge and
+    captions overlay the art. Runs after the classic plan is fully built
+    (punch-ins, pairs, splits already decided) so every card -- first
+    showing, punch-in, each side of a pair -- gets the same edge audit.
+
+    Returns {"caption_risk": [...], "figure_risk": [...],
+    "reviewer_focal_ignored": [...], "unusable": [...]} -- panel ids flagged
+    with a caption/text collision, a figure too tall for any window this
+    layout/upscale cap allows to fully contain, a fixes.json focal crop that
+    wide mode could not use as-is (the panel was shown whole because its own
+    aspect is >= 6/16, or the focal itself doesn't fit and was re-anchored),
+    or a card whose final window -- after every trim attempt -- still has
+    too little real art in it to show (plan["wide_caption_risk"] /
+    plan["wide_figure_risk"] / plan["wide_reviewer_focal_ignored"] /
+    plan["wide_unusable"]). "unusable" is a hard-stop condition: the caller
+    must refuse to build rather than render a blank/bubble-dominated card --
+    see make_plan's check in build.py.
+    """
+    if fmt.width <= fmt.height:
+        return {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [], "unusable": []}
+    min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
+    pair_aspect = (fmt.width / 2.0) / fmt.height
+    caption_risk: List[str] = []
+    figure_risk: List[str] = []
+    reviewer_focal_ignored: List[str] = []
+    unusable: List[str] = []
+    for s in shots:
+        s["wide"] = True
+        s["caption_bar"] = False
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        if not pair:
+            s["layout"] = "single"
+            cards = cards[:1]
+        for c in cards:
+            pid = c.get("panel")
+            p = designer.by_id.get(pid) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if pw > 0 and ph > 0:
+                flags = _wide_style_card(c, designer, pw, ph, min_win_h, pair_aspect if pair else None)
+                if flags["caption_risk"] and pid not in caption_risk:
+                    caption_risk.append(pid)
+                if flags["figure_risk"] and pid not in figure_risk:
+                    figure_risk.append(pid)
+                if flags["reviewer_focal_ignored"] and pid not in reviewer_focal_ignored:
+                    reviewer_focal_ignored.append(pid)
+                if flags.get("unusable") and pid not in unusable:
+                    unusable.append(pid)
+            else:
+                c["pad_y"] = 0.0
+                c["wide_display"] = True
+        s["cards"] = cards
+    return {"caption_risk": caption_risk, "figure_risk": figure_risk,
+           "reviewer_focal_ignored": reviewer_focal_ignored, "unusable": unusable}
+
+
+def _reposition_for_figure(box: List[float], fig_top: float, fig_bottom: float) -> List[float]:
+    """Slide a FIXED-size crop box (same width/height -- it must stay one of
+    the classic allowed shapes) vertically within the panel so it best
+    contains [fig_top, fig_bottom] (panel fractions), instead of wherever
+    the classic bubble-avoidance pick happened to land it. Never changes
+    the box's width or height, only its position; when the box is shorter
+    than the figure it cannot fully contain it (same honest limit as
+    wide_crop's figure_risk), so it centres on the figure as a best effort.
+    """
+    x0, y0, x1, y1 = box
+    h = y1 - y0
+    if h <= 0:
+        return box
+    lo = max(0.0, fig_bottom - h)
+    hi = min(fig_top, 1.0 - h)
+    if hi < lo:
+        mid = (fig_top + fig_bottom) / 2.0
+        y0n = max(0.0, min(1.0 - h, mid - h / 2.0))
+    else:
+        y0n = max(lo, min(hi, fig_top))
+    return [x0, round(y0n, 4), x1, round(y0n + h, 4)]
+
+
+def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                   acfg: Dict[str, Any], wcfg: Dict[str, Any]) -> Dict[str, List[str]]:
+    """video.mode: adaptive -- per shot (not the whole video), show the panel
+    in whichever treatment actually suits its own shape:
+
+    - a naturally wide/landscape panel (its own aspect >= video.adaptive.
+      wide_threshold) gets the SAME full-frame-height, edge-safe wide-mode
+      window as video.mode: wide (via _wide_style_card -- the two modes
+      share one implementation so they can never drift apart);
+    - a narrower panel keeps its classic crop/shape exactly as the planner
+      already chose, but drops the equal-area shrink (card.wide_fill) that
+      forces every shape onto the same on-screen size -- the "stale, small
+      panel" the equal-area rule otherwise produces regardless of how much
+      visual weight a panel's own content actually carries.
+
+    Pairs are never wide-style (classic pairing already excludes landscape
+    panels from pairing -- see _pair_up's `wide()` guard), so a pair shot's
+    two cards are always the classic-style branch.
+
+    Captions always overlay the art here (never a dedicated bar), the same
+    way for every shot regardless of which treatment that shot's own card
+    took -- a video that flips between a caption bar and overlaid captions
+    shot to shot is exactly the kind of visual inconsistency this mode
+    exists to avoid.
+
+    Returns the same {"caption_risk", "figure_risk", "reviewer_focal_ignored",
+    "unusable"} shape as _wide_pass (plan["wide_caption_risk"] / etc. are reused).
+    """
+    if fmt.width <= fmt.height:
+        return {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [], "unusable": []}
+    threshold = float((acfg or {}).get("wide_threshold", 1.333))
+    min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
+    caption_risk: List[str] = []
+    figure_risk: List[str] = []
+    reviewer_focal_ignored: List[str] = []
+    unusable: List[str] = []
+    for s in shots:
+        s["caption_bar"] = False
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        any_wide = False
+        for c in cards:
+            pid = c.get("panel")
+            p = designer.by_id.get(pid) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if pw <= 0 or ph <= 0:
+                continue
+            if not pair and (pw / ph) >= threshold:
+                flags = _wide_style_card(c, designer, pw, ph, min_win_h, None)
+                if flags["caption_risk"] and pid not in caption_risk:
+                    caption_risk.append(pid)
+                if flags["figure_risk"] and pid not in figure_risk:
+                    figure_risk.append(pid)
+                if flags["reviewer_focal_ignored"] and pid not in reviewer_focal_ignored:
+                    reviewer_focal_ignored.append(pid)
+                if flags.get("unusable") and pid not in unusable:
+                    unusable.append(pid)
+                any_wide = True
+            else:
+                # Classic-style: the card is bigger on screen (wide_fill, no
+                # equal-area shrink) than a classic build ever showed it, so
+                # a crop that excludes part of the figure -- the same thing
+                # _wide_style_card hardens against for wide-aspect panels --
+                # is far more visible here too. Reposition the SAME fixed
+                # shape (never resized, so it stays an allowed classic
+                # shape) to best contain the detected figure, instead of
+                # leaving it wherever classic's bubble-avoidance-only pick
+                # happened to land.
+                img = designer.img(pid) if pid in designer.by_id else None
+                box = list(c.get("crop") or [0, 0, 1, 1])
+                if img is not None and pid not in (designer.fixes.get("crop") or {}):
+                    head = head_of(_panel_maps(img, designer.map_options))
+                    if head.get("figure") and head.get("top") is not None and head.get("bottom") is not None:
+                        # The crop box's height is FIXED (reposition only
+                        # slides it, never resizes -- it must stay an
+                        # allowed classic shape), so that height is exactly
+                        # this call's legal budget: a figure taller than it
+                        # already gets _reposition_for_figure's own
+                        # best-effort centring, not a mid-way geometry mess.
+                        top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]),
+                                                          max_span=box[3] - box[1])
+                        new_box = _reposition_for_figure(box, top, bottom)
+                        yb = content_bands(img, axis="y", exclude=[(top, bottom)])
+                        h = new_box[3] - new_box[1]
+                        y0 = safe_span(1.0, h, 0.0, 1.0 - h, yb, new_box[1])
+                        box = [new_box[0], round(y0, 4), new_box[2], round(y0 + h, 4)]
+                c["crop"] = box
+                c["wide_fill"] = True
+        s["wide"] = any_wide
+    return {"caption_risk": caption_risk, "figure_risk": figure_risk,
+           "reviewer_focal_ignored": reviewer_focal_ignored, "unusable": unusable}
+
+
+# ------------------------------------------------------------------ panel-fit pass
+#
+# Panel-fit mode (video.mode: panelfit) — the MEASURED reference style
+# (~/workspace/your_files/reference-video-measured-spec.md; 85 shots of
+# the channel's own video, measured frame by frame). No cards, no
+# cropping of ordinary panels: every shot's panel is shown WHOLE at its
+# native aspect ratio, sharp and centred, over the same panel
+# cover-scaled and heavily blurred (50px) at FULL brightness — the
+# text descriptions' "60% opacity" was measured to be wrong, and the
+# measurements govern (user arbitration 2026-10-23: "copy the video
+# exactly — no captions, no shake/flash").
+#
+# The measured grammar, as coded below:
+#   * aspect (w/h) >= PF_FILL_ASPECT (~1.6): the panel fills the frame
+#     full-bleed (3/3 measured cases; blur bands are never used).
+#   * narrower panels: height-fit pillars over the blur. Motion is a
+#     gentle vertical DRIFT (total travel 5-13% of frame height at a
+#     constant ~6.8%/s of frame height, direction alternating) for
+#     pillars under PF_DRIFT_ASPECT_MAX, else a zoom-IN at a constant
+#     RATE (+5.0%/s; +8.8%/s on impact shots) — never a fixed total,
+#     never a zoom-out, never a full strip traversal (the old width-fit
+#     scroll is gone: their tallest pillar, aspect 0.31, is height-fit
+#     and merely drifts).
+#   * NO impact shake, NO white flash (measured: neither exists in the
+#     reference; impacts are fast zooms).
+#   * NO burned-in captions in this mode (measured: none; PF_CAPTIONS).
+#   * Rhythm: this mode's shot floor is PF_MIN_SHOT (0.3s, the measured
+#     minimum) and sentences over PF_SPLIT_ABOVE split in two (the
+#     reference's median shot is 1.97s).
+#   * Timeline cues in the narration become split-flap TITLE CARDS
+#     (titlecards.py + insert_title_cards below).
+# Every parameter is a named constant, pinned to the config defaults
+# (video.panelfit.*) and to the renderer's mirrors (frames.PFR_*) by
+# tests; the values must never live only in an agent's head.
+#
+# Assets reach this pass already white-space-eradicated (Rule 6:
+# panels.trim_v2 at panel build — ink-bbox trim + gap slicing), so the
+# composed frame contains no white margins in either layer.
+#
+# Parallax is NOT here: the detector stack yields boxes, not character
+# segmentations; deferred to build B11 of the movie plan.
+
+PF_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
+PF_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+PF_SHADOW_DY = 20          # foreground drop shadow (B1e E8, the user's
+PF_SHADOW_BLUR = 10        # fourth engine fix): black, offset (0, +20px),
+PF_SHADOW_OPACITY = 0.40   # blur 10px, 40% opacity — under the panel only
+PF_FILL_ASPECT = 1.6       # panel aspect (w/h) at/above which it fills the frame
+PF_DRIFT_ASPECT_MAX = 0.72  # pillars narrower than this drift; wider ones zoom
+PF_DRIFT_SPEED = 0.0658    # drift speed, frame-heights per second. The reference
+                           # fixes SPEED and lets travel vary (B1d F2): 3.7% of
+                           # frame WIDTH per second at 16:9 ≈ 71 px/s at 1080p
+                           # (measured band 3.2-4.3% width/s). B1c instead fixed
+                           # travel at the cap and derived speed, which measured
+                           # slow (2.2-2.9% width/s) on the sample.
+PF_DRIFT_MIN_TRAVEL = 0.05  # span travel floor, share of frame height (centering/
+                           # oversize for very short spans; the motion itself
+                           # always runs at PF_DRIFT_SPEED and may not finish it)
+PF_DRIFT_MAX_TRAVEL = 0.13  # span travel cap, share of frame height: at the cap
+                           # the panel HOLDS position — never reverses, never
+                           # slows down to stretch the travel over the span
+PF_DRIFT_HEADROOM = 0.03   # fg oversize beyond the travel (edges never show)
+PF_STRIP_ASPECT = 1.6      # panel height/width at/above which a panel is a
+                           # STRIP — panels.TALL_RATIO, the codebase's existing
+                           # strip threshold (kept out of the config defaults
+                           # deliberately; a test pins the two together).
+                           # B1e (the user's locked ruling, shot 6 of their
+                           # second-by-second analysis): a strip no longer
+                           # drift-caps like the reference's short pillars —
+                           # it TRAVERSES, a deliberate linear slide from the
+                           # top of the art to the bottom across the span.
+PF_ZOOM_OUT_FAST_RATE = 0.176  # zoom-OUT rate for a blast (B1e motion hint
+                           # "zoom_out_fast"): exactly 2x the impact zoom-in
+                           # rate, per the user's detonator->explosion ruling
+PF_ZOOM_RATE = 0.05        # zoom-in rate per second (measured band 3.6-6.5%/s)
+PF_ZOOM_RATE_IMPACT = 0.088  # impact zoom-in rate per second (measured, clash shot)
+PF_ZOOM_MAX_TOTAL = 0.50   # total zoom cap: at +50% the scale HOLDS (measured
+                           # totals top out at +46%; the cap binds only on
+                           # shots longer than the reference ever runs)
+PF_MAX_UPSCALE = 2.4       # quality guard: never upscale a panel past this
+PF_STILL_LIMIT = 0.5       # spec: no image still for longer than this, seconds
+PF_MIN_SHOT = 0.3          # this mode's shot floor (measured minimum shot)
+PF_SPLIT_ABOVE = 3.0       # sentences longer than this split into two shots
+                           # (B1d F7: 3.5 -> 3.0, moving the median shot toward
+                           # the reference's 1.97s; the residual gap is the
+                           # script's sentence lengths, not the planner)
+PF_SPLIT_MIN_PIECE = 1.2   # smallest piece such a split may produce
+PF_CAPTIONS = False        # no burned-in captions in this mode (measured: none)
+PF_TITLE_CARDS = True      # timeline cues become split-flap title cards
+PF_TTS_GAP = 0.11          # the mode's recommended tts.gap_seconds. MEASURED basis
+                           # (B1d F4): the 0.20 setting rendered as 0.296s median
+                           # silence in the B1c sample — per-sentence TTS edge
+                           # padding adds ≈ +0.09s — so 0.11 lands the MEASURED
+                           # gap at ≈ 0.20s, on the reference's 0.214s median.
+PF_ASPECT_TOL = 0.01       # log-aspect distance under which a panel counts as exactly canvas-shaped
+PF_FIT_TOL = 1.0           # px slack when checking a fitted foreground stays inside the frame
+# The coded fallback's impact verbs: the same hit words the SFX planner
+# (editor.plan_sfx) keys "hit" sounds on. In this mode an impact only
+# selects the fast zoom rate — there is no shake/flash to trigger.
+PF_IMPACT_WORDS = ("slams", "crashes", "explodes", "strikes", "smashes", "blasts", "shatters")
+# Per-sentence motion overrides (B1e E5): the pairing surface (cues.json /
+# pairs.json "motion") may overrule this mode's aspect routing for ONE
+# sentence, from the user's shot-by-shot rulings — "zoom_out" for a
+# reveal (the hand), "zoom_out_fast" for a blast (the explosion),
+# "duo" for a two-panel moment shown side by side. "default" (or no
+# hint) keeps the measured grammar. Pinned to cues.MOTION_HINTS by test.
+# B1f adds "zoom_in": a push-in at the standard rate (PF_ZOOM_RATE),
+# forcing the zoom geometry even on a panel that would drift/traverse.
+PF_MOTION_HINTS = ("default", "zoom_in", "zoom_out", "zoom_out_fast", "duo")
+
+
+def panelfit_drift_travel(dur: float, pcfg: Dict[str, Any] | None = None) -> float:
+    """Total vertical travel of a drift SPAN, as a share of frame
+    height: the pinned constant speed times the span's duration,
+    clamped to the measured 5-13% band. `dur` is the whole span the
+    motion is planned over (a sentence, across its sub-shots), never a
+    single sub-shot: speed is the invariant, travel is derived (F2)."""
+    pcfg = pcfg or {}
+    speed = float(pcfg.get("drift_speed", PF_DRIFT_SPEED))
+    lo = float(pcfg.get("drift_min_travel", PF_DRIFT_MIN_TRAVEL))
+    hi = float(pcfg.get("drift_max_travel", PF_DRIFT_MAX_TRAVEL))
+    return round(min(hi, max(lo, speed * max(0.0, float(dur)))), 4)
+
+
+def panelfit_drift_offset(travel: float, tau: float, direction: str,
+                          pcfg: Dict[str, Any] | None = None) -> float:
+    """Signed foreground offset (share of frame height, down-positive)
+    at `tau` seconds into a drift span whose total travel is `travel`:
+    the span starts at -travel/2 (down) / +travel/2 (up), moves at the
+    pinned SPEED, and HOLDS at the far edge once the travel is spent —
+    it never reverses and never slows to stretch the travel (F2). The
+    planner slices spans with this function and the renderer replays
+    it, so both agree on the position at every seam."""
+    pcfg = pcfg or {}
+    speed = float(pcfg.get("drift_speed", PF_DRIFT_SPEED))
+    pos = -float(travel) / 2.0 + min(speed * max(0.0, float(tau)), float(travel))
+    return pos if direction == "down" else -pos
+
+
+def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
+                 pcfg: Dict[str, Any] | None = None,
+                 force: str | None = None) -> Tuple[str, float, float, float]:
+    """(kind, base_w, base_h, scale) for one panel on the canvas.
+
+    "traverse": a STRIP (height/width >= PF_STRIP_ASPECT) fitted BY
+    WIDTH at the capped scale, so it stands taller than the frame and
+    can slide from its top to its bottom (B1e E4). When even the
+    width-fit leaves it no taller than the frame it degrades to the
+    ordinary fits below.
+    "fill": aspect >= PF_FILL_ASPECT — the panel cover-fills the whole
+    frame (full-bleed; cropped by the frame, never letterboxed). Only
+    when the cover scale fits under the upscale cap: a wide-but-tiny
+    panel that cannot actually fill at the cap falls through to the
+    capped pillar fit instead (over blur, smaller, never stretched).
+    "drift": a narrow pillar (aspect < PF_DRIFT_ASPECT_MAX), height-fit
+    and oversized by (travel + headroom) so its gentle vertical drift
+    never exposes a panel edge.
+    "zoom": a wider pillar, height-fit exactly; it zoom-ins by rate.
+    `force="zoom"` (a per-sentence motion hint, B1e E5) skips the strip
+    and drift routing and returns the plain zoom geometry.
+    All fits preserve the panel's aspect exactly and cap the scale at
+    PF_MAX_UPSCALE (a capped pillar sits smaller; never a stretch).
+    """
+    pcfg = pcfg or {}
+    cap = max(0.1, float(pcfg.get("max_upscale", PF_MAX_UPSCALE)))
+    fill_aspect = float(pcfg.get("fill_aspect", PF_FILL_ASPECT))
+    drift_max = float(pcfg.get("drift_aspect_max", PF_DRIFT_ASPECT_MAX))
+    strip_aspect = float(pcfg.get("strip_aspect", PF_STRIP_ASPECT))
+    pw, ph = max(1.0, float(pw)), max(1.0, float(ph))
+    aspect = pw / ph
+    if force != "zoom" and ph / pw >= strip_aspect:
+        s = min(fmt.width / pw, cap)
+        if ph * s > fmt.height + 0.5:
+            return "traverse", pw * s, ph * s, s
+    if aspect >= fill_aspect:
+        s_cover = max(fmt.width / pw, fmt.height / ph)
+        if s_cover <= cap:
+            return "fill", pw * s_cover, ph * s_cover, s_cover
+    s = min(fmt.height / ph, fmt.width / pw, cap)
+    if force != "zoom" and aspect < drift_max:
+        over = 1.0 + panelfit_drift_travel(dur, pcfg) \
+            + float(pcfg.get("drift_headroom", PF_DRIFT_HEADROOM))
+        return "drift", pw * s * over, ph * s * over, s * over
+    return "zoom", pw * s, ph * s, s
+
+
+def panelfit_spec(pw: float, ph: float, motion: str, fmt: Format,
+                  pcfg: Dict[str, Any] | None, *, dur: float = 2.0,
+                  impact: bool = False, span_dur: float | None = None,
+                  elapsed: float = 0.0, direction: str | None = None,
+                  hint: str | None = None) -> Dict[str, Any]:
+    """The per-card composition spec the renderer consumes.
+
+    `motion` (the classic designer's pick) no longer steers this mode:
+    routing is by aspect + impact only, zoom is always IN (the reference
+    never zooms out, and pull_out does not reverse), and drift
+    direction is assigned by the pass (alternating per sentence, as
+    measured). A per-sentence motion HINT (B1e E5 — the pairing
+    surface's override, from the user's shot-by-shot rulings) is the
+    one exception: "zoom_out" / "zoom_out_fast" force the zoom
+    geometry with dir "out".
+
+    Motion is planned over the whole SPAN a sentence occupies
+    (`span_dur`, defaulting to this shot's own `dur`) and sliced per
+    sub-shot: `elapsed` is how much of the span precedes this sub-shot.
+    A zoom slice carries `zoom_start` (the scale the span has reached
+    when the sub-shot opens); a drift slice carries `drift_from` /
+    `drift_to` / `drift_rate` (the span's signed offsets and its
+    constant speed); a traverse slice carries `traverse_from` /
+    `traverse_to` / `traverse_rate` (signed offsets in frame heights
+    from the TOP anchor: 0 = the art's top at the frame's top,
+    `traverse_to` = the art's bottom at the frame's bottom). Sub-shot
+    2 therefore opens exactly where sub-shot 1 ended — no reset, never
+    a reversal (B1d F1).
+    """
+    pcfg = pcfg or {}
+    dur = max(0.0, float(dur))
+    span = max(dur, float(span_dur)) if span_dur is not None else dur
+    elapsed = min(max(0.0, float(elapsed)), span)
+    force = "zoom" if hint in ("zoom_in", "zoom_out", "zoom_out_fast") else None
+    kind, bw, bh, _s = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg, force=force)
+    rate = 0.0
+    if kind in ("zoom", "fill"):
+        rate = float(pcfg.get("zoom_rate_impact" if impact else "zoom_rate",
+                              PF_ZOOM_RATE_IMPACT if impact else PF_ZOOM_RATE))
+    bg = True
+    if pw > 0 and ph > 0:
+        bg = abs(math.log((pw / ph) / (fmt.width / fmt.height))) > PF_ASPECT_TOL
+    zoom_cap = 1.0 + float(pcfg.get("zoom_max_total", PF_ZOOM_MAX_TOTAL))
+    spec: Dict[str, Any] = {"kind": kind, "dir": "down" if kind == "drift" else "in",
+                            "bg": bg, "base_w": round(bw, 2), "base_h": round(bh, 2),
+                            "zoom_rate": round(rate, 4),
+                            "zoom_end": round(min(1.0 + rate * span, zoom_cap), 4),
+                            "drift_frac": 0.0, "impact": bool(impact)}
+    if hint == "zoom_in":
+        # B1f: the editor's push-in — the zoom geometry (panelfit_fit
+        # already skipped the drift/traverse routing via force="zoom")
+        # at the STANDARD zoom-in rate, sliced over the span like every
+        # other zoom: this slice opens at zoom_start (the scale the
+        # span has reached) and grows at zoom_rate. An impact's faster
+        # rate does not override an explicit hint.
+        rate_in = float(pcfg.get("zoom_rate", PF_ZOOM_RATE))
+        spec.update({"dir": "in", "zoom_rate": round(rate_in, 4),
+                     "zoom_end": round(min(1.0 + rate_in * span, zoom_cap), 4),
+                     "zoom_start": round(min(1.0 + rate_in * elapsed, zoom_cap), 4)})
+    elif hint in ("zoom_out", "zoom_out_fast"):
+        # The user's per-shot rulings (hand reveal, the blast): the span
+        # OPENS enlarged and settles to the exact fit — a zoom OUT at a
+        # constant rate, sliced like every other span motion. The rate
+        # is stored SIGNED (negative) so the renderer replays it with
+        # the same clamp math as a zoom-in.
+        rate_out = float(pcfg.get("zoom_rate" if hint == "zoom_out" else "zoom_out_fast_rate",
+                                  PF_ZOOM_RATE if hint == "zoom_out"
+                                  else PF_ZOOM_OUT_FAST_RATE))
+        z0 = min(1.0 + rate_out * span, zoom_cap)
+        spec.update({"dir": "out", "zoom_rate": round(-rate_out, 4), "zoom_end": 1.0,
+                     "zoom_start": round(max(1.0, z0 - rate_out * elapsed), 4)})
+    elif kind == "traverse":
+        # B1e E4: the whole span slides the strip from its top anchor
+        # to its bottom anchor, arriving exactly at the span's end —
+        # the rate is whatever the span's length makes it (a deliberate
+        # slide, not the drift's pinned speed and never capped short).
+        total = (bh - fmt.height) / fmt.height   # frame heights of travel (> 0)
+        trate = -total / span if span > 0 else 0.0
+        spec.update({"dir": "down", "zoom_rate": 0.0, "zoom_end": 1.0,
+                     "traverse_from": round(trate * elapsed, 4),
+                     "traverse_to": round(-total, 4),
+                     "traverse_rate": round(trate, 4)})
+    elif kind in ("zoom", "fill"):
+        spec["zoom_start"] = round(min(1.0 + rate * elapsed, zoom_cap), 4)
+    elif kind == "drift":
+        d = direction if direction in ("down", "up") else "down"
+        travel = panelfit_drift_travel(span, pcfg)
+        off0 = panelfit_drift_offset(travel, elapsed, d, pcfg)
+        off1 = panelfit_drift_offset(travel, elapsed + dur, d, pcfg)
+        speed = float(pcfg.get("drift_speed", PF_DRIFT_SPEED))
+        spec.update({"dir": d,
+                     "drift_from": round(off0, 4),
+                     "drift_to": round(panelfit_drift_offset(travel, span, d, pcfg), 4),
+                     "drift_rate": round(speed if d == "down" else -speed, 4),
+                     # this sub-shot's own signed travel (0.0 on a cap-hold slice)
+                     "drift_frac": round(off1 - off0, 4)})
+    return spec
+
+
+def panelfit_advance_slice(spec: Dict[str, Any], cut_in: float) -> Dict[str, Any]:
+    """Advance a panelfit span slice by `cut_in` seconds — a clip that
+    starts mid-shot (build._clip_plan) skips the shot's head, so the
+    slice must open at the position the SPAN had reached by then, not
+    at the slice's own start. Without this, a clip starting inside a
+    split sentence replays the span from its beginning on the first
+    piece and jumps at the seam (B1d F1, found on the proof sample:
+    a 65px position jump at the first seam of a mid-span clip).
+    Legacy specs (no slice keys) are returned unchanged."""
+    sp = dict(spec or {})
+    cut = max(0.0, float(cut_in))
+    if cut == 0.0:
+        return sp
+    if sp.get("kind") in ("drift", "duo") and sp.get("drift_from") is not None:
+        frm, to = float(sp["drift_from"]), float(sp["drift_to"])
+        rate = float(sp["drift_rate"])
+        new = frm + rate * cut
+        new = min(new, to) if rate > 0 else max(new, to)
+        sp["drift_from"] = round(new, 4)
+        sp["drift_frac"] = round(float(sp["drift_frac"]) - (new - frm), 4)
+    elif sp.get("kind") == "traverse" and sp.get("traverse_from") is not None:
+        frm, to = float(sp["traverse_from"]), float(sp["traverse_to"])
+        rate = float(sp["traverse_rate"])
+        new = frm + rate * cut
+        new = min(new, frm) if rate > 0 else max(new, to)
+        sp["traverse_from"] = round(new, 4)
+    elif sp.get("kind") in ("zoom", "fill", "duo") and "zoom_start" in sp:
+        # Signed rate (B1e): a zoom-in clamps at zoom_end from below, a
+        # zoom-out (negative rate) from above — same clamp, mirrored.
+        rate = float(sp["zoom_rate"])
+        new = float(sp["zoom_start"]) + rate * cut
+        new = min(new, float(sp["zoom_end"])) if rate > 0 else max(new, float(sp["zoom_end"]))
+        sp["zoom_start"] = round(new, 4)
+    return sp
+
+
+def panelfit_duo_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
+                     pcfg: Dict[str, Any] | None = None) -> Tuple[str, float, float]:
+    """(mode, base_w, base_h) for one panel inside its DUO cell (B1e E3).
+
+    The frame splits into two cells, left and right, each half the
+    frame's width and its full height. "slide": the panel cover-fits
+    the cell's height, oversized by (travel + headroom) exactly like a
+    drift pillar, and fits the cell's width at that size — it can
+    slide vertically without ever exposing the cell's edge. When it
+    cannot (too wide for the cell at cover height, or the oversize
+    would break the upscale cap), the mode is "zoom_out": the panel
+    contain-fits its cell and the pair falls back to a slow zoom-out
+    (the user's own fallback for a too-short/too-wide pair).
+    """
+    pcfg = pcfg or {}
+    cap = max(0.1, float(pcfg.get("max_upscale", PF_MAX_UPSCALE)))
+    cw, ch = fmt.width / 2.0, float(fmt.height)
+    pw, ph = max(1.0, float(pw)), max(1.0, float(ph))
+    over = 1.0 + panelfit_drift_travel(dur, pcfg) \
+        + float(pcfg.get("drift_headroom", PF_DRIFT_HEADROOM))
+    s_cover = ch / ph
+    if pw * s_cover * over <= cw + 1e-6 and s_cover * over <= cap:
+        return "slide", pw * s_cover * over, ph * s_cover * over
+    s = min(cw / pw, ch / ph, cap)
+    return "zoom_out", pw * s, ph * s
+
+
+def panelfit_duo_spec(pw: float, ph: float, fmt: Format, pcfg: Dict[str, Any] | None,
+                      *, cell: str, mode: str, dur: float = 2.0,
+                      span_dur: float | None = None, elapsed: float = 0.0) -> Dict[str, Any]:
+    """One card's spec inside a duo shot (B1e E3): the two panels of one
+    sentence side by side over their shared blur — the LEFT panel
+    slides slowly UP, the RIGHT slowly DOWN (the user's counter-slide),
+    sliced over the sentence span like every other span motion; or,
+    when either panel lacks slide room (decided jointly by the pass),
+    both panels zoom OUT slowly in their cells instead.
+    """
+    pcfg = pcfg or {}
+    dur = max(0.0, float(dur))
+    span = max(dur, float(span_dur)) if span_dur is not None else dur
+    elapsed = min(max(0.0, float(elapsed)), span)
+    _mode, bw, bh = panelfit_duo_fit(pw, ph, fmt, dur=span, pcfg=pcfg)
+    direction = "up" if cell == "left" else "down"
+    spec: Dict[str, Any] = {"kind": "duo", "duo_mode": mode, "cell": cell,
+                            "dir": direction, "bg": True,
+                            "base_w": round(bw, 2), "base_h": round(bh, 2),
+                            "zoom_rate": 0.0, "zoom_end": 1.0, "drift_frac": 0.0,
+                            "impact": False}
+    if mode == "slide":
+        travel = panelfit_drift_travel(span, pcfg)
+        off0 = panelfit_drift_offset(travel, elapsed, direction, pcfg)
+        off1 = panelfit_drift_offset(travel, elapsed + dur, direction, pcfg)
+        speed = float(pcfg.get("drift_speed", PF_DRIFT_SPEED))
+        spec.update({"drift_from": round(off0, 4),
+                     "drift_to": round(panelfit_drift_offset(travel, span, direction, pcfg), 4),
+                     "drift_rate": round(speed if direction == "down" else -speed, 4),
+                     "drift_frac": round(off1 - off0, 4)})
+    else:  # zoom_out fallback: opens enlarged, settles to the cell fit
+        rate = float(pcfg.get("zoom_rate", PF_ZOOM_RATE))
+        zcap = 1.0 + float(pcfg.get("zoom_max_total", PF_ZOOM_MAX_TOTAL))
+        z0 = min(1.0 + rate * span, zcap)
+        spec.update({"zoom_rate": round(-rate, 4),
+                     "zoom_start": round(max(1.0, z0 - rate * elapsed), 4),
+                     "zoom_end": 1.0})
+    return spec
+
+
+def panelfit_is_impact(shot: Dict[str, Any]) -> Tuple[bool, str | None]:
+    """(is_impact, rule) for one shot. Flags come from the plan's
+    existing beat markers first (shot["effects"], built from the
+    {impact}/{reveal} cues — a shake or flash effect marks the beat);
+    fallback (coded): the shot's sentence classifies as VISUAL_ACTION
+    and carries an impact verb. In this mode the ONLY consequence is
+    the fast zoom rate (PF_ZOOM_RATE_IMPACT) — no shake, no flash."""
+    for e in shot.get("effects") or []:
+        if isinstance(e, dict) and e.get("type") in ("shake", "flash"):
+            return True, "marker"
+    sentence = str(shot.get("sentence") or "")
+    if sentence:
+        kind, _why = _classify_sentence(sentence)
+        low = sentence.lower()
+        if kind == "VISUAL_ACTION" and any(w in low for w in PF_IMPACT_WORDS):
+            return True, "fallback"
+    return False, None
+
+
+def _panelfit_duo_group(gshots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                        pcfg: Dict[str, Any], report: Dict[str, Any],
+                        span: float, g_start: float) -> bool:
+    """Give one DUO sentence group its side-by-side specs (B1e E3).
+
+    Every shot in the group must be a pair of exactly two panels — a
+    duo hint on anything else is a pairing mistake, not a layout to
+    guess at, so it fails fast with a UserError. Both cards appear for
+    the shot's whole window (the second card's staggered `at` is
+    cleared): the moment is simultaneous by the user's ruling. The
+    slide/zoom-out decision is JOINT: if either panel lacks slide room
+    in its cell, both panels zoom out. Returns whether the group moves.
+    """
+    moving = False
+    for s in gshots:
+        cards = s.get("cards") or []
+        if s.get("layout") != "pair" or len(cards) != 2:
+            raise UserError(
+                f"panelfit: motion hint 'duo' needs a sentence paired to exactly "
+                f"two panels (shot {s.get('id')} has {len(cards)} card(s), layout "
+                f"{s.get('layout')!r}); fix the pairing for sentence "
+                f"{str(s.get('sentence') or '')[:60]!r}")
+        dur = max(0.0, float(s.get("end") or 0) - float(s.get("start") or 0))
+        elapsed = max(0.0, float(s.get("start") or 0) - g_start)
+        dims = []
+        for c in cards:
+            p = designer.by_id.get(c.get("panel")) or {}
+            dims.append((float(p.get("width") or 0), float(p.get("height") or 0)))
+        modes = [panelfit_duo_fit(pw, ph, fmt, dur=span, pcfg=pcfg)[0]
+                 if pw > 0 and ph > 0 else "zoom_out" for pw, ph in dims]
+        mode = "slide" if all(m == "slide" for m in modes) else "zoom_out"
+        for c, (pw, ph) in zip(cards, dims):
+            cell = "left" if c is cards[0] else "right"
+            if pw > 0 and ph > 0:
+                c["panelfit"] = panelfit_duo_spec(pw, ph, fmt, pcfg, cell=cell, mode=mode,
+                                                  dur=dur, span_dur=span, elapsed=elapsed)
+            else:  # unknown panel size: static full-cell fallback spec
+                c["panelfit"] = {"kind": "duo", "duo_mode": "zoom_out", "cell": cell,
+                                 "dir": "up" if cell == "left" else "down", "bg": True,
+                                 "base_w": fmt.width / 2.0, "base_h": float(fmt.height),
+                                 "zoom_rate": 0.0, "zoom_end": 1.0, "drift_frac": 0.0,
+                                 "impact": False}
+            spec = c["panelfit"]
+            if spec.get("drift_frac") or (spec.get("zoom_rate", 0.0) != 0
+                                          and spec.get("zoom_start", 1.0) != spec.get("zoom_end", 1.0)):
+                moving = True
+        cards[1]["at"] = 0.0   # simultaneous: both panels from the first frame
+        report["duo"].append(s.get("id"))
+    return moving
+
+
+def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                   pcfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite classic shots into panel-fit shots (landscape only, like
+    the wide/adaptive passes; portrait formats stay classic).
+
+    Motion is planned per SENTENCE SPAN, not per shot (B1d F1): a
+    maximal run of consecutive shots carrying the same sentence on the
+    same panel(s) — the pieces a long sentence split into — shares ONE
+    motion, sliced per piece (see panelfit_spec's span_dur/elapsed), so
+    the position is continuous at every seam and the direction can
+    never reverse inside a sentence. Drift direction alternates per
+    sentence span, as measured — except that a panel reused by the
+    immediately following sentence keeps the direction it already has.
+
+    Returns {"static", "hold", "over_cap", "impact", "traverse",
+    "duo", "zoom_out", "zoom_in"} — shot ids whose whole span carries no motion
+    (none by construction; computed honestly from the specs, not
+    asserted), shot ids that sit entirely in a travel-cap hold (the
+    span's motion finished before they open — the F2 hold, reported,
+    never hidden), panel ids whose uncapped fit would exceed
+    PF_MAX_UPSCALE (their foreground is capped, so it sits smaller —
+    an honest quality note, never a stretch), the impact report (which
+    shots earned the fast zoom rate, and by which rule), and — B1e —
+    the shot ids shown as strip traverses, duo side-by-sides, and
+    per-sentence zoom-out hints (B1f: zoom-in hints likewise).
+    """
+    report: Dict[str, Any] = {"static": [], "hold": [], "over_cap": [], "impact": [],
+                              "traverse": [], "duo": [], "zoom_out": [], "zoom_in": []}
+    if fmt.width <= fmt.height:
+        return report
+    pcfg = pcfg or {}
+    cap = float(pcfg.get("max_upscale", PF_MAX_UPSCALE))
+    fill_aspect = float(pcfg.get("fill_aspect", PF_FILL_ASPECT))
+    for s in shots:
+        s["panelfit"] = True
+        s["caption_bar"] = False  # this mode burns no captions at all
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        if not pair:
+            s["layout"] = "single"
+            cards = cards[:1]
+        s["cards"] = cards
+    # Group the split pieces: same sentence text AND same panel list,
+    # back to back. Shots without a sentence (fillers) never group.
+    # B1f: the panel list keys on slice ids where a card carries one —
+    # two slices of the SAME panel under one sentence are independent
+    # placeable units with their own fits, never one shared span.
+    grouped: List[Tuple[Any, List[Dict[str, Any]]]] = []
+    for s in shots:
+        text = str(s.get("sentence") or "")
+        panels = tuple(c.get("slice_id") or c.get("panel") for c in (s.get("cards") or []))
+        key = (text, panels) if text and panels and all(panels) else None
+        if key is not None and grouped and grouped[-1][0] == key:
+            grouped[-1][1].append(s)
+        else:
+            grouped.append((key, [s]))
+    drift_groups = 0  # drift-span ordinal: direction alternates, as measured
+    prev_dirs: Dict[Any, str] = {}  # panel -> drift direction of the previous span
+    for _key, gshots in grouped:
+        g_start = float(gshots[0].get("start") or 0)
+        g_end = float(gshots[-1].get("end") or 0)
+        span = max(0.0, g_end - g_start)
+        group_dirs: Dict[Any, str] = {}
+        group_moving = False
+        # The group's per-sentence motion hint (B1e E5), if the pairing
+        # surface set one. Unknown values are a hard error — a typo'd
+        # hint must never silently render as the default grammar.
+        hint = next((str(s.get("motion_hint")) for s in gshots if s.get("motion_hint")), None)
+        if hint is not None and hint not in PF_MOTION_HINTS:
+            raise UserError(f"panelfit: unknown motion hint {hint!r} on sentence "
+                            f"{str(gshots[0].get('sentence') or '')[:60]!r}; "
+                            f"use one of {', '.join(PF_MOTION_HINTS)}")
+        if hint == "duo":
+            group_moving = _panelfit_duo_group(gshots, designer, fmt, pcfg, report, span, g_start)
+            prev_dirs = {}
+            continue
+        for s in gshots:
+            dur = max(0.0, float(s.get("end") or 0) - float(s.get("start") or 0))
+            elapsed = max(0.0, float(s.get("start") or 0) - g_start)
+            impact, rule = panelfit_is_impact(s)
+            moving = False
+            for c in s.get("cards") or []:
+                pid = c.get("panel")
+                p = designer.by_id.get(pid) or {}
+                pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+                if isinstance(c.get("slice"), list) and len(c["slice"]) == 2:
+                    # B1f: a slice is fitted on its OWN dimensions —
+                    # the panel's width, the band's height — through
+                    # the same fit/spec logic as any whole panel.
+                    ph = ph * max(0.0, float(c["slice"][1]) - float(c["slice"][0]))
+                if pw > 0 and ph > 0:
+                    force = "zoom" if hint in ("zoom_in", "zoom_out", "zoom_out_fast") else None
+                    kind = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg, force=force)[0]
+                    direction = None
+                    if kind == "drift":
+                        if pid in group_dirs:
+                            direction = group_dirs[pid]
+                        elif pid in prev_dirs:
+                            # Consecutive sentences on one panel keep the
+                            # direction that panel already drifts in.
+                            direction = prev_dirs[pid]
+                        else:
+                            direction = "down" if drift_groups % 2 == 0 else "up"
+                            drift_groups += 1
+                        group_dirs[pid] = direction
+                    c["panelfit"] = panelfit_spec(pw, ph, str(c.get("motion") or ""), fmt, pcfg,
+                                                  dur=dur, impact=impact, span_dur=span,
+                                                  elapsed=elapsed, direction=direction,
+                                                  hint=hint if force else None)
+                    aspect = pw / ph
+                    uncapped = (fmt.width / pw if kind == "traverse"
+                                else max(fmt.width / pw, fmt.height / ph) if aspect >= fill_aspect
+                                else min(fmt.width / pw, fmt.height / ph))
+                    if uncapped > cap and pid not in report["over_cap"]:
+                        report["over_cap"].append(pid)
+                    if kind == "traverse" and s.get("id") not in report["traverse"]:
+                        report["traverse"].append(s.get("id"))
+                else:
+                    rate = float(pcfg.get("zoom_rate", PF_ZOOM_RATE))
+                    zcap = 1.0 + float(pcfg.get("zoom_max_total", PF_ZOOM_MAX_TOTAL))
+                    c["panelfit"] = {"kind": "zoom", "dir": "in", "bg": True,
+                                     "base_w": float(fmt.width), "base_h": float(fmt.height),
+                                     "zoom_rate": rate,
+                                     "zoom_start": round(min(1.0 + rate * elapsed, zcap), 4),
+                                     "zoom_end": round(min(1.0 + rate * span, zcap), 4),
+                                     "drift_frac": 0.0, "impact": bool(impact)}
+                spec = c["panelfit"]
+                if spec["kind"] == "drift":
+                    if spec.get("drift_frac"):
+                        moving = True
+                elif spec["kind"] == "traverse":
+                    moving = True   # travel > 0 by construction (base_h > frame)
+                elif spec.get("zoom_rate", 0.0) != 0 \
+                        and spec.get("zoom_start", 1.0) != spec.get("zoom_end", 1.0):
+                    moving = True
+            if hint in ("zoom_out", "zoom_out_fast") and s.get("id") not in report["zoom_out"]:
+                report["zoom_out"].append(s.get("id"))
+            if hint == "zoom_in" and s.get("id") not in report["zoom_in"]:
+                report["zoom_in"].append(s.get("id"))
+            if moving:
+                group_moving = True
+            else:
+                report["hold"].append(s.get("id"))
+            if rule:
+                report["impact"].append({"id": s.get("id"), "rule": rule,
+                                         "zoom_rate": float(pcfg.get("zoom_rate_impact",
+                                                                     PF_ZOOM_RATE_IMPACT))})
+        if not group_moving:
+            report["static"].extend(s.get("id") for s in gshots)
+        prev_dirs = group_dirs
+    # A hold entry only means something when the span itself never
+    # moved; a fully static span is already reported as static.
+    report["hold"] = [i for i in report["hold"] if i not in set(report["static"])]
+    return report
+
+
+def _card_shot(cue: Dict[str, Any], start: float, end: float, sentence: str) -> Dict[str, Any]:
+    """One title-card shot: no panels, just the cue it covers."""
+    return {"id": "CARD", "start": round(start, 3), "end": round(end, 3),
+            "layout": "single", "background": "black", "cards": [],
+            "exit": "cut", "transition": "cut", "effects": [], "callouts": [],
+            "sentence": sentence[:300] or None,
+            "panelfit": True, "caption_bar": False,
+            "title_card": {"label": cue["label"], "number": int(cue["number"]),
+                           "line": cue["line"]}}
+
+
+def insert_title_cards(shots: List[Dict[str, Any]], windows: List[Dict[str, Any]] | None,
+                       pcfg: Dict[str, Any] | None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Turn timeline-cue sentences into split-flap title-card shots.
+
+    `windows` are the narration sentences ({text, start, end}). A cue
+    sentence (titlecards.detect_title_cue) is replaced on screen by a
+    card that starts at the sentence's aligned start and lasts
+    clamp(cue span, 1.4, 2.1)s; the card CONSUMES whatever plan time it
+    overlaps — the overlapped shot is split/truncated around it, and a
+    remainder under 0.2s is absorbed into the card (its duration then
+    exceeds the clamp by that sliver, the honest price of back-to-back
+    shots). An Age fragment ("Age 4.") merges with a directly
+    following unit cue ("Week 6 of possession.") into one card whose
+    span covers both sentences. Returns (shots, report); shot ids are
+    renumbered (S001...) only when a card was actually inserted.
+    """
+    from . import titlecards as _tc
+    pcfg = pcfg or {}
+    if not bool(pcfg.get("title_cards", PF_TITLE_CARDS)) or not windows:
+        return shots, []
+    wins = sorted((w for w in windows
+                   if isinstance(w, dict) and w.get("text") and w.get("end") is not None),
+                  key=lambda w: float(w.get("start") or 0.0))
+    cues: List[Tuple[float, float, Dict[str, Any], str]] = []
+    i = 0
+    while i < len(wins):
+        w = wins[i]
+        cue = _tc.detect_title_cue(w.get("text"))
+        if cue is not None and cue["line"] == "" and i + 1 < len(wins):
+            nxt = _tc.detect_title_cue(wins[i + 1].get("text"))
+            if nxt is not None and nxt["line"] and nxt["label"] != "Age":
+                cue = {**cue, "line": nxt["line"]}
+                cues.append((float(w.get("start") or 0.0), float(wins[i + 1]["end"]),
+                             cue, f"{w.get('text')} {wins[i + 1].get('text')}"))
+                i += 2
+                continue
+        if cue is not None:
+            cues.append((float(w.get("start") or 0.0), float(w["end"]), cue,
+                         str(w.get("text"))))
+        i += 1
+    if not cues:
+        return shots, []
+    out = [dict(s) for s in shots]
+    report: List[Dict[str, Any]] = []
+    for cs, ce, cue, text in cues:
+        dur = _tc.card_duration(ce - cs)
+        card_start, card_end = float(cs), float(cs) + dur
+        # A shot straddling the cue start by less than a visible sliver
+        # lends its start to the card (the card still opens on the cue).
+        for s in out:
+            if float(s["start"]) < card_start < float(s["end"]) and card_start - float(s["start"]) < 0.2:
+                card_start = float(s["start"])
+                card_end = card_start + dur
+                break
+        if out:
+            card_end = min(card_end, max(float(s["end"]) for s in out))
+        new: List[Dict[str, Any]] = []
+        placed = False
+        for s in out:
+            a, b = float(s["start"]), float(s["end"])
+            if b <= card_start + 1e-9 or a >= card_end - 1e-9:
+                new.append(s)
+                continue
+            if not placed and a >= card_start - 1e-9:
+                new.append(_card_shot(cue, card_start, card_end, text))
+                placed = True
+            if a < card_start - 1e-9:  # head piece survives
+                head = dict(s)
+                head["end"] = round(card_start, 3)
+                if head["end"] - float(head["start"]) >= 0.2:
+                    new.append(head)
+                if not placed:
+                    new.append(_card_shot(cue, card_start, card_end, text))
+                    placed = True
+            if b > card_end + 1e-9:  # tail piece survives (or is absorbed)
+                if b - card_end >= 0.2:
+                    tail = dict(s)
+                    shift = card_end - a
+                    tail["start"] = round(card_end, 3)
+                    tail["cards"] = [{**c, "at": round(max(0.0, float(c.get("at") or 0.0) - shift), 3)}
+                                     for c in (s.get("cards") or [])]
+                    tail["effects"] = [e for e in (s.get("effects") or [])
+                                       if float(e.get("t") or 0) >= card_end - 1e-9]
+                    tail["callouts"] = [c for c in (s.get("callouts") or [])
+                                        if float(c.get("t") or 0) >= card_end - 1e-9]
+                    new.append(tail)
+                else:
+                    card_end = b  # absorb the sliver into the card
+                    for ns in new:
+                        if ns.get("title_card") and abs(float(ns["start"]) - card_start) < 1e-6:
+                            ns["end"] = round(card_end, 3)
+            # a shot fully inside the card interval is consumed by it
+        if not placed:
+            new.append(_card_shot(cue, card_start, card_end, text))
+            new.sort(key=lambda s: float(s["start"]))
+        out = new
+        report.append({"at": round(card_start, 3), "duration": round(card_end - card_start, 3),
+                       "label": cue["label"], "number": int(cue["number"]),
+                       "line": cue["line"]})
+    for idx, s in enumerate(out):
+        s["id"] = f"S{idx + 1:03d}"
+    by_start = {round(float(r["at"]), 3): r for r in report}
+    for s in out:
+        if s.get("title_card"):
+            r = by_start.get(round(float(s["start"]), 3))
+            if r is not None:
+                r["id"] = s["id"]
+    return out, report
+
+
+
+
+# ------------------------------------------------------------------ fullframe mode
+
+# Full-frame mode ("video.mode: fullframe") drops the card entirely: every
+# shot is a full-bleed 1920x1080 camera viewport travelling over the panel.
+# The classic focal crop (or a fixes.json crop) says WHERE the camera looks;
+# this section resolves it into a camera path: a `window` (the panel region
+# the shot covers) plus `from`/`to` viewports -- both exactly 16:9, both
+# inside the window -- that the renderer interpolates between:
+#   * window taller than the viewport -> a vertical pan (the webtoon scroll);
+#   * window wider than the viewport  -> a horizontal pan;
+#   * window ~16:9                     -> a zoom (push_in / pull_out), or a
+#     still frame for a hand-set `hold`.
+# Timing, panels and `at` offsets are NEVER touched (the sync audit reads
+# them), so a full-frame plan audits exactly like the classic plan it was
+# derived from. Captions overlay the art (no bar), like wide mode.
+FF_ASPECT = 16.0 / 9.0
+FF_MIN_TRAVEL = 1.12    # a pan window must exceed its viewport by >=12% or it is a zoom instead
+FF_MIN_ZOOM = 1.03      # below this depth a zoom is a still frame; reported, never disguised
+FF_CAPTION_ZONE = WIDE_CAPTION_ZONE   # bottom share of the viewport the overlaid captions occupy
+# Every full-frame style parameter is a named constant (the HARDCODE-IT
+# rule: style lives in code/config, never in an agent's head). The three
+# user-facing knobs live in config (video.fullframe.*, DEFAULTS in
+# config.py); these constants are their in-code defaults and the single
+# fallback every .get() uses -- a test pins the two to each other.
+FF_MAX_UPSCALE = 2.4    # default of video.fullframe.max_upscale
+FF_ZOOM_DEPTH = 1.18    # default of video.fullframe.zoom_depth
+FF_PAN_TRAVEL = 1.0     # default of video.fullframe.pan_travel
+FF_PX_TOL = 1.0         # panel-pixel tolerance for containment / floor comparisons
+FF_CONTAIN_TOL = 0.002  # fraction tolerance for the viewport-inside-window checks
+FF_ASPECT_TOL = 0.02    # log-space tolerance of the QA gate's exact-16:9 check
+
+
+def _ff_place(f0: float, flen: float, win: float, extent: float,
+              bands: List[Tuple[float, float]]) -> float:
+    """Start coordinate for a window of length `win` on one axis: contains
+    the focal span [f0, f0+flen] when it fits (wide_crop's containment
+    clamp), centres on it when it cannot, then safe_span nudges the edges
+    off content bands outside the focal."""
+    if flen <= win:
+        lo = max(0.0, f0 + flen - win)
+        hi = min(f0, max(0.0, extent - win))
+        anchor = max(lo, min(hi, f0))
+    else:
+        lo, hi = 0.0, max(0.0, extent - win)
+        anchor = max(lo, min(hi, f0 + flen / 2.0 - win / 2.0))
+    return safe_span(extent, win, lo, hi, bands, anchor)
+
+
+def fullframe_viewport(pw: float, ph: float, box: List[float], motion: str, *,
+                       min_vp_w: float, min_vp_h: float,
+                       zoom_depth: float = FF_ZOOM_DEPTH, pan_travel: float = FF_PAN_TRAVEL,
+                       img: Image.Image | None = None
+                       ) -> Tuple[Dict[str, List[float]], Dict[str, Any]]:
+    """Resolve one card's camera path over a panel of (pw, ph) pixels.
+
+    `box` is the focal crop in panel fractions (the classic planner's crop,
+    or a fixes.json reviewer crop -- either way it defines where the camera
+    looks). `min_vp_w` / `min_vp_h` are the zoom guardrail in panel pixels:
+    no viewport shown is smaller than that when the panel can supply it
+    (config video.fullframe.max_upscale: frame 1920x1080 / FF_MAX_UPSCALE
+    = 800x450 at the default).
+
+    Returns ({"window", "from", "to"} in panel fractions, info) where info
+    carries the resolved "motion", the path "kind" ("zoom" | "pan_y" |
+    "pan_x"), and honest flags: "static" (from == to: no camera motion was
+    possible), "over_cap" (a viewport below the guardrail floor -- the
+    panel itself is too small to supply more), "focal_overflow" (the focal
+    cannot fit inside any single 16:9 viewport on this panel, so it is
+    traversed or centred, never wholly framed at once) and "caption_risk"
+    (panel text sits in the bottom caption zone of the from/to viewport).
+    """
+    try:
+        bx0, by0, bx1, by1 = (float(v) for v in box[:4])
+    except (TypeError, ValueError, IndexError):
+        bx0, by0, bx1, by1 = 0.0, 0.0, 1.0, 1.0
+    bx0 = max(0.0, min(1.0, bx0)); by0 = max(0.0, min(1.0, by0))
+    bx1 = max(bx0, min(1.0, bx1)); by1 = max(by0, min(1.0, by1))
+    fx0, fy0 = bx0 * pw, by0 * ph
+    fw, fh = max(1.0, (bx1 - bx0) * pw), max(1.0, (by1 - by0) * ph)
+    bands_y: List[Tuple[float, float]] = []
+    bands_x: List[Tuple[float, float]] = []
+    if img is not None:
+        bands_y = content_bands(img, axis="y", exclude=[(by0, by1)])
+        bands_x = content_bands(img, axis="x", exclude=[(bx0, bx1)])
+    info: Dict[str, Any] = {"motion": motion, "kind": "zoom", "static": False,
+                            "over_cap": False, "focal_overflow": False, "caption_risk": False}
+    depth_target = max(1.0, float(zoom_depth))
+    travel = max(0.0, float(pan_travel))
+
+    def zoom_path(depth_wanted: float) -> Tuple[Tuple[float, float, float, float],
+                                                Tuple[float, float, float, float]]:
+        """(outer, inner) 16:9 rects in panel pixels; outer contains the
+        focal when any 16:9 viewport on this panel can, inner is outer
+        shrunk by the (guardrail-capped) zoom depth around the focal."""
+        ow = max(fw, fh * FF_ASPECT)
+        oh = ow / FF_ASPECT
+        if oh < min_vp_h * depth_wanted:      # room to zoom AND stay above the floor
+            oh = min_vp_h * depth_wanted
+            ow = oh * FF_ASPECT
+        if ow > pw:
+            ow, oh = pw, pw / FF_ASPECT
+        if oh > ph:
+            oh, ow = ph, ph * FF_ASPECT
+        if fw > ow + FF_PX_TOL or fh > oh + FF_PX_TOL:
+            info["focal_overflow"] = True
+        x0 = _ff_place(fx0, fw, ow, pw, bands_x)
+        y0 = _ff_place(fy0, fh, oh, ph, bands_y)
+        outer = (x0, y0, ow, oh)
+        depth = min(depth_wanted, ow / max(1.0, min_vp_w), oh / max(1.0, min_vp_h))
+        depth = max(1.0, depth)
+        iw, ih = ow / depth, oh / depth
+        ix = max(x0, min(x0 + ow - iw, fx0 + fw / 2.0 - iw / 2.0))
+        iy = max(y0, min(y0 + oh - ih, fy0 + fh / 2.0 - ih / 2.0))
+        ix = safe_span(pw, iw, x0, x0 + ow - iw, bands_x, ix)
+        iy = safe_span(ph, ih, y0, y0 + oh - ih, bands_y, iy)
+        return outer, (ix, iy, iw, ih)
+
+    def pan_y_path() -> Tuple[Tuple[float, float, float, float],
+                              Tuple[float, float, float, float],
+                              Tuple[float, float, float, float]] | None:
+        """(window, first, last) for a vertical pan, or None when the panel
+        cannot give the viewport at least FF_MIN_TRAVEL of travel."""
+        vp_w = min(pw, max(fw, min_vp_w))
+        vp_h = vp_w / FF_ASPECT
+        win_h = min(ph, max(fh, vp_h * (1.0 + travel)))
+        if win_h < vp_h * FF_MIN_TRAVEL:
+            return None
+        wx = _ff_place(fx0, fw, vp_w, pw, bands_x)
+        wy = _ff_place(fy0, fh, win_h, ph, bands_y)
+        window = (wx, wy, vp_w, win_h)
+        top = (wx, wy, vp_w, vp_h)
+        bottom = (wx, wy + win_h - vp_h, vp_w, vp_h)
+        return window, top, bottom
+
+    def pan_x_path() -> Tuple[Tuple[float, float, float, float],
+                              Tuple[float, float, float, float],
+                              Tuple[float, float, float, float]] | None:
+        """(window, first, last) for a horizontal pan (pan_left semantics:
+        the camera starts on the right and travels left), or None."""
+        vp_h = min(ph, max(fh, min_vp_h))
+        vp_w = vp_h * FF_ASPECT
+        win_w = min(pw, max(fw, vp_w * (1.0 + travel)))
+        if win_w < vp_w * FF_MIN_TRAVEL:
+            return None
+        wy = _ff_place(fy0, fh, vp_h, ph, bands_y)
+        wx = _ff_place(fx0, fw, win_w, pw, bands_x)
+        window = (wx, wy, win_w, vp_h)
+        left = (wx, wy, vp_w, vp_h)
+        right = (wx + win_w - vp_w, wy, vp_w, vp_h)
+        return window, right, left   # pan_left: from = right, to = left
+
+    window = frm = to = None
+    want = motion if motion in MOTIONS else "push_in"
+    if want == "hold":
+        outer, _inner = zoom_path(1.0)
+        window = frm = to = outer
+        info["motion"] = "hold"
+    elif want in ("pan_down", "pan_up"):
+        got = pan_y_path()
+        if got is not None:
+            window, top, bottom = got
+            frm, to = (top, bottom) if want == "pan_down" else (bottom, top)
+            info["motion"], info["kind"] = want, "pan_y"
+        else:   # no travel on this panel: a zoom moves instead (wide mode's swap)
+            info["motion"] = "push_in" if want == "pan_down" else "pull_out"
+            outer, inner = zoom_path(depth_target)
+            window = outer
+            frm, to = (outer, inner) if info["motion"] == "push_in" else (inner, outer)
+    elif want in ("pan_left", "pan_right"):
+        got = pan_x_path()
+        if got is not None:
+            window, first, last = got
+            frm, to = (first, last) if want == "pan_left" else (last, first)
+            info["motion"], info["kind"] = want, "pan_x"
+        else:
+            info["motion"] = "pull_out" if want == "pan_left" else "push_in"
+            outer, inner = zoom_path(depth_target)
+            window = outer
+            frm, to = (outer, inner) if info["motion"] == "push_in" else (inner, outer)
+    else:   # push_in / pull_out
+        # A focal no 16:9 viewport on this panel can contain (a tall figure,
+        # a full-width strip section) is traversed by a scroll, not sliced
+        # by a static zoom window -- when the panel offers the travel.
+        fits = max(fw, fh * FF_ASPECT) <= pw + FF_PX_TOL and max(fh, fw / FF_ASPECT) <= ph + FF_PX_TOL
+        got = None if fits else pan_y_path()
+        if got is not None:
+            window, top, bottom = got
+            frm, to = top, bottom
+            info["motion"], info["kind"] = "pan_down", "pan_y"
+        else:
+            outer, inner = zoom_path(depth_target)
+            window = outer
+            frm, to = (outer, inner) if want == "push_in" else (inner, outer)
+            info["motion"] = want
+
+    assert window is not None and frm is not None and to is not None
+    info["static"] = frm == to
+    smallest_w = min(frm[2], to[2])
+    smallest_h = min(frm[3], to[3])
+    info["over_cap"] = smallest_w < min_vp_w - FF_PX_TOL or smallest_h < min_vp_h - FF_PX_TOL
+    if bands_y:
+        for vy0, vh in ((frm[1], frm[3]), (to[1], to[3])):
+            zone_top = (vy0 + vh * (1.0 - FF_CAPTION_ZONE)) / ph
+            zone_bot = (vy0 + vh) / ph
+            if any(b0 < zone_bot and b1 > zone_top for b0, b1 in bands_y):
+                info["caption_risk"] = True
+                break
+
+    def fin(rect: Tuple[float, float, float, float]) -> List[float]:
+        x, y, w, h = rect
+        return [round(x / pw, 4), round(y / ph, 4), round((x + w) / pw, 4), round((y + h) / ph, 4)]
+
+    win_f = fin(window)
+    out: Dict[str, List[float]] = {"window": win_f, "from": fin(frm), "to": fin(to)}
+    for key in ("from", "to"):   # rounding may push an edge a hair outside the window
+        r = out[key]
+        r[0] = max(win_f[0], min(r[0], win_f[2]))
+        r[1] = max(win_f[1], min(r[1], win_f[3]))
+        r[2] = max(r[0], min(r[2], win_f[2]))
+        r[3] = max(r[1], min(r[3], win_f[3]))
+    return out, info
+
+
+def _fullframe_style_card(c: Dict[str, Any], designer: "_Designer", pw: float, ph: float,
+                          min_vp_w: float, min_vp_h: float,
+                          fcfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite one card in place for full-frame mode: its classic crop (or
+    fixes.json focal) becomes the seed the camera path is derived from; the
+    card gains a "viewport" {window, from, to} and keeps `crop` = the window
+    so other tooling still sees the region the shot covers. Returns the
+    fullframe_viewport info dict for the pass's risk lists."""
+    pid = c.get("panel")
+    img = designer.img(pid) if pid in designer.by_id else None
+    box = list(c.get("crop") or [0, 0, 1, 1])
+    if img is not None and pid not in (designer.fixes.get("crop") or {}):
+        # Same figure hardening as wide mode: the classic focal can exclude
+        # part of the figure (head found, body cut). Grow the seed to cover
+        # the detected head AND the connected body before deriving the path
+        # (a reviewer-set crop is never second-guessed).
+        head = head_of(_panel_maps(img, designer.map_options))
+        if head.get("figure") and head.get("top") is not None and head.get("bottom") is not None:
+            top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]),
+                                              max_span=1.0)
+            box[1] = min(box[1], top)
+            box[3] = max(box[3], bottom)
+    vp, info = fullframe_viewport(pw, ph, box, str(c.get("motion") or "push_in"),
+                                  min_vp_w=min_vp_w, min_vp_h=min_vp_h,
+                                  zoom_depth=float(fcfg.get("zoom_depth", FF_ZOOM_DEPTH)),
+                                  pan_travel=float(fcfg.get("pan_travel", FF_PAN_TRAVEL)),
+                                  img=img)
+    c["viewport"] = vp
+    c["crop"] = list(vp["window"])
+    c["motion"] = info["motion"]
+    c["pad_y"] = 0.0
+    c["fullframe"] = True
+    info["reviewer_focal_ignored"] = bool(
+        pid in (designer.fixes.get("crop") or {}) and info.get("focal_overflow"))
+    return info
+
+
+def _fullframe_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                    fcfg: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Rewrite a classic plan for full-frame mode: every shot becomes a
+    full-bleed camera move (see fullframe_viewport). Pairs keep both cards
+    (the renderer shows them one after another, full-frame, cutting at the
+    second card's `at`); every other layout collapses to its first card.
+    caption_bar is off (captions overlay the art). Timing, panels and `at`
+    are untouched, so the sync audit sees the identical plan.
+
+    Returns panel-id lists for the honest-report fields on the plan:
+    caption_risk (text in a viewport's caption zone), figure_risk (focal
+    cannot fit one 16:9 viewport), reviewer_focal_ignored (a fixes.json
+    focal that overflowed), over_cap (viewport below the upscale floor --
+    panel too small), and static (shot ids where no camera motion was
+    possible on the source pixels available).
+    """
+    empty: Dict[str, List[str]] = {"caption_risk": [], "figure_risk": [],
+                                   "reviewer_focal_ignored": [], "over_cap": [], "static": []}
+    if fmt.width <= fmt.height:
+        return empty   # portrait formats untouched (Shorts keep the card look)
+    fcfg = fcfg or {}
+    max_upscale = max(1.0, float(fcfg.get("max_upscale", FF_MAX_UPSCALE)))
+    min_vp_w = fmt.width / max_upscale     # guardrail floors, in panel pixels
+    min_vp_h = fmt.height / max_upscale    # (same convention as wide's min_win_h)
+    risks: Dict[str, List[str]] = {k: [] for k in empty}
+    for s in shots:
+        s["fullframe"] = True
+        s["caption_bar"] = False
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        if not pair:
+            s["layout"] = "single"
+            cards = cards[:1]
+        shot_static = bool(cards)
+        for c in cards:
+            pid = c.get("panel")
+            p = designer.by_id.get(pid) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if pw > 0 and ph > 0:
+                info = _fullframe_style_card(c, designer, pw, ph, min_vp_w, min_vp_h, fcfg)
+                for key in ("caption_risk", "figure_risk", "reviewer_focal_ignored", "over_cap"):
+                    if info.get(key) and pid not in risks[key]:
+                        risks[key].append(pid)
+                if not info.get("static"):
+                    shot_static = False
+            else:
+                c["pad_y"] = 0.0
+                c["fullframe"] = True
+                c["viewport"] = {"window": list(c.get("crop") or [0, 0, 1, 1]),
+                                 "from": list(c.get("crop") or [0, 0, 1, 1]),
+                                 "to": list(c.get("crop") or [0, 0, 1, 1])}
+                shot_static = False
+        if shot_static and str(s.get("id")) not in risks["static"]:
+            risks["static"].append(str(s.get("id")))
+        s["cards"] = cards
+    return risks
+
+
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
                vcfg: Dict[str, Any], image_for: Callable[[Dict[str, Any]], Image.Image],
                sentences: List[Dict[str, Any]] | None = None,
@@ -1025,7 +2552,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                alignment_meta: Dict[str, Any] | None = None,
                settings: Dict[str, float] | None = None,
                root: Path | None = None,
-               caption_sentences: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+               caption_sentences: List[Dict[str, Any]] | None = None,
+               slice_hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
     this function makes no panel decisions of its own - it only lays out,
@@ -1048,9 +2576,38 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     fmt = format_from(vcfg.get("format", "16:9"), int(vcfg.get("fps", 30)))
     by_id = {p["id"]: p for p in panels}
     st = settings or sync_mod.effective_settings(vcfg, log=lambda _msg: None)
+    _pf_mode = str(vcfg.get("mode") or "classic") == "panelfit"
+    _pcfg = vcfg.get("panelfit") or {}
+    # B1f landmark slice hints (cues.json "slice_hints", via
+    # slicehints.py): panel-fit mode only — the mode whose prep they
+    # extend. Normalised here so a malformed spec fails the plan loudly
+    # instead of slicing wrong; with no hints the expansion below is
+    # never called and the plan is exactly the pre-B1f plan.
+    _slice_hints: Dict[str, Any] = {}
+    if slice_hints:
+        from .slicehints import parse_slice_hints as _parse_slice_hints
+
+        _slice_hints, _sh_problems = _parse_slice_hints(slice_hints)
+        if _sh_problems:
+            raise UserError("slice_hints have problems (nothing was planned):\n  - "
+                            + "\n  - ".join(_sh_problems[:8]))
+        if not _pf_mode:
+            _slice_hints = {}
+
+    def _expand(units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not _slice_hints:
+            return units
+        from .slicehints import expand_units as _expand_units
+
+        return _expand_units(units, _slice_hints)
+    if _pf_mode:
+        # Panel-fit (measured reference) rhythm: the mode's own shot
+        # floor replaces the classic 3.0s hold floor everywhere the
+        # floor is consulted for this plan (hold groups, beat snaps).
+        st = {**st, "min_hold": float(_pcfg.get("min_shot", PF_MIN_SHOT))}
     timing = None
     if alignment_units is not None:
-        shots_units, timing = hold_groups(alignment_units, st["min_hold"], lead=st["lead"],
+        shots_units, timing = hold_groups(_expand(alignment_units), st["min_hold"], lead=st["lead"],
                                           max_late=st["max_late"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         # Carries the real whisper outcome through ("synced"/"estimated"/"even"),
@@ -1058,11 +2615,11 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         # "estimated" plan must keep working exactly as it did before this.
         mode = (alignment_meta or {}).get("sync_mode") or "aligned"
     elif sentences:
-        units = _pair_up(synced_units(panels, sentences, duration, vcfg), chapter,
+        units = _pair_up(_expand(synced_units(panels, sentences, duration, vcfg)), chapter,
                          float(vcfg.get("pair_ratio", 0.3)), by_id, timed=True)
         mode = "synced"
     else:
-        shots_units, timing = hold_groups(even_units(panels, duration, vcfg), st["min_hold"],
+        shots_units, timing = hold_groups(_expand(even_units(panels, duration, vcfg)), st["min_hold"],
                                           lead=st["lead"], max_late=st["max_late"])
         units = _pair_up(shots_units, chapter, float(vcfg.get("pair_ratio", 0.3)), by_id)
         mode = "even"
@@ -1071,11 +2628,19 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     units = split_system_window_units(units, by_id)
     designer = _Designer(chapter, panels, fmt, vcfg, image_for, fixes,
                          root=root, fingerprint=panels_data.get("fingerprint"))
-    shots = [designer.shot(i, u, i == len(units) - 1) for i, u in enumerate(units)]
+    shots = [designer.shot(i, u) for i, u in enumerate(units)]
     # P3 editor layer: split frozen >8s shots with a punch-in crop change,
     # then attach chapter cards + SFX. Callouts already ride on each shot.
     _pacing_before = pacing_qa(shots)
-    shots, _nsplit = split_long_shots(shots)
+    if _pf_mode:
+        # Measured rhythm: sentences longer than the mode's split
+        # threshold become two shots via the same split machinery
+        # (the second piece is the punch-in); pieces stay >= the
+        # mode's split_min_piece by construction (ceil halves).
+        shots, _nsplit = split_long_shots(
+            shots, max_hold=float(_pcfg.get("split_above", PF_SPLIT_ABOVE)))
+    else:
+        shots, _nsplit = split_long_shots(shots)
     # CapCut bugfix (defect 1d): a split must never leave two shots on the
     # same panel with the same crop -- the second shot is punched in.
     shots, _split_crop_changes = ensure_split_crop_change(shots)
@@ -1114,6 +2679,10 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     # per-shot captions gap during filler shots and show a sentence's
     # tail before its words are spoken.
     _captions_on = bool(vcfg.get("captions", True))
+    if _pf_mode and not bool(_pcfg.get("captions", PF_CAPTIONS)):
+        # Measured reference style: NO burned-in captions in this mode.
+        # The mode's pin wins over the generic video.captions switch.
+        _captions_on = False
     _captions = []
     if _captions_on:
         _sent = caption_sentences if caption_sentences is not None else sentences
@@ -1124,8 +2693,61 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         for _s in shots:
             _s["caption_bar"] = True  # dedicated bottom bar, below the cards
     sfx = plan_sfx(shots, chapter_cards)
+    _mode = str(vcfg.get("mode") or "classic")
+    _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [], "unusable": []}
+    _pf_report = {"static": [], "hold": [], "over_cap": [], "impact": [],
+                  "traverse": [], "duo": [], "zoom_out": [], "zoom_in": []}
+    _ff_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [],
+                "over_cap": [], "static": []}
+    if _mode == "wide":
+        _wide_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
+    elif _mode == "adaptive":
+        _wide_risk = _adaptive_pass(shots, designer, fmt, vcfg.get("adaptive") or {}, vcfg.get("wide") or {})
+    elif _mode == "panelfit":
+        _pf_report = _panelfit_pass(shots, designer, fmt, vcfg.get("panelfit") or {})
+    elif _mode == "fullframe":
+        _ff_risk = _fullframe_pass(shots, designer, fmt, vcfg.get("fullframe") or {})
+    _pf_title_cards: List[Dict[str, Any]] = []
+    if _mode == "panelfit":
+        # Title Card Generator: timeline-cue sentences become card
+        # shots. Windows come from the alignment segments (via
+        # caption_sentences) or, on the cues path, from `sentences`
+        # (ends derived from the next sentence's start).
+        _wins: List[Dict[str, Any]] = []
+        for _w in (caption_sentences if caption_sentences is not None else sentences) or []:
+            if isinstance(_w, dict) and _w.get("text") and _w.get("start") is not None:
+                _wins.append({"text": _w.get("text"), "start": float(_w["start"]),
+                              "end": (float(_w["end"]) if _w.get("end") is not None else None)})
+        _wins.sort(key=lambda w: w["start"])
+        for _i, _w in enumerate(_wins):
+            if _w["end"] is None:
+                _w["end"] = float(_wins[_i + 1]["start"]) if _i + 1 < len(_wins) else float(duration)
+        shots, _pf_title_cards = insert_title_cards(shots, _wins, vcfg.get("panelfit") or {})
+    # B1f: the slice ids actually placed (empty unless slice hints ran).
+    _slices_applied = [c["slice_id"] for s in shots for c in (s.get("cards") or [])
+                       if c.get("slice_id")]
     return {
         "version": PLAN_VERSION,
+        "mode": _mode,
+        "wide_caption_risk": _wide_risk["caption_risk"],
+        "wide_figure_risk": _wide_risk["figure_risk"],
+        "wide_reviewer_focal_ignored": _wide_risk["reviewer_focal_ignored"],
+        "wide_unusable": _wide_risk["unusable"],
+        "panelfit_static": _pf_report["static"],
+        "panelfit_hold": _pf_report["hold"],
+        "panelfit_over_cap": _pf_report["over_cap"],
+        "panelfit_impact": _pf_report["impact"],
+        "panelfit_traverse": _pf_report.get("traverse", []),
+        "panelfit_duo": _pf_report.get("duo", []),
+        "panelfit_zoom_out": _pf_report.get("zoom_out", []),
+        "panelfit_zoom_in": _pf_report.get("zoom_in", []),
+        "panelfit_slices": _slices_applied,
+        "panelfit_title_cards": _pf_title_cards,
+        "fullframe_caption_risk": _ff_risk["caption_risk"],
+        "fullframe_figure_risk": _ff_risk["figure_risk"],
+        "fullframe_reviewer_focal_ignored": _ff_risk["reviewer_focal_ignored"],
+        "fullframe_over_cap": _ff_risk["over_cap"],
+        "fullframe_static": _ff_risk["static"],
         "chapter": chapter,
         "format": vcfg.get("format", "16:9"),
         "fps": int(vcfg.get("fps", 30)),
@@ -1161,8 +2783,12 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                    "max_shot": pacing_qa(shots)["max_shot"],
                    # Rule 1: max shots = floor(audio_seconds / 3). More shots
                    # than this means the average shot is under the 3s floor.
-                   "max_shots": max(0, int(float(duration) // MIN_SHOT)),
-                   "min_shot": MIN_SHOT},
+                   # Panel-fit mode runs the measured reference rhythm
+                   # instead: cap = floor(audio_seconds / 1.0), floor = the
+                   # mode's own min_shot.
+                   "max_shots": max(0, int(float(duration) // (1.0 if _pf_mode else MIN_SHOT))),
+                   "min_shot": (float(_pcfg.get("min_shot", PF_MIN_SHOT))
+                                if _pf_mode else MIN_SHOT)},
         "split_crop_changes": _split_crop_changes,
         "motion_changes": _motion_changes,
         "diversity_changes": _diversity_changes,
@@ -1214,9 +2840,17 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
         if s.get("bg_panel") is not None and s["bg_panel"] not in panel_ids:
             errs.append(f"{where}: bg_panel '{s['bg_panel']}' doesn't exist")
         cards = s.get("cards")
-        if not isinstance(cards, list) or not cards:
+        if not isinstance(cards, list) or (not cards and not s.get("title_card")):
             errs.append(f"{where}: needs at least one card")
             cards = []
+        _tc_spec = s.get("title_card")
+        if _tc_spec is not None and not (
+                isinstance(_tc_spec, dict)
+                and isinstance(_tc_spec.get("label"), str)
+                and isinstance(_tc_spec.get("line"), str)
+                and isinstance(_tc_spec.get("number"), int)):
+            errs.append(f"{where}: title_card must be {{label: str, number: int, line: str}} "
+                        "(video/titlecards.py writes it; rebuild the plan with --force)")
         if s.get("layout") == "pair" and len(cards) < 2:
             errs.append(f"{where}: a pair layout needs two cards")
         for k, c in enumerate(cards):
@@ -1233,11 +2867,43 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     raise ValueError
             except (TypeError, ValueError):
                 errs.append(f"{cw}: crop must be [x0, y0, x1, y1] fractions of the panel, e.g. [0, 0.2, 1, 0.7]")
+            _slice = c.get("slice")
+            if _slice is not None:
+                # B1f: a landmark-slice card's band (panel-height
+                # fractions), written by the planner from cues.json
+                # "slice_hints" — never hand-edited like a crop.
+                try:
+                    _sf0, _sf1 = (float(v) for v in _slice)
+                    if not 0.0 <= _sf0 < _sf1 <= 1.0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errs.append(f"{cw}: slice must be [f0, f1] panel-height fractions with "
+                                f"0 <= f0 < f1 <= 1 (cues.json \"slice_hints\" writes it; "
+                                f"rebuild the plan with --force)")
             try:
                 if not 0.0 <= float(c.get("pad_y") or 0.0) <= PAD_LIMIT:
                     raise ValueError
             except (TypeError, ValueError):
                 errs.append(f"{cw}: pad_y (blurred padding above and below, in panel heights) must be 0 to {PAD_LIMIT:g}")
+            if c.get("viewport") is not None:
+                # Full-frame camera path: structural check only (the 16:9
+                # aspect itself needs the panel's pixel size -- QA in
+                # build.py checks that; here: boxes valid, from/to inside
+                # the window).
+                vp = c.get("viewport") or {}
+                try:
+                    boxes = {k: [float(v) for v in vp[k]] for k in ("window", "from", "to")}
+                    w = boxes["window"]
+                    ok = all(0 <= b[0] < b[2] <= 1 and 0 <= b[1] < b[3] <= 1 for b in boxes.values())
+                    for k in ("from", "to"):
+                        r = boxes[k]
+                        ok = ok and r[0] >= w[0] - FF_CONTAIN_TOL and r[1] >= w[1] - FF_CONTAIN_TOL \
+                            and r[2] <= w[2] + FF_CONTAIN_TOL and r[3] <= w[3] + FF_CONTAIN_TOL
+                    if not ok:
+                        raise ValueError
+                except (KeyError, TypeError, ValueError):
+                    errs.append(f"{cw}: viewport must be {{\"window\", \"from\", \"to\"}} panel-fraction boxes "
+                                f"with from/to inside the window (video.mode: fullframe)")
             if c.get("enter", "cut") not in ENTRANCES:
                 errs.append(f"{cw}: enter must be one of {', '.join(ENTRANCES)}")
             if c.get("motion", "push_in") not in MOTIONS:
@@ -1248,6 +2914,79 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     errs.append(f"{cw}: \"at\" ({at}s after the shot starts) must leave it on screen at least 0.2s")
             except (TypeError, ValueError):
                 errs.append(f"{cw}: \"at\" must be seconds after the shot starts")
+            _pf = c.get("panelfit")
+            if _pf is not None:
+                _pf_ok = (isinstance(_pf, dict)
+                          and _pf.get("kind") in ("zoom", "drift", "fill", "scroll", "traverse", "duo")
+                          and _pf.get("dir") in (("up", "down") if _pf.get("kind") in ("scroll", "drift", "traverse", "duo")
+                                                 else ("in", "out")))
+                if _pf_ok:
+                    try:
+                        _pf_ok = (float(_pf["base_w"]) > 0 and float(_pf["base_h"]) > 0
+                                  and float(_pf["zoom_end"]) > 0)
+                        if _pf.get("kind") in ("zoom", "fill"):
+                            if _pf.get("dir") == "out":
+                                # A per-sentence zoom-OUT (B1e E5): the rate
+                                # is stored signed (negative), the span
+                                # opens at zoom_start and settles at
+                                # zoom_end == 1.0.
+                                _pf_ok = _pf_ok and -PF_ZOOM_OUT_FAST_RATE - 1e-6 \
+                                    <= float(_pf["zoom_rate"]) < 0 \
+                                    and 1.0 - 1e-6 <= float(_pf["zoom_end"]) \
+                                    <= float(_pf["zoom_start"]) + 1e-6 \
+                                    and float(_pf["zoom_start"]) <= 1.0 + PF_ZOOM_MAX_TOTAL + 1e-6
+                            else:
+                                _pf_ok = _pf_ok and float(_pf["zoom_rate"]) > 0 \
+                                    and float(_pf["zoom_end"]) <= 1.0 + PF_ZOOM_MAX_TOTAL + 1e-6
+                                if "zoom_start" in _pf:  # a span slice (B1d): opens mid-zoom
+                                    _pf_ok = _pf_ok and 1.0 - 1e-6 <= float(_pf["zoom_start"]) \
+                                        <= float(_pf["zoom_end"]) + 1e-6
+                        if _pf.get("kind") == "traverse":
+                            # B1e E4: offsets in frame heights from the
+                            # top anchor — traverse_to <= traverse_from
+                            # <= 0, rate <= 0, and the start never sits
+                            # past the end.
+                            _pf_ok = _pf_ok and float(_pf["traverse_to"]) \
+                                <= float(_pf["traverse_from"]) <= 1e-6 \
+                                and float(_pf["traverse_rate"]) <= 1e-9 \
+                                and abs(float(_pf["traverse_to"])) <= 64.0
+                        if _pf.get("kind") == "duo":
+                            # B1e E3: cell + mode pinned; a slide duo
+                            # reuses the drift fields, a zoom-out duo
+                            # the signed zoom fields.
+                            _pf_ok = _pf_ok and _pf.get("cell") in ("left", "right") \
+                                and _pf.get("duo_mode") in ("slide", "zoom_out") \
+                                and _pf.get("dir") == ("up" if _pf.get("cell") == "left" else "down")
+                            if _pf.get("duo_mode") == "slide":
+                                _pf_ok = _pf_ok and abs(float(_pf["drift_frac"])) <= 0.25 \
+                                    and (float(_pf["drift_frac"]) <= 1e-9 if _pf.get("cell") == "left"
+                                         else float(_pf["drift_frac"]) >= -1e-9)
+                            else:
+                                _pf_ok = _pf_ok and float(_pf["zoom_rate"]) <= 0 \
+                                    and 1.0 - 1e-6 <= float(_pf["zoom_end"]) \
+                                    <= float(_pf.get("zoom_start", 1.0)) + 1e-6
+                        if _pf.get("kind") == "drift":
+                            # drift_frac is SIGNED (B1d span slices): its sign
+                            # must agree with dir, and a zero-travel slice is
+                            # only legal as a cap-hold carrying drift_from.
+                            _frac = float(_pf["drift_frac"])
+                            _pf_ok = _pf_ok and -0.25 <= _frac <= 0.25
+                            _pf_ok = _pf_ok and (_frac >= -1e-9 if _pf.get("dir") == "down"
+                                                 else _frac <= 1e-9)
+                            if "drift_from" in _pf:
+                                _pf_ok = _pf_ok and abs(float(_pf["drift_from"])) <= 0.25 \
+                                    and abs(float(_pf["drift_to"])) <= 0.25 \
+                                    and abs(float(_pf["drift_rate"])) <= 0.25 \
+                                    and (float(_pf["drift_rate"]) >= -1e-9 if _pf.get("dir") == "down"
+                                         else float(_pf["drift_rate"]) <= 1e-9)
+                            else:
+                                _pf_ok = _pf_ok and _frac != 0.0
+                    except (KeyError, TypeError, ValueError):
+                        _pf_ok = False
+                if not _pf_ok:
+                    errs.append(f"{cw}: panelfit spec must be {{kind: zoom|drift|fill|traverse|duo, dir, base_w, base_h, "
+                                "zoom_rate, zoom_end, drift_frac} "
+                                "(video.mode: panelfit writes it; rebuild the plan with --force)")
         from .editor import validate_callout as _validate_callout
         for _co in s.get("callouts") or []:
             for _err in _validate_callout(_co):

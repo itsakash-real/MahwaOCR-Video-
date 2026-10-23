@@ -36,6 +36,11 @@ python -m manhwa_ocr video hook --chapters 1-6 --audio audio/chapter_0.mp3 \
     --cues intro/intro.cues.json --session "Your Series Name"
 ```
 
+A cues sentence may pin its own panels — `"panels": ["ch2:P010-14"]`,
+1–3 refs — in which case auto-pick is skipped and exactly those panels
+are used (every sentence must pin, pins must be drawable and unique).
+See "Pin the panels yourself" in `PREVIOUSLY_GUIDE.md`.
+
 `video intro --auto` is the same auto build (same flags, same output).
 `video hook --dry-run` plans without rendering.
 

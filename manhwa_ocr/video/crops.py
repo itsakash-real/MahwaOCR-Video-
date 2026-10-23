@@ -121,6 +121,225 @@ def text_bands(img: Image.Image, limit: float = 0.45) -> Tuple[float, float]:
     return top / n, 1 - bottom / n
 
 
+def trim_blank_edges(img: Image.Image, box: Box, cap: float = 0.85) -> Box | None:
+    """Shave any blank/caption/bubble band off the TOP and BOTTOM of `box`
+    itself (not the whole panel), however large, so a final wide-mode window
+    never ships with a caption box or a dominant bubble riding its edge.
+
+    Unlike text_bands (which only trims the whole panel's own margins), this
+    works on an arbitrary already-chosen crop window: whatever growth or
+    containment clamp produced `box`, this re-validates and re-trims its
+    actual edges before the card is accepted. Cutting into a bubble/caption
+    is intentional here (the narrator already reads the dialogue aloud) --
+    only a genuinely unusable box (too little art would remain) returns None,
+    so the caller can drop/substitute the panel instead of showing it blank.
+    """
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    if bw <= 0 or bh <= 0:
+        return None
+    rgb = _small(img.crop((round(x0 * img.width), round(y0 * img.height),
+                          round(x1 * img.width), round(y1 * img.height))), 120)
+    soft, hard, flat_white = _art_maps(rgb)
+    texty = np.clip(flat_white + hard, 0, 1).mean(axis=1)
+    art = soft.mean(axis=1)
+    row = (texty > 0.45) & (texty > 2.0 * art)
+    row = np.convolve(row.astype(np.float32), np.ones(3) / 3, mode="same") > 0.5
+    n = len(row)
+    cap_rows = int(cap * n)
+
+    def run(seq) -> int:
+        end = 0
+        while end < min(cap_rows, len(seq)) and seq[end]:
+            end += 1
+        return end
+
+    top, bottom = run(row), run(row[::-1])
+    kept = slice(top, n - bottom) if n - bottom > top else slice(0, 0)
+    # Same blank bar the rest of the pipeline already trusts (verify.py's
+    # own soft < 0.02 "blank" criterion): a kept region can clear the
+    # row-count floor below and still be nothing but flat/decorative
+    # background with no real art in it.
+    if (n - top - bottom) < 0.30 * n or float(soft[kept].mean()) < 0.02:
+        return None   # too little art would remain: this box is unusable, not trimmable
+    if top == 0 and bottom == 0:
+        return box
+    return (x0, round(y0 + top / n * bh, 4), x1, round(y1 - bottom / n * bh, 4))
+
+
+def content_bands(img: Image.Image, axis: str = "y", threshold: float = 0.4,
+                  min_run_frac: float = 0.015,
+                  exclude: List[Tuple[float, float]] | None = None) -> List[Tuple[float, float]]:
+    """Bands dense with lettering or flat white -- speech bubbles, caption
+    boxes, SFX lettering, chat rows, UI banners -- as fractions of the
+    panel's height (axis="y") or width (axis="x").
+
+    Used by wide mode to keep a crop window's edge from landing in the
+    middle of one of these (see safe_span): a window edge is fine right
+    at a band's boundary, but splitting it mid-bubble/mid-line is the
+    defect wide mode must avoid.
+
+    This is a cheap row/column density scan, not a shape-aware bubble
+    detector (see bubble_regions for that): detailed white/pale-coloured
+    character art with crisp outline linework (a white dragon's scales,
+    say) can score just as "flat white + hard edges" as an actual bubble
+    or caption, flagging the character's OWN body as a band to avoid --
+    which then pushes a crop window AWAY from the character it was meant
+    to frame. `exclude` (panel fractions, same axis) drops any band that
+    mostly overlaps a region already known to be the subject -- pass the
+    detected figure's own range when calling this during figure framing.
+    """
+    rgb = _small(img, 160)
+    _, hard, flat_white = _art_maps(rgb)
+    texty = np.clip(flat_white + hard, 0, 1)
+    density = texty.mean(axis=1) if axis == "y" else texty.mean(axis=0)
+    n = len(density)
+    rows = density > threshold
+    min_run = max(1, int(min_run_frac * n))
+    bands: List[Tuple[float, float]] = []
+    i = 0
+    while i < n:
+        if rows[i]:
+            j = i
+            while j < n and rows[j]:
+                j += 1
+            if j - i >= min_run:
+                bands.append((i / n, j / n))
+            i = j
+        else:
+            i += 1
+    if exclude:
+        def _overlap_frac(b: Tuple[float, float]) -> float:
+            span = b[1] - b[0]
+            if span <= 1e-9:
+                return 0.0
+            covered = sum(max(0.0, min(b[1], e[1]) - max(b[0], e[0])) for e in exclude)
+            return covered / span
+        bands = [b for b in bands if _overlap_frac(b) < 0.5]
+    return bands
+
+
+def safe_span(extent: float, win: float, lo: float, hi: float,
+             bands: List[Tuple[float, float]], anchor: float) -> float:
+    """A start coordinate in [lo, hi] (same units as `extent`) for a window
+    of length `win` whose edges (p, p + win) land outside every band
+    (`bands`, fractions of `extent`), as close to `anchor` as possible.
+
+    Falls back to `anchor` (clamped into range) when no clean position
+    exists -- growing the window further would break the layout's fixed
+    aspect (pairs) or push it out of the panel.
+    """
+    lo = max(0.0, lo)
+    hi = min(extent - win, hi)
+    if hi < lo:
+        lo, hi = 0.0, max(0.0, extent - win)
+    anchor = max(lo, min(hi, anchor))
+
+    def clean(p: float) -> bool:
+        q = p + win
+        for b0, b1 in bands:
+            x0, x1 = b0 * extent, b1 * extent
+            if x0 + 1e-6 < p < x1 - 1e-6:
+                return False
+            if x0 + 1e-6 < q < x1 - 1e-6:
+                return False
+        return True
+
+    if clean(anchor):
+        return anchor
+    candidates = {lo, hi}
+    for b0, b1 in bands:
+        x0, x1 = b0 * extent, b1 * extent
+        candidates.update({x0, x1, x0 - win, x1 - win})
+    best = None
+    for c in candidates:
+        if lo - 1e-6 <= c <= hi + 1e-6:
+            c = max(lo, min(hi, c))
+            if clean(c):
+                d = abs(c - anchor)
+                if best is None or d < best[0]:
+                    best = (d, c)
+    return best[1] if best else anchor
+
+
+MAX_SPAN_FRAC = 0.75   # extend_figure_range never returns a span wider than this share of the panel
+
+
+def extend_figure_range(img: Image.Image, top: float, bottom: float,
+                        lo: float = 0.0, hi: float = 1.0,
+                        max_span: float | None = None) -> Tuple[float, float]:
+    """Grow a known figure range (e.g. a head's top/bottom from head_of)
+    outward while the panel keeps showing dense, non-text art -- the rest
+    of the body, wings, tail -- stopping at the first clearly empty or
+    text/background band. Small gaps (a thin neck, a gutter line) are
+    tolerated so the scan doesn't stop at the first dip.
+
+    This exists because a head/face detector only answers "where is the
+    head", not "where does the figure end" -- a focal crop or a classic
+    card can authentically overlook the rest of the body (wings, tail,
+    legs) even with a confident head. Wide mode's generous height budget
+    should include the whole figure where the panel allows it, not just
+    the head, so a full-body subject is never "totally cut off".
+
+    `max_span`, when given, overrides the default cap (MAX_SPAN_FRAC) with
+    the caller's own known legal budget (e.g. a narrow panel's window
+    height cap): callers that know exactly how much room they have should
+    pass it, so a budget that is itself under MAX_SPAN_FRAC still gets a
+    PARTIAL, figure-centred extension here instead of having to discard
+    the whole union when the generic default doesn't fit.
+    Returns (new_top, new_bottom), both widened or equal to the input.
+    """
+    rgb = _small(img, 160)
+    soft, hard, flat_white = _art_maps(rgb)
+    content = np.clip(soft + 0.6 * hard, 0, 1) * (1 - flat_white)
+    density = content.mean(axis=1)
+    n = len(density)
+    if n < 4:
+        return top, bottom
+    top = max(0.0, min(1.0, top))
+    bottom = max(top, min(1.0, bottom))
+    lo_i, hi_i = max(0, int(round(lo * n))), min(n, int(round(hi * n)))
+    span_h = max(1, int(round((bottom - top) * n)))
+    max_gap = max(3, span_h // 2)
+    thresh = 0.05
+
+    def extend(start: int, step: int, limit: int) -> int:
+        i, gap, last_good = start, 0, start
+        while lo_i <= i < hi_i and i != limit:
+            if density[i] > thresh:
+                last_good, gap = i, 0
+            else:
+                gap += step
+                if abs(gap) > max_gap:
+                    break
+            i += step
+        return last_good
+
+    new_top_i = extend(max(lo_i, int(round(top * n)) - 1), -1, lo_i - 1)
+    new_bottom_i = extend(min(hi_i - 1, int(round(bottom * n))), 1, hi_i)
+    new_top = min(top, new_top_i / n)
+    new_bottom = max(bottom, (new_bottom_i + 1) / n)
+    # A gently shaded/halftoned background can keep "content" density above
+    # the threshold almost everywhere, letting the scan run all the way to
+    # the panel's edges instead of stopping at the figure -- a runaway
+    # extension that swallows most of the panel is a worse crop than the
+    # un-extended head alone. Cap the total span at MAX_SPAN_FRAC of the
+    # panel, trimming back whichever side(s) grew (never the original
+    # input itself) so the caller always gets a bounded, usable result
+    # without needing its own guard against this case.
+    cap = MAX_SPAN_FRAC if max_span is None else max(0.0, max_span)
+    if (new_bottom - new_top) > cap:
+        budget = max(0.0, cap - (bottom - top))
+        grown_top, grown_bottom = top - new_top, new_bottom - bottom
+        grown_total = grown_top + grown_bottom
+        if grown_total > 1e-9:
+            new_top = top - budget * (grown_top / grown_total)
+            new_bottom = bottom + budget * (grown_bottom / grown_total)
+        else:
+            new_top, new_bottom = top, bottom
+    return max(lo, new_top), min(hi, new_bottom)
+
+
 def focal_crops(img: Image.Image, aspect: float, k: int = 3, zoom: float = 1.0,
                 trim_text: bool = True) -> List[Box]:
     """Up to k crop boxes of width/height `aspect`, best first.
