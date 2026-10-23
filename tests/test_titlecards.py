@@ -1,5 +1,7 @@
-"""Title Card Generator (video/titlecards.py + plan.insert_title_cards):
-timeline cues in the narration become split-flap cards, measured from
+"""Title Card Generator (video/titlecards.py + plan.title_card_overlays):
+timeline cues in the narration become split-flap card OVERLAYS drawn
+over the running shot (analysis fix 3 — the timeline and the master
+audio are never cut for a card), measured from
 the reference video — black field, serif label, two beige flap tiles
 (33% of frame height), one Anton ALL-CAPS line. Detection must
 reproduce the reference's three cards exactly and must NOT fire on
@@ -16,7 +18,7 @@ from manhwa_ocr.config import load_config
 from manhwa_ocr.video import plan as plan_mod
 from manhwa_ocr.video import syncaudit, titlecards
 from manhwa_ocr.video.frames import ShotRenderer, format_from
-from manhwa_ocr.video.plan import build_plan, insert_title_cards, validate
+from manhwa_ocr.video.plan import build_plan, title_card_overlays, validate
 from manhwa_ocr.video.titlecards import card_duration, detect_title_cue, render_title_card
 
 FMT = format_from("16:9", 30)
@@ -126,58 +128,56 @@ def test_renderer_draws_a_title_card_shot():
     assert np.array_equal(a, r.frame_array(1.5))     # a card never moves
 
 
-# --------------------------------------------------------------- plan insertion
+# --------------------------------------------------------------- plan overlays
 
-def _shot(i, start, end, pid="P001-01"):
-    return {"id": f"S{i:03d}", "start": float(start), "end": float(end),
-            "layout": "single", "background": "blur", "exit": "cut",
-            "transition": "cut", "effects": [], "callouts": [],
-            "cards": [{"panel": pid, "crop": [0, 0, 1, 1], "enter": "cut",
-                       "at": 0.0, "motion": "push_in"}],
-            "sentence": None, "panelfit": True, "caption_bar": False}
-
-
-def _tiles(shots):
-    return [(float(s["start"]), float(s["end"])) for s in shots]
-
-
-def test_insert_card_consumes_the_following_shots_head():
-    shots = [_shot(1, 0, 6), _shot(2, 6, 12)]
+def test_overlay_fires_at_the_cue_sentence_start():
+    # Analysis fix 3: the card is an overlay at the cue's own start —
+    # no shot is consumed, split or shifted for it.
     wins = [{"text": "Age 4. Week 6 of possession.", "start": 6.0, "end": 7.5}]
-    out, report = insert_title_cards(shots, wins, {})
-    assert _tiles(out) == [(0.0, 6.0), (6.0, 7.5), (7.5, 12.0)]   # clamp(1.5) = 1.5s card
-    card = out[1]
-    assert card["title_card"] == {"label": "Age", "number": 4, "line": "WEEK 6 OF POSSESSION."}
-    assert card["cards"] == [] and card["id"] == "S002"
-    assert report == [{"id": "S002", "at": 6.0, "duration": 1.5, "label": "Age",
-                        "number": 4, "line": "WEEK 6 OF POSSESSION."}]
+    out = title_card_overlays(wins, {})
+    assert out == [{"at": 6.0, "duration": 1.5, "label": "Age", "number": 4,
+                    "line": "WEEK 6 OF POSSESSION.",
+                    "sentence": "Age 4. Week 6 of possession."}]
 
 
-def test_insert_card_long_cue_clamps_to_the_measured_max():
-    shots = [_shot(1, 0, 6), _shot(2, 6, 14)]
+def test_overlay_long_cue_clamps_to_the_measured_max():
     wins = [{"text": "Age 8. Year 4 of possession.", "start": 6.0, "end": 11.0}]
-    out, report = insert_title_cards(shots, wins, {})
-    assert _tiles(out) == [(0.0, 6.0), (6.0, 8.1), (8.1, 14.0)]
-    assert report[0]["duration"] == 2.1
+    out = title_card_overlays(wins, {})
+    assert out[0]["at"] == 6.0 and out[0]["duration"] == 2.1
 
 
-def test_insert_merges_an_age_fragment_with_the_next_cue():
-    shots = [_shot(1, 0, 20), _shot(2, 20, 30)]
+def test_overlay_merges_an_age_fragment_with_the_next_cue():
     wins = [{"text": "Age 4.", "start": 20.0, "end": 20.8},
             {"text": "Week 6 of possession.", "start": 20.9, "end": 22.0}]
-    out, report = insert_title_cards(shots, wins, {})
-    cards = [s for s in out if s.get("title_card")]
-    assert len(cards) == 1 and cards[0]["title_card"]["line"] == "WEEK 6 OF POSSESSION."
-    assert (float(cards[0]["start"]), float(cards[0]["end"])) == (20.0, 22.0)
+    out = title_card_overlays(wins, {})
+    assert len(out) == 1
+    assert out[0]["line"] == "WEEK 6 OF POSSESSION."
+    assert out[0]["at"] == 20.0 and out[0]["duration"] == 2.0   # span 20.0-22.0
 
 
-def test_insert_no_cues_leaves_the_plan_untouched():
-    shots = [_shot(1, 0, 6), _shot(2, 6, 12)]
+def test_overlay_no_cues_or_disabled_means_no_overlays():
     wins = [{"text": "He trained for 4 weeks.", "start": 6.0, "end": 8.0}]
-    out, report = insert_title_cards(shots, wins, {})
-    assert out == shots and report == []
-    out2, report2 = insert_title_cards(shots, wins, {"title_cards": False})
-    assert out2 == shots and report2 == []
+    assert title_card_overlays(wins, {}) == []
+    assert title_card_overlays(wins, {"title_cards": False}) == []
+    assert title_card_overlays([], {}) == []
+
+
+def test_renderer_draws_an_overlay_over_the_running_shot():
+    shot = {"id": "S001", "start": 0.0, "end": 5.0, "layout": "single",
+            "background": "blur", "effects": [], "callouts": [],
+            "cards": [{"panel": "P1", "crop": [0, 0, 1, 1], "enter": "cut",
+                       "at": 0.0, "motion": "push_in"}]}
+    img = Image.new("RGB", (900, 1200), (120, 90, 70))
+    overlays = [{"at": 1.0, "duration": 2.0, "label": "Age", "number": 4,
+                 "line": "WEEK 6 OF POSSESSION."}]
+    r = ShotRenderer(shot, {"P1": img}, FMT, title_overlays=overlays)
+    before = r.frame_array(0.5)
+    assert before.mean() > 5                       # the panel shot, not a card
+    during = r.frame_array(1.5)
+    assert tuple(during[0, 0]) == (0, 0, 0)        # the card's black field
+    assert not np.array_equal(before, during)
+    after = r.frame_array(4.0)
+    assert after.mean() > 5                        # the shot resumes underneath
 
 
 # --------------------------------------------------------------- build + validate + audit
@@ -194,7 +194,7 @@ PANELS = [{"id": "P001-01", "width": 900, "height": 1200, "text": ""},
           {"id": "P001-02", "width": 900, "height": 1000, "text": ""}]
 
 
-def test_build_plan_with_a_cue_sentence_gets_a_card_shot():
+def test_build_plan_with_a_cue_sentence_gets_a_card_overlay():
     vcfg = {**VCFG, "mode": "panelfit"}
     sentences = [
         {"start": 0.0, "text": "He was a nameless servant.", "panels": ["P001-01"],
@@ -207,14 +207,16 @@ def test_build_plan_with_a_cue_sentence_gets_a_card_shot():
     plan = build_plan(chapter="1", panels_data={"panels": PANELS, "fingerprint": "tc"},
                       duration=9.5, audio=None, vcfg=vcfg, image_for=_img_for,
                       sentences=sentences)
-    cards = [s for s in plan["shots"] if s.get("title_card")]
-    assert len(cards) == 1
-    # clamp(1.5) = 1.5s; the start snaps to the cue shot's own start
-    # (shots open `lead` — 0.15s — before their sentence).
-    assert cards[0]["start"] == pytest.approx(3.85, abs=0.01)
-    assert cards[0]["end"] - cards[0]["start"] == pytest.approx(1.5)
-    assert cards[0]["title_card"]["line"] == "WEEK 6 OF POSSESSION."
-    assert plan["panelfit_title_cards"][0]["id"] == cards[0]["id"]
+    # Analysis fix 3: NO card shot exists — the cue is a plan-level
+    # overlay at the sentence's own start, and the shots are exactly
+    # the ones the pass planned (nothing consumed or split).
+    assert not any(s.get("title_card") for s in plan["shots"])
+    overlays = plan["title_card_overlays"]
+    assert len(overlays) == 1
+    assert overlays[0]["at"] == pytest.approx(4.0)
+    assert overlays[0]["duration"] == pytest.approx(1.5)   # clamp(5.5 - 4.0)
+    assert overlays[0]["line"] == "WEEK 6 OF POSSESSION."
+    assert plan["panelfit_title_cards"] == overlays        # QA reads the same list
     # The plan still tiles the whole duration, back to back.
     spans = [(float(s["start"]), float(s["end"])) for s in plan["shots"]]
     assert spans[0][0] == 0.0 and spans[-1][1] == 9.5
@@ -230,6 +232,19 @@ def test_validate_rejects_a_malformed_title_card():
         "chapter_cards": [], "sfx": [], "captions": []}
     errs = validate(plan, {"P001-01"})
     assert any("title_card" in e for e in errs)
+
+
+def test_validate_rejects_a_malformed_title_card_overlay():
+    plan = {"version": plan_mod.PLAN_VERSION, "duration": 6.0, "shots": [
+        {"id": "S001", "start": 0.0, "end": 6.0, "layout": "single", "background": "blur",
+         "exit": "cut", "transition": "cut", "effects": [], "callouts": [],
+         "cards": [{"panel": "P001-01", "crop": [0, 0, 1, 1], "enter": "cut",
+                    "at": 0.0, "motion": "push_in"}]}],
+        "chapter_cards": [], "sfx": [], "captions": [],
+        "title_card_overlays": [{"at": 2.0, "duration": 9.0, "label": "Age",
+                                 "number": "four", "line": "WEEK 6."}]}
+    errs = validate(plan, {"P001-01"})
+    assert any("title_card_overlays" in e for e in errs)
 
 
 def test_audit_counts_card_time_as_covering_its_cue():
@@ -248,17 +263,19 @@ def test_audit_counts_card_time_as_covering_its_cue():
         {"id": "S001", "start": 0.0, "end": 2.0, "layout": "single", "background": "blur",
          "cards": [{"panel": "P1", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0.0,
                     "motion": "push_in"}]},
-        {"id": "S002", "start": 2.0, "end": 4.0, "layout": "single", "background": "black",
-         "cards": [], "title_card": {"label": "Age", "number": 4,
-                                     "line": "WEEK 6 OF POSSESSION."}},
+        {"id": "S002", "start": 2.0, "end": 4.0, "layout": "single", "background": "blur",
+         "cards": [{"panel": "P2", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0.0,
+                    "motion": "push_in"}]},
         {"id": "S003", "start": 4.0, "end": 6.0, "layout": "single", "background": "blur",
          "cards": [{"panel": "P2", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0.0,
                     "motion": "push_in"}]},
     ]
-    plan = {"chapter": "1", "duration": 6.0, "mode": "panelfit", "shots": shots}
+    plan = {"chapter": "1", "duration": 6.0, "mode": "panelfit", "shots": shots,
+            "title_card_overlays": [{"at": 2.0, "duration": 2.0, "label": "Age",
+                                     "number": 4, "line": "WEEK 6 OF POSSESSION."}]}
     rep = syncaudit.audit(plan, {"segments": segs}, [])
-    # The cue sentence is fully "covered" by its card, and the next
-    # sentence's panel arriving at the card's end is not a late cut.
+    # The cue sentence is fully "covered" by its card overlay, and the
+    # next sentence opening under the overlay's tail is not a late cut.
     cov = {c["sentence"]: c for c in rep["tagged_coverage"]}
     assert cov[2]["coverage"] == 1.0 and cov[2]["pass"] is True
     assert rep["late_cuts"] == []

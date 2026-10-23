@@ -840,6 +840,13 @@ def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) ->
 
 PFR_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
 PFR_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+# Foreground drop shadow (analysis fix 4 — the user's numbers, 2026-10-23):
+# solid black under the sharp foreground, Y-offset 20px, blur 10px, 40%
+# opacity (all at 1080p). This — never a dimmed background — is what
+# separates the foreground's edges from the full-brightness blur.
+PFR_SHADOW_DY = 20          # shadow Y offset, px at 1080p
+PFR_SHADOW_BLUR = 10        # shadow blur radius, px at 1080p
+PFR_SHADOW_OPACITY = 0.40   # shadow opacity
 
 
 class PanelFitView:
@@ -933,6 +940,26 @@ class PanelFitView:
         src = panel if (fw, fh) == (pw, ph) else panel.resize((fw, fh), Image.LANCZOS)
         self.src = src.convert("RGBA")
         self.src_w, self.src_h = self.src.size
+        # Foreground drop shadow (analysis fix 4): built once from the
+        # foreground source — solid black, the source's alpha scaled to
+        # PFR_SHADOW_OPACITY, pre-blurred in source space (the display
+        # blur divided by the display/source scale), so each frame it
+        # costs one affine transform, exactly like the foreground.
+        # Composited in frame() BETWEEN the full-brightness background
+        # and the sharp foreground. On height-covering views it lands
+        # off-frame (invisible); on a wide "fill" panel floating over
+        # its blur it is the dark line under the panel's bottom edge.
+        self.shadow_src: Image.Image | None = None
+        if PFR_SHADOW_OPACITY > 0:
+            _sh = Image.new("RGBA", self.src.size, (0, 0, 0, 0))
+            _sh.putalpha(self.src.getchannel("A").point(
+                lambda v: int(v * PFR_SHADOW_OPACITY)))
+            _radius = PFR_SHADOW_BLUR * (fmt.height / 1080.0) \
+                * (self.src_w / max(1.0, self.base_w))
+            if _radius >= 0.5:
+                _sh = _sh.filter(ImageFilter.GaussianBlur(_radius))
+            self.shadow_src = _sh
+        self.shadow_dy = PFR_SHADOW_DY * fmt.height / 1080.0
 
     def visible(self, t: float) -> bool:
         return t >= self.appear - self.tol
@@ -984,6 +1011,14 @@ class PanelFitView:
             dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0
         a = self.src_w / max(1.0, disp_w)
         e = self.src_h / max(1.0, disp_h)
+        if self.shadow_src is not None:
+            # The drop shadow rides the same affine as the foreground,
+            # offset PFR_SHADOW_DY further down (analysis fix 4).
+            shadow = self.shadow_src.transform((W, H), Image.AFFINE,
+                                               (a, 0.0, -dx * a, 0.0, e,
+                                                -(dy + self.shadow_dy) * e),
+                                               resample=Image.BILINEAR, fill=0)
+            img = Image.alpha_composite(img, shadow)
         layer = self.src.transform((W, H), Image.AFFINE,
                                    (a, 0.0, -dx * a, 0.0, e, -dy * e),
                                    resample=Image.BILINEAR, fill=0)
@@ -1000,6 +1035,20 @@ class PanelFitView:
 # ------------------------------------------------------------------ shot
 
 
+def _pf_slice_image(img: Image.Image, card: Dict[str, Any]) -> Image.Image:
+    """The panel band a gutter-segment card shows (analysis fix 1):
+    the panel image cropped to the card's `slice` height fractions.
+    Cards without a slice show the whole panel, exactly as before."""
+    sl = card.get("slice")
+    if isinstance(sl, (list, tuple)) and len(sl) == 2:
+        h = img.height
+        y0 = int(round(float(sl[0]) * h))
+        y1 = int(round(float(sl[1]) * h))
+        if 0 <= y0 < y1 <= h and (y0, y1) != (0, h):
+            return img.crop((0, y0, img.width, y1))
+    return img
+
+
 def _mix(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
     """(1-k)*a + k*b in integer math; far faster than float on 1080p frames."""
     w = int(round(max(0.0, min(1.0, k)) * 256))
@@ -1011,7 +1060,8 @@ class ShotRenderer:
 
     def __init__(self, shot: Dict[str, Any], images: Dict[str, Image.Image], fmt: Format,
                  effects_on: Dict[str, bool] | None = None, video_end: float | None = None,
-                 end_fade: bool = False, chapter_cards: List[Dict[str, Any]] | None = None):
+                 end_fade: bool = False, chapter_cards: List[Dict[str, Any]] | None = None,
+                 title_overlays: List[Dict[str, Any]] | None = None):
         # P3: shot-level callouts ride on the shot dict; plan-level chapter
         # cards are passed in (render.py) so a clip can shift them with the shot.
         self.caption_bar = bool(shot.get("caption_bar"))
@@ -1059,7 +1109,8 @@ class ShotRenderer:
         if shot.get("panelfit") and fmt.width > fmt.height and cards:
             _specs = [c.get("panelfit") for c in cards]
             if all(isinstance(_sp, dict) for _sp in _specs):
-                self.pf_views = [PanelFitView(images[c["panel"]], _sp, c, self.start, self.end, fmt)
+                self.pf_views = [PanelFitView(_pf_slice_image(images[c["panel"]], c), _sp, c,
+                                              self.start, self.end, fmt)
                                  for c, _sp in zip(cards, _specs)]
         # Title-card shots (Title Card Generator): no panels at all --
         # the whole shot is the split-flap card, drawn once here.
@@ -1071,6 +1122,24 @@ class ShotRenderer:
                                              str(_tc_spec.get("label") or ""),
                                              int(_tc_spec.get("number") or 0),
                                              str(_tc_spec.get("line") or ""))
+        # Title-card OVERLAYS (analysis fix 3): plan-level timed cards
+        # passed in like chapter cards (render.py shifts them into clip
+        # time). While an overlay covers t, frame_array returns the
+        # card INSTEAD of the running shot — the shot's own timing,
+        # motion phase and the master audio are never touched.
+        self.title_overlays: List[Tuple[float, float, Image.Image]] = []
+        for _ov in title_overlays or []:
+            if not isinstance(_ov, dict):
+                continue
+            try:
+                _oa, _od = float(_ov["at"]), float(_ov["duration"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if _oa < self.end and _oa + _od > self.start:
+                from .titlecards import render_title_card as _render_tco
+                self.title_overlays.append((_oa, _oa + _od, _render_tco(
+                    fmt.width, fmt.height, str(_ov.get("label") or ""),
+                    int(_ov.get("number") or 0), str(_ov.get("line") or ""))))
 
         bg_kind = shot.get("background") if shot.get("background") in BACKGROUNDS else "blur"
         bg_panel = shot.get("bg_panel") if shot.get("bg_panel") in images else (cards[0]["panel"] if cards else None)
@@ -1126,6 +1195,9 @@ class ShotRenderer:
             self._can_freeze = all(v.is_static() for v in self.views)
         else:
             self._can_freeze = all(c.motion == "hold" for c in self.cards) and not self.pf_views
+        if self.title_overlays:
+            # An overlay changes the picture mid-shot: never freeze.
+            self._can_freeze = False
         self._static: np.ndarray | None = None
 
     def is_static(self, t: float) -> bool:
@@ -1169,6 +1241,9 @@ class ShotRenderer:
             return self._static
         if self.title_card_img is not None:
             return self._title_frame_array(t)
+        for _oa, _ob, _oimg in self.title_overlays:
+            if _oa <= t < _ob:
+                return self._overlay_frame_array(_oimg, t)
         if self.pf_views:
             return self._pf_frame_array(t)
         extra = punch_amount(t, self.punches)
@@ -1254,6 +1329,16 @@ class ShotRenderer:
 
     def _title_frame_array(self, t: float) -> np.ndarray:
         out = np.asarray(self.title_card_img, dtype=np.uint8)
+        if self.fade_from is not None and t > self.fade_from:
+            span = max(1e-3, self.end - self.fade_from)
+            out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
+        return out
+
+    def _overlay_frame_array(self, img: Image.Image, t: float) -> np.ndarray:
+        """A title-card overlay frame (analysis fix 3): the card full
+        screen over the running shot, with the same end-fade handling
+        as a legacy card shot."""
+        out = np.asarray(img, dtype=np.uint8)
         if self.fade_from is not None and t > self.fade_from:
             span = max(1e-3, self.end - self.fade_from)
             out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))

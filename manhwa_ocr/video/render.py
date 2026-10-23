@@ -83,7 +83,8 @@ def render_segment(job: Dict[str, Any]) -> str:
               for pid, p in job["panels"].items()}
     shot = ShotRenderer(job["shot"], images, fmt, job["effects_on"],
                         video_end=job["video_end"], end_fade=job["end_fade"],
-                        chapter_cards=job.get("chapter_cards") or [])
+                        chapter_cards=job.get("chapter_cards") or [],
+                        title_overlays=job.get("title_overlays") or [])
 
     out = Path(job["out"])
     tmp = out.with_name(out.stem + ".part.mp4")
@@ -150,6 +151,7 @@ def _jobs(root: Path, chapter: str, plan: Dict[str, Any], panels_data: Dict[str,
             "panels": {pid: panels[pid] for pid in dict.fromkeys(used) if pid in panels},
             "shot": shot, "fmt": (fmt.width, fmt.height, fmt.fps), "f0": f0, "f1": f1,
             "chapter_cards": list(plan.get("chapter_cards") or []),
+            "title_overlays": list(plan.get("title_card_overlays") or []),
             "video_end": duration if last else None, "end_fade": end_fade and last,
             "effects_on": effects_on, "crf": crf, "preset": preset, "page_stamp": page_stamp,
         }

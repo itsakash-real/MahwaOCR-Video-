@@ -1408,7 +1408,7 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
 #     minimum) and sentences over PF_SPLIT_ABOVE split in two (the
 #     reference's median shot is 1.97s).
 #   * Timeline cues in the narration become split-flap TITLE CARDS
-#     (titlecards.py + insert_title_cards below).
+#     (titlecards.py + title_card_overlays below).
 # Every parameter is a named constant, pinned to the config defaults
 # (video.panelfit.*) and to the renderer's mirrors (frames.PFR_*) by
 # tests; the values must never live only in an agent's head.
@@ -1452,6 +1452,14 @@ PF_SPLIT_ABOVE = 3.0       # sentences longer than this split into two shots
 PF_SPLIT_MIN_PIECE = 1.2   # smallest piece such a split may produce
 PF_CAPTIONS = False        # no burned-in captions in this mode (measured: none)
 PF_TITLE_CARDS = True      # timeline cues become split-flap title cards
+# Analysis fixes (user's second-by-second analysis, 2026-10-23):
+PF_SHADOW_DY = 20          # foreground drop shadow: Y offset, px at 1080p
+PF_SHADOW_BLUR = 10        # ... blur radius, px at 1080p
+PF_SHADOW_OPACITY = 0.40   # ... black at 40%; contrast comes from this
+                           # shadow — the background is NEVER dimmed
+PF_GUTTER_SEGMENTS = True  # shots split at their panel's gutter segments
+                           # (analysis fix 1; segments recorded at panel
+                           # build as panels.gutter_segments)
 PF_TTS_GAP = 0.11          # the mode's recommended tts.gap_seconds. MEASURED basis
                            # (B1d F4): the 0.20 setting rendered as 0.296s median
                            # silence in the B1c sample — per-sentence TTS edge
@@ -1652,7 +1660,8 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     smaller — an honest quality note, never a stretch), and the impact
     report (which shots earned the fast zoom rate, and by which rule).
     """
-    report: Dict[str, Any] = {"static": [], "hold": [], "over_cap": [], "impact": []}
+    report: Dict[str, Any] = {"static": [], "hold": [], "over_cap": [], "impact": [],
+                              "segments": []}
     if fmt.width <= fmt.height:
         return report
     pcfg = pcfg or {}
@@ -1667,13 +1676,78 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
             s["layout"] = "single"
             cards = cards[:1]
         s["cards"] = cards
+    # Analysis fix 1 (the user's "double panel" fix): a single-card
+    # shot whose panel holds stacked images across an interior gutter
+    # (panels.gutter_segments, recorded at panel build under trim_v2)
+    # splits into one sub-shot per segment, sequenced inside the shot's
+    # own time — feather first, then the "BUT..." panel; the detonator
+    # press, then the explosion. Pieces divide the shot's duration in
+    # proportion to their heights, never below the mode's PF_MIN_SHOT
+    # floor (the shortfall is borrowed from the largest piece); a shot
+    # too short to give every segment its floor stays whole. Pair
+    # shots are untouched: their two cards are already separate
+    # assets. Ids are renumbered afterwards (the title-card pass used
+    # to renumber too; everything downstream reads the final ids).
+    if bool(pcfg.get("gutter_segments", PF_GUTTER_SEGMENTS)):
+        expanded: List[Dict[str, Any]] = []
+        for s in shots:
+            cards = s.get("cards") or []
+            segs: List[Tuple[float, float]] = []
+            if s.get("layout") == "single" and len(cards) == 1:
+                p = designer.by_id.get(cards[0].get("panel")) or {}
+                for g in p.get("gutter_segments") or []:
+                    if isinstance(g, (list, tuple)) and len(g) == 2 \
+                            and float(g[1]) > float(g[0]):
+                        segs.append((float(g[0]), float(g[1])))
+            dur = float(s.get("end") or 0) - float(s.get("start") or 0)
+            if len(segs) < 2 or dur < len(segs) * PF_MIN_SHOT:
+                expanded.append(s)
+                continue
+            heights = [b - a for a, b in segs]
+            total_h = sum(heights) or 1.0
+            spans = [dur * h / total_h for h in heights]
+            for _ in range(len(spans)):
+                small = [i for i, v in enumerate(spans) if v < PF_MIN_SHOT - 1e-9]
+                if not small:
+                    break
+                big = max(range(len(spans)), key=lambda i: spans[i])
+                need = PF_MIN_SHOT - spans[small[0]]
+                if big == small[0] or spans[big] - need < PF_MIN_SHOT:
+                    break
+                spans[big] -= need
+                spans[small[0]] = PF_MIN_SHOT
+            t = float(s.get("start") or 0)
+            for i, ((f0, f1), piece) in enumerate(zip(segs, spans)):
+                ns = dict(s)
+                ns["start"] = round(t, 3)
+                ns["end"] = round(t + piece, 3) if i < len(segs) - 1 else s["end"]
+                card = dict(cards[0])
+                card["slice"] = [round(f0, 4), round(f1, 4)]
+                card["at"] = 0.0
+                ns["cards"] = [card]
+                lo, hi = float(ns["start"]), float(ns["end"])
+                ns["effects"] = [e for e in (s.get("effects") or [])
+                                 if lo - 1e-9 <= float(e.get("t") or 0) < hi + 1e-9]
+                ns["callouts"] = [c for c in (s.get("callouts") or [])
+                                  if lo - 1e-9 <= float(c.get("t") or 0) < hi + 1e-9]
+                expanded.append(ns)
+                t = float(ns["end"])
+            pid = cards[0].get("panel")
+            if pid and pid not in report["segments"]:
+                report["segments"].append(pid)
+        shots[:] = expanded
+        for idx, s in enumerate(shots):
+            s["id"] = f"S{idx + 1:03d}"
     # Group the split pieces: same sentence text AND same panel list,
     # back to back. Shots without a sentence (fillers) never group.
+    # A gutter segment is part of the key: two sub-shots of one panel
+    # showing DIFFERENT segments are different pictures, never one span.
     grouped: List[Tuple[Any, List[Dict[str, Any]]]] = []
     for s in shots:
         text = str(s.get("sentence") or "")
-        panels = tuple(c.get("panel") for c in (s.get("cards") or []))
-        key = (text, panels) if text and panels and all(panels) else None
+        panels = tuple((c.get("panel"), tuple(c.get("slice") or ()))
+                       for c in (s.get("cards") or []))
+        key = (text, panels) if text and panels and all(p for p, _sl in panels) else None
         if key is not None and grouped and grouped[-1][0] == key:
             grouped[-1][1].append(s)
         else:
@@ -1695,6 +1769,12 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                 pid = c.get("panel")
                 p = designer.by_id.get(pid) or {}
                 pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+                _sl = c.get("slice")
+                if isinstance(_sl, (list, tuple)) and len(_sl) == 2 and ph > 0:
+                    # A gutter segment (analysis fix 1): the card shows
+                    # only this band of the panel, so it fits and moves
+                    # as a panel of the segment's own height.
+                    ph = ph * (float(_sl[1]) - float(_sl[0]))
                 if pw > 0 and ph > 0:
                     kind = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg)[0]
                     direction = None
@@ -1750,37 +1830,36 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     return report
 
 
-def _card_shot(cue: Dict[str, Any], start: float, end: float, sentence: str) -> Dict[str, Any]:
-    """One title-card shot: no panels, just the cue it covers."""
-    return {"id": "CARD", "start": round(start, 3), "end": round(end, 3),
-            "layout": "single", "background": "black", "cards": [],
-            "exit": "cut", "transition": "cut", "effects": [], "callouts": [],
-            "sentence": sentence[:300] or None,
-            "panelfit": True, "caption_bar": False,
-            "title_card": {"label": cue["label"], "number": int(cue["number"]),
-                           "line": cue["line"]}}
+def title_card_overlays(windows: List[Dict[str, Any]] | None,
+                        pcfg: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    """Timeline-cue sentences -> title-card OVERLAYS (analysis fix 3).
 
+    The user's rule (2026-10-23): a title card is a visual overlay
+    triggered at its cue — never a hole cut into the timeline. The old
+    behaviour REPLACED the shots under the cue: it consumed plan time,
+    split the straddling shot, and froze the picture's motion for the
+    card's whole span. Now the shots — and with them every shot's
+    timing and motion phase — are left exactly as planned, and each
+    cue yields one overlay {"at", "duration", "label", "number",
+    "line", "sentence"}: the renderer draws the split-flap card OVER
+    whatever shot is running at `at`, and the master audio (muxed
+    whole at render, never per-shot) plays straight through
+    underneath — it is never paused, split or muted for a card.
 
-def insert_title_cards(shots: List[Dict[str, Any]], windows: List[Dict[str, Any]] | None,
-                       pcfg: Dict[str, Any] | None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Turn timeline-cue sentences into split-flap title-card shots.
-
-    `windows` are the narration sentences ({text, start, end}). A cue
-    sentence (titlecards.detect_title_cue) is replaced on screen by a
-    card that starts at the sentence's aligned start and lasts
-    clamp(cue span, 1.4, 2.1)s; the card CONSUMES whatever plan time it
-    overlaps — the overlapped shot is split/truncated around it, and a
-    remainder under 0.2s is absorbed into the card (its duration then
-    exceeds the clamp by that sliver, the honest price of back-to-back
-    shots). An Age fragment ("Age 4.") merges with a directly
-    following unit cue ("Week 6 of possession.") into one card whose
-    span covers both sentences. Returns (shots, report); shot ids are
-    renumbered (S001...) only when a card was actually inserted.
+    `at` is the cue sentence's aligned start: every cue shape the
+    detector accepts OPENS its sentence ("Age 4...", "Three years
+    later...", "Week 6 of..."), so the sentence start is the cue
+    word's whisper timestamp (the alignment carries sentence-level
+    timings only). An Age fragment ("Age 4.") merges with a directly
+    following unit cue ("Week 6 of possession.") into one overlay
+    whose span covers both sentences, exactly as the reference's
+    narration pairs them; the on-screen duration is that span clamped
+    to the measured [1.4, 2.1]s window.
     """
     from . import titlecards as _tc
     pcfg = pcfg or {}
     if not bool(pcfg.get("title_cards", PF_TITLE_CARDS)) or not windows:
-        return shots, []
+        return []
     wins = sorted((w for w in windows
                    if isinstance(w, dict) and w.get("text") and w.get("end") is not None),
                   key=lambda w: float(w.get("start") or 0.0))
@@ -1801,76 +1880,10 @@ def insert_title_cards(shots: List[Dict[str, Any]], windows: List[Dict[str, Any]
             cues.append((float(w.get("start") or 0.0), float(w["end"]), cue,
                          str(w.get("text"))))
         i += 1
-    if not cues:
-        return shots, []
-    out = [dict(s) for s in shots]
-    report: List[Dict[str, Any]] = []
-    for cs, ce, cue, text in cues:
-        dur = _tc.card_duration(ce - cs)
-        card_start, card_end = float(cs), float(cs) + dur
-        # A shot straddling the cue start by less than a visible sliver
-        # lends its start to the card (the card still opens on the cue).
-        for s in out:
-            if float(s["start"]) < card_start < float(s["end"]) and card_start - float(s["start"]) < 0.2:
-                card_start = float(s["start"])
-                card_end = card_start + dur
-                break
-        if out:
-            card_end = min(card_end, max(float(s["end"]) for s in out))
-        new: List[Dict[str, Any]] = []
-        placed = False
-        for s in out:
-            a, b = float(s["start"]), float(s["end"])
-            if b <= card_start + 1e-9 or a >= card_end - 1e-9:
-                new.append(s)
-                continue
-            if not placed and a >= card_start - 1e-9:
-                new.append(_card_shot(cue, card_start, card_end, text))
-                placed = True
-            if a < card_start - 1e-9:  # head piece survives
-                head = dict(s)
-                head["end"] = round(card_start, 3)
-                if head["end"] - float(head["start"]) >= 0.2:
-                    new.append(head)
-                if not placed:
-                    new.append(_card_shot(cue, card_start, card_end, text))
-                    placed = True
-            if b > card_end + 1e-9:  # tail piece survives (or is absorbed)
-                if b - card_end >= 0.2:
-                    tail = dict(s)
-                    shift = card_end - a
-                    tail["start"] = round(card_end, 3)
-                    tail["cards"] = [{**c, "at": round(max(0.0, float(c.get("at") or 0.0) - shift), 3)}
-                                     for c in (s.get("cards") or [])]
-                    tail["effects"] = [e for e in (s.get("effects") or [])
-                                       if float(e.get("t") or 0) >= card_end - 1e-9]
-                    tail["callouts"] = [c for c in (s.get("callouts") or [])
-                                        if float(c.get("t") or 0) >= card_end - 1e-9]
-                    new.append(tail)
-                else:
-                    card_end = b  # absorb the sliver into the card
-                    for ns in new:
-                        if ns.get("title_card") and abs(float(ns["start"]) - card_start) < 1e-6:
-                            ns["end"] = round(card_end, 3)
-            # a shot fully inside the card interval is consumed by it
-        if not placed:
-            new.append(_card_shot(cue, card_start, card_end, text))
-            new.sort(key=lambda s: float(s["start"]))
-        out = new
-        report.append({"at": round(card_start, 3), "duration": round(card_end - card_start, 3),
-                       "label": cue["label"], "number": int(cue["number"]),
-                       "line": cue["line"]})
-    for idx, s in enumerate(out):
-        s["id"] = f"S{idx + 1:03d}"
-    by_start = {round(float(r["at"]), 3): r for r in report}
-    for s in out:
-        if s.get("title_card"):
-            r = by_start.get(round(float(s["start"]), 3))
-            if r is not None:
-                r["id"] = s["id"]
-    return out, report
-
-
+    return [{"at": round(cs, 3), "duration": _tc.card_duration(ce - cs),
+             "label": cue["label"], "number": int(cue["number"]),
+             "line": cue["line"], "sentence": text[:300]}
+            for cs, ce, cue, text in cues]
 
 
 # ------------------------------------------------------------------ fullframe mode
@@ -2320,7 +2333,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     sfx = plan_sfx(shots, chapter_cards)
     _mode = str(vcfg.get("mode") or "classic")
     _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
-    _pf_report = {"static": [], "hold": [], "over_cap": [], "impact": []}
+    _pf_report = {"static": [], "hold": [], "over_cap": [], "impact": [], "segments": []}
     _ff_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [],
                 "over_cap": [], "static": []}
     if _mode == "wide":
@@ -2334,7 +2347,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     _pf_title_cards: List[Dict[str, Any]] = []
     if _mode == "panelfit":
         # Title Card Generator: timeline-cue sentences become card
-        # shots. Windows come from the alignment segments (via
+        # OVERLAYS (analysis fix 3) — the shots are not touched.
+        # Windows come from the alignment segments (via
         # caption_sentences) or, on the cues path, from `sentences`
         # (ends derived from the next sentence's start).
         _wins: List[Dict[str, Any]] = []
@@ -2346,7 +2360,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         for _i, _w in enumerate(_wins):
             if _w["end"] is None:
                 _w["end"] = float(_wins[_i + 1]["start"]) if _i + 1 < len(_wins) else float(duration)
-        shots, _pf_title_cards = insert_title_cards(shots, _wins, vcfg.get("panelfit") or {})
+        _pf_title_cards = title_card_overlays(_wins, vcfg.get("panelfit") or {})
     return {
         "version": PLAN_VERSION,
         "mode": _mode,
@@ -2357,7 +2371,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "panelfit_hold": _pf_report["hold"],
         "panelfit_over_cap": _pf_report["over_cap"],
         "panelfit_impact": _pf_report["impact"],
+        "panelfit_segments": _pf_report["segments"],
         "panelfit_title_cards": _pf_title_cards,
+        "title_card_overlays": _pf_title_cards,
         "fullframe_caption_risk": _ff_risk["caption_risk"],
         "fullframe_figure_risk": _ff_risk["figure_risk"],
         "fullframe_reviewer_focal_ignored": _ff_risk["reviewer_focal_ignored"],
@@ -2580,6 +2596,24 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     errs.append(f"chapter card '{_cc.get('title')}' at {_t}s is outside the video")
             except (TypeError, ValueError):
                 errs.append(f"chapter card '{_cc.get('title')}' needs a numeric \"t\"")
+    for _ov in plan.get("title_card_overlays") or []:
+        # Analysis fix 3: overlays are timed card drawings over the
+        # running shots — {at, duration, label, number, line}.
+        if not isinstance(_ov, dict) \
+                or not isinstance(_ov.get("label"), str) \
+                or not isinstance(_ov.get("line"), str) \
+                or not isinstance(_ov.get("number"), int):
+            errs.append("title_card_overlays entries must be {at, duration, "
+                        "label: str, number: int, line: str} "
+                        "(video/titlecards.py + plan.title_card_overlays write them)")
+            continue
+        try:
+            if not 0 <= float(_ov["at"]) < max(duration, 0) \
+                    or not 0 < float(_ov["duration"]) <= 2.1 + 1e-9:
+                errs.append(f"title card overlay at {_ov.get('at')}s must start inside "
+                            f"the video and last (0, 2.1]s")
+        except (KeyError, TypeError, ValueError):
+            errs.append("title_card_overlays entries need numeric \"at\" and \"duration\"")
     for _sfx in plan.get("sfx") or []:
         if not isinstance(_sfx, dict) or _sfx.get("type") not in tuple(SFX_ALL):
             errs.append(f"sfx entries need one of {', '.join(sorted(SFX_ALL))}")

@@ -27,9 +27,10 @@ agent's head):
   tiles, centre seam, dark numerals), and the big line in Anton (the
   bundled OFL font; metric fallback Liberation/DejaVu Sans Bold).
 
-The planner (plan.insert_title_cards) turns cue sentences into card
-shots; the renderer (frames.ShotRenderer) draws them through
-render_title_card. Nothing here knows about panels or audio.
+The planner (plan.title_card_overlays) turns cue sentences into
+timed card overlays; the renderer (frames.ShotRenderer) draws them
+over the running shot through render_title_card. Nothing here knows
+about panels or audio.
 """
 
 from __future__ import annotations

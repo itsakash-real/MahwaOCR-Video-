@@ -305,11 +305,26 @@ stretch — ever:
   possession", "3 years later") become split-flap title cards: solid
   black, a small serif label over two beige flap tiles (zero-padded
   digits, block = 33% of frame height), one bold condensed ALL-CAPS
-  line in Anton below (rendered ink ≈12.2% of frame height). A card
-  starts at its cue sentence's aligned start and lasts
-  clamp(cue span, 1.4, 2.1)s, consuming the plan time it overlaps;
-  the sync audit counts card time as covering its cue.
+  line in Anton below (rendered ink ≈12.2% of frame height). Since
+  the 2026-10-23 analysis fixes, a card is a timed OVERLAY
+  (`title_card_overlays` on the plan), drawn over whatever shot is
+  running at its cue sentence's aligned start for
+  clamp(cue span, 1.4, 2.1)s — it consumes no plan time, splits no
+  shot, and the master audio is never paused or split under it; the
+  sync audit counts overlay time as covering its cue.
   See `video/titlecards.py`.
+- **Gutter segments.** With `panels.trim_v2` on, panel detection
+  records each panel's interior gutter segments (stacked images
+  across a pure white/black strip over 15px high —
+  `panels.gutter_slice_min`) as metadata; a single-card shot on such
+  a panel splits into one sub-shot per segment, sequenced inside the
+  shot's own time with durations proportional to segment heights
+  (floor `panelfit.min_shot` per piece), each fitted as a picture of
+  the segment's own height. Panel ids and assets never change.
+- **Drop shadow.** The sharp foreground carries a black drop shadow
+  (`panelfit.shadow_dy` 20px, `shadow_blur` 10px, `shadow_opacity`
+  0.40, all at 1080p) composited between the full-brightness blurred
+  background and the foreground — the background is never dimmed.
 - **Sync.** Shots anchor to sentence boundaries via the alignment, as
   in every mode; keyframe endpoints are the shot boundaries.
 - **Parallax** is deferred (build B11): the detector yields boxes, not
@@ -318,8 +333,10 @@ stretch — ever:
   empty), `panelfit_hold` (sub-shots sitting in a travel-cap hold —
   info only), `panelfit_over_cap` (panels fitted at the upscale cap —
   shown smaller, never stretched), `panelfit_impact` (which shots got
-  the fast zoom rate, and by which rule) and `panelfit_title_cards`.
-  A card breaking the composition invariants fails the build.
+  the fast zoom rate, and by which rule), `panelfit_title_cards`
+  (the card overlays) and `panelfit_segments` (panels whose shots
+  split at gutter segments). A card breaking the composition
+  invariants fails the build.
 - **Storyboard** shows the composed frame at shot start and end, side
   by side. Landscape only; portrait formats stay classic.
 
@@ -329,7 +346,8 @@ Knobs (`video.panelfit.*`, defaults pinned in code): `bg_blur` 50,
 `drift_headroom` 0.03, `zoom_rate` 0.05, `zoom_rate_impact` 0.088,
 `max_upscale` 2.4, `still_limit` 0.5, `min_shot` 0.3, `split_above`
 3.0, `split_min_piece` 1.2, `captions` false, `title_cards` true,
-`tts_gap_seconds` 0.11.
+`shadow_dy` 20, `shadow_blur` 10, `shadow_opacity` 0.40,
+`gutter_segments` true, `tts_gap_seconds` 0.11.
 ## Full-frame mode (`video.mode: fullframe`)
 
 No cards, no backdrop, no borders: every shot fills the 1920×1080 frame with a

@@ -138,7 +138,26 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # the reference carries none -- platform CC only)
             "title_cards": True,       # Title Card Generator: timeline cues in the
                                        # narration ("Age 4" / "Week 6") become split-flap
-                                       # cards (see video/titlecards.py)
+                                       # cards (see video/titlecards.py). Analysis
+                                       # fix 3 (2026-10-23): cards render as timed
+                                       # OVERLAYS over the running shot at the cue's
+                                       # start — shots are never consumed or split
+                                       # for a card, and the master audio (muxed
+                                       # whole at render) never pauses for one.
+            "shadow_dy": 20,           # Analysis fix 4 (user's spec, 2026-10-23):
+                                       # black drop shadow under the sharp
+                                       # foreground layer — Y offset, px at 1080p.
+            "shadow_blur": 10,         # ... its blur radius, px at 1080p.
+            "shadow_opacity": 0.40,    # ... at 40% opacity. The background blur
+                                       # stays at FULL brightness (bg_opacity 1.0);
+                                       # contrast comes from this shadow, never
+                                       # from dimming the background.
+            "gutter_segments": True,   # Analysis fix 1: a shot whose panel holds
+                                       # stacked images across a >15px white/black
+                                       # gutter (panels.gutter_segments, recorded
+                                       # at panel build under trim_v2) splits into
+                                       # one sub-shot per segment, sequenced
+                                       # with the narration.
             "tts_gap_seconds": 0.11,   # the mode's recommended narration gap. The
                                        # reference's MEASURED median gap is 0.214s,
                                        # but a 0.20 setting rendered as 0.296s median
@@ -178,6 +197,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "trim_cap": 0.40,       # max share of a panel's height the v1 trim cuts per side
             "trim_v2": False,       # Rule 6: full ink-bbox trim (white+black, rows+cols) +
                                     # white-gap slicing, at panel build (opt-in; panelfit prep)
+            "gutter_slice_min": 15, # Analysis fix 1: interior white/black gutters
+                                    # TALLER than this (px) mark stacked-image
+                                    # segments inside a panel (recorded as
+                                    # panels.gutter_segments when trim_v2 is on)
         },
         # Bubble/text detector (Build 4/3 shared step): ogkalu RT-DETR, Apache-2.0.
         # "model": path to the ONNX file ("" = ~/.config/manhwa/models/ or $MANHWA_DETECTOR_MODEL)

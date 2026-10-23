@@ -50,6 +50,14 @@ def test_constants_pinned_across_config_planner_renderer():
     assert pf["captions"] is False and plan_mod.PF_CAPTIONS is False
     assert pf["title_cards"] is True and plan_mod.PF_TITLE_CARDS is True
     assert pf["tts_gap_seconds"] == plan_mod.PF_TTS_GAP == 0.11
+    # Analysis fixes (user's second-by-second analysis, 2026-10-23):
+    # the foreground drop shadow (fix 4) and gutter segment splitting
+    # (fix 1), pinned across config / planner / renderer like the rest.
+    assert pf["shadow_dy"] == plan_mod.PF_SHADOW_DY == frames_mod.PFR_SHADOW_DY == 20
+    assert pf["shadow_blur"] == plan_mod.PF_SHADOW_BLUR == frames_mod.PFR_SHADOW_BLUR == 10
+    assert pf["shadow_opacity"] == plan_mod.PF_SHADOW_OPACITY \
+        == frames_mod.PFR_SHADOW_OPACITY == 0.40
+    assert pf["gutter_segments"] is True and plan_mod.PF_GUTTER_SEGMENTS is True
 
 
 def test_no_fx_constants_remain():
@@ -333,6 +341,40 @@ def test_render_has_no_flash_or_shake_even_with_a_legacy_fx_key():
     assert float(plain.frame_array(0.0).mean()) < 200   # never a white flash frame
 
 
+def test_render_drop_shadow_under_a_floating_panel():
+    # Analysis fix 4: a panel floating over its own blur (here a small
+    # panel held at the upscale cap, so it sits inside the frame)
+    # carries a black shadow (Y-offset 20px, blur 10px, 40% opacity)
+    # under its bottom edge — while the background elsewhere stays
+    # FULL brightness (the mode never dims the blur; the shadow is
+    # the only contrast device).
+    img = Image.new("RGB", (400, 300), (255, 0, 0))
+    r = _renderer(img, panelfit_spec(400, 300, "push_in", FMT, {}))
+    f = r.frame_array(0.1).astype(int)
+    # Capped fit: 960x720, centred -> fg spans y 180..900.
+    assert tuple(f[850, 960]) == (255, 0, 0)          # the fg itself, untouched
+    assert 90 < f[910, 960][0] < 235                  # the shadow band below it
+    assert f[100, 960][0] >= 250                      # bg above: undimmed blur
+
+
+def test_render_slice_shows_only_the_segment_band():
+    # Analysis fix 1: a card with a `slice` renders only that band of
+    # the panel, fitted as a picture of the segment's own height.
+    img = Image.new("RGB", (900, 1800), (200, 30, 30))
+    ImageDraw.Draw(img).rectangle((0, 900, 900, 1800), fill=(30, 30, 200))
+    shot = {"id": "S001", "start": 0.0, "end": 4.0, "layout": "single", "background": "blur",
+            "cards": [{"panel": "P001-01", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0.0,
+                       "motion": "push_in", "panelfit": panelfit_spec(900, 900, "push_in", FMT, {}),
+                       "slice": [0.5, 1.0]}],
+            "effects": [], "panelfit": True, "sentence": None, "callouts": []}
+    r = ShotRenderer(shot, {"P001-01": img}, FMT)
+    f = r.frame_array(0.5)
+    centre = f[540, 960].astype(int)
+    assert centre[2] > 150 and centre[0] < 80         # the blue (bottom) segment
+    plain = _renderer(img, panelfit_spec(900, 1800, "push_in", FMT, {}))
+    assert not np.array_equal(f, plain.frame_array(0.5))
+
+
 # --------------------------------------------------------------- build_plan + QA
 
 def _img_for(p):
@@ -400,6 +442,72 @@ def test_build_plan_rhythm_split_and_caps():
     assert plan["pacing"]["min_shot"] == 0.3
     assert plan["pacing"]["max_shots"] == int(6.5 // 1.0)
     assert validate(plan, {p["id"] for p in PANELS}) == []
+
+
+SEG_PANELS = [
+    {"id": "P001-01", "width": 900, "height": 1200, "text": ""},
+    {"id": "P001-02", "width": 900, "height": 2000, "text": "",
+     "gutter_segments": [[0.0, 0.4], [0.4, 1.0]]},
+    {"id": "P001-03", "width": 900, "height": 2000, "text": "",
+     "gutter_segments": [[0.0, 0.34], [0.34, 0.67], [0.67, 1.0]]},
+]
+
+
+def _seg_plan(pcfg_extra=None):
+    vcfg = {**VCFG, "mode": "panelfit"}
+    if pcfg_extra:
+        vcfg = {**vcfg, "panelfit": {**(VCFG.get("panelfit") or {}), **pcfg_extra}}
+    sentences = [
+        {"start": 0.0, "text": "before", "panels": ["P001-01"], "cues": [], "emphasis": []},
+        {"start": 5.0, "text": "the feather floated down", "panels": ["P001-02"],
+         "cues": [], "emphasis": []},
+        {"start": 7.9, "text": "after", "panels": ["P001-01"], "cues": [], "emphasis": []},
+    ]
+    return build_plan(chapter="1", panels_data={"panels": SEG_PANELS, "fingerprint": "seg"},
+                      duration=12.9, audio=None, vcfg=vcfg, image_for=_img_for,
+                      sentences=sentences)
+
+
+def test_build_plan_splits_a_shot_at_its_gutter_segments():
+    # Analysis fix 1: the stacked panel's shot becomes one sub-shot
+    # per segment, sequenced inside the shot's own time, durations
+    # proportional to the segment heights.
+    plan = _seg_plan()
+    seg_shots = [s for s in plan["shots"] if any(c.get("slice") for c in s["cards"])]
+    assert len(seg_shots) == 2
+    assert [s["cards"][0]["slice"] for s in seg_shots] == [[0.0, 0.4], [0.4, 1.0]]
+    d0 = float(seg_shots[0]["end"]) - float(seg_shots[0]["start"])
+    d1 = float(seg_shots[1]["end"]) - float(seg_shots[1]["start"])
+    assert d0 / (d0 + d1) == pytest.approx(0.4, abs=0.02)
+    # The pieces tile exactly the span the unsplit shot would have run.
+    control = _seg_plan({"gutter_segments": False})
+    plain = [s for s in control["shots"] if s["cards"][0]["panel"] == "P001-02"]
+    assert len(plain) == 1
+    assert float(seg_shots[0]["start"]) == pytest.approx(float(plain[0]["start"]))
+    assert float(seg_shots[-1]["end"]) == pytest.approx(float(plain[0]["end"]))
+    assert plan["panelfit_segments"] == ["P001-02"]
+    # The spec is fitted to the SEGMENT's height (2000 x 0.4 = 800),
+    # not the whole panel's: a 900x800 picture, height-fitted.
+    spec0 = seg_shots[0]["cards"][0]["panelfit"]
+    assert spec0["base_h"] == pytest.approx(1080.0)
+    assert spec0["base_w"] == pytest.approx(900 / 800 * 1080)
+    assert validate(plan, {p["id"] for p in SEG_PANELS}) == []
+    ids = [s["id"] for s in plan["shots"]]
+    assert ids == [f"S{i + 1:03d}" for i in range(len(ids))]
+
+
+def test_build_plan_keeps_a_too_short_shot_whole():
+    # Three segments need 3 x 0.3s of floor; a ~0.85s shot stays whole.
+    vcfg = {**VCFG, "mode": "panelfit"}
+    sentences = [
+        {"start": 0.0, "text": "quick", "panels": ["P001-03"], "cues": [], "emphasis": []},
+        {"start": 0.6, "text": "next", "panels": ["P001-01"], "cues": [], "emphasis": []},
+    ]
+    plan = build_plan(chapter="1", panels_data={"panels": SEG_PANELS, "fingerprint": "seg"},
+                      duration=4.0, audio=None, vcfg=vcfg, image_for=_img_for,
+                      sentences=sentences)
+    assert not any(c.get("slice") for s in plan["shots"] for c in s["cards"])
+    assert plan["panelfit_segments"] == []
 
 
 def test_qa_flags_a_stretched_foreground():
