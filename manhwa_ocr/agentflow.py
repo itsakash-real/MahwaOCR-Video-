@@ -69,7 +69,7 @@ class AgentFlow:
     # ------------------------------------------------------------------ step 1
 
     def prepare(self, *, chapter: str, url: str | None = None, folder: Path | None = None,
-                shards: int = 1) -> Path:
+                shards: int | None = None) -> Path:
         chapter = require_chapter(chapter)
         chapter_dir = self._chapter_dir(chapter)
 
@@ -94,9 +94,15 @@ class AgentFlow:
         tiles = build_tiles(pages, chapter_dir / "tiles", config=self.cfg.slicing, log=self.log)
         self.log(f"  {len(pages)} pages -> {len(tiles)} tiles")
 
-        # Shards split the tile list across several agents; each shard writes
-        # its own results file and assemble merges them. Clamped so every
-        # shard gets at least one tile.
+        # Shards split the tile list across several reading workers; each shard
+        # writes its own results file and assemble merges them. A worker's
+        # context must stay safely below its limit, so the count is COMPUTED
+        # from a tiles-per-shard bound (pipeline.agent_shard_tiles), not left
+        # to hope: an unsharded chapter is the one context-blowup failure mode
+        # this tool has. `--shards` overrides the computation.
+        if shards is None:
+            per_shard = max(1, int(self.cfg.pipeline.get("agent_shard_tiles", 20)))
+            shards = max(1, -(-len(tiles) // per_shard)) if tiles else 1
         shards = max(1, int(shards))
         if tiles:
             shards = min(shards, len(tiles))
@@ -164,20 +170,30 @@ class AgentFlow:
         return task_path
 
     def _render_task_index(self, chapter: str, shards: int, chapter_dir: Path) -> str:
+        max_parallel = max(1, int(self.cfg.pipeline.get("max_parallel_shards", 6)))
         lines = "\n".join(
             f"- `TASK_{k}.md` — shard {k} of {shards}; writes `{self._rel(chapter_dir / f'tile_results_shard_{k}.json')}`"
             for k in range(1, shards + 1)
         )
         return f"""# Transcription task — {self.cfg.series_name}, chapter {chapter}
 
-This chapter is split into {shards} shards so several agents can read tiles in parallel.
-Work through the shard tasks in any order; each one lists its own tiles and writes its own results file.
+This chapter is split into {shards} shards so the reading can run in PARALLEL, and so
+no single reader's context is ever asked to hold a whole chapter of images.
+
+Run one worker (a sub-agent, or yourself shard by shard) per `TASK_k.md`, up to
+{max_parallel} at a time. Each worker reads only its own tiles and writes only its own
+results file, re-writing the whole file after every tile (or small batch) it reads —
+so an interrupted worker loses at most the tile it was on, never the shard.
+
+The shards are independent: start them all, in any order; a finished shard is never
+redone. If a worker dies, start that shard's task again; it keeps what is already in
+its results file.
 
 {lines}
 
 ## Then
 
-Once every shard's results file exists:
+Once every shard's results file exists (check with `next` — it counts all of them):
 
 ```bash
 {command(f"assemble --chapter {chapter}", self.session)}
@@ -210,6 +226,11 @@ You are acting as the vision model for `manhwa-ocr`. Read the tile images below
 and write structured results. Paths are relative to `{self.workdir}`.
 
 {scope} If you are interrupted, you can resume: anything already in `{result_name}` is kept.
+
+**Write results incrementally:** after every tile (or small batch of tiles) you
+read, re-write `{self._rel(chapter_dir / result_name)}` with everything so far.
+Never hold a whole shard in memory unwritten — an interrupted worker must lose at
+most the tile it was on, not the shard.
 
 ---
 

@@ -80,6 +80,40 @@ def test_prepare_shards_clamps_to_tile_count(tmp_path):
     assert manifest["shards"]["count"] < 99
 
 
+def test_prepare_auto_shards_computed_from_tile_bound(tmp_path):
+    # shards=None (the CLI default) computes ceil(tiles / agent_shard_tiles),
+    # so no reader is ever handed an unbounded chapter of images.
+    src = tmp_path / "pages"
+    src.mkdir()
+    for i in range(2):
+        Image.new("RGB", (900, 4000), "white").save(src / f"{i + 1}.png")
+    ws = tmp_path / "ws"
+    flow = AgentFlow(load_config(series__workdir=str(ws), series__name="T",
+                                 pipeline__agent_shard_tiles=2), log=lambda *_: None)
+    flow.prepare(chapter="1", folder=src)  # no shards= -> auto
+    work = w.chapter_work_dir(ws, "1")
+    manifest = json.loads((work / "manifest.json").read_text())
+    n_tiles = len(manifest["tiles"])
+    assert n_tiles >= 4
+    expected = -(-n_tiles // 2)
+    assert manifest["shards"]["count"] == expected
+    for k in range(1, expected + 1):
+        assert (work / f"TASK_{k}.md").exists()
+    index = (work / "TASK.md").read_text()
+    assert "PARALLEL" in index
+    assert "tile_results_shard_1.json" in index
+
+
+def test_prepare_auto_shards_single_for_small_chapters(tmp_path):
+    # A chapter that fits one shard keeps the plain TASK.md workflow.
+    _, _, work, manifest = _prepared(tmp_path, pages=1)  # default bound 20 -> 1 shard
+    assert manifest["shards"]["count"] == 1
+    assert (work / "TASK.md").exists()
+    assert not (work / "TASK_1.md").exists()
+    task = (work / "TASK.md").read_text()
+    assert "Write results incrementally" in task or "incrementally" in task
+
+
 def test_assemble_merges_shard_files(tmp_path):
     flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
     tiles = manifest["tiles"]
