@@ -167,6 +167,55 @@ def test_read_tiles_instruction_is_shard_aware_and_watches_staleness(tmp_path):
     assert "STALLED" in text and "kept" in text
 
 
+# ------------------------------------------------- provider stall watchdog
+
+
+class _SleepyProvider:
+    """A provider whose calls go quiet (no completion, no exception)."""
+
+    def __init__(self, seconds: float = 1.5):
+        self.seconds = seconds
+
+    def fingerprint(self) -> str:
+        return "sleepy"
+
+    def vision(self, system, prompt, images):
+        import time
+        time.sleep(self.seconds)
+        return '{"scene": "", "blocks": []}'
+
+    def text(self, system, prompt):
+        return '{"transcript": "ok"}'
+
+
+def test_stage1_stall_watchdog_fails_loudly(tmp_path):
+    import time as _t
+
+    from manhwa_ocr.util import UserError
+
+    provider = _SleepyProvider(seconds=1.5)
+    pipe = _pipeline(tmp_path, provider, vision_batch=1)
+    pipe.cfg.pipeline["stall_minutes"] = 0.01  # 0.6s without a completion -> hang
+    tiles = _tiles(tmp_path, 3)
+    t0 = _t.perf_counter()
+    with pytest.raises(UserError) as exc:
+        pipe._read_tiles(tiles, briefing="", chapter_label="chapter 1")
+    elapsed = _t.perf_counter() - t0
+    assert "no progress" in str(exc.value)
+    assert "cached" in str(exc.value)
+    assert elapsed < 5  # it failed fast instead of waiting out the sleep
+
+
+def test_stage1_watchdog_lets_healthy_reads_finish(tmp_path):
+    provider = _SleepyProvider(seconds=0)
+    pipe = _pipeline(tmp_path, provider, vision_batch=1)
+    pipe.cfg.pipeline["stall_minutes"] = 0.01
+    tiles = _tiles(tmp_path, 3)
+    out = pipe._read_tiles(tiles, briefing="", chapter_label="chapter 1")
+    assert len(out) == 3
+    assert all("error" not in r for r in out)
+
+
 def test_assemble_shard_entry_wins_over_single_file(tmp_path):
     flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
     tiles = manifest["tiles"]

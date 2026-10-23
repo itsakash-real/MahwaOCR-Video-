@@ -13,8 +13,10 @@ retry really retries.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -197,30 +199,62 @@ class Pipeline:
     def _read_tiles(self, tiles: List[Tile], briefing: str, chapter_label: str) -> List[Dict]:
         workers = max(1, int(self.cfg.pipeline.get("concurrency", 4)))
         batch = max(1, int(self.cfg.pipeline.get("vision_batch", 1)))
+        # No-progress watchdog: every completed unit (tile or batch) bumps the
+        # clock; a stage that goes quiet for longer than stall_minutes is a
+        # hang, so it fails LOUDLY instead of sitting for hours. Cached tiles
+        # are kept, so a re-run resumes rather than restarts.
+        stall_s = max(0.0, float(self.cfg.pipeline.get("stall_minutes", 10))) * 60
         results: List[Dict[str, Any]] = [{} for _ in tiles]
         counter = {"done": 0}
 
         if batch <= 1:
-            def run(i: int, tile: Tile):
+            def run(unit: List[tuple[int, Tile]]):
+                (i, tile) = unit[0]
                 results[i] = self._read_tile(tile, briefing, chapter_label)
                 counter["done"] += 1
                 self.log(f"    [{counter['done']}/{len(tiles)}] {tile.label}")
 
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                list(pool.map(lambda p: run(*p), enumerate(tiles)))
+            units: List[List[tuple[int, Tile]]] = [
+                [(i, tile)] for i, tile in enumerate(tiles)
+            ]
+        else:
+            def run(unit: List[tuple[int, Tile]]):
+                out = self._read_tile_batch([t for _, t in unit], briefing, chapter_label)
+                for (i, _), res in zip(unit, out):
+                    results[i] = res
+                counter["done"] += len(unit)
+                self.log(f"    [{counter['done']}/{len(tiles)}] batch of {len(unit)} tiles")
+
+            units = [list(enumerate(tiles[s:s + batch], start=s)) for s in range(0, len(tiles), batch)]
+
+        if not units:
             return results
 
-        groups = [list(enumerate(tiles[s:s + batch], start=s)) for s in range(0, len(tiles), batch)]
-
-        def run_group(group: List[tuple[int, Tile]]):
-            out = self._read_tile_batch([t for _, t in group], briefing, chapter_label)
-            for (i, _), res in zip(group, out):
-                results[i] = res
-            counter["done"] += len(group)
-            self.log(f"    [{counter['done']}/{len(tiles)}] batch of {len(group)} tiles")
-
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(run_group, groups))
+            futures = [pool.submit(run, unit) for unit in units]
+            pending = set(futures)
+            # Rolling no-progress deadline: every completed unit resets it, so
+            # a healthy chapter can run as long as it likes while a silent one
+            # is cut off stall_minutes after its last completion.
+            deadline = time.monotonic() + (stall_s or float("inf"))
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, timeout=max(0.0, deadline - time.monotonic()),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                if not done:
+                    # Fail LOUDLY now; the in-flight calls are each bounded by
+                    # the provider timeout, so the process drains soon after.
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise UserError(
+                        f"stage 1 (tile reading) made no progress for "
+                        f"{float(self.cfg.pipeline.get('stall_minutes', 10)):.0f} minutes "
+                        f"({counter['done']}/{len(tiles)} tiles done). Stopping instead of hanging. "
+                        "Successful tiles are cached: re-run the same command to resume."
+                    ) from None
+                deadline = time.monotonic() + (stall_s or float("inf"))
+                for f in done:
+                    f.result()  # surface worker exceptions, as pool.map did
         return results
 
     # ---------------- stage 2 ----------------
