@@ -174,6 +174,15 @@ class AgentFlow:
                 for f in sorted(chapter_dir.glob("tile_results_shard_*.json")):
                     f.replace(f.with_name(f.name + ".stale"))
                     self.log(f"  tiles changed; set aside old {f.name}")
+        # A previous prepare may have split into MORE shards than this one;
+        # stale TASK_k.md files beyond the current count would look like work.
+        for f in chapter_dir.glob("TASK_*.md"):
+            try:
+                k = int(f.stem.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            if k > shards:
+                f.unlink()
 
         atomic_write_json(manifest_path, manifest)
         briefing = self.memory.as_briefing()
@@ -258,6 +267,9 @@ and write structured results. Paths are relative to `{self.workdir}`.
 read, re-write `{self._rel(chapter_dir / result_name)}` with everything so far.
 Never hold a whole shard in memory unwritten — an interrupted worker must lose at
 most the tile it was on, not the shard.
+
+**Resume, never redo:** before reading a tile, check whether its id already has
+an entry in `{result_name}`; skip every id that is already present.
 
 ---
 
