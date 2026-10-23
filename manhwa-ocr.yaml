@@ -70,7 +70,7 @@ video:
   lead: 0.15              # panel appears this long before its sentence
   min_shot: 1.0           # recap pacing: ~2.7s average shot, 1-5s range
   max_shot: 5.0
-  min_hold: 3.0           # no picture stays up for less than this (seconds)
+  min_hold: 1.5           # no picture stays up for less than this (seconds)
   target_shot: 2.7        # average seconds per shot (recap channels: about 2.7)
   pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
   workers: 0              # parallel renders; 0 = all your CPU cores

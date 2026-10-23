@@ -34,6 +34,7 @@ from PIL import Image
 from ..util import UserError, atomic_write_text, read_agent_json, require_chapter
 from . import sync as sync_mod
 from .crops import (_panel_maps, content_bands, extend_figure_range, head_of, is_mask_risk,
+                    text_bands, trim_blank_edges,
                     is_system_window, safe_span, tone)
 from .cropcache import crop_key, load_crop, store_crop
 from .verify import find_pair_safe_shape, pick_card
@@ -1059,11 +1060,25 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
     # keeping the full panel height.
     if pair_aspect is None and WIDE_MIN_ASPECT <= panel_aspect <= 1.777:
         info["whole"] = True
+        top, bottom = 0.0, 1.0
         if img is not None:
+            # "Whole panel" must still touch both walls with real art, not a
+            # caption box or blank margin: trim any such band off the top/
+            # bottom edges first (trim_blank_edges refuses to trim past the
+            # point where too little art would remain, flagging "unusable"
+            # instead), THEN flag whatever edge risk is left in what's kept.
+            trimmed = trim_blank_edges(img, (0.0, 0.0, 1.0, 1.0))
+            if trimmed is None:
+                info["unusable"] = True
+                return [0.0, 0.0, 1.0, 1.0], info
+            _, top, _, bottom = trimmed
             bands = (content_bands(img, axis="y", exclude=[(by0, by1)])
                     + content_bands(img, axis="x", exclude=[(bx0, bx1)]))
-            info["edge_text"] = any(b0 <= WIDE_EDGE_MARGIN or b1 >= 1 - WIDE_EDGE_MARGIN for b0, b1 in bands)
-        return [0.0, 0.0, 1.0, 1.0], info
+            info["edge_text"] = any(
+                (b0 <= WIDE_EDGE_MARGIN or b1 >= 1 - WIDE_EDGE_MARGIN)
+                and max(b0, top) < min(b1, bottom)
+                for b0, b1 in bands)
+        return [0.0, top, 1.0, bottom], info
     subj_w, subj_h = (bx1 - bx0) * pw, (by1 - by0) * ph
     grow = 1.0 + 2.0 * WIDE_HEADROOM
     if pair_aspect is not None:
@@ -1130,6 +1145,20 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
             else:
                 info["caption_risk"] = True
 
+        # The containment clamp (lo_y/hi_y above) can force this window to
+        # start right at a caption/bubble band that safe_span had no room to
+        # dodge -- the subject pinned the legal range. Re-validate and
+        # re-trim the FINAL window itself, not just its anchor position,
+        # before accepting it.
+        frac_box = (x0 / pw, y0 / ph, (x0 + win_w) / pw, (y0 + win_h) / ph)
+        trimmed = trim_blank_edges(img, frac_box)
+        if trimmed is None:
+            info["unusable"] = True
+        else:
+            nx0, ny0, nx1, ny1 = trimmed
+            x0, y0 = nx0 * pw, ny0 * ph
+            win_w, win_h = (nx1 - nx0) * pw, (ny1 - ny0) * ph
+
     return [round(x0 / pw, 4), round(y0 / ph, 4), round((x0 + win_w) / pw, 4),
            round((y0 + win_h) / ph, 4)], info
 
@@ -1142,11 +1171,12 @@ def _wide_style_card(c: Dict[str, Any], designer: "_Designer", pw: float, ph: fl
     _adaptive_pass (only the cards a naturally wide/landscape panel picks
     for this treatment), so the two never drift out of sync.
 
-    Returns {"caption_risk", "figure_risk", "reviewer_focal_ignored"} (bool)
-    for THIS card -- the caller appends its panel id to its own risk lists.
+    Returns {"caption_risk", "figure_risk", "reviewer_focal_ignored", "unusable"}
+    (bool) for THIS card -- the caller appends its panel id to its own risk lists.
     """
     pid = c.get("panel")
-    flags = {"caption_risk": False, "figure_risk": False, "reviewer_focal_ignored": False}
+    flags = {"caption_risk": False, "figure_risk": False, "reviewer_focal_ignored": False,
+             "unusable": False}
     img = designer.img(pid) if pid in designer.by_id else None
     box = list(c.get("crop") or [0, 0, 1, 1])
     if img is not None:
@@ -1185,6 +1215,7 @@ def _wide_style_card(c: Dict[str, Any], designer: "_Designer", pw: float, ph: fl
     c["crop"] = crop
     flags["caption_risk"] = bool(info.get("caption_risk"))
     flags["figure_risk"] = bool(info.get("figure_risk"))
+    flags["unusable"] = bool(info.get("unusable"))
     has_reviewer_crop = pid in (designer.fixes.get("crop") or {})
     if has_reviewer_crop and (info.get("whole") or info.get("figure_risk")):
         # The reviewer's own focal is either discarded (panel shown whole)
@@ -1221,21 +1252,26 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
     showing, punch-in, each side of a pair -- gets the same edge audit.
 
     Returns {"caption_risk": [...], "figure_risk": [...],
-    "reviewer_focal_ignored": [...]} -- panel ids flagged with a caption/
-    text collision, a figure too tall for any window this layout/upscale
-    cap allows to fully contain, or a fixes.json focal crop that wide mode
-    could not use as-is (the panel was shown whole because its own aspect
-    is >= 6/16, or the focal itself doesn't fit and was re-anchored) --
-    for an honest report rather than a silent miss (plan["wide_caption_risk"]
-    / plan["wide_figure_risk"] / plan["wide_reviewer_focal_ignored"]).
+    "reviewer_focal_ignored": [...], "unusable": [...]} -- panel ids flagged
+    with a caption/text collision, a figure too tall for any window this
+    layout/upscale cap allows to fully contain, a fixes.json focal crop that
+    wide mode could not use as-is (the panel was shown whole because its own
+    aspect is >= 6/16, or the focal itself doesn't fit and was re-anchored),
+    or a card whose final window -- after every trim attempt -- still has
+    too little real art in it to show (plan["wide_caption_risk"] /
+    plan["wide_figure_risk"] / plan["wide_reviewer_focal_ignored"] /
+    plan["wide_unusable"]). "unusable" is a hard-stop condition: the caller
+    must refuse to build rather than render a blank/bubble-dominated card --
+    see make_plan's check in build.py.
     """
     if fmt.width <= fmt.height:
-        return {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}  # portrait formats untouched
+        return {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [], "unusable": []}
     min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
     pair_aspect = (fmt.width / 2.0) / fmt.height
     caption_risk: List[str] = []
     figure_risk: List[str] = []
     reviewer_focal_ignored: List[str] = []
+    unusable: List[str] = []
     for s in shots:
         s["wide"] = True
         s["caption_bar"] = False
@@ -1256,12 +1292,14 @@ def _wide_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                     figure_risk.append(pid)
                 if flags["reviewer_focal_ignored"] and pid not in reviewer_focal_ignored:
                     reviewer_focal_ignored.append(pid)
+                if flags.get("unusable") and pid not in unusable:
+                    unusable.append(pid)
             else:
                 c["pad_y"] = 0.0
                 c["wide_display"] = True
         s["cards"] = cards
     return {"caption_risk": caption_risk, "figure_risk": figure_risk,
-           "reviewer_focal_ignored": reviewer_focal_ignored}
+           "reviewer_focal_ignored": reviewer_focal_ignored, "unusable": unusable}
 
 
 def _reposition_for_figure(box: List[float], fig_top: float, fig_bottom: float) -> List[float]:
@@ -1312,16 +1350,17 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     shot to shot is exactly the kind of visual inconsistency this mode
     exists to avoid.
 
-    Returns the same {"caption_risk", "figure_risk", "reviewer_focal_ignored"}
-    shape as _wide_pass (plan["wide_caption_risk"] / etc. are reused).
+    Returns the same {"caption_risk", "figure_risk", "reviewer_focal_ignored",
+    "unusable"} shape as _wide_pass (plan["wide_caption_risk"] / etc. are reused).
     """
     if fmt.width <= fmt.height:
-        return {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
+        return {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [], "unusable": []}
     threshold = float((acfg or {}).get("wide_threshold", 1.333))
     min_win_h = fmt.height / max(0.5, float((wcfg or {}).get("max_upscale", 1.5)))
     caption_risk: List[str] = []
     figure_risk: List[str] = []
     reviewer_focal_ignored: List[str] = []
+    unusable: List[str] = []
     for s in shots:
         s["caption_bar"] = False
         cards = s.get("cards") or []
@@ -1341,6 +1380,8 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                     figure_risk.append(pid)
                 if flags["reviewer_focal_ignored"] and pid not in reviewer_focal_ignored:
                     reviewer_focal_ignored.append(pid)
+                if flags.get("unusable") and pid not in unusable:
+                    unusable.append(pid)
                 any_wide = True
             else:
                 # Classic-style: the card is bigger on screen (wide_fill, no
@@ -1374,7 +1415,7 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                 c["wide_fill"] = True
         s["wide"] = any_wide
     return {"caption_risk": caption_risk, "figure_risk": figure_risk,
-           "reviewer_focal_ignored": reviewer_focal_ignored}
+           "reviewer_focal_ignored": reviewer_focal_ignored, "unusable": unusable}
 
 
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
@@ -1486,7 +1527,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
             _s["caption_bar"] = True  # dedicated bottom bar, below the cards
     sfx = plan_sfx(shots, chapter_cards)
     _mode = str(vcfg.get("mode") or "classic")
-    _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
+    _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [], "unusable": []}
     if _mode == "wide":
         _wide_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     elif _mode == "adaptive":
@@ -1497,6 +1538,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "wide_caption_risk": _wide_risk["caption_risk"],
         "wide_figure_risk": _wide_risk["figure_risk"],
         "wide_reviewer_focal_ignored": _wide_risk["reviewer_focal_ignored"],
+        "wide_unusable": _wide_risk["unusable"],
         "chapter": chapter,
         "format": vcfg.get("format", "16:9"),
         "fps": int(vcfg.get("fps", 30)),

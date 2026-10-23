@@ -121,6 +121,52 @@ def text_bands(img: Image.Image, limit: float = 0.45) -> Tuple[float, float]:
     return top / n, 1 - bottom / n
 
 
+def trim_blank_edges(img: Image.Image, box: Box, cap: float = 0.85) -> Box | None:
+    """Shave any blank/caption/bubble band off the TOP and BOTTOM of `box`
+    itself (not the whole panel), however large, so a final wide-mode window
+    never ships with a caption box or a dominant bubble riding its edge.
+
+    Unlike text_bands (which only trims the whole panel's own margins), this
+    works on an arbitrary already-chosen crop window: whatever growth or
+    containment clamp produced `box`, this re-validates and re-trims its
+    actual edges before the card is accepted. Cutting into a bubble/caption
+    is intentional here (the narrator already reads the dialogue aloud) --
+    only a genuinely unusable box (too little art would remain) returns None,
+    so the caller can drop/substitute the panel instead of showing it blank.
+    """
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    if bw <= 0 or bh <= 0:
+        return None
+    rgb = _small(img.crop((round(x0 * img.width), round(y0 * img.height),
+                          round(x1 * img.width), round(y1 * img.height))), 120)
+    soft, hard, flat_white = _art_maps(rgb)
+    texty = np.clip(flat_white + hard, 0, 1).mean(axis=1)
+    art = soft.mean(axis=1)
+    row = (texty > 0.45) & (texty > 2.0 * art)
+    row = np.convolve(row.astype(np.float32), np.ones(3) / 3, mode="same") > 0.5
+    n = len(row)
+    cap_rows = int(cap * n)
+
+    def run(seq) -> int:
+        end = 0
+        while end < min(cap_rows, len(seq)) and seq[end]:
+            end += 1
+        return end
+
+    top, bottom = run(row), run(row[::-1])
+    kept = slice(top, n - bottom) if n - bottom > top else slice(0, 0)
+    # Same blank bar the rest of the pipeline already trusts (verify.py's
+    # own soft < 0.02 "blank" criterion): a kept region can clear the
+    # row-count floor below and still be nothing but flat/decorative
+    # background with no real art in it.
+    if (n - top - bottom) < 0.30 * n or float(soft[kept].mean()) < 0.02:
+        return None   # too little art would remain: this box is unusable, not trimmable
+    if top == 0 and bottom == 0:
+        return box
+    return (x0, round(y0 + top / n * bh, 4), x1, round(y1 - bottom / n * bh, 4))
+
+
 def content_bands(img: Image.Image, axis: str = "y", threshold: float = 0.4,
                   min_run_frac: float = 0.015,
                   exclude: List[Tuple[float, float]] | None = None) -> List[Tuple[float, float]]:

@@ -126,6 +126,16 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     if cs.get("bubble"):
         failures.append(f"{len(cs['bubble'])} panel(s) would show a speech bubble or caption in their card: "
                         f"{', '.join(cs['bubble'][:8])}")
+    # Wide mode's own final window (after headroom growth/containment
+    # clamping, separate from the classic crop_stats check above) can still
+    # be a caption box, a dominant bubble, or essentially nothing -- plan.py
+    # already tried to trim it and flags it "unusable" only when trimming
+    # could not leave enough real art. This must stop the build, not just
+    # warn: a card like this would otherwise ship showing a blank/bubble
+    # full-frame, exactly the defect this check exists to catch for good.
+    if plan.get("wide_unusable"):
+        failures.append(f"{len(plan['wide_unusable'])} panel(s) have no usable wide-mode window (mostly "
+                        f"caption/bubble/blank, even after trimming): {', '.join(plan['wide_unusable'][:8])}")
     # A shot under the floor is the honest price of dense narration (one-word
     # sentences): it is counted in timing.short_shots and never fixed by
     # stealing time from neighbours, so only a shot too short to be seen at

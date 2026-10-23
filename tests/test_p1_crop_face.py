@@ -233,6 +233,25 @@ def test_verify_keeps_figure_panel_with_ordinary_lettering_not_dropped(monkeypat
     assert report["bubble_beside_figure"] == ["P001-01"]
 
 
+def test_verify_drops_a_panel_that_is_nothing_but_a_bubble():
+    # Regression: a panel that is almost entirely a speech bubble over a flat
+    # dark background (no character, no real art anywhere) used to score
+    # "clean" overall -- averaged across the whole panel, neither region
+    # individually crossed the blank/texty thresholds, so it was never
+    # dropped and a wide-mode card showed the raw bubble full-frame. This is
+    # a downscaled copy of the actual chapter-6 panel that produced that bug
+    # (classification is scale-invariant: pick_card gave clean=True,
+    # figure=False on both the full-size original and this copy).
+    fixture = Path(__file__).parent / "fixtures" / "bubble_only_panel.png"
+    img = Image.open(fixture)
+    report = verify_mod.verify_chapter(
+        [{"id": "P019-02", "width": img.width, "height": img.height}],
+        lambda p: img, [0.75, 1.0, 1.333, 1.777, 0.667])
+    assert report["panels"]["P019-02"]["action"] == "dropped"
+    assert report["dropped"][0]["panel"] == "P019-02"
+    assert "no character" in report["dropped"][0]["reason"]
+
+
 def test_verify_flags_layout_sensitive_crop(monkeypatch):
     report = _verify_with(
         monkeypatch,

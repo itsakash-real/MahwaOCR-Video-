@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw
 
 from manhwa_ocr.config import load_config
 from manhwa_ocr.video import build as build_mod
-from manhwa_ocr.video.crops import content_bands, extend_figure_range, head_of, _panel_maps
+from manhwa_ocr.video.crops import content_bands, extend_figure_range, head_of, _panel_maps, trim_blank_edges
 from manhwa_ocr.video.frames import Format, ShotRenderer, format_from
 from manhwa_ocr.video.plan import WIDE_MIN_ASPECT, build_plan, wide_crop
 
@@ -48,6 +48,65 @@ def test_panel_aspect_at_or_above_6_over_16_is_shown_whole():
     crop, info = wide_crop(720, 1014, [0.3, 0.3, 0.7, 0.7], min_win_h=720)  # aspect 0.71
     assert crop == [0.0, 0.0, 1.0, 1.0]
     assert info["whole"]
+
+
+def test_windowed_crop_is_retrimmed_when_the_containment_clamp_reintroduces_a_caption_box():
+    # Regression: wide_crop's windowed branch can be forced by the subject's
+    # own containment clamp to start exactly at the panel's top edge (y0=0),
+    # even when that edge is a caption box the classic focal box (`box`)
+    # correctly excluded -- safe_span has no room left to nudge away from it.
+    # The final window must still be retrimmed before it's accepted.
+    w, h = 600, 2000   # tall panel, outside the "whole" aspect range
+    art = Image.effect_noise((w, h), 40).convert("RGB")
+    panel = Image.merge("RGB", [art.getchannel(0).point(lambda v: v // 2 + 60)] * 3)
+    ImageDraw.Draw(panel).rectangle((0, 0, w, 220), fill=(255, 255, 255))
+    for i in range(3):
+        ImageDraw.Draw(panel).text((40, 20 + 50 * i), "SOLOMON SON OF DAVID TOOK UP HYSSOP " * 2,
+                                   fill=(0, 0, 0))
+    # subject sits right under the caption box, tall enough that the window
+    # must be anchored at (or above) the subject's own top to contain it --
+    # colliding with lo_y=0, same as the production P010-01/P012-06 cases.
+    box = [0.1, 0.12, 0.9, 0.95]
+    crop, info = wide_crop(w, h, box, min_win_h=1200, img=panel)
+    x0, y0, x1, y1 = crop
+    assert y0 * h > 180          # the caption band is excluded, not just nudged a little
+    assert not info.get("unusable")
+
+
+def test_whole_panel_with_no_real_art_is_flagged_unusable_not_shown_blank():
+    # Regression: a panel that is almost entirely a speech bubble over a flat
+    # background (no real art anywhere) used to be accepted as a "whole" card
+    # showing the blank bubble full-frame. wide_crop must flag it unusable
+    # instead of returning a box with too little art left after trimming.
+    w, h = 700, 900   # aspect 0.778, inside the "whole" range
+    panel = Image.new("RGB", (w, h), (40, 40, 45))   # flat dark background, no texture
+    d = ImageDraw.Draw(panel)
+    d.rectangle((0, 130, w, h), fill=(255, 255, 255))   # bubble box reaches the bottom edge
+    for i in range(4):
+        d.text((60, 300 + 60 * i), "THEY WOULD NEVER SAY SUCH A THING", fill=(0, 0, 0))
+    box = [0.0, 0.0, 1.0, 0.2]
+    crop, info = wide_crop(w, h, box, min_win_h=720, img=panel)
+    assert info.get("unusable")
+
+
+def test_whole_panel_trims_a_caption_band_instead_of_showing_it():
+    # A "shown whole" panel must still touch both walls with real art, not a
+    # blank caption box: a wide card at this aspect used to return the full
+    # [0, 0, 1, 1] box even when the bottom rows were a narration box. Same
+    # caption fixture as test_video.py::test_detector_tells_lettering_from_art,
+    # which already proves text_bands finds it; this proves wide_crop acts on it.
+    w, h = 600, 800   # aspect 0.75, inside the "whole" range
+    art = Image.effect_noise((w, h), 40).convert("RGB")
+    panel = Image.merge("RGB", [art.getchannel(0).point(lambda v: v // 2 + 60)] * 3)
+    ImageDraw.Draw(panel).rectangle((0, 640, w, h), fill=(255, 255, 255))
+    for i in range(3):
+        ImageDraw.Draw(panel).text((60, 660 + 40 * i), "THE SMELL OF HOT BLOOD " * 3, fill=(0, 0, 0))
+    box = [0.2, 0.1, 0.8, 0.7]
+    crop, info = wide_crop(w, h, box, min_win_h=720, img=panel)
+    assert info["whole"]
+    x0, y0, x1, y1 = crop
+    assert y0 == 0.0
+    assert y1 < 0.95         # the caption band at the bottom is excluded
 
 
 def test_super_wide_panel_is_windowed_not_shown_whole_with_a_gap():
@@ -454,6 +513,22 @@ def test_qa_gate_wide_pair_requires_0_889_aspect():
                     {"panel": "B", "crop": [0.0, 0.0, 1.0, 0.5], "pad_y": 0.0, "wide_display": True}]}]
     report_bad = _quality(bad)
     assert report_bad["failures"]
+
+
+def test_qa_gate_fails_the_build_when_a_wide_card_is_unusable():
+    # Regression: plan.wide_unusable (set by plan.py when trim_blank_edges
+    # found too little real art in a wide card's final window, even after
+    # every retrim attempt) must stop the build -- not just log a warning --
+    # so a blank/bubble-dominated card can never ship silently.
+    shots = [{"id": "S001", "wide": True, "layout": "single",
+             "cards": [{"panel": "A", "crop": [0.0, 0.0, 1.0, 1.0], "pad_y": 0.0, "wide_display": True}]}]
+    for i, s in enumerate(shots):
+        s.setdefault("start", float(i) * 4.0)
+        s.setdefault("end", float(i) * 4.0 + 4.0)
+    plan = {"format": "16:9", "fps": 30, "shots": shots, "crop_stats": {}, "wide_unusable": ["A"]}
+    report = build_mod.quality_report(plan, _panels_data(), None, min_hold=3.0)
+    assert report["failures"]
+    assert any("A" in f for f in report["failures"])
 
 
 def test_qa_gate_classic_plan_still_uses_classic_shapes():
