@@ -116,8 +116,18 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
                     _bw, _bh = float(_pf["base_w"]), float(_pf["base_h"])
                     _ok = abs(math.log((_bw / _bh) / (pw / ph))) <= PF_ASPECT_TOL
                     _kind = _pf.get("kind")
-                    if _kind == "scroll":  # legacy (pre-measurement) plans only
+                    if _kind in ("scroll", "traverse"):
+                        # Width-fit strip taller than the frame (legacy
+                        # "scroll", or B1e's deliberate traverse).
                         _ok = _ok and _bh > fmt.height + PF_FIT_TOL and _bw <= fmt.width + PF_FIT_TOL
+                    elif _kind == "duo":
+                        # B1e side-by-side: the panel lives in its half
+                        # cell — never wider than the cell, and no
+                        # taller than the slide oversize band (a
+                        # zoom-out duo sits inside the frame entirely).
+                        _max_over = 1.0 + PF_DRIFT_MAX_TRAVEL + PF_DRIFT_HEADROOM
+                        _ok = _ok and _bw <= fmt.width / 2.0 + PF_FIT_TOL \
+                            and _bh <= fmt.height * _max_over + PF_FIT_TOL
                     elif _kind == "drift":
                         # Height-fit pillar oversized by (travel +
                         # headroom): never wider than the frame, and the
@@ -134,6 +144,8 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
                     else:  # zoom: the whole panel fitted inside the frame
                         _ok = _ok and _bw <= fmt.width + PF_FIT_TOL and _bh <= fmt.height + PF_FIT_TOL
                     _want_bg = abs(math.log((pw / ph) / (fmt.width / fmt.height))) > PF_ASPECT_TOL
+                    if _kind == "duo":
+                        _want_bg = True   # a duo always shares the blur backdrop
                     _ok = _ok and bool(_pf.get("bg")) == _want_bg
                 except (KeyError, TypeError, ValueError, ZeroDivisionError):
                     _ok = False
@@ -227,6 +239,10 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "panelfit_over_cap": list(plan.get("panelfit_over_cap") or []),
         "panelfit_impact": list(plan.get("panelfit_impact") or []),
         "panelfit_title_cards": list(plan.get("panelfit_title_cards") or []),
+        # B1e: strip traverses, duo side-by-sides, zoom-out hints. INFO ONLY.
+        "panelfit_traverse": list(plan.get("panelfit_traverse") or []),
+        "panelfit_duo": list(plan.get("panelfit_duo") or []),
+        "panelfit_zoom_out": list(plan.get("panelfit_zoom_out") or []),
         # Full-frame mode only: the same honest-report treatment (see
         # plan._fullframe_pass). INFO ONLY -- never failures.
         "fullframe_caption_risk": list(plan.get("fullframe_caption_risk") or []),

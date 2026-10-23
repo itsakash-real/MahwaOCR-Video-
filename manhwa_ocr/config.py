@@ -120,6 +120,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # on the reference's weapon-clash shot). There is
                                        # NO shake and NO white flash in this mode --
                                        # the reference uses neither, on any shot.
+            "zoom_out_fast_rate": 0.176, # B1e: zoom-OUT rate for a blast, used
+                                       # ONLY by the per-sentence motion hint
+                                       # "zoom_out_fast" (the user's detonator ->
+                                       # explosion ruling): exactly 2x the impact
+                                       # zoom-in rate. Default routing never zooms
+                                       # out; a hint is the only way in.
             "zoom_max_total": 0.50,    # total zoom cap: at +50% the scale holds
                                        # (measured totals top out at +46%)
             "max_upscale": 2.4,        # the foreground is never upscaled past this
