@@ -264,6 +264,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # written. These are the bulk of disk use. Set false while iterating.
         "cleanup": True,
     },
+    "recap": {
+        # Narration voice for recap writing ("default", "speedrun" or "powerfantasy").
+        # "default": calm present-tense voice telling a friend why the chapter matters.
+        # "speedrun": Speedrun Gossip voice — breathless past-tense gossip, role
+        #   labels instead of names, chain-of-consequences sentences with So/But/
+        #   only-to pivots, an editorial aside every few sentences. Full spec:
+        #   docs/RECAP_STYLE_SPEEDRUN.md
+        # "powerfantasy": the Power Fantasy system — in-medias-res hook with the
+        #   "This guy is..." formula, lore drop after the flex, "our guy" lexicon,
+        #   hype-man reactions, gamified vocabulary. A range of chapters is
+        #   recapped only once EVERY transcript in the range exists, so the
+        #   writer holds the whole story. Full spec:
+        #   docs/RECAP_STYLE_POWERFANTASY.md
+        "style": "default",
+    },
 }
 
 
@@ -275,8 +290,9 @@ class Config:
     download: Dict[str, Any] = field(default_factory=dict)
     pipeline: Dict[str, Any] = field(default_factory=dict)
     video: Dict[str, Any] = field(default_factory=dict)
-    # Top-level YAML sections this build doesn't know about (e.g. a `recap:`
-    # section from a sibling branch's config). Kept, not dropped, so a config
+    recap: Dict[str, Any] = field(default_factory=dict)
+    # Top-level YAML sections this build doesn't know about (e.g. a section
+    # written by a newer build's config). Kept, not dropped, so a config
     # file shared between checkouts never crashes load_config -- only code
     # that actually reads a given section needs to know about it.
     extra: Dict[str, Any] = field(default_factory=dict)

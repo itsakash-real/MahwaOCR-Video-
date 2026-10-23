@@ -63,6 +63,16 @@ RECAPS = """1. Run `python -m manhwa_ocr recap --session "{session}" --chapters 
 2. Write original narration: commentary, not a re-read of the dialogue.
    Quote the source only briefly, for lines that land.
    Do not add knowledge from later chapters.
+   Narration voice: the default calm present-tense voice, unless the series
+   config sets `recap.style: speedrun` — then use the Speedrun Gossip voice
+   (docs/RECAP_STYLE_SPEEDRUN.md): past tense, role labels instead of names,
+   chain-of-consequences sentences with So/But/only-to pivots, an editorial
+   aside every few sentences, open on the inciting incident, end mid-escalation.
+   Or `recap.style: powerfantasy` — then use the Power Fantasy system
+   (docs/RECAP_STYLE_POWERFANTASY.md): a range is recapped only after every
+   transcript in it exists; the range opener hooks in medias res with the
+   "This guy is..." formula and drops the lore after the flex; later chapters
+   open mid-flow; no chapter ends on finale language or opens with a restart.
 """ + RECAP_RULES + """7. Run `python -m manhwa_ocr recap --session "{session}" --finalize`.
    Fix every error. Read every warning. Report the tagged ratio and the word count per chapter.
 8. Then STOP. Tell me to record each recaps\\chapter_N.tts.txt and save it as audio\\chapter_N.mp3.

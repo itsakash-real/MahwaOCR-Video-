@@ -85,6 +85,7 @@ RULES:
 - No intro/outro. Exact plot / order / details from the transcript. Never invent events, numbers, dialogue.
 - Names exactly as in SERIES CONTEXT. Third person only. The player is called "the streamer" / "KukuruppingPpong". Never I / my / me / we in narration, even if the source is first person.
 - Casual, conversational, like telling a friend. Engaging, not boring. Just the script.
+- Narration voice: default calm present-tense, unless the series config sets `recap.style: speedrun` — then use the Speedrun Gossip voice (docs/RECAP_STYLE_SPEEDRUN.md); or `recap.style: powerfantasy` — then use the Power Fantasy system (docs/RECAP_STYLE_POWERFANTASY.md): whole-range workflow, all transcripts in the range first, then recaps.
 - Tag EVERY sentence with its panel ({P003-02}, {same}, {impact}). Target 95%+ tagged. Never tag a text-only, bubble-only, blank, or credits panel.
 - Hook/open loops: open with a hook — first 30 seconds give proof (exact rank/number/beat the title promises), stakes, one-line roadmap. Mark it [HOOK] on its own line before the sentence. Open a loop every 2-3 min: [LOOP: the question] on its own line. End on an open question/cliffhanger. [HOOK] / [LOOP: ...] are editing cues, never spoken, never in tts.txt.
 - Never rewrite a recap whose chapter already has audio unless the user asks.
