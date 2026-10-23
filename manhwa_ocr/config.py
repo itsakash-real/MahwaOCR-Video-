@@ -97,6 +97,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "bg_opacity": 1.0,         # that background layer's opacity over black:
                                        # 1.0 = FULL brightness, no dimming (measured;
                                        # the text specs' 50-60% was wrong)
+            "shadow_dy": 20,           # B1e: the foreground's drop shadow — black,
+            "shadow_blur": 10,         # offset (0, +20px), blur 10px, opacity 40%,
+            "shadow_opacity": 0.40,    # layered between backdrop and panel (the
+                                       # backdrop itself stays at full brightness)
             "fill_aspect": 1.6,        # panel aspect (w/h) at/above this fills the frame
                                        # full-bleed; narrower panels are height-fit pillars
             "drift_aspect_max": 0.72,  # pillars narrower than this (w/h) get a gentle

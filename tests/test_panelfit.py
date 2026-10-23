@@ -988,3 +988,28 @@ def test_build_plan_motion_list_gives_each_segment_its_own_motion():
         shown = {c["panel"] for c in s["cards"]}
         assert not {"P001-06", "P001-07"} <= shown
     assert validate(plan, {p["id"] for p in panels}) == []
+
+
+# ------------------------------------------------ B1e: drop shadow (E8)
+
+def test_shadow_constants_pinned():
+    pf = load_config().video["panelfit"]
+    assert pf["shadow_dy"] == plan_mod.PF_SHADOW_DY == frames_mod.PFR_SHADOW_DY == 20
+    assert pf["shadow_blur"] == plan_mod.PF_SHADOW_BLUR == frames_mod.PFR_SHADOW_BLUR == 10
+    assert pf["shadow_opacity"] == plan_mod.PF_SHADOW_OPACITY \
+        == frames_mod.PFR_SHADOW_OPACITY == 0.40
+
+
+def test_render_drop_shadow_darkens_below_the_panel_only(monkeypatch):
+    # A small panel sits inside the frame (720x960 at the cap), so its
+    # bottom edge is visible: just below it the frame must darken (the
+    # shadow), a far corner must keep the backdrop's exact brightness,
+    # and the panel's own pixels are untouched.
+    img = Image.new("RGB", (300, 400), (200, 30, 30))
+    spec = panelfit_spec(300, 400, "push_in", FMT, {}, dur=2.0)
+    with_shadow = _renderer(img, spec).frame_array(0.1).astype(int)
+    monkeypatch.setattr(frames_mod, "PFR_SHADOW_OPACITY", 0.0)
+    without = _renderer(img, spec).frame_array(0.1).astype(int)
+    assert with_shadow[1035, 960][0] < without[1035, 960][0] - 30   # the shadow band
+    assert np.array_equal(with_shadow[30, 30], without[30, 30])    # backdrop untouched
+    assert tuple(with_shadow[540, 960]) == (200, 30, 30)           # the panel itself

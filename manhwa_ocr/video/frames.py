@@ -840,6 +840,9 @@ def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) ->
 
 PFR_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
 PFR_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+PFR_SHADOW_DY = 20          # foreground drop shadow (B1e E8): black, offset
+PFR_SHADOW_BLUR = 10        # (0, +20px), blur 10px, opacity 40% — layered
+PFR_SHADOW_OPACITY = 0.40   # between the blur backdrop and the foreground
 
 
 class PanelFitView:
@@ -1057,12 +1060,41 @@ class PanelFitView:
             layer.putalpha(ImageChops.multiply(layer.getchannel("A"), mask))
         return layer
 
+    def shadow_layer(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+        """The foreground's drop shadow (B1e E8): the placed panel's
+        silhouette in black at PFR_SHADOW_OPACITY, offset (0, +DY) and
+        blurred — composited BETWEEN the full-brightness blur backdrop
+        and the foreground, so the panel's edge gains contrast while
+        the backdrop itself is never dimmed. A duo panel's shadow is
+        clipped to its own cell, like its foreground."""
+        fmt = self.fmt
+        W, H = fmt.width, fmt.height
+        if PFR_SHADOW_OPACITY <= 0:
+            return Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        alpha = self.fg_layer(t, extra_zoom).getchannel("A")
+        if self.cell is not None:
+            mask = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(mask).rectangle(
+                [self.cell_x0, 0, self.cell_x0 + self.cell_w - 1, H - 1], fill=255)
+            alpha = ImageChops.multiply(alpha, mask)
+        scale = H / 1080.0
+        shifted = Image.new("L", (W, H), 0)
+        shifted.paste(alpha, (0, round(PFR_SHADOW_DY * scale)))
+        if PFR_SHADOW_OPACITY < 0.999:
+            op = PFR_SHADOW_OPACITY
+            shifted = shifted.point(lambda v: int(v * op))
+        shifted = shifted.filter(ImageFilter.GaussianBlur(max(0.1, PFR_SHADOW_BLUR * scale)))
+        out = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+        out.putalpha(shifted)
+        return out
+
     def frame(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
         fmt = self.fmt
         img = self.bg.convert("RGBA")
         if t < self.appear - self.tol:
             return img.convert("RGB")
-        out = Image.alpha_composite(img, self.fg_layer(t, extra_zoom))
+        out = Image.alpha_composite(img, self.shadow_layer(t, extra_zoom))
+        out = Image.alpha_composite(out, self.fg_layer(t, extra_zoom))
         if self.enter == "fade_in" and t < self.appear + self.enter_dur:
             # The only blended entrance in this mode: fade in from the
             # blurred background alone. Every other entrance is a cut —
@@ -1314,6 +1346,7 @@ class ShotRenderer:
             # for the whole moment, never two different blurs stitched).
             img = self.pf_views[0].bg.convert("RGBA")
             for v in self.pf_views:
+                img = Image.alpha_composite(img, v.shadow_layer(t, extra))
                 img = Image.alpha_composite(img, v.fg_layer(t, extra))
             img = img.convert("RGB")
         else:

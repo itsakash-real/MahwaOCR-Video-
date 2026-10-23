@@ -1476,6 +1476,9 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
 
 PF_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
 PF_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+PF_SHADOW_DY = 20          # foreground drop shadow (B1e E8, the user's
+PF_SHADOW_BLUR = 10        # fourth engine fix): black, offset (0, +20px),
+PF_SHADOW_OPACITY = 0.40   # blur 10px, 40% opacity — under the panel only
 PF_FILL_ASPECT = 1.6       # panel aspect (w/h) at/above which it fills the frame
 PF_DRIFT_ASPECT_MAX = 0.72  # pillars narrower than this drift; wider ones zoom
 PF_DRIFT_SPEED = 0.0658    # drift speed, frame-heights per second. The reference
