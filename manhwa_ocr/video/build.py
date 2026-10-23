@@ -104,6 +104,12 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         allowed = shapes_for(s.get("layout", "single"), fmt)
         for c in s.get("cards") or []:
             pw, ph = dims.get(c["panel"], (1.0, 1.0))
+            _sl = c.get("slice")
+            if isinstance(_sl, (list, tuple)) and len(_sl) == 2:
+                # A gutter-segment card (analysis fix 1) shows one band
+                # of its panel: its composition is judged against the
+                # SEGMENT's aspect, not the whole panel's.
+                ph = ph * (float(_sl[1]) - float(_sl[0]))
             _pf = c.get("panelfit")
             if isinstance(_pf, dict):
                 # Panel-fit cards are not classic shapes: the foreground

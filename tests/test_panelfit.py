@@ -510,6 +510,25 @@ def test_build_plan_keeps_a_too_short_shot_whole():
     assert plan["panelfit_segments"] == []
 
 
+def test_qa_judges_a_segment_card_against_its_segment():
+    # Analysis fix 1: a sliced card's spec is fitted to the segment
+    # band, so QA must judge it against the SEGMENT's aspect — and
+    # the very same spec on the unsliced card must still fail.
+    panels = {"panels": [{"id": "P001-01", "width": 900, "height": 2000, "text": ""}]}
+    spec = dict(panelfit_spec(900, 800, "push_in", FMT, {}))
+    card = {"panel": "P001-01", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0.0,
+            "motion": "push_in", "panelfit": spec, "slice": [0.0, 0.4]}
+    plan = {"chapter": "1", "format": "16:9", "fps": 30, "duration": 4.0,
+            "shots": [{"id": "S001", "start": 0.0, "end": 4.0, "layout": "single",
+                       "background": "blur", "cards": [card]}]}
+    qa = build_mod.quality_report(plan, panels, None, 3.0)
+    assert not any("panel-fit" in f for f in qa["failures"])
+    bare = {k: v for k, v in card.items() if k != "slice"}
+    plan2 = {**plan, "shots": [{**plan["shots"][0], "cards": [bare]}]}
+    qa2 = build_mod.quality_report(plan2, panels, None, 3.0)
+    assert any("panel-fit" in f for f in qa2["failures"])
+
+
 def test_qa_flags_a_stretched_foreground():
     plan = _panelfit_plan()
     panels = {"panels": PANELS}
