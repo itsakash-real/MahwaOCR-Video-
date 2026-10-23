@@ -131,6 +131,42 @@ def test_assemble_merges_shard_files(tmp_path):
     assert "alpha line" in raw and "beta line" in raw
 
 
+def test_tile_progress_counts_shard_files(tmp_path):
+    # A sharded chapter writes ONLY tile_results_shard_N.json; progress tools
+    # must see them, or the chapter can never leave the "reading" stage.
+    flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
+    tiles = manifest["tiles"]
+    half = len(tiles) // 2
+    (work / "tile_results_shard_1.json").write_text(json.dumps(
+        [{"id": t["id"], "blocks": []} for t in tiles[:half]]))
+    got, total, parses = w.tile_progress(work)
+    assert parses and total == len(tiles) and got == half
+    assert w.chapter_stage(ws, "1") == w.STAGE_READ_TILES
+    (work / "tile_results_shard_2.json").write_text(json.dumps(
+        [{"id": t["id"], "blocks": []} for t in tiles[half:]]))
+    got, total, parses = w.tile_progress(work)
+    assert parses and got == total
+    assert w.chapter_stage(ws, "1") == w.STAGE_ASSEMBLE
+
+
+def test_read_tiles_instruction_is_shard_aware_and_watches_staleness(tmp_path):
+    flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
+    tiles = manifest["tiles"]
+    (work / "tile_results_shard_1.json").write_text(json.dumps(
+        [{"id": t["id"], "blocks": []} for t in tiles[: len(tiles) // 2]]))
+    text = w.stage_instruction(w.STAGE_READ_TILES, "1", ws, stale_minutes=None)
+    assert "shard" in text and "parallel" in text and "TASK.md" in text
+    assert "STALLED" not in text
+    # Fresh mtime: not stale even with a threshold.
+    text = w.stage_instruction(w.STAGE_READ_TILES, "1", ws, stale_minutes=5)
+    assert "STALLED" not in text
+    # 0.001 min = 0.06s threshold; sleep past it -> stale.
+    import time as _t
+    _t.sleep(0.1)
+    text = w.stage_instruction(w.STAGE_READ_TILES, "1", ws, stale_minutes=0.001)
+    assert "STALLED" in text and "kept" in text
+
+
 def test_assemble_shard_entry_wins_over_single_file(tmp_path):
     flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
     tiles = manifest["tiles"]
