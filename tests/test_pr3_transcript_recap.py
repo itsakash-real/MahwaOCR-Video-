@@ -216,6 +216,32 @@ def test_stage1_watchdog_lets_healthy_reads_finish(tmp_path):
     assert all("error" not in r for r in out)
 
 
+# ------------------------------------------------- landscape credits pages
+
+
+def test_build_tiles_skips_landscape_banner_pages(tmp_path):
+    src = tmp_path / "pages"
+    src.mkdir()
+    Image.new("RGB", (1532, 1024), "white").save(src / "banner.png")   # Asura-style credits
+    Image.new("RGB", (900, 4000), "white").save(src / "strip.png")     # real webtoon page
+    pages = import_pages(sorted(src.glob("*.png")), tmp_path / "out")
+    tiles = build_tiles(pages, tmp_path / "tiles")
+    assert tiles, "the portrait strip must still produce tiles"
+    assert all(t.page_index != 1 for t in tiles), "the landscape banner (page 1) must be skipped"
+    # All tiles come from the strip (page 2).
+    assert {t.page_index for t in tiles} == {2}
+
+
+def test_build_tiles_keeps_all_landscape_when_that_is_the_whole_chapter(tmp_path):
+    src = tmp_path / "pages"
+    src.mkdir()
+    Image.new("RGB", (1400, 900), "white").save(src / "1.png")
+    Image.new("RGB", (1500, 800), "white").save(src / "2.png")
+    pages = import_pages(sorted(src.glob("*.png")), tmp_path / "out")
+    tiles = build_tiles(pages, tmp_path / "tiles")
+    assert len(tiles) == 2  # nothing dropped: an all-landscape source isn't banners
+
+
 def test_assemble_shard_entry_wins_over_single_file(tmp_path):
     flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
     tiles = manifest["tiles"]

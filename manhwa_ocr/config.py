@@ -47,6 +47,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_height_to_slice": 1800,
         # Downscale very wide pages before slicing (keeps tiles in model's sweet spot).
         "max_width": 1100,
+        # Pages wider than tall (reader-site credits banners, e.g. AsuraScans'
+        # first page) are skipped for reading; the page file itself is kept.
+        "drop_landscape_pages": True,
     },
     "download": {
         "timeout": 60,

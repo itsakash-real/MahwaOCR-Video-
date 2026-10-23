@@ -262,6 +262,11 @@ def _settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "gutter_search": max(0, int(cfg.get("gutter_search", 220))),
         "min_height_to_slice": int(cfg.get("min_height_to_slice", 1800)),
         "max_width": int(cfg.get("max_width", 1100) or 0),
+        # Reader sites (e.g. AsuraScans) prepend a wide credits banner to the
+        # page list; in a vertical webtoon a page WIDER than it is tall is
+        # never story content. Skip it for tiling (the page file is kept for
+        # the video side, which has its own landscape handling).
+        "drop_landscape_pages": bool(cfg.get("drop_landscape_pages", True)),
     }
     # An overlap at or above half the tile height would make little or no
     # forward progress per tile; cap it so slicing always terminates sensibly.
@@ -325,6 +330,20 @@ def slice_tall_image(
     return tiles
 
 
+def _landscape_pages(pages: List[Path]) -> set:
+    """Pages wider than they are tall (reader-site credits banners)."""
+    out: set = set()
+    for p in pages:
+        try:
+            with Image.open(p) as im:
+                w, h = im.size
+        except (OSError, UnidentifiedImageError):
+            continue
+        if w > h:
+            out.add(p.name)
+    return out
+
+
 def build_tiles(
     pages: List[Path],
     out_dir: Path,
@@ -339,9 +358,21 @@ def build_tiles(
     and clears them instead of silently reusing mismatched slices.
     """
     settings = _settings(config or {})
+    # Tiles keep the page number of the file they were cut from (p002_* from
+    # page_002.png), and the video side maps tiles to panels through those
+    # numbers -- so dropped pages leave a gap in the sequence, never a renumber.
+    indexed = list(enumerate(pages, start=1))
+    if settings["drop_landscape_pages"] and indexed:
+        landscape = _landscape_pages(pages)
+        # Only ever drop SOME pages: a chapter that is entirely landscape is
+        # not a banner-decorated webtoon (it's a different kind of source),
+        # and an empty tile list would silently produce an empty transcript.
+        if landscape and len(landscape) < len(pages):
+            indexed = [(i, p) for i, p in indexed if p.name not in landscape]
+            log(f"  {len(landscape)} landscape page(s) skipped for reading (credits/banner pages)")
     fingerprint = hashlib.sha256(
         json.dumps(
-            {"settings": settings, "pages": [(p.name, p.stat().st_size) for p in pages]},
+            {"settings": settings, "pages": [(p.name, p.stat().st_size) for _, p in indexed]},
             sort_keys=True,
         ).encode()
     ).hexdigest()[:16]
@@ -352,13 +383,13 @@ def build_tiles(
 
     # Slicing is per-page independent; Pillow releases the GIL while encoding,
     # so threads help. Results come back in page order (executor.map).
-    workers = min(8, max(1, len(pages)))
+    workers = min(8, max(1, len(indexed)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         page_results = list(pool.map(
-            lambda p: slice_tall_image(p[1], p[0], out_dir, config=settings),
-            enumerate(pages, start=1)))
+            lambda pair: slice_tall_image(pair[1], pair[0], out_dir, config=settings),
+            indexed))
     tiles: List[Tile] = []
-    for i, page_tiles in enumerate(page_results, start=1):
+    for (i, _page), page_tiles in zip(indexed, page_results):
         tiles.extend(page_tiles)
         if len(page_tiles) > 1:
             log(f"  page {i:>3} -> {len(page_tiles)} slices")
