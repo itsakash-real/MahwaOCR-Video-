@@ -22,6 +22,7 @@ active session elsewhere can never redirect an agent that is mid-chapter.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -31,6 +32,7 @@ from .memory import SeriesMemory
 from .merge import flatten
 from .prompts import CHAPTER_SYSTEM, TILE_SYSTEM, render_chapter_prompt, render_tile_prompt
 from .scrapers import discover_pages
+from .timing import render_report_table, write_chapter_report
 from .util import (
     UserError,
     atomic_write_json,
@@ -38,9 +40,27 @@ from .util import (
     read_agent_json,
     require_chapter,
 )
-from .workspace import chapter_work_dir, clean_chapter
+from .workspace import chapter_work_dir, clean_chapter, newest_result_mtime, tile_progress
 
 DOWNSTREAM = ("tile_results.json", "ASSEMBLE.md", "assembled.json", "raw_blocks.txt")
+STAGE_TIMES = "stage_times.json"
+
+
+def _read_stage_times(chapter_dir: Path) -> Dict[str, float]:
+    try:
+        data = json.loads((chapter_dir / STAGE_TIMES).read_text(encoding="utf-8"))
+        return {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_stage_times(chapter_dir: Path, **updates: float) -> None:
+    data = _read_stage_times(chapter_dir)
+    data.update({k: float(v) for k, v in updates.items() if v is not None})
+    try:
+        atomic_write_json(chapter_dir / STAGE_TIMES, data)
+    except OSError:
+        pass  # timing is instrumentation; never block the run
 
 
 def command(args: str, session: str | None) -> str:
@@ -73,6 +93,7 @@ class AgentFlow:
         chapter = require_chapter(chapter)
         chapter_dir = self._chapter_dir(chapter)
 
+        t0 = time.monotonic()
         if folder:
             found = list_images(Path(folder))
             if not found:
@@ -89,10 +110,16 @@ class AgentFlow:
             )
         else:
             raise UserError("Give a chapter URL, --folder, or --next.")
+        download_s = time.monotonic() - t0
 
         self.log("  slicing...")
+        t1 = time.monotonic()
         tiles = build_tiles(pages, chapter_dir / "tiles", config=self.cfg.slicing, log=self.log)
+        slice_s = time.monotonic() - t1
         self.log(f"  {len(pages)} pages -> {len(tiles)} tiles")
+        # Stage markers for the per-chapter timing report written at finalize.
+        _write_stage_times(chapter_dir, download_s=download_s, slice_s=slice_s,
+                           prepared_at=time.time(), tiles_total=len(tiles))
 
         # Shards split the tile list across several reading workers; each shard
         # writes its own results file and assemble merges them. A worker's
@@ -355,6 +382,7 @@ Rules:
                 f"Chapter {chapter} has not been prepared. Run:  "
                 + command("prepare --next", self.session)
             )
+        t0 = time.monotonic()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         by_id = self._load_results(chapter_dir, manifest)
 
@@ -406,6 +434,7 @@ Answer the prompt below and write the JSON to
 """
         out = chapter_dir / "ASSEMBLE.md"
         atomic_write_text(out, doc)
+        _write_stage_times(chapter_dir, assemble_s=time.monotonic() - t0)
         return out
 
     def _save_tile_notes(self, chapter: str, chapter_dir: Path) -> None:
@@ -425,9 +454,53 @@ Answer the prompt below and write the JSON to
             notes.append({**t, "scene": scene, "text": text})
         save_tile_notes(self.workdir, chapter, notes)
 
+    def _chapter_timing_report(self, chapter: str, chapter_dir: Path, finalize_s: float) -> Dict[str, Any]:
+        """Compose the per-chapter report from stage markers and file mtimes.
+
+        Wall-clock per stage, so the 10-minute target is measurable. The read
+        phase is derived from disk (first tile's mtime -> last results write):
+        the readers are external agents, only their artifacts are observable.
+        """
+        st = _read_stage_times(chapter_dir)
+        prepare_s = (st.get("download_s", 0.0) or 0.0) + (st.get("slice_s", 0.0) or 0.0) or None
+
+        read_s = None
+        tiles_dir = chapter_dir / "tiles"
+        tile_mtimes = [p.stat().st_mtime for p in tiles_dir.glob("*.png")] if tiles_dir.is_dir() else []
+        read_end = newest_result_mtime(chapter_dir)
+        if tile_mtimes and read_end is not None:
+            read_s = max(0.0, read_end - min(tile_mtimes))
+
+        answer_s = None
+        try:
+            a0 = (chapter_dir / "ASSEMBLE.md").stat().st_mtime
+            a1 = (chapter_dir / "assembled.json").stat().st_mtime
+            answer_s = max(0.0, a1 - a0)
+        except OSError:
+            pass
+
+        total_s = None
+        if st.get("prepared_at"):
+            total_s = max(0.0, time.time() - st["prepared_at"])
+
+        try:
+            manifest = json.loads((chapter_dir / "manifest.json").read_text(encoding="utf-8"))
+            tiles_total = len(manifest.get("tiles", []))
+            shards = max(1, int((manifest.get("shards") or {}).get("count", 1)))
+        except (OSError, ValueError, TypeError):
+            tiles_total, shards = 0, 1
+        got, _, _ = tile_progress(chapter_dir)
+        return {
+            "mode": "agent",
+            "stages_s": {"prepare": prepare_s, "read_tiles": read_s, "assemble": st.get("assemble_s"),
+                         "answer_assembly": answer_s, "finalize": finalize_s, "total": total_s},
+            "tiles": {"total": tiles_total, "read": got, "shards": shards},
+        }
+
     # ------------------------------------------------------------------ step 3
 
     def finalize(self, *, chapter: str, keep_work: bool = False) -> Path:
+        t0 = time.monotonic()
         chapter = require_chapter(chapter)
         chapter_dir = self._chapter_dir(chapter)
         out = self.workdir / f"chapter_{chapter}.md"
@@ -473,6 +546,12 @@ Answer the prompt below and write the JSON to
 
         atomic_write_text(out, "\n".join(header) + transcript.strip() + "\n")
         self._save_tile_notes(chapter, chapter_dir)
+
+        # Per-chapter timing report (survives the scratch cleanup below).
+        report = self._chapter_timing_report(chapter, chapter_dir, time.monotonic() - t0)
+        report_path = write_chapter_report(self.workdir, chapter, report)
+        self.log(render_report_table(report))
+        self.log(f"  timing report: {self._rel(report_path)}")
 
         # Scratch (downloaded pages + tiles) is the bulk of disk use. Clear it
         # once the transcript exists; --keep preserves it for debugging.

@@ -242,6 +242,43 @@ def test_build_tiles_keeps_all_landscape_when_that_is_the_whole_chapter(tmp_path
     assert len(tiles) == 2  # nothing dropped: an all-landscape source isn't banners
 
 
+# ------------------------------------------------- per-chapter timing report
+
+
+def test_finalize_writes_per_chapter_timing_report(tmp_path):
+    import time as _t
+
+    from manhwa_ocr.timing import read as timings_read  # noqa: F401 - clarity only
+
+    flow, ws, work, manifest = _prepared(tmp_path, pages=1)  # 3 tiles, 1 shard
+    ids = [t["id"] for t in manifest["tiles"]]
+    _t.sleep(0.05)
+    (work / "tile_results.json").write_text(
+        json.dumps([{"id": i, "scene": "s", "blocks": []} for i in ids]))
+    assert flow.assemble(chapter="1").exists()
+    _t.sleep(0.05)
+    (work / "assembled.json").write_text(json.dumps(
+        {"transcript": "## Scene 1\n\n**A:** \"hello there friend\"\n" * 3,
+         "summary": "things happen", "memory_update": {}}))
+    logs: list = []
+    flow.log = logs.append
+    out = flow.finalize(chapter="1")
+    assert out.exists()
+    report_file = ws / ".work" / "timing" / "chapter_1.json"
+    assert report_file.exists(), "the report must survive the chapter scratch cleanup"
+    report = json.loads(report_file.read_text())
+    stages = report["stages_s"]
+    assert stages["prepare"] is not None and stages["prepare"] >= 0
+    assert stages["read_tiles"] is not None and stages["read_tiles"] >= 0
+    assert stages["assemble"] is not None and stages["assemble"] >= 0
+    assert stages["answer_assembly"] is not None and stages["answer_assembly"] >= 0
+    assert stages["finalize"] is not None and stages["finalize"] >= 0
+    assert stages["total"] is not None and stages["total"] >= 0
+    assert report["tiles"]["total"] == len(ids) and report["tiles"]["read"] == len(ids)
+    assert any("timing report" in str(x) for x in logs)
+    assert any("per-stage timing" in str(x) for x in logs)
+
+
 def test_assemble_shard_entry_wins_over_single_file(tmp_path):
     flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
     tiles = manifest["tiles"]

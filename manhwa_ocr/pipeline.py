@@ -320,7 +320,9 @@ class Pipeline:
 
         briefing = self.memory.as_briefing()
         self.log("  reading tiles...")
+        t_read = time.monotonic()
         tile_results = self._read_tiles(tiles, briefing, label)
+        read_s = time.monotonic() - t_read
         failed = sum(1 for r in tile_results if "error" in r)
         if failed:
             raise UserError(
@@ -330,10 +332,12 @@ class Pipeline:
             )
 
         self.log("  assembling chapter...")
+        t_asm = time.monotonic()
         threshold = float(self.cfg.pipeline.get("dedupe_threshold", 0.86))
         raw_blocks = flatten(((t.label, r) for t, r in zip(tiles, tile_results)), threshold)
         atomic_write_text(chapter_dir / "raw_blocks.txt", raw_blocks)
         assembled = self._assemble(raw_blocks, briefing, label)
+        assemble_s = time.monotonic() - t_asm
 
         update = assembled.get("memory_update") if isinstance(assembled.get("memory_update"), dict) else {}
         notes = self.memory.merge(update, label)
@@ -352,7 +356,22 @@ class Pipeline:
         ]
         if summary:
             header += ["## Summary", "", summary, "", "---", ""]
+        t_out = time.monotonic()
         atomic_write_text(out_path, "\n".join(header) + transcript + "\n")
+        finalize_s = time.monotonic() - t_out
+
+        from .timing import render_report_table, write_chapter_report
+
+        report = {
+            "mode": "provider",
+            "stages_s": {"prepare": None, "read_tiles": read_s, "assemble": assemble_s,
+                         "answer_assembly": None, "finalize": finalize_s,
+                         "total": read_s + assemble_s + finalize_s},
+            "tiles": {"total": len(tiles), "read": len(tiles) - failed, "shards": 1},
+        }
+        report_file = write_chapter_report(self.workdir, chapter, report)
+        self.log(render_report_table(report))
+        self.log(f"  timing report: {report_file.relative_to(self.workdir)}")
 
         from .video.media import save_tile_notes, tile_notes_from
 
