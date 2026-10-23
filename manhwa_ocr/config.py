@@ -269,7 +269,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "cleanup": True,
     },
     "recap": {
-        # Narration voice for recap writing ("default", "speedrun" or "powerfantasy").
+        # Narration voice for recap writing ("default", "speedrun", "powerfantasy"
+        # or "manhwabro").
         # "default": calm present-tense voice telling a friend why the chapter matters.
         # "speedrun": Speedrun Gossip voice — breathless past-tense gossip, role
         #   labels instead of names, chain-of-consequences sentences with So/But/
@@ -281,6 +282,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         #   recapped only once EVERY transcript in the range exists, so the
         #   writer holds the whole story. Full spec:
         #   docs/RECAP_STYLE_POWERFANTASY.md
+        # "manhwabro": sarcastic hype-man fan narrator — cold open in the fight,
+        #   a "So, why is he so strong?" pivot into the lore, "our boy / this
+        #   brat / bro" for the protagonist, roasts for everyone else, meme
+        #   slang. Writes from the FULL transcript (OCR + character and panel
+        #   descriptions). Full spec: docs/RECAP_STYLE_MANHWABRO.md
         "style": "default",
     },
 }

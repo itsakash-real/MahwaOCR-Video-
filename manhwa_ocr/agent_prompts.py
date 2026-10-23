@@ -73,6 +73,10 @@ RECAPS = """1. Run `python -m manhwa_ocr recap --session "{session}" --chapters 
    transcript in it exists; the range opener hooks in medias res with the
    "This guy is..." formula and drops the lore after the flex; later chapters
    open mid-flow; no chapter ends on finale language or opens with a restart.
+   Or `recap.style: manhwabro` — then use the Manhwa Bro voice
+   (docs/RECAP_STYLE_MANHWABRO.md): cold open in the fight, a "So, why is he so
+   strong?" pivot into the lore, "our boy / this brat / bro" for the protagonist,
+   roasts for everyone else; write from the whole transcript, descriptions included.
 """ + RECAP_RULES + """7. Run `python -m manhwa_ocr recap --session "{session}" --finalize`.
    Fix every error. Read every warning. Report the tagged ratio and the word count per chapter.
 8. Then STOP. Tell me to record each recaps\\chapter_N.tts.txt and save it as audio\\chapter_N.mp3.

@@ -205,3 +205,76 @@ def format_report(issues: List[LintIssue]) -> str:
         lines.append(f"  [{issue.code}]: {issue.message} Fix: {issue.fix}"
                      + (f"\n    \"{snippet}\"" if snippet else ""))
     return "\n".join(lines)
+
+
+# ---- Manhwa Bro (recap.style: manhwabro) ---------------------------------
+# Additive: lint_powerfantasy above is untouched. The Manhwa Bro lane shares
+# its continuity / purity / cue-form gates with Power Fantasy (a chapter never
+# ends on finale language, never opens with a restart, carries no camera
+# directions, and writes time skips in a form the title-card generator
+# detects), and adds the two things that make the voice recognisable.
+
+# The range opener's pivot into the lore: "So, why is he so strong?" style.
+BRO_PIVOT_RE = re.compile(r"\bso,?\s+why\b|\bwhy\s+(is|does|did|was|can|could)\b[^.?!]*\?",
+                          re.IGNORECASE)
+BRO_PIVOT_SEARCH_SENTENCES = 14   # the pivot lands within the first minute or two
+
+# Protagonist epithets (the persona's signature). Word-bounded so "brother"
+# or "broken" never counts as "bro".
+BRO_EPITHET_RE = re.compile(
+    r"\bour (boy|guy|man|protagonist|cool)\b|\bthis (brat|man|guy|kid|dude)\b|\bbro\b|"
+    r"\bthe young master\b", re.IGNORECASE)
+BRO_MIN_EPITHETS = 1              # at least one per chapter; the system asks for a few
+
+
+def lint_manhwabro(narration: str, *, range_opener: bool) -> List[LintIssue]:
+    """All Manhwa Bro style issues in one chapter's narration (empty = clean).
+
+    Shared gates (finale / restart / camera / cue-form) run for every chapter
+    by delegating to lint_powerfantasy with range_opener=False, which skips
+    that style's hook-formula and lore-phrase checks. The range opener must
+    additionally pivot with a "So, why is...?" question and must not lead
+    with the past; every chapter must use at least one protagonist epithet.
+    """
+    issues: List[LintIssue] = list(lint_powerfantasy(narration, range_opener=False))
+    lines = _spoken_lines(narration)
+    sentences = _sentences(lines)
+    if not sentences:
+        return issues
+    full = " ".join(sentences)
+
+    if range_opener:
+        region = " ".join(sentences[:BRO_PIVOT_SEARCH_SENTENCES])
+        if not BRO_PIVOT_RE.search(region):
+            issues.append(LintIssue(
+                "bro-pivot",
+                "The range opener never pivots with a rhetorical question "
+                "(\"So, why is [protagonist] so strong?\") after the cold open.",
+                "Right after the opening payoff, ask the viewer that question, then explain the lore.",
+                region[:120]))
+        opening = " ".join(sentences[:OPENING_SENTENCES])
+        marker = next((m for m in PAST_LIFE_MARKERS if m in opening.lower()), None)
+        if marker:
+            issues.append(LintIssue(
+                "past-life-opening",
+                f"The opener leads with the past (\"{marker}\") before the fight; "
+                "this style opens in the middle of the action.",
+                "Open on the strongest fight, then pivot to the backstory.", opening[:120]))
+
+    if len(BRO_EPITHET_RE.findall(full)) < BRO_MIN_EPITHETS:
+        issues.append(LintIssue(
+            "bro-epithet",
+            "The chapter never calls the protagonist by the persona's epithets "
+            "(\"our boy\", \"this brat\", \"bro\", \"this man\").",
+            "Use at least one epithet for the protagonist; the voice depends on it.", ""))
+    return issues
+
+
+def format_bro_report(issues: List[LintIssue]) -> str:
+    lines = [f"{len(issues)} manhwa-bro style issue(s) found -- fix all of them in the "
+             "recap, then re-finalize:"]
+    for issue in issues:
+        snippet = issue.text if len(issue.text) <= 70 else issue.text[:67] + "..."
+        lines.append(f"  [{issue.code}]: {issue.message} Fix: {issue.fix}"
+                     + (f"\n    \"{snippet}\"" if snippet else ""))
+    return "\n".join(lines)

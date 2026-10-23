@@ -238,6 +238,10 @@ Ask me before running anything with --force that discards edits.
    transcript in it exists; the range opener hooks in medias res with the
    "This guy is..." formula and drops the lore after the flex; later chapters
    open mid-flow; no chapter ends on finale language or opens with a restart.
+   Or `recap.style: manhwabro` — then use the Manhwa Bro voice
+   (docs/RECAP_STYLE_MANHWABRO.md): cold open in the fight, a "So, why is he so
+   strong?" pivot into the lore, "our boy / this brat / bro" for the protagonist,
+   roasts for everyone else; write from the whole transcript, descriptions included.
 3. Tagging rules. Check each one before you finalize.
    - Tag EVERY sentence. Target a tagged ratio of 95% or higher.
    - Use only drawn panels. Never tag a panel marked text-only, credits or watermark.

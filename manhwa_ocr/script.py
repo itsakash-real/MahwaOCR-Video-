@@ -129,6 +129,47 @@ Pipeline contract (this style runs inside the recap tool, which adds the rest):
 Return only valid JSON. No preamble, no markdown fences."""
 
 
+# The "Manhwa Bro" system: a sarcastic, hype-the-protagonist fan narrator,
+# reverse-engineered from a recap-channel sample (docs/RECAP_STYLE_MANHWABRO.md).
+# Additive lane: nothing above is changed by it; it is selected only by
+# recap.style: manhwabro.
+MANHWABRO_SYSTEM = """You are a sarcastic, hype-man manhwa recap narrator, a fan telling a friend about a chapter you love. You are a bro first and a storyteller second, but you never get a fact wrong.
+
+THE INPUT. Your transcript is the full chapter: every line of dialogue and narration from the OCR, plus the written descriptions of who each character is, what they look like, and what is happening in each panel. Treat it as the single source of truth. Use the character descriptions to know who is who (hair, clothing, role, relationships) and the panel descriptions to know what actually happens, so you can narrate action the speech bubbles never spell out. Use each character's name exactly as the transcript and series context give it, and spell it the same way every time.
+
+VOICE AND PERSONA:
+- Present tense for the action and for framing; past tense only inside a flashback.
+- Conversational and judgmental, like an online friend, never a formal narrator.
+- Hype the protagonist: \"our boy\", \"this brat\", \"bro\", \"this man\", \"our cool, epic protagonist\". Use at least a few of these per chapter.
+- Mock everyone else: a bad hero is a \"clown\", an annoying servant an \"old fart\", a beaten enemy \"the poor bastard\". Mock-sympathy for the victim (\"poor guy\") is a staple.
+- Slip into the protagonist's head now and then (\"thinks it must be some kind of...\", \"questioning how low his self-esteem really was\").
+- Roast character decisions out loud, with a short aside, then keep moving.
+
+STRUCTURE (a range of chapters is one continuous film):
+- The first chapter opens IN THE MIDDLE OF THE ACTION, in the strongest fight or confrontation the chapter has, with no backstory first. Right after the first payoff, pivot with a rhetorical question to the viewer, \"So, why is [protagonist] so [strong / ruthless / calm]?\", and only then explain the past or the lore.
+- Every later chapter opens mid-flow on its strongest beat. No restart language and no re-explaining what came before.
+- Never end a chapter on finale or closing language. End mid-escalation, on the beat that pulls into the next chapter, ideally on the protagonist's resolve or a fresh threat.
+
+RHYTHM:
+- Short punchy sentences (about 8 to 15 words), then one long run-on that builds momentum, then a short one to land the joke.
+- Pivot with \"But\", \"Then\", \"And before X can recover...\", \"Well, of course...\", \"Unfortunately...\". Set up an expectation, then flip it at the end of the beat.
+- Use fragments for sarcasm, rhetorical questions to steer the viewer, ironic understatement (\"casually holding one of the fire lances\" when it is huge), and deadpan stacking: a plot fact, an insult, the next fact.
+- Intensifiers on action beats: completely, absolutely, desperately, immediately, hastily, even.
+- Power language: endless storm, completely overwhelms, defenses collapse, crushes it like it's nothing.
+
+HUMOR (use sparingly, one or two moves per beat, never at the cost of clarity):
+- Modern internet slang dropped into the fantasy (\"mogged\", \"Chad\", \"incel\", \"chilling\", \"has the balls to\", \"ain't no\").
+- One pop-culture comparison per chapter at most.
+- Hyperbole about the protagonist's power.
+
+Format the output as a spoken voiceover script: only the words the narrator speaks. No camera directions, no visual notes.
+
+Pipeline contract (this style runs inside the recap tool, which adds the rest):
+- Write ORIGINAL narration in your own words. Never invent events, characters, powers or dialogue that are not in the transcript. The jokes and insults are your commentary, never new plot. Quote the source only sparingly, for lines that genuinely land.
+- The recap file also carries panel tags and bracketed editing cues, exactly as the chapter prompt describes. They are stripped before the script reaches the narrator, are never spoken, and are not camera directions.
+Return only valid JSON. No preamble, no markdown fences."""
+
+
 SCRIPT_PROMPT = """{briefing_block}{previous_block}{panel_block}
 Series: "{series}"
 Chapter: {chapter}
@@ -235,6 +276,71 @@ what happened in this chapter, where each main character is now, what each
 character wants or fears going forward, and what is still unresolved. Write it
 so someone who has read nothing else can pick the story up from it. No
 [HOOK] or [LOOP] markers and no editing cues in the summary.
+
+Return exactly this shape:
+{{
+  "narration": "the full narration segment, as markdown",
+  "hook": "the opening line, repeated on its own",
+  "summary": "3-5 sentences: events, where each main character is now, open threads"
+}}"""
+
+
+_MB_OPENER_NOTE = """SCOPE FOR THIS CHAPTER: this chapter OPENS the range (chapters {first}-{last}).
+Open in the middle of the chapter's strongest fight or confrontation, with no
+backstory first. Right after that first payoff, pivot with a rhetorical
+question to the viewer ("So, why is [protagonist] so strong?") and only then
+explain the past or the lore. Do NOT start with the protagonist's past,
+reincarnation or childhood."""
+
+_MB_CONTINUATION_NOTE = """SCOPE FOR THIS CHAPTER: this chapter CONTINUES the range (chapters {first}-{last});
+the range opener already ran the cold open and the "So, why is...?" pivot.
+Open mid-flow on this chapter's strongest beat. Do NOT repeat the pivot
+question, do NOT re-explain the setup, and use no restart language: the film
+flows straight from the previous chapter into this one."""
+
+
+# The Manhwa Bro chapter prompt. The system (MANHWABRO_SYSTEM) carries the
+# voice; this template carries the pipeline framing and hands the writer the
+# WHOLE transcript (OCR text + character and panel descriptions) as source.
+MANHWABRO_PROMPT = """{briefing_block}{previous_block}{panel_block}
+Series: "{series}"
+Chapter: {chapter}
+Target length: about {words} words (~{minutes} minutes read aloud)
+
+{scope_note}
+
+FRAMING — how the Manhwa Bro system runs inside this pipeline:
+- SOURCE OF TRUTH. The transcript below is the complete chapter: OCR dialogue
+  and narration, plus the written descriptions of each character and each
+  panel's situation. Read ALL of it before writing. Name characters as the
+  transcript and series context do, keep every name spelled one way, and
+  take appearance, emotion and action from the descriptions. A joke may
+  exaggerate a reaction, but it never changes what happened or who did it.
+- CONTINUITY. Never end a chapter on finale or closing language, and never
+  open one with a restart ("welcome back", "previously on", ...). End
+  mid-escalation, on the beat that pulls into the next chapter.
+- TAG LAYER. The narration text itself stays pure voiceover. The panel tags
+  and bracketed editing cues the panel block above describes still go into
+  the recap file exactly as it says; they are stripped before the script
+  reaches the narrator and are not camera directions.
+- TITLE-CARD CUES. When the chapter genuinely skips time, write the skip as
+  its own standalone sentence ("Three years later." / "Age fifteen."), so the
+  video's title-card generator can pick it up.
+
+Here is the full chapter transcript to work from:
+
+<transcript>
+{transcript}
+</transcript>
+
+Write the narration segment for this chapter.
+
+Also write a "summary": 3-5 plain sentences for the next chapter's writer. Cover
+what happened in this chapter, where each main character is now, what each
+character wants or fears going forward, and what is still unresolved. Write it
+in plain neutral language, no slang and no jokes, so someone who has read
+nothing else can pick the story up from it. No [HOOK] or [LOOP] markers and no
+editing cues in the summary.
 
 Return exactly this shape:
 {{
@@ -553,6 +659,8 @@ class RecapBuilder:
             return SPEEDRUN_SYSTEM
         if style == "powerfantasy":
             return POWERFANTASY_SYSTEM
+        if style == "manhwabro":
+            return MANHWABRO_SYSTEM
         return SCRIPT_SYSTEM
 
     def _range_block(self, chapter: str, range_chapters: List[str] | None) -> str:
@@ -588,7 +696,10 @@ class RecapBuilder:
 
     def _scope_note(self, chapter: str, range_chapters: List[str] | None) -> str:
         span = _range_span(range_chapters or [chapter])
-        note = _PF_OPENER_NOTE if chapter == span[0] else _PF_CONTINUATION_NOTE
+        if self._style() == "manhwabro":
+            note = _MB_OPENER_NOTE if chapter == span[0] else _MB_CONTINUATION_NOTE
+        else:
+            note = _PF_OPENER_NOTE if chapter == span[0] else _PF_CONTINUATION_NOTE
         return note.format(first=span[0], last=span[-1])
 
     def _is_range_opener(self, chapter: str, task_chapters: List[str]) -> bool:
@@ -602,6 +713,11 @@ class RecapBuilder:
     def _lint_errors(self, chapter: str, narration: str, task_chapters: List[str]) -> List[str]:
         """Power Fantasy script-lint failures for a finished chapter (empty
         for other styles). A failing chapter is not saved, like a tag error."""
+        if self._style() == "manhwabro":
+            from .script_lint import lint_manhwabro
+
+            issues = lint_manhwabro(narration, range_opener=self._is_range_opener(chapter, task_chapters))
+            return [f"[manhwa-bro lint] {i.message} Fix: {i.fix}" for i in issues]
         if self._style() != "powerfantasy":
             return []
         from .script_lint import lint_powerfantasy
@@ -616,6 +732,20 @@ class RecapBuilder:
             return POWERFANTASY_PROMPT.format(
                 briefing_block=self._briefing_block(),
                 range_block=self._range_block(chapter, range_chapters),
+                previous_block=self._previous_block(chapter),
+                panel_block=self._panel_block(chapter, sheets),
+                series=self.cfg.series_name,
+                chapter=chapter,
+                words=_target_words(minutes),
+                minutes=minutes,
+                scope_note=self._scope_note(chapter, range_chapters),
+                transcript=self._transcript(chapter),
+            )
+        if self._style() == "manhwabro":
+            # Per-chapter series bible (no later reveals), the chapter's FULL
+            # transcript, and the same range-aware scope note as Power Fantasy.
+            return MANHWABRO_PROMPT.format(
+                briefing_block=self._briefing_block(upto=chapter),
                 previous_block=self._previous_block(chapter),
                 panel_block=self._panel_block(chapter, sheets),
                 series=self.cfg.series_name,
