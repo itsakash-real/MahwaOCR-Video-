@@ -69,11 +69,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                     #   the wide treatment; a narrower one keeps its classic
                                     #   crop/shape but without the equal-area shrink (no more
                                     #   stale small cards) -- real per-panel variety in one video
-                                    #   panelfit: no cards, no cropping -- every panel shown
-                                    #   WHOLE at its native aspect over a blurred 60%
-                                    #   self-fill; standard panels slow-zoom 100->108%,
-                                    #   tall strips scroll top->bottom, all LINEAR
-                                    #   (the user's rendering spec; see panelfit: below)
+                                    #   panelfit: the MEASURED reference style (see
+                                    #   reference-video-measured-spec.md) -- every panel
+                                    #   shown WHOLE at its native aspect over its own
+                                    #   full-brightness blurred fill, gentle LINEAR
+                                    #   drift or constant-rate zoom-in, wide panels
+                                    #   full-bleed, NO burned captions, NO shake/flash,
+                                    #   split-flap title cards on timeline cues
+                                    #   (see panelfit: below)
         "wide": {
             "min_width_ratio": 0.375,  # 6/16 of the frame wide; no thin slivers, ever
             "max_upscale": 1.5,         # a panel is never upscaled past this (1080p sharpness)
@@ -82,21 +85,55 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "wide_threshold": 1.333,   # a panel's own aspect >= this (4:3) earns the wide treatment
         },
         "panelfit": {
+            # Every value below is pinned to the MEASURED reference video
+            # (reference-video-measured-spec.md, 85 shots). Where the older
+            # text descriptions disagreed with the measurements, the
+            # measurements won (user arbitration, 2026-10-23).
             "bg_blur": 50,             # Gaussian radius (px at 1080p) of the cover-scaled,
                                        # blurred copy of the panel that fills the frame
-            "bg_opacity": 0.60,        # that background layer's opacity over black
-            "zoom_end": 1.08,          # slow zoom end scale: 100% -> 108% (pull_out reverses)
-            "strip_aspect": 1.9,       # panel height/width at or above this = a vertical
-                                       # strip: fit by width and scroll, never zoom-crop
+            "bg_opacity": 1.0,         # that background layer's opacity over black:
+                                       # 1.0 = FULL brightness, no dimming (measured;
+                                       # the text specs' 50-60% was wrong)
+            "fill_aspect": 1.6,        # panel aspect (w/h) at/above this fills the frame
+                                       # full-bleed; narrower panels are height-fit pillars
+            "drift_aspect_max": 0.72,  # pillars narrower than this (w/h) get a gentle
+                                       # vertical drift; wider pillars get a zoom-in
+            "drift_speed": 0.068,      # drift speed, frame-heights/second (measured
+                                       # cluster 20.7-27.6 px/s at 360p = 5.8-7.7%/s)
+            "drift_min_travel": 0.05,  # a drift always travels at least this share of
+                                       # the frame height (measured totals: 5-13%)
+            "drift_max_travel": 0.13,  # ... and never more than this share
+            "drift_headroom": 0.03,    # extra foreground oversize beyond the travel,
+                                       # so a drift never exposes a panel edge
+            "zoom_rate": 0.05,         # zoom-in rate: +5.0%/s (measured band
+                                       # +3.6-6.5%/s) -- a constant RATE, so the total
+                                       # grows with shot length; never a fixed total,
+                                       # never a zoom-out
+            "zoom_rate_impact": 0.088, # impact shots zoom at +8.8%/s instead (measured
+                                       # on the reference's weapon-clash shot). There is
+                                       # NO shake and NO white flash in this mode --
+                                       # the reference uses neither, on any shot.
+            "zoom_max_total": 0.50,    # total zoom cap: at +50% the scale holds
+                                       # (measured totals top out at +46%)
             "max_upscale": 2.4,        # the foreground is never upscaled past this
-                                       # (readability floor for strips and small panels)
+                                       # (readability floor for small panels)
             "still_limit": 0.5,        # seconds: nothing on screen may stay still longer
-                                       # (spec's zero-static rule; motion is continuous by
+                                       # (zero-static rule; motion is continuous by
                                        # construction, tests pin the invariant)
-            "fx": True,                # impact FX on flagged shots: screen shake + white flash
-            "shake_seconds": 0.2,      # screen-shake duration on an impact beat
-            "shake_amplitude": 10.0,   # screen-shake amplitude, px at 1080p
-            "flash_frames": 3,         # white-flash length at impact cuts, frames (spec: 2-4)
+            "min_shot": 0.3,           # this mode's shot floor (measured reference
+                                       # minimum 0.30s; classic keeps its own 3.0s floor)
+            "split_above": 3.5,        # sentences longer than this split into two
+                                       # shots (the reference's median shot is ~2s)
+            "split_min_piece": 1.2,    # smallest piece such a split may produce
+            "captions": False,         # NO burned-in captions in this mode (measured:
+                                       # the reference carries none -- platform CC only)
+            "title_cards": True,       # Title Card Generator: timeline cues in the
+                                       # narration ("Age 4" / "Week 6") become split-flap
+                                       # cards (see video/titlecards.py)
+            "tts_gap_seconds": 0.20,   # the mode's recommended narration gap (measured
+                                       # median 0.214s, max 0.364s). The global TTS
+                                       # default stays 0.35; use this value for
+                                       # tts.gap_seconds when synthesizing for this mode.
         },
         "crf": 20,                  # x264 quality: lower = better and bigger
         "preset": "veryfast",

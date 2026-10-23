@@ -720,88 +720,74 @@ def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) ->
 
 # ------------------------------------------------------------------ panel-fit views
 #
-# Panel-fit mode (video.mode: panelfit): the renderer half of the user's
-# rendering spec. Mirror constants of the planner's (plan.PF_*); config
-# pins all of them to the same numbers and tests fail on drift.
+# Panel-fit mode (video.mode: panelfit): the renderer half of the
+# MEASURED reference style. Mirror constants of the planner's (plan.PF_*);
+# config pins all of them to the same numbers and tests fail on drift.
 
 PFR_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
-PFR_BG_OPACITY = 0.60       # background layer opacity over black
-PFR_SHAKE_SECONDS = 0.2     # impact screen-shake duration (spec section 4)
-PFR_SHAKE_AMPLITUDE = 10.0  # impact screen-shake amplitude, px at 1080p
-PFR_FLASH_FRAMES = 3        # impact white-flash length, frames (spec: 2-4)
-
-
-def panelfit_shake_offset(t: float, times: List[float], fmt: Format) -> Tuple[float, float]:
-    """The spec's impact shake: PFR_SHAKE_SECONDS of rapid small X/Y
-    oscillation, decaying linearly to zero. Not the classic shake (a 0.5s
-    damped wobble) — this mode's FX have their own shape and constants."""
-    for te in times:
-        dt = t - te
-        if 0 <= dt < PFR_SHAKE_SECONDS:
-            amp = PFR_SHAKE_AMPLITUDE * fmt.unit * (1.0 - dt / PFR_SHAKE_SECONDS)
-            return (amp * math.sin(2 * math.pi * 13 * dt),
-                    0.7 * amp * math.cos(2 * math.pi * 11 * dt))
-    return 0.0, 0.0
-
-
-def panelfit_flash_alpha(t: float, times: List[float], fps: int) -> float:
-    """White flash at an impact cut: full white on the first frame,
-    stepping down over exactly PFR_FLASH_FRAMES frames."""
-    best = 0.0
-    for te in times:
-        k = int(round((t - te) * max(1, fps)))
-        if 0 <= k < PFR_FLASH_FRAMES:
-            best = max(best, (PFR_FLASH_FRAMES - k) / PFR_FLASH_FRAMES)
-    return best
+PFR_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
 
 
 class PanelFitView:
-    """One panel composed per the user's rendering spec: the panel shown
-    WHOLE at its native aspect — sharp, centred — over the same panel
-    cover-scaled, heavily blurred, at 60% opacity on black. Assets arrive
-    already white-space-eradicated (Rule 6: panels.trim_v2), so neither
-    layer ever contains a white margin.
+    """One panel composed per the measured reference style: the panel
+    shown WHOLE at its native aspect — sharp, centred — over the same
+    panel cover-scaled, heavily blurred, at FULL brightness (the
+    measured reference has no dimming layer). Assets arrive already
+    white-space-eradicated (Rule 6: panels.trim_v2), so neither layer
+    ever contains a white margin.
 
     Motion is LINEAR and sub-pixel: the foreground source is LANCZOS-
     resized once to the largest size the motion reaches, and each frame
     samples it with a float AFFINE transform — no per-frame integer
-    rounding (the ffmpeg-zoompan jitter), no ease curves (the jerk the
-    user rejected in the full-frame sample). Scroll velocity is constant
-    by construction.
+    rounding (the ffmpeg-zoompan jitter), no ease curves.
 
-    kind "zoom": fitted inside the frame, slow zoom 100% -> zoom_end
-    (dir "in") or the reverse (dir "out").
-    kind "scroll": a tall strip fitted by width, scrolled top->bottom
-    (dir "down") or bottom->top (dir "up") across the view's window.
+    kind "zoom": a height-fit pillar zooming IN at a constant rate
+    (the spec's zoom_end = 1 + rate x shot duration; dir "out" exists
+    only on pre-measurement plans — the measured style never zooms out).
+    kind "fill": a wide panel cover-filling the whole frame, same zoom.
+    kind "drift": a narrow pillar, height-fit and oversized by
+    (drift_frac + headroom); across the shot it drifts vertically by
+    drift_frac of the frame height, centred, so no panel edge ever
+    enters the frame (dir "down": the art moves downward).
+    kind "scroll": LEGACY (pre-measurement plans only): a tall strip
+    fitted by width and scrolled across the view's window.
     """
 
     def __init__(self, panel: Image.Image, spec: Dict[str, Any], card: Dict[str, Any],
                  shot_start: float, shot_end: float, fmt: Format):
         self.fmt = fmt
-        self.kind = spec.get("kind") if spec.get("kind") in ("zoom", "scroll") else "zoom"
-        self.dir = spec.get("dir") or ("down" if self.kind == "scroll" else "in")
+        self.kind = spec.get("kind") if spec.get("kind") in ("zoom", "drift", "fill", "scroll") else "zoom"
+        self.dir = spec.get("dir") or ("down" if self.kind in ("scroll", "drift") else "in")
         self.base_w = float(spec.get("base_w") or fmt.width)
         self.base_h = float(spec.get("base_h") or fmt.height)
         self.zoom_end = float(spec.get("zoom_end") or 1.08)
+        self.zoom_rate = float(spec.get("zoom_rate") or 0.0)
+        self.drift_frac = float(spec.get("drift_frac") or 0.0)
         self.appear = shot_start + max(0.0, float(card.get("at") or 0.0))
         self.end = shot_end
+        if self.zoom_rate <= 0 and self.kind in ("zoom", "fill"):
+            # Legacy specs (pre-measurement plans) carry only zoom_end:
+            # derive the constant rate that reaches it across the view.
+            self.zoom_rate = max(0.0, self.zoom_end - 1.0) / max(0.01, self.end - self.appear)
         self.enter = card.get("enter") if card.get("enter") in ENTRANCES else "cut"
         self.enter_dur = ENTER_DUR[self.enter]
         pw, ph = panel.size
-        # Background layer: the same panel, cover-scaled past the frame
-        # by the shake margin, blurred, dimmed over black. Built once.
-        m = int(math.ceil(PFR_SHAKE_AMPLITUDE * fmt.unit)) + 2
-        self.margin = m
-        cover = max((fmt.width + 2 * m) / max(1, pw), (fmt.height + 2 * m) / max(1, ph))
+        # Background layer: the same panel, cover-scaled to the frame,
+        # blurred, at FULL brightness (opacity 1.0 = no blend over
+        # black). Built once; static for the whole shot.
+        cover = max(fmt.width / max(1, pw), fmt.height / max(1, ph))
         bw, bh = max(1, round(pw * cover)), max(1, round(ph * cover))
         bg = panel.resize((bw, bh), Image.LANCZOS)
-        bx, by = (bw - (fmt.width + 2 * m)) // 2, (bh - (fmt.height + 2 * m)) // 2
-        bg = bg.crop((bx, by, bx + fmt.width + 2 * m, by + fmt.height + 2 * m))
+        bx, by = (bw - fmt.width) // 2, (bh - fmt.height) // 2
+        bg = bg.crop((bx, by, bx + fmt.width, by + fmt.height))
         bg = bg.filter(ImageFilter.GaussianBlur(PFR_BG_BLUR * bg.height / 1080.0))
-        self.bg = Image.blend(Image.new("RGB", bg.size, (0, 0, 0)), bg, PFR_BG_OPACITY)
+        if PFR_BG_OPACITY < 0.999:
+            bg = Image.blend(Image.new("RGB", bg.size, (0, 0, 0)), bg, PFR_BG_OPACITY)
+        self.bg = bg
         # Foreground source: the whole panel at the largest size the
-        # motion reaches (base * zoom_end for zooms, base for scrolls).
-        top = self.zoom_end if self.kind == "zoom" else 1.0
+        # motion reaches (base * zoom_end for zooms, base otherwise —
+        # a drift's base is already oversized by the planner).
+        top = self.zoom_end if self.kind in ("zoom", "fill") else 1.0
         fw, fh = max(2, round(self.base_w * top)), max(2, round(self.base_h * top))
         src = panel if (fw, fh) == (pw, ph) else panel.resize((fw, fh), Image.LANCZOS)
         self.src = src.convert("RGBA")
@@ -810,32 +796,39 @@ class PanelFitView:
     def visible(self, t: float) -> bool:
         return t >= self.appear - 1e-9
 
-    def frame(self, t: float, shake: Tuple[float, float] = (0.0, 0.0),
-              extra_zoom: float = 0.0) -> Image.Image:
+    def frame(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
         fmt = self.fmt
         W, H = fmt.width, fmt.height
-        sx, sy = shake
-        ox, oy = self.margin - int(round(sx)), self.margin - int(round(sy))
-        img = self.bg.crop((ox, oy, ox + W, oy + H)).convert("RGBA")
+        img = self.bg.convert("RGBA")
         if t < self.appear - 1e-9:
             return img.convert("RGB")
         dur = max(0.01, self.end - self.appear)
         p = min(1.0, max(0.0, (t - self.appear) / dur))
         # LINEAR progress everywhere in this mode — constant velocity is
-        # the spec's headline smoothness requirement.
+        # the measured style's headline smoothness property.
         if self.kind == "scroll":
             disp_w, disp_h = self.base_w, self.base_h
             span = H - disp_h  # <= 0 for a strip taller than the frame
             dy = span * p if self.dir == "down" else span * (1.0 - p)
             dx = (W - disp_w) / 2.0
-        else:
+        elif self.kind == "drift":
+            disp_w, disp_h = self.base_w, self.base_h
+            travel = self.drift_frac * H
+            off = (p - 0.5) * travel if self.dir == "down" else (0.5 - p) * travel
+            dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0 + off
+        else:  # zoom / fill: constant-RATE zoom-in, capped at zoom_end
             z = self.zoom_end
-            s = (1.0 + (z - 1.0) * p) if self.dir == "in" else (z - (z - 1.0) * p)
+            if self.dir == "in":
+                # Grow at zoom_rate per second of screen time and HOLD
+                # at zoom_end (the planner caps zoom_end at +50%
+                # total: past the cap the scale stays, it does not
+                # slow down and stretch the rate over the shot).
+                s = min(1.0 + self.zoom_rate * max(0.0, t - self.appear), z)
+            else:  # legacy zoom-out (pre-measurement plans only)
+                s = z - (z - 1.0) * p
             s *= 1.0 + extra_zoom
             disp_w, disp_h = self.base_w * s, self.base_h * s
             dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0
-        dx += sx
-        dy += sy
         a = self.src_w / max(1.0, disp_w)
         e = self.src_h / max(1.0, disp_h)
         layer = self.src.transform((W, H), Image.AFFINE,
@@ -897,16 +890,21 @@ class ShotRenderer:
         # card, the shot is composed from PanelFitViews instead of cards
         # (the cards stay built as the fallback if a spec is missing).
         self.pf_views: List[PanelFitView] = []
-        self.pf_shakes: List[float] = []
-        self.pf_flashes: List[float] = []
         if shot.get("panelfit") and fmt.width > fmt.height and cards:
             _specs = [c.get("panelfit") for c in cards]
             if all(isinstance(_sp, dict) for _sp in _specs):
                 self.pf_views = [PanelFitView(images[c["panel"]], _sp, c, self.start, self.end, fmt)
                                  for c, _sp in zip(cards, _specs)]
-                _pfx = shot.get("panelfit_fx") or {}
-                self.pf_shakes = [self.start + float(x) for x in (_pfx.get("shake_t") or [])]
-                self.pf_flashes = [self.start + float(x) for x in (_pfx.get("flash_t") or [])]
+        # Title-card shots (Title Card Generator): no panels at all --
+        # the whole shot is the split-flap card, drawn once here.
+        self.title_card_img: Image.Image | None = None
+        _tc_spec = shot.get("title_card")
+        if isinstance(_tc_spec, dict):
+            from .titlecards import render_title_card as _render_tc
+            self.title_card_img = _render_tc(fmt.width, fmt.height,
+                                             str(_tc_spec.get("label") or ""),
+                                             int(_tc_spec.get("number") or 0),
+                                             str(_tc_spec.get("line") or ""))
 
         bg_kind = shot.get("background") if shot.get("background") in BACKGROUNDS else "blur"
         bg_panel = shot.get("bg_panel") if shot.get("bg_panel") in images else (cards[0]["panel"] if cards else None)
@@ -964,6 +962,8 @@ class ShotRenderer:
     def frame_array(self, t: float) -> np.ndarray:
         if self.is_static(t) and self._static is not None:
             return self._static
+        if self.title_card_img is not None:
+            return self._title_frame_array(t)
         if self.pf_views:
             return self._pf_frame_array(t)
         img = self._bg_pil.copy()
@@ -1018,13 +1018,15 @@ class ShotRenderer:
         return out
 
     def _pf_frame_array(self, t: float) -> np.ndarray:
+        # Measured reference style: hard cuts and the panel's own motion
+        # only -- no shake, no white flash, no glitch on this path (the
+        # reference uses none of them, on any shot).
         view = self.pf_views[0]
         for v in self.pf_views:
             if v.visible(t):
                 view = v
-        shake = panelfit_shake_offset(t, self.pf_shakes, self.fmt)
         extra = punch_amount(t, self.punches)
-        img = view.frame(t, shake=shake, extra_zoom=extra)
+        img = view.frame(t, extra_zoom=extra)
         for _co in self.callouts:
             _draw_callout(img, _co, self.fmt, t, caption_bar=self.caption_bar)
         for _cc in self.chapter_cards:
@@ -1034,12 +1036,13 @@ class ShotRenderer:
             out = (out.astype(np.float32) * (1.0 - self.darken)).astype(np.uint8)
         if self.grade == "subtle":
             out = grade_subtle(out)
-        _glitch = glitch_offset(t, self.glitches, self.fmt.unit)
-        if _glitch > 0:
-            out = glitch_split(out, _glitch)
-        fa = panelfit_flash_alpha(t, self.pf_flashes, self.fmt.fps)
-        if fa > 0.001:
-            out = _mix(out, np.full_like(out, 255), fa)
+        if self.fade_from is not None and t > self.fade_from:
+            span = max(1e-3, self.end - self.fade_from)
+            out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
+        return out
+
+    def _title_frame_array(self, t: float) -> np.ndarray:
+        out = np.asarray(self.title_card_img, dtype=np.uint8)
         if self.fade_from is not None and t > self.fade_from:
             span = max(1e-3, self.end - self.fade_from)
             out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))

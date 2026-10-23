@@ -241,14 +241,22 @@ deterministic (same inputs → identical JSON).
 
 ## Panel-fit mode (`video.mode: panelfit`)
 
-The user's rendering spec, as a mode alongside classic/wide/adaptive
-(existing modes untouched). No cards, no cropping, no stretch — ever:
+The MEASURED reference style, as a mode alongside classic/wide/adaptive
+(existing modes untouched). It replicates one specific channel's edit,
+measured shot-by-shot from their video (85 shots; see
+`reference-video-measured-spec.md`). Where the older text descriptions
+of that style disagreed with the measurements, the measurements govern
+(user arbitration 2026-10-23: "copy the video exactly — no captions,
+no shake/flash"). No cards, no cropping of ordinary panels, no
+stretch — ever:
 
-- **Composition.** Every shot's panel is shown WHOLE at its native aspect
-  ratio: sharp, centred, fitted by height (aspect ≤ canvas) or by width
-  (wider than canvas), over the same panel cover-scaled with a heavy
-  Gaussian blur (~50px) at 60% opacity on black. The blurred background is
-  flagged on exactly when the panel isn't itself canvas-shaped.
+- **Composition.** Every shot's panel is shown WHOLE at its native
+  aspect ratio: sharp, centred, height-fit, over the same panel
+  cover-scaled with a heavy Gaussian blur (~50px) at FULL brightness
+  (no dimming layer — the measured video has none). Panels at aspect
+  (w/h) >= `panelfit.fill_aspect` (~1.6) instead fill the frame
+  full-bleed; blur bands are never used. The blurred background is
+  static within a shot.
 - **Pre-processing (Rule 6).** Panel build must run with
   `video.panels.trim_v2: true` (prep order: recap → trim/slice → pair/plan
   → compose; raw pages untouched). Assets are trimmed to their ink
@@ -257,31 +265,56 @@ The user's rendering spec, as a mode alongside classic/wide/adaptive
   layer ever contains a white margin. `video plan` warns when a panelfit
   build's panels carry no `trim2` record. Cuts/slices are recorded per
   panel in `panels.json` (`trim2`).
-- **Motion.** Zero static: standard panels slow-zoom 100%→108% (reversed
-  for `pull_out`); tall strips (h/w ≥ `panelfit.strip_aspect`) are fitted
-  by width and scrolled top→bottom. All motion is LINEAR and sub-pixel
-  (LANCZOS source + float AFFINE sampling) — scroll velocity is constant
-  by construction; ease curves and integer rounding are banned in this
-  mode because they read as jerk.
-- **Impact FX.** Cuts flagged by the plan's `{impact}`/`{reveal}` markers
-  (fallback: a VISUAL_ACTION sentence carrying an impact verb) get a
-  3-frame white flash at the cut and a 0.2s screen shake. No
-  cross-dissolves.
-- **Sync.** Shots anchor to sentence boundaries via the alignment, as in
-  every mode; keyframe endpoints are the shot boundaries.
+- **Motion.** Zero static, all LINEAR and sub-pixel (LANCZOS source +
+  float AFFINE sampling; ease curves and integer rounding are banned —
+  they read as jerk). Narrow pillars (aspect < `panelfit.drift_aspect_max`,
+  0.72) get a gentle vertical DRIFT: constant ~6.8% of frame height per
+  second, total travel clamped to 5-13% of frame height, direction
+  alternating shot by shot, the foreground oversized by travel +
+  headroom so no panel edge ever shows. Wider pillars and full-bleed
+  shots get a zoom-IN at a constant RATE (+5.0%/s; the total grows with
+  shot length, capped at +50% — `panelfit.zoom_max_total` — where the
+  scale holds). There is no full strip traversal and no zoom-out.
+- **Impact.** Shots flagged by `{impact}`/`{reveal}` markers (fallback:
+  a VISUAL_ACTION sentence with an impact verb) zoom at +8.8%/s
+  instead. There is NO screen shake and NO white flash in this mode —
+  the measured reference uses neither, on any shot.
+- **Captions.** None are burned in, ever, in this mode
+  (`panelfit.captions: false` pins it; the reference carries no burned
+  captions — platform CC only).
+- **Rhythm.** The mode's own shot floor is `panelfit.min_shot` (0.3s,
+  the measured minimum; the sync gate honours it for these plans) and
+  sentences over `panelfit.split_above` (3.5s) split into two shots.
+  Narration for this mode should be synthesized with
+  `tts.gap_seconds = panelfit.tts_gap_seconds` (0.20s; measured median
+  gap 0.214s).
+- **Title cards.** Timeline cues in the narration ("Age 4", "Week 6 of
+  possession", "3 years later") become split-flap title cards: solid
+  black, a small serif label over two beige flap tiles (zero-padded
+  digits, block = 33% of frame height), one bold condensed ALL-CAPS
+  line in Anton below. A card starts at its cue sentence's aligned
+  start and lasts clamp(cue span, 2.0, 3.0)s, consuming the plan time
+  it overlaps; the sync audit counts card time as covering its cue.
+  See `video/titlecards.py`.
+- **Sync.** Shots anchor to sentence boundaries via the alignment, as
+  in every mode; keyframe endpoints are the shot boundaries.
 - **Parallax** is deferred (build B11): the detector yields boxes, not
   character segmentations, so cut-outs aren't cheap yet.
-- **QA.** `chapter_N.qa.json` carries `panelfit_static` (must be empty),
-  `panelfit_over_cap` (panels fitted at the upscale cap — shown smaller,
-  never stretched) and `panelfit_impact` (which shots got FX, and by
-  which rule). A card breaking the composition invariants fails the build.
-- **Storyboard** shows the composed frame at shot start and end, side by
-  side. Landscape only; portrait formats stay classic.
+- **QA.** `chapter_N.qa.json` carries `panelfit_static` (must be
+  empty), `panelfit_over_cap` (panels fitted at the upscale cap —
+  shown smaller, never stretched), `panelfit_impact` (which shots got
+  the fast zoom rate, and by which rule) and `panelfit_title_cards`.
+  A card breaking the composition invariants fails the build.
+- **Storyboard** shows the composed frame at shot start and end, side
+  by side. Landscape only; portrait formats stay classic.
 
 Knobs (`video.panelfit.*`, defaults pinned in code): `bg_blur` 50,
-`bg_opacity` 0.60, `zoom_end` 1.08, `strip_aspect` 1.9, `max_upscale` 2.4,
-`still_limit` 0.5, `fx` true, `shake_seconds` 0.2, `shake_amplitude` 10.0,
-`flash_frames` 3.
+`bg_opacity` 1.0, `fill_aspect` 1.6, `drift_aspect_max` 0.72,
+`drift_speed` 0.068, `drift_min_travel` 0.05, `drift_max_travel` 0.13,
+`drift_headroom` 0.03, `zoom_rate` 0.05, `zoom_rate_impact` 0.088,
+`max_upscale` 2.4, `still_limit` 0.5, `min_shot` 0.3, `split_above`
+3.5, `split_min_piece` 1.2, `captions` false, `title_cards` true,
+`tts_gap_seconds` 0.20.
 
 ## `fixes.json` overrides (all in one file, `video/chapter_N.fixes.json`)
 
