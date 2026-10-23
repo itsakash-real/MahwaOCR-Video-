@@ -1583,6 +1583,33 @@ def panelfit_spec(pw: float, ph: float, motion: str, fmt: Format,
     return spec
 
 
+def panelfit_advance_slice(spec: Dict[str, Any], cut_in: float) -> Dict[str, Any]:
+    """Advance a panelfit span slice by `cut_in` seconds — a clip that
+    starts mid-shot (build._clip_plan) skips the shot's head, so the
+    slice must open at the position the SPAN had reached by then, not
+    at the slice's own start. Without this, a clip starting inside a
+    split sentence replays the span from its beginning on the first
+    piece and jumps at the seam (B1d F1, found on the proof sample:
+    a 65px position jump at the first seam of a mid-span clip).
+    Legacy specs (no slice keys) are returned unchanged."""
+    sp = dict(spec or {})
+    cut = max(0.0, float(cut_in))
+    if cut == 0.0:
+        return sp
+    if sp.get("kind") == "drift" and sp.get("drift_from") is not None:
+        frm, to = float(sp["drift_from"]), float(sp["drift_to"])
+        rate = float(sp["drift_rate"])
+        new = frm + rate * cut
+        new = min(new, to) if rate > 0 else max(new, to)
+        sp["drift_from"] = round(new, 4)
+        sp["drift_frac"] = round(float(sp["drift_frac"]) - (new - frm), 4)
+    elif sp.get("kind") in ("zoom", "fill") and "zoom_start" in sp:
+        sp["zoom_start"] = round(min(float(sp["zoom_start"])
+                                     + float(sp["zoom_rate"]) * cut,
+                                     float(sp["zoom_end"])), 4)
+    return sp
+
+
 def panelfit_is_impact(shot: Dict[str, Any]) -> Tuple[bool, str | None]:
     """(is_impact, rule) for one shot. Flags come from the plan's
     existing beat markers first (shot["effects"], built from the

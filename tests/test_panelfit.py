@@ -618,3 +618,44 @@ def test_validate_accepts_span_slices_and_rejects_opposing_drift():
     bad = dict(sp)
     bad["drift_frac"] = -abs(sp["drift_frac"])                  # opposes its dir
     assert any("panelfit" in e for e in validate(_plan_with_spec(bad), {"P001-01"}))
+
+
+def test_advance_slice_moves_a_drift_slice_to_the_span_position():
+    sp = panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=1.7,
+                       span_dur=3.4, elapsed=0.0, direction="down")
+    adv = plan_mod.panelfit_advance_slice(sp, 0.88)
+    want = plan_mod.panelfit_drift_offset(plan_mod.panelfit_drift_travel(3.4), 0.88, "down")
+    assert adv["drift_from"] == pytest.approx(want, abs=1e-3)
+    assert adv["drift_frac"] == pytest.approx(sp["drift_frac"] - (want - sp["drift_from"]),
+                                              abs=1e-3)
+    # A hold slice stays held; a zoom slice opens mid-zoom, capped.
+    hold = panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=1.7,
+                         span_dur=7.7, elapsed=5.13, direction="down")
+    adv_hold = plan_mod.panelfit_advance_slice(hold, 1.0)
+    assert adv_hold["drift_from"] == hold["drift_from"] and adv_hold["drift_frac"] == 0.0
+    zoom = panelfit_spec(900, 1200, "push_in", FMT, {}, dur=2.0,
+                         span_dur=10.0, elapsed=2.0)
+    adv_zoom = plan_mod.panelfit_advance_slice(zoom, 3.0)
+    assert adv_zoom["zoom_start"] == pytest.approx(
+        min(zoom["zoom_start"] + zoom["zoom_rate"] * 3.0, zoom["zoom_end"]), abs=1e-3)
+
+
+def test_clip_starting_mid_span_keeps_the_motion_phase():
+    # F1 on the clip path (build._clip_plan): a clip that opens inside
+    # a split sentence must not restart the span's motion on its first
+    # piece — measured on the B1d proof sample as a 65px jump at the
+    # first seam before this fix.
+    plan = _one_sentence_plan("P001-02", 3.4)
+    assert len(plan["shots"]) == 2
+    clip = build_mod._clip_plan(plan, 0.88, 3.4, "16:9")
+    shots = clip["shots"]
+    assert len(shots) == 2
+    img = Image.new("RGB", (900, 2400), (255, 0, 0))
+    ImageDraw.Draw(img).rectangle((0, 1200, 900, 2399), fill=(0, 0, 255))
+    imgs = {"P001-02": img}
+    a, b = (ShotRenderer(s, imgs, FMT) for s in shots)
+    seam_frame = int(round(float(shots[1]["start"]) * FMT.fps))
+    y_last_a = _boundary_y(a.frame_array((seam_frame - 1) / FMT.fps))
+    y_first_b = _boundary_y(b.frame_array(seam_frame / FMT.fps))
+    assert y_first_b - y_last_a == pytest.approx(
+        plan_mod.PF_DRIFT_SPEED * 1080 / FMT.fps, abs=3)

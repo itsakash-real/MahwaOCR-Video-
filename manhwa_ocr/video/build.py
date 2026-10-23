@@ -31,7 +31,7 @@ from .ffmpeg import audio_timing, close_encoder, media_duration, open_encoder, r
 from .frames import background, format_from, shapes_for
 from . import fixes as fixes_mod
 from .verify import verify_chapter
-from .plan import map_options
+from .plan import map_options, panelfit_advance_slice
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
 from .plan import (FF_ASPECT, FF_ASPECT_TOL, FF_CONTAIN_TOL, PLAN_VERSION, build_plan, load_plan,
@@ -901,7 +901,14 @@ def _clip_plan(plan: Dict[str, Any], start: float, end: float, fmt: str) -> Dict
             at = float(c.get("at") or 0) - cut_in
             # A card that already arrived before the clip starts is simply there:
             # replaying its entrance would look like a glitch.
-            cards.append({**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"})
+            card = {**c, "at": round(max(0.0, at), 3), "enter": c.get("enter") if at >= 0 else "cut"}
+            if cut_in > 0 and isinstance(c.get("panelfit"), dict):
+                # Panel-fit span slices are phased from the shot's own start:
+                # skipping the head must advance the slice to the span position
+                # the clip actually opens on, or the motion restarts and jumps
+                # at the next seam (B1d F1).
+                card["panelfit"] = panelfit_advance_slice(c["panelfit"], cut_in)
+            cards.append(card)
         # P3: callouts ride on shots with absolute times — shift them into
         # the clip timeline and drop ones outside the clip.
         clip_callouts = [{"t": round(float(c["t"]) - start, 3), "text": c.get("text"),
