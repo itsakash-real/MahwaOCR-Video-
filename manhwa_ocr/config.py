@@ -97,6 +97,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "bg_opacity": 1.0,         # that background layer's opacity over black:
                                        # 1.0 = FULL brightness, no dimming (measured;
                                        # the text specs' 50-60% was wrong)
+            "shadow_dy": 20,           # B1e: the foreground's drop shadow — black,
+            "shadow_blur": 10,         # offset (0, +20px), blur 10px, opacity 40%,
+            "shadow_opacity": 0.40,    # layered between backdrop and panel (the
+                                       # backdrop itself stays at full brightness)
             "fill_aspect": 1.6,        # panel aspect (w/h) at/above this fills the frame
                                        # full-bleed; narrower panels are height-fit pillars
             "drift_aspect_max": 0.72,  # pillars narrower than this (w/h) get a gentle
@@ -120,6 +124,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # on the reference's weapon-clash shot). There is
                                        # NO shake and NO white flash in this mode --
                                        # the reference uses neither, on any shot.
+            "zoom_out_fast_rate": 0.176, # B1e: zoom-OUT rate for a blast, used
+                                       # ONLY by the per-sentence motion hint
+                                       # "zoom_out_fast" (the user's detonator ->
+                                       # explosion ruling): exactly 2x the impact
+                                       # zoom-in rate. Default routing never zooms
+                                       # out; a hint is the only way in.
             "zoom_max_total": 0.50,    # total zoom cap: at +50% the scale holds
                                        # (measured totals top out at +46%)
             "max_upscale": 2.4,        # the foreground is never upscaled past this

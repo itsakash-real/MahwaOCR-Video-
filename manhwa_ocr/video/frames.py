@@ -34,7 +34,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 LAYOUTS = ("single", "pair", "inset", "wide")
 BACKGROUNDS = ("blur", "black", "white")
@@ -840,6 +840,9 @@ def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) ->
 
 PFR_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
 PFR_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+PFR_SHADOW_DY = 20          # foreground drop shadow (B1e E8): black, offset
+PFR_SHADOW_BLUR = 10        # (0, +20px), blur 10px, opacity 40% — layered
+PFR_SHADOW_OPACITY = 0.40   # between the blur backdrop and the foreground
 
 
 class PanelFitView:
@@ -865,6 +868,13 @@ class PanelFitView:
     enters the frame (dir "down": the art moves downward).
     kind "scroll": LEGACY (pre-measurement plans only): a tall strip
     fitted by width and scrolled across the view's window.
+    kind "traverse" (B1e): a strip fitted by width, sliding linearly
+    from its top anchor to its bottom anchor across the sentence span
+    (traverse_from/to/rate — the drift slice's sibling fields).
+    kind "duo" (B1e): one of two panels shown side by side, each in its
+    own half-frame cell over the pair's shared blur — sliding
+    vertically (duo_mode "slide", the drift fields) or zooming out
+    (duo_mode "zoom_out", the signed zoom fields).
 
     Span slices (B1d): when a sentence split into sub-shots, each
     sub-shot's spec is a slice of ONE span motion — a zoom carries
@@ -880,7 +890,7 @@ class PanelFitView:
     def __init__(self, panel: Image.Image, spec: Dict[str, Any], card: Dict[str, Any],
                  shot_start: float, shot_end: float, fmt: Format):
         self.fmt = fmt
-        self.kind = spec.get("kind") if spec.get("kind") in ("zoom", "drift", "fill", "scroll") else "zoom"
+        self.kind = spec.get("kind") if spec.get("kind") in ("zoom", "drift", "fill", "scroll", "traverse", "duo") else "zoom"
         self.dir = spec.get("dir") or ("down" if self.kind in ("scroll", "drift") else "in")
         self.base_w = float(spec.get("base_w") or fmt.width)
         self.base_h = float(spec.get("base_h") or fmt.height)
@@ -888,6 +898,16 @@ class PanelFitView:
         self.zoom_rate = float(spec.get("zoom_rate") or 0.0)
         self.zoom_start = float(spec.get("zoom_start") or 1.0)
         self.drift_frac = float(spec.get("drift_frac") or 0.0)
+        # B1e: a traverse slice carries its span position like a drift
+        # slice does (offsets in frame heights from the top anchor).
+        self.traverse_from = float(spec["traverse_from"]) if spec.get("traverse_from") is not None else None
+        self.traverse_to = float(spec.get("traverse_to") or 0.0)
+        self.traverse_rate = float(spec.get("traverse_rate") or 0.0)
+        # B1e: a duo card lives in one half-frame cell.
+        self.duo_mode = spec.get("duo_mode") if self.kind == "duo" else None
+        self.cell = spec.get("cell") if self.kind == "duo" else None
+        self.cell_w = fmt.width / 2.0
+        self.cell_x0 = self.cell_w if self.cell == "right" else 0.0
         # Span-slice keys (B1d); absent on pre-B1d plans.
         self.drift_from = spec.get("drift_from")
         self.drift_to = spec.get("drift_to")
@@ -906,9 +926,12 @@ class PanelFitView:
         # only ever shows the slice's true first position.
         self.tol = 0.5 / max(1.0, float(fmt.fps or 30))
         self.end = shot_end
-        if self.zoom_rate <= 0 and self.kind in ("zoom", "fill"):
+        self.sliced = spec.get("zoom_start") is not None
+        if self.zoom_rate <= 0 and self.kind in ("zoom", "fill") and not self.sliced:
             # Legacy specs (pre-measurement plans) carry only zoom_end:
             # derive the constant rate that reaches it across the view.
+            # A SLICED spec's rate is signed on purpose (B1e zoom-out
+            # hints store it negative) — never "derive" over it.
             self.zoom_rate = max(0.0, self.zoom_end - 1.0) / max(0.01, self.end - self.appear)
         self.enter = card.get("enter") if card.get("enter") in ENTRANCES else "cut"
         self.enter_dur = ENTER_DUR[self.enter]
@@ -927,8 +950,11 @@ class PanelFitView:
         self.bg = bg
         # Foreground source: the whole panel at the largest size the
         # motion reaches (base * zoom_end for zooms, base otherwise —
-        # a drift's base is already oversized by the planner).
-        top = self.zoom_end if self.kind in ("zoom", "fill") else 1.0
+        # a drift's base is already oversized by the planner). A
+        # zoom-OUT reaches its largest size at zoom_START (B1e).
+        top = max(self.zoom_start, self.zoom_end) \
+            if self.kind in ("zoom", "fill") \
+            or (self.kind == "duo" and self.duo_mode == "zoom_out") else 1.0
         fw, fh = max(2, round(self.base_w * top)), max(2, round(self.base_h * top))
         src = panel if (fw, fh) == (pw, ph) else panel.resize((fw, fh), Image.LANCZOS)
         self.src = src.convert("RGBA")
@@ -937,29 +963,49 @@ class PanelFitView:
     def visible(self, t: float) -> bool:
         return t >= self.appear - self.tol
 
-    def frame(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+    def _place(self, t: float, extra_zoom: float = 0.0):
+        """(dx, dy, disp_w, disp_h): where the foreground sits at t.
+
+        Placement anchors CENTRE (B1e E6): the foreground is centred on
+        the frame — or, for a duo card, on its cell — so a cover-crop's
+        overflow splits equally on both sides. The traverse is the one
+        exception: it anchors the art's TOP at the span's start and its
+        BOTTOM at the span's end. LINEAR progress everywhere in this
+        mode — constant velocity is the measured style's headline
+        smoothness property.
+        """
         fmt = self.fmt
         W, H = fmt.width, fmt.height
-        img = self.bg.convert("RGBA")
-        if t < self.appear - self.tol:
-            return img.convert("RGB")
         dur = max(0.01, self.end - self.appear)
         p = min(1.0, max(0.0, (t - self.appear) / dur))
-        # LINEAR progress everywhere in this mode — constant velocity is
-        # the measured style's headline smoothness property.
+        dt = max(0.0, t - self.appear)
         if self.kind == "scroll":
             disp_w, disp_h = self.base_w, self.base_h
             span = H - disp_h  # <= 0 for a strip taller than the frame
             dy = span * p if self.dir == "down" else span * (1.0 - p)
-            dx = (W - disp_w) / 2.0
-        elif self.kind == "drift":
+            return (W - disp_w) / 2.0, dy, disp_w, disp_h
+        if self.kind == "traverse":
+            disp_w, disp_h = self.base_w, self.base_h
+            if self.traverse_from is not None:
+                # Span slice (B1e): the offset walks from traverse_from
+                # (0 = the art's top at the frame's top) down to
+                # traverse_to (the art's bottom at the frame's bottom),
+                # arriving exactly at the span's end — clamped to the
+                # slice's own window, continuous at seams.
+                off = self.traverse_from + self.traverse_rate * dt
+                off = min(self.traverse_from, max(self.traverse_to, off))
+                return (W - disp_w) / 2.0, off * H, disp_w, disp_h
+            span = H - disp_h  # legacy per-shot traverse (no slice keys)
+            dy = span * p if self.dir == "down" else span * (1.0 - p)
+            return (W - disp_w) / 2.0, dy, disp_w, disp_h
+        if self.kind == "drift" or (self.kind == "duo" and self.duo_mode == "slide"):
             disp_w, disp_h = self.base_w, self.base_h
             if self.drift_from is not None:
                 # Span slice (B1d): absolute offset in frame heights,
                 # moving at the span's constant rate toward drift_to,
                 # then HOLDING there — continuous at seams, never a
                 # reversal, never a slow-mo stretch.
-                off = self.drift_from + self.drift_rate * max(0.0, t - self.appear)
+                off = self.drift_from + self.drift_rate * dt
                 if self.drift_rate > 0:
                     off = min(off, self.drift_to)
                 elif self.drift_rate < 0:
@@ -968,26 +1014,87 @@ class PanelFitView:
             else:  # legacy centred drift (pre-B1d plans)
                 travel = self.drift_frac * H
                 off = (p - 0.5) * travel if self.dir == "down" else (0.5 - p) * travel
-            dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0 + off
-        else:  # zoom / fill: constant-RATE zoom-in, capped at zoom_end
-            z = self.zoom_end
-            if self.dir == "in":
-                # Grow at zoom_rate per second of screen time and HOLD
-                # at zoom_end (the planner caps zoom_end at +50%
-                # total: past the cap the scale stays, it does not
-                # slow down and stretch the rate over the shot).
-                s = min(self.zoom_start + self.zoom_rate * max(0.0, t - self.appear), z)
-            else:  # legacy zoom-out (pre-measurement plans only)
-                s = z - (z - 1.0) * p
-            s *= 1.0 + extra_zoom
-            disp_w, disp_h = self.base_w * s, self.base_h * s
-            dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0
+            if self.cell is not None:  # a duo slide stays inside its cell
+                return self.cell_x0 + (self.cell_w - disp_w) / 2.0, \
+                    (H - disp_h) / 2.0 + off, disp_w, disp_h
+            return (W - disp_w) / 2.0, (H - disp_h) / 2.0 + off, disp_w, disp_h
+        # zoom / fill / duo zoom-out: constant-RATE zoom, capped at zoom_end
+        z = self.zoom_end
+        if self.kind == "duo" or (self.dir == "out" and self.sliced):
+            # B1e: a sliced zoom-OUT (a per-sentence hint, or the duo
+            # fallback) — walk from zoom_start DOWN to zoom_end at the
+            # signed rate, clamped to the slice's own window.
+            s = max(z, min(self.zoom_start, self.zoom_start + self.zoom_rate * dt))
+        elif self.dir == "in":
+            # Grow at zoom_rate per second of screen time and HOLD
+            # at zoom_end (the planner caps zoom_end at +50%
+            # total: past the cap the scale stays, it does not
+            # slow down and stretch the rate over the shot).
+            s = min(self.zoom_start + self.zoom_rate * dt, z)
+        else:  # legacy zoom-out (pre-measurement plans only)
+            s = z - (z - 1.0) * p
+        s *= 1.0 + extra_zoom
+        disp_w, disp_h = self.base_w * s, self.base_h * s
+        if self.cell is not None:
+            return self.cell_x0 + (self.cell_w - disp_w) / 2.0, \
+                (H - disp_h) / 2.0, disp_w, disp_h
+        return (W - disp_w) / 2.0, (H - disp_h) / 2.0, disp_w, disp_h
+
+    def fg_layer(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+        """The foreground alone, as a full-frame transparent layer: the
+        panel source affine-sampled at its placed rect, clipped to its
+        duo cell when it has one (B1e E3 — a sliding panel must never
+        bleed across the centre line into its partner's cell)."""
+        fmt = self.fmt
+        W, H = fmt.width, fmt.height
+        dx, dy, disp_w, disp_h = self._place(t, extra_zoom)
         a = self.src_w / max(1.0, disp_w)
         e = self.src_h / max(1.0, disp_h)
         layer = self.src.transform((W, H), Image.AFFINE,
                                    (a, 0.0, -dx * a, 0.0, e, -dy * e),
                                    resample=Image.BILINEAR, fill=0)
-        out = Image.alpha_composite(img, layer)
+        if self.cell is not None:
+            mask = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(mask).rectangle(
+                [self.cell_x0, 0, self.cell_x0 + self.cell_w - 1, H - 1], fill=255)
+            layer.putalpha(ImageChops.multiply(layer.getchannel("A"), mask))
+        return layer
+
+    def shadow_layer(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+        """The foreground's drop shadow (B1e E8): the placed panel's
+        silhouette in black at PFR_SHADOW_OPACITY, offset (0, +DY) and
+        blurred — composited BETWEEN the full-brightness blur backdrop
+        and the foreground, so the panel's edge gains contrast while
+        the backdrop itself is never dimmed. A duo panel's shadow is
+        clipped to its own cell, like its foreground."""
+        fmt = self.fmt
+        W, H = fmt.width, fmt.height
+        if PFR_SHADOW_OPACITY <= 0:
+            return Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        alpha = self.fg_layer(t, extra_zoom).getchannel("A")
+        if self.cell is not None:
+            mask = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(mask).rectangle(
+                [self.cell_x0, 0, self.cell_x0 + self.cell_w - 1, H - 1], fill=255)
+            alpha = ImageChops.multiply(alpha, mask)
+        scale = H / 1080.0
+        shifted = Image.new("L", (W, H), 0)
+        shifted.paste(alpha, (0, round(PFR_SHADOW_DY * scale)))
+        if PFR_SHADOW_OPACITY < 0.999:
+            op = PFR_SHADOW_OPACITY
+            shifted = shifted.point(lambda v: int(v * op))
+        shifted = shifted.filter(ImageFilter.GaussianBlur(max(0.1, PFR_SHADOW_BLUR * scale)))
+        out = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+        out.putalpha(shifted)
+        return out
+
+    def frame(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
+        fmt = self.fmt
+        img = self.bg.convert("RGBA")
+        if t < self.appear - self.tol:
+            return img.convert("RGB")
+        out = Image.alpha_composite(img, self.shadow_layer(t, extra_zoom))
+        out = Image.alpha_composite(out, self.fg_layer(t, extra_zoom))
         if self.enter == "fade_in" and t < self.appear + self.enter_dur:
             # The only blended entrance in this mode: fade in from the
             # blurred background alone. Every other entrance is a cut —
@@ -1232,12 +1339,22 @@ class ShotRenderer:
         # Measured reference style: hard cuts and the panel's own motion
         # only -- no shake, no white flash, no glitch on this path (the
         # reference uses none of them, on any shot).
-        view = self.pf_views[0]
-        for v in self.pf_views:
-            if v.visible(t):
-                view = v
         extra = punch_amount(t, self.punches)
-        img = view.frame(t, extra_zoom=extra)
+        if len(self.pf_views) == 2 and all(v.kind == "duo" for v in self.pf_views):
+            # B1e E3: a duo shows BOTH panels at once, side by side over
+            # their shared blur (the first/left panel's — one backdrop
+            # for the whole moment, never two different blurs stitched).
+            img = self.pf_views[0].bg.convert("RGBA")
+            for v in self.pf_views:
+                img = Image.alpha_composite(img, v.shadow_layer(t, extra))
+                img = Image.alpha_composite(img, v.fg_layer(t, extra))
+            img = img.convert("RGB")
+        else:
+            view = self.pf_views[0]
+            for v in self.pf_views:
+                if v.visible(t):
+                    view = v
+            img = view.frame(t, extra_zoom=extra)
         for _co in self.callouts:
             _draw_callout(img, _co, self.fmt, t, caption_bar=self.caption_bar)
         for _cc in self.chapter_cards:

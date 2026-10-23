@@ -122,6 +122,16 @@ def _nearest_art(panels: List[Dict[str, Any]], index: int, avoid: set, reach: in
 MIN_PIECE = 1.8   # a panel inside a multi-panel sentence stays at least this long
 
 
+def _motion_for(motion: Any, k: int) -> Any:
+    """The motion override (B1e) for the k-th panel a sentence shows: a
+    string applies to the whole sentence; a list runs parallel to the
+    sentence's tagged panels, so k indexes the shown sequence (which
+    the alignment builds from those tags, in order)."""
+    if isinstance(motion, list):
+        return motion[k] if k < len(motion) else None
+    return motion
+
+
 def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], duration: float,
                  vcfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Panel by panel: every sentence shows the panels it is tagged with, in order.
@@ -150,6 +160,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             if unit["sentence"] and unit["sentence"] != u["sentence"]:
                 u["sentence"] = " ".join(x for x in (u["sentence"], unit["sentence"]) if x)
             u["sentence_starts"] += unit["sentence_starts"]
+            if u.get("motion") is None and unit.get("motion") is not None:
+                u["motion"] = unit["motion"]
             return
         units.append(unit)
 
@@ -165,6 +177,18 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             if p and p not in ids:
                 ids.append(p)
         ids = ids or current
+        motion = s.get("motion")
+        if motion == "duo" and len(ids) == 2:
+            # B1e E3: a duo sentence shows BOTH panels at once for its
+            # whole window — one unit, two panels, never split into
+            # sequential stretches.
+            add({"start": start, "end": end, "panels": list(ids),
+                 "cues": list(s.get("cues") or []),
+                 "emphasis": [e for e in (s.get("emphasis") or []) if start <= e < end],
+                 "sentence": s.get("text"), "sentence_starts": [float(s["start"])],
+                 "motion": "duo"})
+            current = ids[-1:]
+            continue
         # Each tagged panel gets its own stretch of the sentence, as long as
         # every stretch is long enough to take in.
         fits = max(1, min(len(ids), int((end - start) // MIN_PIECE)))
@@ -176,7 +200,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
             add({"start": a, "end": b, "panels": [pid],
                  "cues": list(s.get("cues") or []) if k == 0 else [],
                  "emphasis": [e for e in (s.get("emphasis") or []) if a <= e < b],
-                 "sentence": s.get("text"), "sentence_starts": [float(s["start"]) if k == 0 else a]})
+                 "sentence": s.get("text"), "sentence_starts": [float(s["start"]) if k == 0 else a],
+                 "motion": _motion_for(motion, k)})
         current = ids[-1:]
     if not units:
         return even_units(panels, duration, vcfg)
@@ -188,6 +213,8 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
         nxt["emphasis"] = first["emphasis"] + nxt["emphasis"]
         nxt["sentence"] = " ".join(x for x in (first["sentence"], nxt["sentence"]) if x)
         nxt["sentence_starts"] = first["sentence_starts"] + nxt["sentence_starts"]
+        if nxt.get("motion") is None and first.get("motion") is not None:
+            nxt["motion"] = first["motion"]
     units[0]["start"] = 0.0
     units[-1]["end"] = duration
     return units
@@ -217,6 +244,8 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             if unit["sentence"] and unit["sentence"] != u["sentence"]:
                 u["sentence"] = " ".join(x for x in (u["sentence"], unit["sentence"]) if x)
             u["sentence_starts"] += unit["sentence_starts"]
+            if u.get("motion") is None and unit.get("motion") is not None:
+                u["motion"] = unit["motion"]
             return
         units.append(unit)
 
@@ -240,6 +269,13 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if not seq:
             continue  # nothing has ever been shown yet; nothing to hold either
         start, end = float(seg["start"]), float(seg["end"])
+        motion = seg.get("motion")
+        if motion == "duo" and len(seq) == 2:
+            # B1e E3: both panels at once for the whole sentence — one
+            # two-panel unit, never split by the sequence shares.
+            add({"start": start, "end": end, "panels": list(seq), "cues": [], "emphasis": [],
+                 "sentence": seg.get("text"), "sentence_starts": [start], "motion": "duo"})
+            continue
         # Split on the shares place_impactful() recorded (tagged ~65% +
         # filler ~35% for a long sentence), NOT evenly: an even split
         # would give the filler half the window and break tagged coverage.
@@ -254,7 +290,8 @@ def units_from_alignment(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             cursor_t = b
             add({"start": a, "end": b, "panels": [pid], "cues": [], "emphasis": [],
                  "sentence": seg.get("text") if k == 0 else None,
-                 "sentence_starts": [start] if k == 0 else [a]})
+                 "sentence_starts": [start] if k == 0 else [a],
+                 "motion": _motion_for(motion, k)})
     if units:
         units[0]["start"] = 0.0
     return units
@@ -297,7 +334,15 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     groups: List[List[Dict[str, Any]]] = []
     i = 0
     while i < len(units):
-        if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units):
+        # A multi-panel unit (a B1e duo) never groups with a neighbour:
+        # the pair construction below keeps exactly one panel per unit,
+        # and a duo's two panels must stay together in their own shot.
+        # A unit carrying a motion hint never groups either: its beats
+        # were sequenced deliberately by the pairing surface, and a
+        # grouped pair would show them simultaneously instead.
+        if float(units[i]["end"]) - float(units[i]["start"]) < min_hold - 1e-6 and i + 1 < len(units) \
+                and len(units[i]["panels"]) == 1 and len(units[i + 1]["panels"]) == 1 \
+                and units[i].get("motion") is None and units[i + 1].get("motion") is None:
             groups.append([units[i], units[i + 1]])
             i += 2
         else:
@@ -307,7 +352,8 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
     # A lone short tail after a pair sometimes fits better as that pair's
     # second card (its first panel becomes the short one): slide the last
     # three units while that lowers the total shortfall.
-    while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2:
+    while len(groups) >= 2 and len(groups[-1]) == 1 and len(groups[-2]) == 2 \
+            and all(len(u["panels"]) == 1 for g in (groups[-2], groups[-1]) for u in g):
         x, y = groups[-2]
         z = groups[-1][0]
         now = max(0.0, floor - span(groups[-2])) + max(0.0, floor - span(groups[-1]))
@@ -366,11 +412,14 @@ def hold_groups(units: List[Dict[str, Any]], min_hold: float = MIN_HOLD, *,
             continue
         pairs += 1
         a, c = g
-        shots.append({"start": start, "end": end, "panels": [a["panels"][0], c["panels"][0]],
-                      "cues": a["cues"] + c["cues"], "emphasis": a["emphasis"] + c["emphasis"],
-                      "sentence": " ".join(x for x in (a.get("sentence"), c.get("sentence")) if x) or None,
-                      "sentence_starts": a["sentence_starts"] + c["sentence_starts"],
-                      "second_at": c["start"] - a["start"]})
+        merged = {"start": start, "end": end, "panels": [a["panels"][0], c["panels"][0]],
+                  "cues": a["cues"] + c["cues"], "emphasis": a["emphasis"] + c["emphasis"],
+                  "sentence": " ".join(x for x in (a.get("sentence"), c.get("sentence")) if x) or None,
+                  "sentence_starts": a["sentence_starts"] + c["sentence_starts"],
+                  "second_at": c["start"] - a["start"]}
+        if isinstance(a.get("motion"), str):
+            merged["motion"] = a["motion"]   # the pair keeps its first unit's hint (B1e)
+        shots.append(merged)
     shots[0]["start"] = 0.0
     shots[-1]["end"] = units[-1]["end"]
     stats = {"min_hold": min_hold, "shots": len(shots), "pairs": pairs,
@@ -961,6 +1010,10 @@ class _Designer:
         }
         if self.vcfg.get("grade") == "subtle":
             shot["grade"] = "subtle"  # CapCut grade, off by default (video.grade)
+        if isinstance(unit.get("motion"), str):
+            # B1e: the sentence's motion override rides to the panelfit
+            # pass (other modes ignore the key).
+            shot["motion_hint"] = unit["motion"]
         self._prev_shot = shot
         if bg_panel:
             shot["bg_panel"] = bg_panel
@@ -997,6 +1050,7 @@ def _pair_up(units: List[Dict[str, Any]], chapter: str, ratio: float, by_id: Dic
             solo_cues = set(u.get("cues") or []) | set(v.get("cues") or [])
             same_sentence = (u.get("sentence") or "") == (v.get("sentence") or "") and bool(u.get("sentence"))
             if (long_enough and len(u["panels"]) == 1 and len(v["panels"]) == 1
+                    and u.get("motion") is None and v.get("motion") is None
                     and u["panels"][0] != v["panels"][0] and not wide(a) and not wide(b)
                     and story_close and (same_sentence or not (solo_cues & {"impact", "reveal"}))
                     and (2.8 <= (v["end"] - u["start"]) <= MAX_PAIR_SHOT)
@@ -1422,6 +1476,9 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
 
 PF_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
 PF_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+PF_SHADOW_DY = 20          # foreground drop shadow (B1e E8, the user's
+PF_SHADOW_BLUR = 10        # fourth engine fix): black, offset (0, +20px),
+PF_SHADOW_OPACITY = 0.40   # blur 10px, 40% opacity — under the panel only
 PF_FILL_ASPECT = 1.6       # panel aspect (w/h) at/above which it fills the frame
 PF_DRIFT_ASPECT_MAX = 0.72  # pillars narrower than this drift; wider ones zoom
 PF_DRIFT_SPEED = 0.0658    # drift speed, frame-heights per second. The reference
@@ -1437,6 +1494,18 @@ PF_DRIFT_MAX_TRAVEL = 0.13  # span travel cap, share of frame height: at the cap
                            # the panel HOLDS position — never reverses, never
                            # slows down to stretch the travel over the span
 PF_DRIFT_HEADROOM = 0.03   # fg oversize beyond the travel (edges never show)
+PF_STRIP_ASPECT = 1.6      # panel height/width at/above which a panel is a
+                           # STRIP — panels.TALL_RATIO, the codebase's existing
+                           # strip threshold (kept out of the config defaults
+                           # deliberately; a test pins the two together).
+                           # B1e (the user's locked ruling, shot 6 of their
+                           # second-by-second analysis): a strip no longer
+                           # drift-caps like the reference's short pillars —
+                           # it TRAVERSES, a deliberate linear slide from the
+                           # top of the art to the bottom across the span.
+PF_ZOOM_OUT_FAST_RATE = 0.176  # zoom-OUT rate for a blast (B1e motion hint
+                           # "zoom_out_fast"): exactly 2x the impact zoom-in
+                           # rate, per the user's detonator->explosion ruling
 PF_ZOOM_RATE = 0.05        # zoom-in rate per second (measured band 3.6-6.5%/s)
 PF_ZOOM_RATE_IMPACT = 0.088  # impact zoom-in rate per second (measured, clash shot)
 PF_ZOOM_MAX_TOTAL = 0.50   # total zoom cap: at +50% the scale HOLDS (measured
@@ -1463,6 +1532,13 @@ PF_FIT_TOL = 1.0           # px slack when checking a fitted foreground stays in
 # (editor.plan_sfx) keys "hit" sounds on. In this mode an impact only
 # selects the fast zoom rate — there is no shake/flash to trigger.
 PF_IMPACT_WORDS = ("slams", "crashes", "explodes", "strikes", "smashes", "blasts", "shatters")
+# Per-sentence motion overrides (B1e E5): the pairing surface (cues.json /
+# pairs.json "motion") may overrule this mode's aspect routing for ONE
+# sentence, from the user's shot-by-shot rulings — "zoom_out" for a
+# reveal (the hand), "zoom_out_fast" for a blast (the explosion),
+# "duo" for a two-panel moment shown side by side. "default" (or no
+# hint) keeps the measured grammar. Pinned to cues.MOTION_HINTS by test.
+PF_MOTION_HINTS = ("default", "zoom_out", "zoom_out_fast", "duo")
 
 
 def panelfit_drift_travel(dur: float, pcfg: Dict[str, Any] | None = None) -> float:
@@ -1494,9 +1570,15 @@ def panelfit_drift_offset(travel: float, tau: float, direction: str,
 
 
 def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
-                 pcfg: Dict[str, Any] | None = None) -> Tuple[str, float, float, float]:
+                 pcfg: Dict[str, Any] | None = None,
+                 force: str | None = None) -> Tuple[str, float, float, float]:
     """(kind, base_w, base_h, scale) for one panel on the canvas.
 
+    "traverse": a STRIP (height/width >= PF_STRIP_ASPECT) fitted BY
+    WIDTH at the capped scale, so it stands taller than the frame and
+    can slide from its top to its bottom (B1e E4). When even the
+    width-fit leaves it no taller than the frame it degrades to the
+    ordinary fits below.
     "fill": aspect >= PF_FILL_ASPECT — the panel cover-fills the whole
     frame (full-bleed; cropped by the frame, never letterboxed). Only
     when the cover scale fits under the upscale cap: a wide-but-tiny
@@ -1506,6 +1588,8 @@ def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
     and oversized by (travel + headroom) so its gentle vertical drift
     never exposes a panel edge.
     "zoom": a wider pillar, height-fit exactly; it zoom-ins by rate.
+    `force="zoom"` (a per-sentence motion hint, B1e E5) skips the strip
+    and drift routing and returns the plain zoom geometry.
     All fits preserve the panel's aspect exactly and cap the scale at
     PF_MAX_UPSCALE (a capped pillar sits smaller; never a stretch).
     """
@@ -1513,14 +1597,19 @@ def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
     cap = max(0.1, float(pcfg.get("max_upscale", PF_MAX_UPSCALE)))
     fill_aspect = float(pcfg.get("fill_aspect", PF_FILL_ASPECT))
     drift_max = float(pcfg.get("drift_aspect_max", PF_DRIFT_ASPECT_MAX))
+    strip_aspect = float(pcfg.get("strip_aspect", PF_STRIP_ASPECT))
     pw, ph = max(1.0, float(pw)), max(1.0, float(ph))
     aspect = pw / ph
+    if force != "zoom" and ph / pw >= strip_aspect:
+        s = min(fmt.width / pw, cap)
+        if ph * s > fmt.height + 0.5:
+            return "traverse", pw * s, ph * s, s
     if aspect >= fill_aspect:
         s_cover = max(fmt.width / pw, fmt.height / ph)
         if s_cover <= cap:
             return "fill", pw * s_cover, ph * s_cover, s_cover
     s = min(fmt.height / ph, fmt.width / pw, cap)
-    if aspect < drift_max:
+    if force != "zoom" and aspect < drift_max:
         over = 1.0 + panelfit_drift_travel(dur, pcfg) \
             + float(pcfg.get("drift_headroom", PF_DRIFT_HEADROOM))
         return "drift", pw * s * over, ph * s * over, s * over
@@ -1530,14 +1619,18 @@ def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
 def panelfit_spec(pw: float, ph: float, motion: str, fmt: Format,
                   pcfg: Dict[str, Any] | None, *, dur: float = 2.0,
                   impact: bool = False, span_dur: float | None = None,
-                  elapsed: float = 0.0, direction: str | None = None) -> Dict[str, Any]:
+                  elapsed: float = 0.0, direction: str | None = None,
+                  hint: str | None = None) -> Dict[str, Any]:
     """The per-card composition spec the renderer consumes.
 
     `motion` (the classic designer's pick) no longer steers this mode:
     routing is by aspect + impact only, zoom is always IN (the reference
     never zooms out, and pull_out does not reverse), and drift
     direction is assigned by the pass (alternating per sentence, as
-    measured).
+    measured). A per-sentence motion HINT (B1e E5 — the pairing
+    surface's override, from the user's shot-by-shot rulings) is the
+    one exception: "zoom_out" / "zoom_out_fast" force the zoom
+    geometry with dir "out".
 
     Motion is planned over the whole SPAN a sentence occupies
     (`span_dur`, defaulting to this shot's own `dur`) and sliced per
@@ -1545,14 +1638,19 @@ def panelfit_spec(pw: float, ph: float, motion: str, fmt: Format,
     A zoom slice carries `zoom_start` (the scale the span has reached
     when the sub-shot opens); a drift slice carries `drift_from` /
     `drift_to` / `drift_rate` (the span's signed offsets and its
-    constant speed). Sub-shot 2 therefore opens exactly where sub-shot
-    1 ended — no reset, never a reversal (B1d F1).
+    constant speed); a traverse slice carries `traverse_from` /
+    `traverse_to` / `traverse_rate` (signed offsets in frame heights
+    from the TOP anchor: 0 = the art's top at the frame's top,
+    `traverse_to` = the art's bottom at the frame's bottom). Sub-shot
+    2 therefore opens exactly where sub-shot 1 ended — no reset, never
+    a reversal (B1d F1).
     """
     pcfg = pcfg or {}
     dur = max(0.0, float(dur))
     span = max(dur, float(span_dur)) if span_dur is not None else dur
     elapsed = min(max(0.0, float(elapsed)), span)
-    kind, bw, bh, _s = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg)
+    force = "zoom" if hint in ("zoom_out", "zoom_out_fast") else None
+    kind, bw, bh, _s = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg, force=force)
     rate = 0.0
     if kind in ("zoom", "fill"):
         rate = float(pcfg.get("zoom_rate_impact" if impact else "zoom_rate",
@@ -1566,7 +1664,30 @@ def panelfit_spec(pw: float, ph: float, motion: str, fmt: Format,
                             "zoom_rate": round(rate, 4),
                             "zoom_end": round(min(1.0 + rate * span, zoom_cap), 4),
                             "drift_frac": 0.0, "impact": bool(impact)}
-    if kind in ("zoom", "fill"):
+    if hint in ("zoom_out", "zoom_out_fast"):
+        # The user's per-shot rulings (hand reveal, the blast): the span
+        # OPENS enlarged and settles to the exact fit — a zoom OUT at a
+        # constant rate, sliced like every other span motion. The rate
+        # is stored SIGNED (negative) so the renderer replays it with
+        # the same clamp math as a zoom-in.
+        rate_out = float(pcfg.get("zoom_rate" if hint == "zoom_out" else "zoom_out_fast_rate",
+                                  PF_ZOOM_RATE if hint == "zoom_out"
+                                  else PF_ZOOM_OUT_FAST_RATE))
+        z0 = min(1.0 + rate_out * span, zoom_cap)
+        spec.update({"dir": "out", "zoom_rate": round(-rate_out, 4), "zoom_end": 1.0,
+                     "zoom_start": round(max(1.0, z0 - rate_out * elapsed), 4)})
+    elif kind == "traverse":
+        # B1e E4: the whole span slides the strip from its top anchor
+        # to its bottom anchor, arriving exactly at the span's end —
+        # the rate is whatever the span's length makes it (a deliberate
+        # slide, not the drift's pinned speed and never capped short).
+        total = (bh - fmt.height) / fmt.height   # frame heights of travel (> 0)
+        trate = -total / span if span > 0 else 0.0
+        spec.update({"dir": "down", "zoom_rate": 0.0, "zoom_end": 1.0,
+                     "traverse_from": round(trate * elapsed, 4),
+                     "traverse_to": round(-total, 4),
+                     "traverse_rate": round(trate, 4)})
+    elif kind in ("zoom", "fill"):
         spec["zoom_start"] = round(min(1.0 + rate * elapsed, zoom_cap), 4)
     elif kind == "drift":
         d = direction if direction in ("down", "up") else "down"
@@ -1596,18 +1717,94 @@ def panelfit_advance_slice(spec: Dict[str, Any], cut_in: float) -> Dict[str, Any
     cut = max(0.0, float(cut_in))
     if cut == 0.0:
         return sp
-    if sp.get("kind") == "drift" and sp.get("drift_from") is not None:
+    if sp.get("kind") in ("drift", "duo") and sp.get("drift_from") is not None:
         frm, to = float(sp["drift_from"]), float(sp["drift_to"])
         rate = float(sp["drift_rate"])
         new = frm + rate * cut
         new = min(new, to) if rate > 0 else max(new, to)
         sp["drift_from"] = round(new, 4)
         sp["drift_frac"] = round(float(sp["drift_frac"]) - (new - frm), 4)
-    elif sp.get("kind") in ("zoom", "fill") and "zoom_start" in sp:
-        sp["zoom_start"] = round(min(float(sp["zoom_start"])
-                                     + float(sp["zoom_rate"]) * cut,
-                                     float(sp["zoom_end"])), 4)
+    elif sp.get("kind") == "traverse" and sp.get("traverse_from") is not None:
+        frm, to = float(sp["traverse_from"]), float(sp["traverse_to"])
+        rate = float(sp["traverse_rate"])
+        new = frm + rate * cut
+        new = min(new, frm) if rate > 0 else max(new, to)
+        sp["traverse_from"] = round(new, 4)
+    elif sp.get("kind") in ("zoom", "fill", "duo") and "zoom_start" in sp:
+        # Signed rate (B1e): a zoom-in clamps at zoom_end from below, a
+        # zoom-out (negative rate) from above — same clamp, mirrored.
+        rate = float(sp["zoom_rate"])
+        new = float(sp["zoom_start"]) + rate * cut
+        new = min(new, float(sp["zoom_end"])) if rate > 0 else max(new, float(sp["zoom_end"]))
+        sp["zoom_start"] = round(new, 4)
     return sp
+
+
+def panelfit_duo_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
+                     pcfg: Dict[str, Any] | None = None) -> Tuple[str, float, float]:
+    """(mode, base_w, base_h) for one panel inside its DUO cell (B1e E3).
+
+    The frame splits into two cells, left and right, each half the
+    frame's width and its full height. "slide": the panel cover-fits
+    the cell's height, oversized by (travel + headroom) exactly like a
+    drift pillar, and fits the cell's width at that size — it can
+    slide vertically without ever exposing the cell's edge. When it
+    cannot (too wide for the cell at cover height, or the oversize
+    would break the upscale cap), the mode is "zoom_out": the panel
+    contain-fits its cell and the pair falls back to a slow zoom-out
+    (the user's own fallback for a too-short/too-wide pair).
+    """
+    pcfg = pcfg or {}
+    cap = max(0.1, float(pcfg.get("max_upscale", PF_MAX_UPSCALE)))
+    cw, ch = fmt.width / 2.0, float(fmt.height)
+    pw, ph = max(1.0, float(pw)), max(1.0, float(ph))
+    over = 1.0 + panelfit_drift_travel(dur, pcfg) \
+        + float(pcfg.get("drift_headroom", PF_DRIFT_HEADROOM))
+    s_cover = ch / ph
+    if pw * s_cover * over <= cw + 1e-6 and s_cover * over <= cap:
+        return "slide", pw * s_cover * over, ph * s_cover * over
+    s = min(cw / pw, ch / ph, cap)
+    return "zoom_out", pw * s, ph * s
+
+
+def panelfit_duo_spec(pw: float, ph: float, fmt: Format, pcfg: Dict[str, Any] | None,
+                      *, cell: str, mode: str, dur: float = 2.0,
+                      span_dur: float | None = None, elapsed: float = 0.0) -> Dict[str, Any]:
+    """One card's spec inside a duo shot (B1e E3): the two panels of one
+    sentence side by side over their shared blur — the LEFT panel
+    slides slowly UP, the RIGHT slowly DOWN (the user's counter-slide),
+    sliced over the sentence span like every other span motion; or,
+    when either panel lacks slide room (decided jointly by the pass),
+    both panels zoom OUT slowly in their cells instead.
+    """
+    pcfg = pcfg or {}
+    dur = max(0.0, float(dur))
+    span = max(dur, float(span_dur)) if span_dur is not None else dur
+    elapsed = min(max(0.0, float(elapsed)), span)
+    _mode, bw, bh = panelfit_duo_fit(pw, ph, fmt, dur=span, pcfg=pcfg)
+    direction = "up" if cell == "left" else "down"
+    spec: Dict[str, Any] = {"kind": "duo", "duo_mode": mode, "cell": cell,
+                            "dir": direction, "bg": True,
+                            "base_w": round(bw, 2), "base_h": round(bh, 2),
+                            "zoom_rate": 0.0, "zoom_end": 1.0, "drift_frac": 0.0,
+                            "impact": False}
+    if mode == "slide":
+        travel = panelfit_drift_travel(span, pcfg)
+        off0 = panelfit_drift_offset(travel, elapsed, direction, pcfg)
+        off1 = panelfit_drift_offset(travel, elapsed + dur, direction, pcfg)
+        speed = float(pcfg.get("drift_speed", PF_DRIFT_SPEED))
+        spec.update({"drift_from": round(off0, 4),
+                     "drift_to": round(panelfit_drift_offset(travel, span, direction, pcfg), 4),
+                     "drift_rate": round(speed if direction == "down" else -speed, 4),
+                     "drift_frac": round(off1 - off0, 4)})
+    else:  # zoom_out fallback: opens enlarged, settles to the cell fit
+        rate = float(pcfg.get("zoom_rate", PF_ZOOM_RATE))
+        zcap = 1.0 + float(pcfg.get("zoom_max_total", PF_ZOOM_MAX_TOTAL))
+        z0 = min(1.0 + rate * span, zcap)
+        spec.update({"zoom_rate": round(-rate, 4),
+                     "zoom_start": round(max(1.0, z0 - rate * elapsed), 4),
+                     "zoom_end": 1.0})
+    return spec
 
 
 def panelfit_is_impact(shot: Dict[str, Any]) -> Tuple[bool, str | None]:
@@ -1629,6 +1826,57 @@ def panelfit_is_impact(shot: Dict[str, Any]) -> Tuple[bool, str | None]:
     return False, None
 
 
+def _panelfit_duo_group(gshots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                        pcfg: Dict[str, Any], report: Dict[str, Any],
+                        span: float, g_start: float) -> bool:
+    """Give one DUO sentence group its side-by-side specs (B1e E3).
+
+    Every shot in the group must be a pair of exactly two panels — a
+    duo hint on anything else is a pairing mistake, not a layout to
+    guess at, so it fails fast with a UserError. Both cards appear for
+    the shot's whole window (the second card's staggered `at` is
+    cleared): the moment is simultaneous by the user's ruling. The
+    slide/zoom-out decision is JOINT: if either panel lacks slide room
+    in its cell, both panels zoom out. Returns whether the group moves.
+    """
+    moving = False
+    for s in gshots:
+        cards = s.get("cards") or []
+        if s.get("layout") != "pair" or len(cards) != 2:
+            raise UserError(
+                f"panelfit: motion hint 'duo' needs a sentence paired to exactly "
+                f"two panels (shot {s.get('id')} has {len(cards)} card(s), layout "
+                f"{s.get('layout')!r}); fix the pairing for sentence "
+                f"{str(s.get('sentence') or '')[:60]!r}")
+        dur = max(0.0, float(s.get("end") or 0) - float(s.get("start") or 0))
+        elapsed = max(0.0, float(s.get("start") or 0) - g_start)
+        dims = []
+        for c in cards:
+            p = designer.by_id.get(c.get("panel")) or {}
+            dims.append((float(p.get("width") or 0), float(p.get("height") or 0)))
+        modes = [panelfit_duo_fit(pw, ph, fmt, dur=span, pcfg=pcfg)[0]
+                 if pw > 0 and ph > 0 else "zoom_out" for pw, ph in dims]
+        mode = "slide" if all(m == "slide" for m in modes) else "zoom_out"
+        for c, (pw, ph) in zip(cards, dims):
+            cell = "left" if c is cards[0] else "right"
+            if pw > 0 and ph > 0:
+                c["panelfit"] = panelfit_duo_spec(pw, ph, fmt, pcfg, cell=cell, mode=mode,
+                                                  dur=dur, span_dur=span, elapsed=elapsed)
+            else:  # unknown panel size: static full-cell fallback spec
+                c["panelfit"] = {"kind": "duo", "duo_mode": "zoom_out", "cell": cell,
+                                 "dir": "up" if cell == "left" else "down", "bg": True,
+                                 "base_w": fmt.width / 2.0, "base_h": float(fmt.height),
+                                 "zoom_rate": 0.0, "zoom_end": 1.0, "drift_frac": 0.0,
+                                 "impact": False}
+            spec = c["panelfit"]
+            if spec.get("drift_frac") or (spec.get("zoom_rate", 0.0) != 0
+                                          and spec.get("zoom_start", 1.0) != spec.get("zoom_end", 1.0)):
+                moving = True
+        cards[1]["at"] = 0.0   # simultaneous: both panels from the first frame
+        report["duo"].append(s.get("id"))
+    return moving
+
+
 def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                    pcfg: Dict[str, Any]) -> Dict[str, Any]:
     """Rewrite classic shots into panel-fit shots (landscape only, like
@@ -1643,16 +1891,20 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     sentence span, as measured — except that a panel reused by the
     immediately following sentence keeps the direction it already has.
 
-    Returns {"static", "hold", "over_cap", "impact"} — shot ids whose
-    whole span carries no motion (none by construction; computed
-    honestly from the specs, not asserted), shot ids that sit entirely
-    in a travel-cap hold (the span's motion finished before they open —
-    the F2 hold, reported, never hidden), panel ids whose uncapped fit
-    would exceed PF_MAX_UPSCALE (their foreground is capped, so it sits
-    smaller — an honest quality note, never a stretch), and the impact
-    report (which shots earned the fast zoom rate, and by which rule).
+    Returns {"static", "hold", "over_cap", "impact", "traverse",
+    "duo", "zoom_out"} — shot ids whose whole span carries no motion
+    (none by construction; computed honestly from the specs, not
+    asserted), shot ids that sit entirely in a travel-cap hold (the
+    span's motion finished before they open — the F2 hold, reported,
+    never hidden), panel ids whose uncapped fit would exceed
+    PF_MAX_UPSCALE (their foreground is capped, so it sits smaller —
+    an honest quality note, never a stretch), the impact report (which
+    shots earned the fast zoom rate, and by which rule), and — B1e —
+    the shot ids shown as strip traverses, duo side-by-sides, and
+    per-sentence zoom-out hints.
     """
-    report: Dict[str, Any] = {"static": [], "hold": [], "over_cap": [], "impact": []}
+    report: Dict[str, Any] = {"static": [], "hold": [], "over_cap": [], "impact": [],
+                              "traverse": [], "duo": [], "zoom_out": []}
     if fmt.width <= fmt.height:
         return report
     pcfg = pcfg or {}
@@ -1686,6 +1938,18 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
         span = max(0.0, g_end - g_start)
         group_dirs: Dict[Any, str] = {}
         group_moving = False
+        # The group's per-sentence motion hint (B1e E5), if the pairing
+        # surface set one. Unknown values are a hard error — a typo'd
+        # hint must never silently render as the default grammar.
+        hint = next((str(s.get("motion_hint")) for s in gshots if s.get("motion_hint")), None)
+        if hint is not None and hint not in PF_MOTION_HINTS:
+            raise UserError(f"panelfit: unknown motion hint {hint!r} on sentence "
+                            f"{str(gshots[0].get('sentence') or '')[:60]!r}; "
+                            f"use one of {', '.join(PF_MOTION_HINTS)}")
+        if hint == "duo":
+            group_moving = _panelfit_duo_group(gshots, designer, fmt, pcfg, report, span, g_start)
+            prev_dirs = {}
+            continue
         for s in gshots:
             dur = max(0.0, float(s.get("end") or 0) - float(s.get("start") or 0))
             elapsed = max(0.0, float(s.get("start") or 0) - g_start)
@@ -1696,7 +1960,8 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                 p = designer.by_id.get(pid) or {}
                 pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
                 if pw > 0 and ph > 0:
-                    kind = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg)[0]
+                    force = "zoom" if hint in ("zoom_out", "zoom_out_fast") else None
+                    kind = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg, force=force)[0]
                     direction = None
                     if kind == "drift":
                         if pid in group_dirs:
@@ -1711,12 +1976,16 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                         group_dirs[pid] = direction
                     c["panelfit"] = panelfit_spec(pw, ph, str(c.get("motion") or ""), fmt, pcfg,
                                                   dur=dur, impact=impact, span_dur=span,
-                                                  elapsed=elapsed, direction=direction)
+                                                  elapsed=elapsed, direction=direction,
+                                                  hint=hint if force else None)
                     aspect = pw / ph
-                    uncapped = (max(fmt.width / pw, fmt.height / ph) if aspect >= fill_aspect
+                    uncapped = (fmt.width / pw if kind == "traverse"
+                                else max(fmt.width / pw, fmt.height / ph) if aspect >= fill_aspect
                                 else min(fmt.width / pw, fmt.height / ph))
                     if uncapped > cap and pid not in report["over_cap"]:
                         report["over_cap"].append(pid)
+                    if kind == "traverse" and s.get("id") not in report["traverse"]:
+                        report["traverse"].append(s.get("id"))
                 else:
                     rate = float(pcfg.get("zoom_rate", PF_ZOOM_RATE))
                     zcap = 1.0 + float(pcfg.get("zoom_max_total", PF_ZOOM_MAX_TOTAL))
@@ -1730,9 +1999,13 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                 if spec["kind"] == "drift":
                     if spec.get("drift_frac"):
                         moving = True
-                elif spec.get("zoom_rate", 0.0) > 0 \
-                        and spec.get("zoom_start", 1.0) < spec.get("zoom_end", 1.0):
+                elif spec["kind"] == "traverse":
+                    moving = True   # travel > 0 by construction (base_h > frame)
+                elif spec.get("zoom_rate", 0.0) != 0 \
+                        and spec.get("zoom_start", 1.0) != spec.get("zoom_end", 1.0):
                     moving = True
+            if hint in ("zoom_out", "zoom_out_fast") and s.get("id") not in report["zoom_out"]:
+                report["zoom_out"].append(s.get("id"))
             if moving:
                 group_moving = True
             else:
@@ -2320,7 +2593,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     sfx = plan_sfx(shots, chapter_cards)
     _mode = str(vcfg.get("mode") or "classic")
     _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
-    _pf_report = {"static": [], "hold": [], "over_cap": [], "impact": []}
+    _pf_report = {"static": [], "hold": [], "over_cap": [], "impact": [],
+                  "traverse": [], "duo": [], "zoom_out": []}
     _ff_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [],
                 "over_cap": [], "static": []}
     if _mode == "wide":
@@ -2357,6 +2631,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "panelfit_hold": _pf_report["hold"],
         "panelfit_over_cap": _pf_report["over_cap"],
         "panelfit_impact": _pf_report["impact"],
+        "panelfit_traverse": _pf_report.get("traverse", []),
+        "panelfit_duo": _pf_report.get("duo", []),
+        "panelfit_zoom_out": _pf_report.get("zoom_out", []),
         "panelfit_title_cards": _pf_title_cards,
         "fullframe_caption_risk": _ff_risk["caption_risk"],
         "fullframe_figure_risk": _ff_risk["figure_risk"],
@@ -2519,19 +2796,54 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
             _pf = c.get("panelfit")
             if _pf is not None:
                 _pf_ok = (isinstance(_pf, dict)
-                          and _pf.get("kind") in ("zoom", "drift", "fill", "scroll")
-                          and _pf.get("dir") in (("up", "down") if _pf.get("kind") in ("scroll", "drift")
+                          and _pf.get("kind") in ("zoom", "drift", "fill", "scroll", "traverse", "duo")
+                          and _pf.get("dir") in (("up", "down") if _pf.get("kind") in ("scroll", "drift", "traverse", "duo")
                                                  else ("in", "out")))
                 if _pf_ok:
                     try:
                         _pf_ok = (float(_pf["base_w"]) > 0 and float(_pf["base_h"]) > 0
                                   and float(_pf["zoom_end"]) > 0)
                         if _pf.get("kind") in ("zoom", "fill"):
-                            _pf_ok = _pf_ok and float(_pf["zoom_rate"]) > 0 \
-                                and float(_pf["zoom_end"]) <= 1.0 + PF_ZOOM_MAX_TOTAL + 1e-6
-                            if "zoom_start" in _pf:  # a span slice (B1d): opens mid-zoom
-                                _pf_ok = _pf_ok and 1.0 - 1e-6 <= float(_pf["zoom_start"]) \
-                                    <= float(_pf["zoom_end"]) + 1e-6
+                            if _pf.get("dir") == "out":
+                                # A per-sentence zoom-OUT (B1e E5): the rate
+                                # is stored signed (negative), the span
+                                # opens at zoom_start and settles at
+                                # zoom_end == 1.0.
+                                _pf_ok = _pf_ok and -PF_ZOOM_OUT_FAST_RATE - 1e-6 \
+                                    <= float(_pf["zoom_rate"]) < 0 \
+                                    and 1.0 - 1e-6 <= float(_pf["zoom_end"]) \
+                                    <= float(_pf["zoom_start"]) + 1e-6 \
+                                    and float(_pf["zoom_start"]) <= 1.0 + PF_ZOOM_MAX_TOTAL + 1e-6
+                            else:
+                                _pf_ok = _pf_ok and float(_pf["zoom_rate"]) > 0 \
+                                    and float(_pf["zoom_end"]) <= 1.0 + PF_ZOOM_MAX_TOTAL + 1e-6
+                                if "zoom_start" in _pf:  # a span slice (B1d): opens mid-zoom
+                                    _pf_ok = _pf_ok and 1.0 - 1e-6 <= float(_pf["zoom_start"]) \
+                                        <= float(_pf["zoom_end"]) + 1e-6
+                        if _pf.get("kind") == "traverse":
+                            # B1e E4: offsets in frame heights from the
+                            # top anchor — traverse_to <= traverse_from
+                            # <= 0, rate <= 0, and the start never sits
+                            # past the end.
+                            _pf_ok = _pf_ok and float(_pf["traverse_to"]) \
+                                <= float(_pf["traverse_from"]) <= 1e-6 \
+                                and float(_pf["traverse_rate"]) <= 1e-9 \
+                                and abs(float(_pf["traverse_to"])) <= 64.0
+                        if _pf.get("kind") == "duo":
+                            # B1e E3: cell + mode pinned; a slide duo
+                            # reuses the drift fields, a zoom-out duo
+                            # the signed zoom fields.
+                            _pf_ok = _pf_ok and _pf.get("cell") in ("left", "right") \
+                                and _pf.get("duo_mode") in ("slide", "zoom_out") \
+                                and _pf.get("dir") == ("up" if _pf.get("cell") == "left" else "down")
+                            if _pf.get("duo_mode") == "slide":
+                                _pf_ok = _pf_ok and abs(float(_pf["drift_frac"])) <= 0.25 \
+                                    and (float(_pf["drift_frac"]) <= 1e-9 if _pf.get("cell") == "left"
+                                         else float(_pf["drift_frac"]) >= -1e-9)
+                            else:
+                                _pf_ok = _pf_ok and float(_pf["zoom_rate"]) <= 0 \
+                                    and 1.0 - 1e-6 <= float(_pf["zoom_end"]) \
+                                    <= float(_pf.get("zoom_start", 1.0)) + 1e-6
                         if _pf.get("kind") == "drift":
                             # drift_frac is SIGNED (B1d span slices): its sign
                             # must agree with dir, and a zero-travel slice is
@@ -2551,7 +2863,7 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     except (KeyError, TypeError, ValueError):
                         _pf_ok = False
                 if not _pf_ok:
-                    errs.append(f"{cw}: panelfit spec must be {{kind: zoom|drift|fill, dir, base_w, base_h, "
+                    errs.append(f"{cw}: panelfit spec must be {{kind: zoom|drift|fill|traverse|duo, dir, base_w, base_h, "
                                 "zoom_rate, zoom_end, drift_frac} "
                                 "(video.mode: panelfit writes it; rebuild the plan with --force)")
         from .editor import validate_callout as _validate_callout

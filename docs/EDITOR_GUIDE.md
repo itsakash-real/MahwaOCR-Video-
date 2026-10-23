@@ -260,15 +260,23 @@ stretch — ever:
   (no dimming layer — the measured video has none). Panels at aspect
   (w/h) >= `panelfit.fill_aspect` (~1.6) instead fill the frame
   full-bleed; blur bands are never used. The blurred background is
-  static within a shot.
+  static within a shot. Placement anchors CENTRE (B1e): a cover
+  crop's overflow splits equally on both sides. The foreground casts
+  a drop shadow — black, offset (0, +20px), blur 10px, opacity 40%
+  (`panelfit.shadow_*`) — layered between the backdrop and the panel;
+  the backdrop itself stays at full brightness.
 - **Pre-processing (Rule 6).** Panel build must run with
   `video.panels.trim_v2: true` (prep order: recap → trim/slice → pair/plan
   → compose; raw pages untouched). Assets are trimmed to their ink
   bounding box (pure-white or pure-black rows/columns are margins) and
-  strips are sliced at large white gaps into separate panels, so neither
-  layer ever contains a white margin. `video plan` warns when a panelfit
-  build's panels carry no `trim2` record. Cuts/slices are recorded per
-  panel in `panels.json` (`trim2`).
+  strips are sliced at any contiguous pure-white gutter **over 15px**
+  (`TRIM2_GAP_MIN_PX`, tightened from 200 in B1e — the user's ruling:
+  stacked panels are ALWAYS separate assets, sequenced with the
+  narration beats, never scrolled through glued), so neither layer
+  ever contains a white margin. Slicing renumbers panel ids in story
+  order; re-pair with the geometric-overlap id-remap after a rebuild.
+  `video plan` warns when a panelfit build's panels carry no `trim2`
+  record. Cuts/slices are recorded per panel in `panels.json` (`trim2`).
 - **Motion.** Zero static, all LINEAR and sub-pixel (LANCZOS source +
   float AFFINE sampling; ease curves and integer rounding are banned —
   they read as jerk). Narrow pillars (aspect < `panelfit.drift_aspect_max`,
@@ -285,8 +293,27 @@ stretch — ever:
   Wider pillars and full-bleed shots get a zoom-IN at a constant RATE
   (+5.0%/s; the total grows with shot length, capped at +50% —
   `panelfit.zoom_max_total` — where the scale holds), sliced across
-  sub-shots the same way. There is no full strip traversal, no
-  zoom-out, and no horizontal motion of any kind.
+  sub-shots the same way. There is no horizontal motion of any kind.
+- **Strips traverse (B1e).** A panel at/above the strip threshold
+  (height/width >= 1.6, `panels.TALL_RATIO`) no longer drift-caps: it
+  is fitted by width and TRAVERSES — a deliberate linear slide from
+  the art's top (anchored at the frame's top) to its bottom (anchored
+  at the frame's bottom), arriving exactly at the sentence span's
+  end, sliced across sub-shots like every other span motion.
+- **Duo (B1e).** A sentence hinted `duo` (below) shows its two panels
+  SIDE BY SIDE, each in a half-frame cell over their shared blur:
+  the left panel slides slowly UP, the right slowly DOWN, at the
+  drift speed with the usual oversize, each foreground clipped to
+  its cell. If either panel lacks slide room in its cell, BOTH fall
+  back to a slow zoom-out.
+- **Motion hints (B1e).** The pairing surface may overrule the
+  routing for one sentence: a cues sentence's `"motion"` (or a
+  pairs.json object entry's) is one of `default`, `zoom_out` (opens
+  enlarged, settles to the fit at the plain zoom rate — a reveal),
+  `zoom_out_fast` (same at `panelfit.zoom_out_fast_rate`, 2× the
+  impact rate — a blast), or `duo`. A list parallel to the
+  sentence's panels gives each sequenced segment its own motion.
+  Unknown values are refused; default routing still never zooms out.
 - **Impact.** Shots flagged by `{impact}`/`{reveal}` markers (fallback:
   a VISUAL_ACTION sentence with an impact verb) zoom at +8.8%/s
   instead. There is NO screen shake and NO white flash in this mode —
@@ -308,7 +335,12 @@ stretch — ever:
   line in Anton below (rendered ink ≈12.2% of frame height). A card
   starts at its cue sentence's aligned start and lasts
   clamp(cue span, 1.4, 2.1)s, consuming the plan time it overlaps;
-  the sync audit counts card time as covering its cue.
+  the sync audit counts card time as covering its cue. A card is a
+  VISUAL overlay only (B1e): the render muxes the chapter narration
+  as one continuous audio input, so the sentence's audio plays
+  unbroken underneath the card — never paused, split or muted (a
+  render-level test proves the tone under a card window survives at
+  full level).
   See `video/titlecards.py`.
 - **Sync.** Shots anchor to sentence boundaries via the alignment, as
   in every mode; keyframe endpoints are the shot boundaries.
@@ -318,7 +350,9 @@ stretch — ever:
   empty), `panelfit_hold` (sub-shots sitting in a travel-cap hold —
   info only), `panelfit_over_cap` (panels fitted at the upscale cap —
   shown smaller, never stretched), `panelfit_impact` (which shots got
-  the fast zoom rate, and by which rule) and `panelfit_title_cards`.
+  the fast zoom rate, and by which rule), `panelfit_title_cards`, and
+  (B1e) `panelfit_traverse`, `panelfit_duo`, `panelfit_zoom_out`
+  (which shots traverse, pair side by side, or took a zoom-out hint).
   A card breaking the composition invariants fails the build.
 - **Storyboard** shows the composed frame at shot start and end, side
   by side. Landscape only; portrait formats stay classic.
@@ -327,9 +361,10 @@ Knobs (`video.panelfit.*`, defaults pinned in code): `bg_blur` 50,
 `bg_opacity` 1.0, `fill_aspect` 1.6, `drift_aspect_max` 0.72,
 `drift_speed` 0.0658, `drift_min_travel` 0.05, `drift_max_travel` 0.13,
 `drift_headroom` 0.03, `zoom_rate` 0.05, `zoom_rate_impact` 0.088,
-`max_upscale` 2.4, `still_limit` 0.5, `min_shot` 0.3, `split_above`
-3.0, `split_min_piece` 1.2, `captions` false, `title_cards` true,
-`tts_gap_seconds` 0.11.
+`zoom_out_fast_rate` 0.176, `shadow_dy` 20, `shadow_blur` 10,
+`shadow_opacity` 0.40, `max_upscale` 2.4, `still_limit` 0.5,
+`min_shot` 0.3, `split_above` 3.0, `split_min_piece` 1.2,
+`captions` false, `title_cards` true, `tts_gap_seconds` 0.11.
 ## Full-frame mode (`video.mode: fullframe`)
 
 No cards, no backdrop, no borders: every shot fills the 1920×1080 frame with a

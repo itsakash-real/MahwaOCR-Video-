@@ -263,3 +263,104 @@ def test_audit_counts_card_time_as_covering_its_cue():
     assert cov[2]["coverage"] == 1.0 and cov[2]["pass"] is True
     assert rep["late_cuts"] == []
     assert rep["gate"]["pass"] is True
+
+
+# ------------------------------------- B1e: a card is an overlay (E7)
+
+def _ffmpeg_ok() -> bool:
+    try:
+        from manhwa_ocr.video.ffmpeg import ffmpeg_exe
+
+        ffmpeg_exe()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+needs_ffmpeg = pytest.mark.skipif(not _ffmpeg_ok(), reason="FFmpeg not available")
+
+
+@needs_ffmpeg
+def test_title_card_render_keeps_the_audio_continuous(tmp_path):
+    """E7: a title card replaces only the VISUAL for its window. The
+    production render muxes the chapter narration as ONE continuous
+    ffmpeg input (render._mux), so the audio under a card cannot be
+    paused, split or muted by construction — proven here end to end:
+    a 660 Hz tone sits under the card window (standing in for the
+    card sentence's own words) between two 440 Hz stretches, and it
+    must come through at full level with no silent gap anywhere."""
+    import subprocess
+
+    from manhwa_ocr.sessions import SessionStore
+    from manhwa_ocr.video import render as render_mod
+    from manhwa_ocr.video.ffmpeg import run as frun
+    from manhwa_ocr.video.media import pages_dir
+    from manhwa_ocr.video.panels import build_panels
+
+    store = SessionStore(tmp_path)
+    sess = store.create("CardAudio")
+    sess.add_links(["https://x.com/1"])
+    (sess.path / "chapter_1.md").write_text("# 1\n\nstuff\n")
+    folder = pages_dir(sess.path, "1")
+    folder.mkdir(parents=True, exist_ok=True)
+    page = Image.new("RGB", (300, 1000), (255, 255, 255))
+    d = ImageDraw.Draw(page)
+    d.rectangle((10, 40, 290, 400), fill=(200, 60, 60))
+    d.rectangle((10, 460, 290, 820), fill=(60, 60, 200))
+    page.save(folder / "page_001.png")
+    panels_data = build_panels(sess.path, "1", log=lambda *_: None)
+    panel = panels_data["panels"][0]
+    pid = panel["id"]
+    spec = plan_mod.panelfit_spec(panel["width"], panel["height"], "push_in", FMT, {}, dur=2.0)
+    (sess.path / "audio").mkdir(exist_ok=True)
+    frun(["-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+          "-f", "lavfi", "-i", "sine=frequency=660:duration=2",
+          "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+          "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[out]",
+          "-map", "[out]", "-c:a", "pcm_s16le",
+          str(sess.path / "audio" / "chapter_1.wav")])
+
+    def pshot(i, a, b):
+        return {"id": f"S{i:03d}", "start": a, "end": b, "layout": "single",
+                "background": "blur", "exit": "cut", "transition": "cut",
+                "panelfit": True, "caption_bar": False, "effects": [], "callouts": [],
+                "sentence": None,
+                "cards": [{"panel": pid, "crop": [0, 0, 1, 1], "enter": "cut", "at": 0.0,
+                           "motion": "push_in", "panelfit": spec}]}
+
+    card_shot = {"id": "S002", "start": 2.0, "end": 4.0, "layout": "single",
+                 "background": "blur", "exit": "cut", "transition": "cut",
+                 "effects": [], "callouts": [], "sentence": None, "cards": [],
+                 "title_card": {"label": "Age", "number": 4, "line": "WEEK 6 OF POSSESSION."}}
+    plan = {"version": plan_mod.PLAN_VERSION, "chapter": "1", "duration": 6.0,
+            "format": "16:9", "fps": 30, "mode": "panelfit",
+            "audio": "audio/chapter_1.wav",
+            "shots": [pshot(1, 0.0, 2.0), card_shot, pshot(3, 4.0, 6.0)],
+            "chapter_cards": [], "sfx": [], "captions": []}
+    out = render_mod.render(sess.path, "1", plan, VCFG, preview=True,
+                            workers=1, log=lambda *_: None)
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(out), "-map", "0:a",
+                          "-ac", "1", "-ar", "8000", "-f", "f32le", "-"],
+                         capture_output=True, check=True).stdout
+    x = np.frombuffer(raw, dtype=np.float32)
+    assert len(x) == pytest.approx(6 * 8000, abs=1200)
+
+    def dominant(a, b):
+        seg = x[int(a * 8000):int(b * 8000)]
+        seg = seg * np.hanning(len(seg))
+        mag = np.abs(np.fft.rfft(seg))
+        return float(np.fft.rfftfreq(len(seg), 1 / 8000)[int(np.argmax(mag))])
+
+    def rms(a, b):
+        seg = x[int(a * 8000):int(b * 8000)]
+        return float(np.sqrt(np.mean(seg ** 2))) if len(seg) else 0.0
+
+    assert dominant(0.3, 1.7) == pytest.approx(440, abs=30)
+    assert dominant(2.3, 3.7) == pytest.approx(660, abs=30)   # the tone UNDER the card
+    assert rms(2.3, 3.7) > 0.05                                # at level, never muted
+    assert dominant(4.3, 5.7) == pytest.approx(440, abs=30)
+    step = 400  # 50 ms windows: no silent gap anywhere before the
+    # mux's one global fade-out at the very end (which starts at 5.2s)
+    levels = [float(np.sqrt(np.mean(x[i:i + step] ** 2)))
+              for i in range(0, len(x) - step, step)]
+    assert min(levels[2:100]) > 0.02
