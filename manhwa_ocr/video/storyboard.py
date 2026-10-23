@@ -72,10 +72,27 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
                         while len(cache) > 32:
                             cache.popitem(last=False)
                     images[pid] = cache[pid]
-                # 85% through: entrances done and a pair's second card has arrived.
-                when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))
-                frame = ShotRenderer(shot, images, fmt, {"punch": False, "shake": False, "flash": False}).frame(when)
-                sheet.paste(frame.resize((thumb_w, thumb_h)), (x, y))
+                if shot.get("panelfit"):
+                    # Panel-fit shots: the COMPOSED frame (foreground over
+                    # blurred background) at shot start AND end, side by
+                    # side. The specs are authored at the plan's canvas
+                    # size, so render at full format, not the preview
+                    # format. The start frame sits past the impact flash
+                    # (3 frames) and shake (0.2s) windows.
+                    _dur = float(shot["end"]) - float(shot["start"])
+                    _r = ShotRenderer(shot, images, format_from(plan.get("format", "16:9"), 30),
+                                      {"punch": False, "shake": False, "flash": False})
+                    _f0 = _r.frame(float(shot["start"]) + min(0.25, 0.08 * _dur))
+                    _f1 = _r.frame(float(shot["start"]) + 0.98 * _dur)
+                    _half = thumb_w // 2
+                    sheet.paste(_f0.resize((_half, thumb_h)), (x, y))
+                    sheet.paste(_f1.resize((thumb_w - _half, thumb_h)), (x + _half, y))
+                    draw.line((x + _half, y, x + _half, y + thumb_h), fill=(255, 214, 90), width=2)
+                else:
+                    # 85% through: entrances done and a pair's second card has arrived.
+                    when = float(shot["start"]) + 0.85 * (float(shot["end"]) - float(shot["start"]))
+                    frame = ShotRenderer(shot, images, fmt, {"punch": False, "shake": False, "flash": False}).frame(when)
+                    sheet.paste(frame.resize((thumb_w, thumb_h)), (x, y))
                 wordy = [pid for pid in dict.fromkeys(ids) if panels[pid].get("text_only")]
                 if wordy:
                     # Hand-picked bubble/lettering/credits panels: flag them for the reviewer.
@@ -90,6 +107,10 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
             draw.text((x, y + thumb_h + 4), head, fill=(255, 214, 90), font=font)
             enters = "/".join(c.get("enter", "cut") for c in shot.get("cards") or [])
             style = f"{shot.get('layout')} · {shot.get('background')} · {enters}{('  +' + fx) if fx else ''}"
+            if shot.get("panelfit"):
+                _kinds = "/".join(f"{c['panelfit']['kind']}:{c['panelfit']['dir']}"
+                                  for c in shot.get("cards") or [] if isinstance(c.get("panelfit"), dict))
+                style += f" · panelfit {_kinds}"
             draw.text((x, y + thumb_h + 26), style, fill=(150, 190, 255), font=small)
             said = textwrap.shorten(shot.get("sentence") or "(no sentence: even timing)", 120, placeholder="…")
             for k, line in enumerate(textwrap.wrap(said, 48)[:2]):

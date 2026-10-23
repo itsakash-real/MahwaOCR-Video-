@@ -239,6 +239,50 @@ deterministic (same inputs → identical JSON).
 | `require_review` | `false` | If true, render refuses unless plan approved |
 | `sync.gate_wrong` / `gate_window` / `gate_grace` | 0.05 / 0.25 / 0.2 | Sync-gate thresholds (plus: any shot <3s fails, any sentence under its tagged-coverage threshold fails, any filler failing the impact test counts as wrong-picture) |
 
+## Panel-fit mode (`video.mode: panelfit`)
+
+The user's rendering spec, as a mode alongside classic/wide/adaptive
+(existing modes untouched). No cards, no cropping, no stretch — ever:
+
+- **Composition.** Every shot's panel is shown WHOLE at its native aspect
+  ratio: sharp, centred, fitted by height (aspect ≤ canvas) or by width
+  (wider than canvas), over the same panel cover-scaled with a heavy
+  Gaussian blur (~50px) at 60% opacity on black. The blurred background is
+  flagged on exactly when the panel isn't itself canvas-shaped.
+- **Pre-processing (Rule 6).** Panel build must run with
+  `video.panels.trim_v2: true` (prep order: recap → trim/slice → pair/plan
+  → compose; raw pages untouched). Assets are trimmed to their ink
+  bounding box (pure-white or pure-black rows/columns are margins) and
+  strips are sliced at large white gaps into separate panels, so neither
+  layer ever contains a white margin. `video plan` warns when a panelfit
+  build's panels carry no `trim2` record. Cuts/slices are recorded per
+  panel in `panels.json` (`trim2`).
+- **Motion.** Zero static: standard panels slow-zoom 100%→108% (reversed
+  for `pull_out`); tall strips (h/w ≥ `panelfit.strip_aspect`) are fitted
+  by width and scrolled top→bottom. All motion is LINEAR and sub-pixel
+  (LANCZOS source + float AFFINE sampling) — scroll velocity is constant
+  by construction; ease curves and integer rounding are banned in this
+  mode because they read as jerk.
+- **Impact FX.** Cuts flagged by the plan's `{impact}`/`{reveal}` markers
+  (fallback: a VISUAL_ACTION sentence carrying an impact verb) get a
+  3-frame white flash at the cut and a 0.2s screen shake. No
+  cross-dissolves.
+- **Sync.** Shots anchor to sentence boundaries via the alignment, as in
+  every mode; keyframe endpoints are the shot boundaries.
+- **Parallax** is deferred (build B11): the detector yields boxes, not
+  character segmentations, so cut-outs aren't cheap yet.
+- **QA.** `chapter_N.qa.json` carries `panelfit_static` (must be empty),
+  `panelfit_over_cap` (panels fitted at the upscale cap — shown smaller,
+  never stretched) and `panelfit_impact` (which shots got FX, and by
+  which rule). A card breaking the composition invariants fails the build.
+- **Storyboard** shows the composed frame at shot start and end, side by
+  side. Landscape only; portrait formats stay classic.
+
+Knobs (`video.panelfit.*`, defaults pinned in code): `bg_blur` 50,
+`bg_opacity` 0.60, `zoom_end` 1.08, `strip_aspect` 1.9, `max_upscale` 2.4,
+`still_limit` 0.5, `fx` true, `shake_seconds` 0.2, `shake_amplitude` 10.0,
+`flash_frames` 3.
+
 ## `fixes.json` overrides (all in one file, `video/chapter_N.fixes.json`)
 
 ```json

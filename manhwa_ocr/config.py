@@ -63,18 +63,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
         "format": "16:9",           # 16:9 (1920x1080) or 9:16 (1080x1920, Shorts)
         "fps": 30,
-        "mode": "classic",          # classic | wide | adaptive
+        "mode": "classic",          # classic | wide | adaptive | panelfit
                                     #   wide: every card full-height, min 6/16 wide
                                     #   adaptive: per shot, a naturally wide/landscape panel gets
                                     #   the wide treatment; a narrower one keeps its classic
                                     #   crop/shape but without the equal-area shrink (no more
                                     #   stale small cards) -- real per-panel variety in one video
+                                    #   panelfit: no cards, no cropping -- every panel shown
+                                    #   WHOLE at its native aspect over a blurred 60%
+                                    #   self-fill; standard panels slow-zoom 100->108%,
+                                    #   tall strips scroll top->bottom, all LINEAR
+                                    #   (the user's rendering spec; see panelfit: below)
         "wide": {
             "min_width_ratio": 0.375,  # 6/16 of the frame wide; no thin slivers, ever
             "max_upscale": 1.5,         # a panel is never upscaled past this (1080p sharpness)
         },
         "adaptive": {
             "wide_threshold": 1.333,   # a panel's own aspect >= this (4:3) earns the wide treatment
+        },
+        "panelfit": {
+            "bg_blur": 50,             # Gaussian radius (px at 1080p) of the cover-scaled,
+                                       # blurred copy of the panel that fills the frame
+            "bg_opacity": 0.60,        # that background layer's opacity over black
+            "zoom_end": 1.08,          # slow zoom end scale: 100% -> 108% (pull_out reverses)
+            "strip_aspect": 1.9,       # panel height/width at or above this = a vertical
+                                       # strip: fit by width and scroll, never zoom-crop
+            "max_upscale": 2.4,        # the foreground is never upscaled past this
+                                       # (readability floor for strips and small panels)
+            "still_limit": 0.5,        # seconds: nothing on screen may stay still longer
+                                       # (spec's zero-static rule; motion is continuous by
+                                       # construction, tests pin the invariant)
+            "fx": True,                # impact FX on flagged shots: screen shake + white flash
+            "shake_seconds": 0.2,      # screen-shake duration on an impact beat
+            "shake_amplitude": 10.0,   # screen-shake amplitude, px at 1080p
+            "flash_frames": 3,         # white-flash length at impact cuts, frames (spec: 2-4)
         },
         "crf": 20,                  # x264 quality: lower = better and bigger
         "preset": "veryfast",
@@ -96,6 +118,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "black_threshold": 13,  # gray below this across a row = near-black gutter
             "trim_v1": False,       # Build 1: gutter-colour blank-row trim + review flags (opt-in)
             "trim_cap": 0.40,       # max share of a panel's height the v1 trim cuts per side
+            "trim_v2": False,       # Rule 6: full ink-bbox trim (white+black, rows+cols) +
+                                    # white-gap slicing, at panel build (opt-in; panelfit prep)
         },
         # Bubble/text detector (Build 4/3 shared step): ogkalu RT-DETR, Apache-2.0.
         # "model": path to the ONNX file ("" = ~/.config/manhwa/models/ or $MANHWA_DETECTOR_MODEL)
