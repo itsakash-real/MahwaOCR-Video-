@@ -95,6 +95,16 @@ def test_fit_mid_panel_height_fit_not_fill():
     assert kind == "zoom" and (bw, bh) == (1296.0, 1080.0)
 
 
+def test_fit_wide_but_tiny_panel_cannot_fill_falls_back_to_pillar():
+    # P039-01 of the real ch1 is 742x242 (aspect 3.07): its cover scale
+    # is 4.46, past the 2.4 upscale cap, so a "fill" would not actually
+    # fill. It must degrade to the capped pillar fit over blur.
+    kind, bw, bh, s = panelfit_fit(741.8, 242.0, FMT)
+    assert kind == "zoom" and s == 2.4
+    assert bw <= FMT.width and bh <= FMT.height
+    assert bw / bh == pytest.approx(741.8 / 242.0, rel=0.005)
+
+
 def test_fit_tiny_panel_capped_not_enlarged_past_cap():
     kind, bw, bh, s = panelfit_fit(300, 400, FMT)
     assert kind == "zoom" and s == 2.4 and (bw, bh) == (720.0, 960.0)

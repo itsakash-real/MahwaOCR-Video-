@@ -1465,7 +1465,10 @@ def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
     """(kind, base_w, base_h, scale) for one panel on the canvas.
 
     "fill": aspect >= PF_FILL_ASPECT — the panel cover-fills the whole
-    frame (full-bleed; cropped by the frame, never letterboxed).
+    frame (full-bleed; cropped by the frame, never letterboxed). Only
+    when the cover scale fits under the upscale cap: a wide-but-tiny
+    panel that cannot actually fill at the cap falls through to the
+    capped pillar fit instead (over blur, smaller, never stretched).
     "drift": a narrow pillar (aspect < PF_DRIFT_ASPECT_MAX), height-fit
     and oversized by (travel + headroom) so its gentle vertical drift
     never exposes a panel edge.
@@ -1480,8 +1483,9 @@ def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
     pw, ph = max(1.0, float(pw)), max(1.0, float(ph))
     aspect = pw / ph
     if aspect >= fill_aspect:
-        s = min(max(fmt.width / pw, fmt.height / ph), cap)
-        return "fill", pw * s, ph * s, s
+        s_cover = max(fmt.width / pw, fmt.height / ph)
+        if s_cover <= cap:
+            return "fill", pw * s_cover, ph * s_cover, s_cover
     s = min(fmt.height / ph, fmt.width / pw, cap)
     if aspect < drift_max:
         over = 1.0 + panelfit_drift_travel(dur, pcfg) \
