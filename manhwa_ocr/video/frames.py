@@ -832,6 +832,139 @@ def _draw_chapter_card(img: Image.Image, card: dict, fmt: "Format", t: float) ->
     return True
 
 
+# ------------------------------------------------------------------ panel-fit views
+#
+# Panel-fit mode (video.mode: panelfit): the renderer half of the user's
+# rendering spec. Mirror constants of the planner's (plan.PF_*); config
+# pins all of them to the same numbers and tests fail on drift.
+
+PFR_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
+PFR_BG_OPACITY = 0.60       # background layer opacity over black
+PFR_SHAKE_SECONDS = 0.2     # impact screen-shake duration (spec section 4)
+PFR_SHAKE_AMPLITUDE = 10.0  # impact screen-shake amplitude, px at 1080p
+PFR_FLASH_FRAMES = 3        # impact white-flash length, frames (spec: 2-4)
+
+
+def panelfit_shake_offset(t: float, times: List[float], fmt: Format) -> Tuple[float, float]:
+    """The spec's impact shake: PFR_SHAKE_SECONDS of rapid small X/Y
+    oscillation, decaying linearly to zero. Not the classic shake (a 0.5s
+    damped wobble) — this mode's FX have their own shape and constants."""
+    for te in times:
+        dt = t - te
+        if 0 <= dt < PFR_SHAKE_SECONDS:
+            amp = PFR_SHAKE_AMPLITUDE * fmt.unit * (1.0 - dt / PFR_SHAKE_SECONDS)
+            return (amp * math.sin(2 * math.pi * 13 * dt),
+                    0.7 * amp * math.cos(2 * math.pi * 11 * dt))
+    return 0.0, 0.0
+
+
+def panelfit_flash_alpha(t: float, times: List[float], fps: int) -> float:
+    """White flash at an impact cut: full white on the first frame,
+    stepping down over exactly PFR_FLASH_FRAMES frames."""
+    best = 0.0
+    for te in times:
+        k = int(round((t - te) * max(1, fps)))
+        if 0 <= k < PFR_FLASH_FRAMES:
+            best = max(best, (PFR_FLASH_FRAMES - k) / PFR_FLASH_FRAMES)
+    return best
+
+
+class PanelFitView:
+    """One panel composed per the user's rendering spec: the panel shown
+    WHOLE at its native aspect — sharp, centred — over the same panel
+    cover-scaled, heavily blurred, at 60% opacity on black. Assets arrive
+    already white-space-eradicated (Rule 6: panels.trim_v2), so neither
+    layer ever contains a white margin.
+
+    Motion is LINEAR and sub-pixel: the foreground source is LANCZOS-
+    resized once to the largest size the motion reaches, and each frame
+    samples it with a float AFFINE transform — no per-frame integer
+    rounding (the ffmpeg-zoompan jitter), no ease curves (the jerk the
+    user rejected in the full-frame sample). Scroll velocity is constant
+    by construction.
+
+    kind "zoom": fitted inside the frame, slow zoom 100% -> zoom_end
+    (dir "in") or the reverse (dir "out").
+    kind "scroll": a tall strip fitted by width, scrolled top->bottom
+    (dir "down") or bottom->top (dir "up") across the view's window.
+    """
+
+    def __init__(self, panel: Image.Image, spec: Dict[str, Any], card: Dict[str, Any],
+                 shot_start: float, shot_end: float, fmt: Format):
+        self.fmt = fmt
+        self.kind = spec.get("kind") if spec.get("kind") in ("zoom", "scroll") else "zoom"
+        self.dir = spec.get("dir") or ("down" if self.kind == "scroll" else "in")
+        self.base_w = float(spec.get("base_w") or fmt.width)
+        self.base_h = float(spec.get("base_h") or fmt.height)
+        self.zoom_end = float(spec.get("zoom_end") or 1.08)
+        self.appear = shot_start + max(0.0, float(card.get("at") or 0.0))
+        self.end = shot_end
+        self.enter = card.get("enter") if card.get("enter") in ENTRANCES else "cut"
+        self.enter_dur = ENTER_DUR[self.enter]
+        pw, ph = panel.size
+        # Background layer: the same panel, cover-scaled past the frame
+        # by the shake margin, blurred, dimmed over black. Built once.
+        m = int(math.ceil(PFR_SHAKE_AMPLITUDE * fmt.unit)) + 2
+        self.margin = m
+        cover = max((fmt.width + 2 * m) / max(1, pw), (fmt.height + 2 * m) / max(1, ph))
+        bw, bh = max(1, round(pw * cover)), max(1, round(ph * cover))
+        bg = panel.resize((bw, bh), Image.LANCZOS)
+        bx, by = (bw - (fmt.width + 2 * m)) // 2, (bh - (fmt.height + 2 * m)) // 2
+        bg = bg.crop((bx, by, bx + fmt.width + 2 * m, by + fmt.height + 2 * m))
+        bg = bg.filter(ImageFilter.GaussianBlur(PFR_BG_BLUR * bg.height / 1080.0))
+        self.bg = Image.blend(Image.new("RGB", bg.size, (0, 0, 0)), bg, PFR_BG_OPACITY)
+        # Foreground source: the whole panel at the largest size the
+        # motion reaches (base * zoom_end for zooms, base for scrolls).
+        top = self.zoom_end if self.kind == "zoom" else 1.0
+        fw, fh = max(2, round(self.base_w * top)), max(2, round(self.base_h * top))
+        src = panel if (fw, fh) == (pw, ph) else panel.resize((fw, fh), Image.LANCZOS)
+        self.src = src.convert("RGBA")
+        self.src_w, self.src_h = self.src.size
+
+    def visible(self, t: float) -> bool:
+        return t >= self.appear - 1e-9
+
+    def frame(self, t: float, shake: Tuple[float, float] = (0.0, 0.0),
+              extra_zoom: float = 0.0) -> Image.Image:
+        fmt = self.fmt
+        W, H = fmt.width, fmt.height
+        sx, sy = shake
+        ox, oy = self.margin - int(round(sx)), self.margin - int(round(sy))
+        img = self.bg.crop((ox, oy, ox + W, oy + H)).convert("RGBA")
+        if t < self.appear - 1e-9:
+            return img.convert("RGB")
+        dur = max(0.01, self.end - self.appear)
+        p = min(1.0, max(0.0, (t - self.appear) / dur))
+        # LINEAR progress everywhere in this mode — constant velocity is
+        # the spec's headline smoothness requirement.
+        if self.kind == "scroll":
+            disp_w, disp_h = self.base_w, self.base_h
+            span = H - disp_h  # <= 0 for a strip taller than the frame
+            dy = span * p if self.dir == "down" else span * (1.0 - p)
+            dx = (W - disp_w) / 2.0
+        else:
+            z = self.zoom_end
+            s = (1.0 + (z - 1.0) * p) if self.dir == "in" else (z - (z - 1.0) * p)
+            s *= 1.0 + extra_zoom
+            disp_w, disp_h = self.base_w * s, self.base_h * s
+            dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0
+        dx += sx
+        dy += sy
+        a = self.src_w / max(1.0, disp_w)
+        e = self.src_h / max(1.0, disp_h)
+        layer = self.src.transform((W, H), Image.AFFINE,
+                                   (a, 0.0, -dx * a, 0.0, e, -dy * e),
+                                   resample=Image.BILINEAR, fill=0)
+        out = Image.alpha_composite(img, layer)
+        if self.enter == "fade_in" and t < self.appear + self.enter_dur:
+            # The only blended entrance in this mode: fade in from the
+            # blurred background alone. Every other entrance is a cut —
+            # no cross-dissolves anywhere near action.
+            k = ease_in_out((t - self.appear) / max(1e-6, self.enter_dur))
+            out = Image.blend(img, out, k)
+        return out.convert("RGB")
+
+
 # ------------------------------------------------------------------ shot
 
 
@@ -887,6 +1020,20 @@ class ShotRenderer:
         else:
             self.cards = [Card(images[c["panel"]], c, layout, i, self.start, self.end, fmt, pair_move_at)
                           for i, c in enumerate(cards)]
+        # Panel-fit mode: when the shot carries a panelfit spec on every
+        # card, the shot is composed from PanelFitViews instead of cards
+        # (the cards stay built as the fallback if a spec is missing).
+        self.pf_views: List[PanelFitView] = []
+        self.pf_shakes: List[float] = []
+        self.pf_flashes: List[float] = []
+        if shot.get("panelfit") and fmt.width > fmt.height and cards:
+            _specs = [c.get("panelfit") for c in cards]
+            if all(isinstance(_sp, dict) for _sp in _specs):
+                self.pf_views = [PanelFitView(images[c["panel"]], _sp, c, self.start, self.end, fmt)
+                                 for c, _sp in zip(cards, _specs)]
+                _pfx = shot.get("panelfit_fx") or {}
+                self.pf_shakes = [self.start + float(x) for x in (_pfx.get("shake_t") or [])]
+                self.pf_flashes = [self.start + float(x) for x in (_pfx.get("flash_t") or [])]
 
         bg_kind = shot.get("background") if shot.get("background") in BACKGROUNDS else "blur"
         bg_panel = shot.get("bg_panel") if shot.get("bg_panel") in images else (cards[0]["panel"] if cards else None)
@@ -933,13 +1080,15 @@ class ShotRenderer:
                                 (self.flashes, FLASH_LEN), (self.glitches, GLITCH_LEN)):
             for te in times:
                 settle = max(settle, te + length)
+        if self.pf_views:
+            settle = self.end  # panel-fit views move for the whole shot; nothing settles early
         self.static_from = settle
         # Defect 1: only a shot whose every card is a hand-set `hold` may
         # freeze. Continuous-motion shots must be re-drawn every frame.
         if self.fullframe:
             self._can_freeze = all(v.is_static() for v in self.views)
         else:
-            self._can_freeze = all(c.motion == "hold" for c in self.cards)
+            self._can_freeze = all(c.motion == "hold" for c in self.cards) and not self.pf_views
         self._static: np.ndarray | None = None
 
     def is_static(self, t: float) -> bool:
@@ -981,6 +1130,8 @@ class ShotRenderer:
     def frame_array(self, t: float) -> np.ndarray:
         if self.is_static(t) and self._static is not None:
             return self._static
+        if self.pf_views:
+            return self._pf_frame_array(t)
         extra = punch_amount(t, self.punches)
         if self.fullframe:
             img = self._ff_frame(t, extra)
@@ -1036,6 +1187,34 @@ class ShotRenderer:
             out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
         if self.is_static(t):
             self._static = out
+        return out
+
+    def _pf_frame_array(self, t: float) -> np.ndarray:
+        view = self.pf_views[0]
+        for v in self.pf_views:
+            if v.visible(t):
+                view = v
+        shake = panelfit_shake_offset(t, self.pf_shakes, self.fmt)
+        extra = punch_amount(t, self.punches)
+        img = view.frame(t, shake=shake, extra_zoom=extra)
+        for _co in self.callouts:
+            _draw_callout(img, _co, self.fmt, t, caption_bar=self.caption_bar)
+        for _cc in self.chapter_cards:
+            _draw_chapter_card(img, _cc, self.fmt, t)
+        out = np.asarray(img, dtype=np.uint8)
+        if self.darken > 0:
+            out = (out.astype(np.float32) * (1.0 - self.darken)).astype(np.uint8)
+        if self.grade == "subtle":
+            out = grade_subtle(out)
+        _glitch = glitch_offset(t, self.glitches, self.fmt.unit)
+        if _glitch > 0:
+            out = glitch_split(out, _glitch)
+        fa = panelfit_flash_alpha(t, self.pf_flashes, self.fmt.fps)
+        if fa > 0.001:
+            out = _mix(out, np.full_like(out, 255), fa)
+        if self.fade_from is not None and t > self.fade_from:
+            span = max(1e-3, self.end - self.fade_from)
+            out = _mix(np.zeros_like(out), out, max(0.0, (self.end - t) / span))
         return out
 
     def frame(self, t: float) -> Image.Image:

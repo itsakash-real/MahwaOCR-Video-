@@ -200,3 +200,132 @@ def trim_report(root: Path, chapter: str, *, cap_share: float = DEFAULT_CAP) -> 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=1, ensure_ascii=False), encoding="utf-8")
     return report
+
+
+# ------------------------------------------------------------------ v2: Rule 6
+#
+# Rule 6 of the user's rendering spec (2026-10-23): pre-processing white
+# space eradication. v1 (above) trims blank ROWS against a detected LIGHT
+# gutter colour, with per-side caps and review flags. v2 is the stricter,
+# literal rule the panel-fit mode is built on, applied at panel build time
+# (video-build prep: after the recap, before pairing/plan — raw page assets
+# are never touched):
+#
+# - an asset is trimmed exactly to its ink bounding box: every outer row
+#   or column that is (near-)pure white OR (near-)pure black is margin;
+# - a strip holding several panels across a large WHITE gap is sliced at
+#   the gap into separate panel assets (the white is discarded).
+#
+# A row/column is blank only when (almost) every pixel is margin — any
+# ink at all, a bubble outline included, stops the trim on that side,
+# exactly the v1 caution. All-blank assets are left untouched and
+# flagged, never emptied. Thresholds are named constants here (the
+# hardcode rule); the white/black levels default to the same values the
+# panel settings use (242 / 13) and panel build passes its settings in.
+
+TRIM2_BLANK_SHARE = BLANK_SHARE  # share of a row/column that must be margin to count as blank
+TRIM2_WHITE_MIN = 242            # a pixel is white margin when its DARKEST channel >= this
+TRIM2_BLACK_MAX = 13             # ... or black margin when its BRIGHTEST channel <= this
+TRIM2_GAP_MIN_PX = 200           # a white gap at least this tall inside a strip slices it
+TRIM2_MIN_KEEP_PX = MIN_KEEP_PX  # never trim an asset below this many px on an axis
+
+
+@dataclass
+class Trim2Result:
+    cut_top: int = 0        # rows/cols, in image pixels
+    cut_bottom: int = 0
+    cut_left: int = 0
+    cut_right: int = 0
+    flags: List[str] = field(default_factory=list)
+    purity: float = 1.0     # lowest margin-share among removed rows/cols (proof)
+
+
+def _margin_shares(arr: np.ndarray, *, white_min: int, black_max: int) -> Tuple[np.ndarray, np.ndarray]:
+    """(per-row, per-column) share of margin pixels in an RGB array."""
+    margin = (arr.min(axis=2) >= white_min) | (arr.max(axis=2) <= black_max)
+    return margin.mean(axis=1), margin.mean(axis=0)
+
+
+def compute_trim_v2(img: Image.Image, *, white_min: int = TRIM2_WHITE_MIN,
+                    black_max: int = TRIM2_BLACK_MAX) -> Trim2Result:
+    """The ink bounding box of one asset, as cuts from each side. Pure."""
+    arr = np.asarray(img.convert("RGB"))
+    h, w = arr.shape[0], arr.shape[1]
+    if h == 0 or w == 0:
+        return Trim2Result()
+    rows, cols = _margin_shares(arr, white_min=white_min, black_max=black_max)
+    rb = rows >= TRIM2_BLANK_SHARE
+    cb = cols >= TRIM2_BLANK_SHARE
+    if rb.all() or cb.all():
+        return Trim2Result(0, 0, 0, 0, ["all_blank"])
+    cut_top = int(np.argmax(~rb))
+    cut_bottom = int(np.argmax(~rb[::-1]))
+    cut_left = int(np.argmax(~cb))
+    cut_right = int(np.argmax(~cb[::-1]))
+    kept_h = h - cut_top - cut_bottom
+    kept_w = w - cut_left - cut_right
+    if kept_h < max(TRIM2_MIN_KEEP_PX, int(MIN_KEEP_SHARE * h)) or kept_w < TRIM2_MIN_KEEP_PX:
+        return Trim2Result(0, 0, 0, 0, ["min_keep"])
+    purity = 1.0
+    if cut_top:
+        purity = min(purity, float(rows[:cut_top].min()))
+    if cut_bottom:
+        purity = min(purity, float(rows[h - cut_bottom:].min()))
+    if cut_left:
+        purity = min(purity, float(cols[:cut_left].min()))
+    if cut_right:
+        purity = min(purity, float(cols[w - cut_right:].min()))
+    return Trim2Result(cut_top, cut_bottom, cut_left, cut_right, [], purity)
+
+
+def apply_trim_v2(img: Image.Image, res: Trim2Result) -> Image.Image:
+    """The bbox-trimmed copy. The original is never modified."""
+    if not (res.cut_top or res.cut_bottom or res.cut_left or res.cut_right):
+        return img
+    return img.crop((res.cut_left, res.cut_top,
+                     img.width - res.cut_right, img.height - res.cut_bottom))
+
+
+def _true_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """[start, end) runs of True in a 1-D mask."""
+    out: List[Tuple[int, int]] = []
+    j, n = 0, len(mask)
+    while j < n:
+        if mask[j]:
+            k = j
+            while k < n and mask[k]:
+                k += 1
+            out.append((j, k))
+            j = k
+        else:
+            j += 1
+    return out
+
+
+def slice_gaps(img: Image.Image, *, gap_min_px: int = TRIM2_GAP_MIN_PX,
+               white_min: int = TRIM2_WHITE_MIN) -> List[Tuple[int, int]]:
+    """(y0, y1) pieces of a strip after slicing at large WHITE gaps.
+
+    A gap is a run of >= gap_min_px rows that are (near-)pure white
+    across the whole strip. Rule 6 point 3 names white gaps: black bands
+    are margins for the bbox trim, never slice points (a long black run
+    can be a deliberate night panel). Gaps touching an edge are margins,
+    not slice points — the bbox trim owns those. Returns [(0, h)] when
+    there is nothing to slice.
+    """
+    arr = np.asarray(img.convert("RGB"))
+    h = arr.shape[0]
+    if h == 0 or arr.shape[1] == 0:
+        return []
+    white = (arr.min(axis=2) >= white_min).mean(axis=1) >= TRIM2_BLANK_SHARE
+    cuts = [(a, b) for a, b in _true_runs(white)
+            if b - a >= gap_min_px and a > 0 and b < h]
+    if not cuts:
+        return [(0, h)]
+    pieces: List[Tuple[int, int]] = []
+    start = 0
+    for a, b in cuts:
+        pieces.append((start, a))
+        start = b
+    pieces.append((start, h))
+    return [(a, b) for a, b in pieces if b - a > 0]

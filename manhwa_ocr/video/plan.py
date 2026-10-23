@@ -41,6 +41,7 @@ from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_card, _inset_crop, build_ch
                      pacing_qa, plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
 from .editor import MOTION_WEIGHTS as P3_MOTION_WEIGHTS
 from .captions import build_captions, build_captions_from_sentences, validate_captions
+from .classify import classify as _classify_sentence
 from .frames import (BACKGROUNDS, EFFECTS, ENTRANCES, EXITS, GLITCH_MIN_GAP, LAYOUTS, MOTIONS,
                      TRANSITION_WEIGHTS, TRANSITIONS, Format, format_from, shapes_for, transition_enter)
 from .media import video_dir
@@ -1377,6 +1378,178 @@ def _adaptive_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
            "reviewer_focal_ignored": reviewer_focal_ignored}
 
 
+# ------------------------------------------------------------------ panel-fit pass
+#
+# Panel-fit mode (video.mode: panelfit) — the user's rendering spec
+# (~/workspace/your_files/reference-recap-rendering-spec.md). No cards, no
+# cropping: every shot's panel is shown WHOLE at its native aspect ratio,
+# sharp and centred, over the same panel cover-scaled, heavily blurred
+# (50px) at 60% opacity on black. Standard panels slow-zoom 100% -> 108%
+# (reversed for pull_out); tall strips are fitted by width and scrolled
+# top->bottom with LINEAR interpolation (constant velocity — ease curves
+# are what made the full-frame sample's scrolling read as jerky). Every
+# parameter below is a named constant, pinned to the config defaults
+# (video.panelfit.*) and to the renderer's mirrors (frames.PFR_*) by
+# tests; the spec values must never live only in an agent's head.
+#
+# Assets reach this pass already white-space-eradicated (Rule 6 of the
+# spec: panels.trim_v2 at panel build — ink-bbox trim + gap slicing), so
+# the composed frame contains no white margins in either layer.
+#
+# Parallax (spec section 3) is NOT here: the detector stack yields boxes,
+# not character segmentations, so cut-outs are not cheap; deferred to
+# build B11 of the movie plan.
+
+PF_BG_BLUR = 50          # background Gaussian blur radius, px at 1080p
+PF_BG_OPACITY = 0.60     # background layer opacity over black
+PF_ZOOM_END = 1.08       # slow-zoom end scale for standard panels
+PF_STRIP_ASPECT = 1.9    # panel height/width at/above which it is a scrolling strip
+PF_MAX_UPSCALE = 2.4     # quality guard: never upscale a panel past this
+PF_STILL_LIMIT = 0.5     # spec: no image still for longer than this, seconds
+PF_FX = True             # impact FX (shake + flash) on flagged shots
+PF_SHAKE_SECONDS = 0.2   # screen-shake duration on an impact beat
+PF_SHAKE_AMPLITUDE = 10.0  # screen-shake amplitude, px at 1080p
+PF_FLASH_FRAMES = 3      # white-flash length at impact cuts, frames (spec: 2-4)
+PF_ASPECT_TOL = 0.01     # log-aspect distance under which a panel counts as exactly canvas-shaped
+PF_FIT_TOL = 1.0         # px slack when checking a fitted foreground stays inside the frame
+# The coded fallback's impact verbs: the same hit words the SFX planner
+# (editor.plan_sfx) keys "hit" sounds on.
+PF_IMPACT_WORDS = ("slams", "crashes", "explodes", "strikes", "smashes", "blasts", "shatters")
+
+
+def panelfit_fit(pw: float, ph: float, fmt: Format, *, strip_aspect: float = PF_STRIP_ASPECT,
+                 max_upscale: float = PF_MAX_UPSCALE) -> Tuple[str, float, float, float]:
+    """(kind, base_w, base_h, scale) for one panel on the canvas.
+
+    "zoom": the whole panel fitted inside the frame (by height when its
+    aspect is <= the canvas's, by width when wider), at the largest scale
+    that keeps it whole, capped at max_upscale.
+    "scroll": a tall strip (h/w >= strip_aspect) fitted BY WIDTH at the
+    capped scale; when even the capped width-fit leaves it no taller
+    than the frame, it degrades to a standard zoom fit.
+    """
+    cap = max(0.1, float(max_upscale))
+    if pw > 0 and ph > 0 and ph / pw >= strip_aspect:
+        s = min(fmt.width / pw, cap)
+        if ph * s > fmt.height + 0.5:
+            return "scroll", pw * s, ph * s, s
+    s = min(fmt.width / max(1.0, pw), fmt.height / max(1.0, ph), cap)
+    return "zoom", pw * s, ph * s, s
+
+
+def panelfit_spec(pw: float, ph: float, motion: str, fmt: Format,
+                  pcfg: Dict[str, Any] | None) -> Dict[str, Any]:
+    """The per-card composition spec the renderer consumes."""
+    pcfg = pcfg or {}
+    kind, bw, bh, _s = panelfit_fit(pw, ph, fmt,
+                                    strip_aspect=float(pcfg.get("strip_aspect", PF_STRIP_ASPECT)),
+                                    max_upscale=float(pcfg.get("max_upscale", PF_MAX_UPSCALE)))
+    if kind == "scroll":
+        direction = "up" if motion == "pan_up" else "down"
+    else:
+        direction = "out" if motion == "pull_out" else "in"
+    bg = True
+    if pw > 0 and ph > 0:
+        bg = abs(math.log((pw / ph) / (fmt.width / fmt.height))) > PF_ASPECT_TOL
+    return {"kind": kind, "dir": direction, "bg": bg,
+            "base_w": round(bw, 2), "base_h": round(bh, 2),
+            "zoom_end": float(pcfg.get("zoom_end", PF_ZOOM_END))}
+
+
+def panelfit_impact_fx(shot: Dict[str, Any], pcfg: Dict[str, Any] | None) -> Tuple[Dict[str, Any], str | None]:
+    """({"shake_t": [...], "flash_t": [...]}, rule) for one shot; times are
+    seconds after the shot starts. Flags come from the plan's existing
+    beat markers first (shot["effects"], built from the {impact}/{reveal}
+    cues): a shake effect shakes, a flash effect flashes, and any marker
+    also flashes the cut INTO the shot (the spec's impact flash sits at
+    the cut). Fallback rule (coded): the shot's sentence classifies as
+    VISUAL_ACTION and carries an impact verb -> shake + flash at the cut.
+    """
+    pcfg = pcfg or {}
+    if not bool(pcfg.get("fx", PF_FX)):
+        return {"shake_t": [], "flash_t": []}, None
+    start = float(shot.get("start") or 0.0)
+    shake_t: List[float] = []
+    flash_t: List[float] = []
+    for e in shot.get("effects") or []:
+        if not isinstance(e, dict):
+            continue
+        try:
+            rel = max(0.0, float(e["t"]) - start)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e.get("type") == "shake":
+            shake_t.append(round(rel, 3))
+        elif e.get("type") == "flash":
+            flash_t.append(round(rel, 3))
+    if shake_t or flash_t:
+        if not any(abs(x) < 1e-6 for x in flash_t):
+            flash_t.append(0.0)  # the impact cut itself flashes
+        return {"shake_t": sorted(shake_t), "flash_t": sorted(flash_t)}, "marker"
+    sentence = str(shot.get("sentence") or "")
+    if sentence:
+        kind, _why = _classify_sentence(sentence)
+        low = sentence.lower()
+        if kind == "VISUAL_ACTION" and any(w in low for w in PF_IMPACT_WORDS):
+            return {"shake_t": [0.0], "flash_t": [0.0]}, "fallback"
+    return {"shake_t": [], "flash_t": []}, None
+
+
+def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                   pcfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite classic shots into panel-fit shots (landscape only, like
+    the wide/adaptive passes; portrait formats stay classic).
+
+    Returns {"static", "over_cap", "impact"} — shot ids that would render
+    static (none by construction: zoom_end != 1 and scrolls always move;
+    computed honestly from the specs, not asserted), panel ids whose
+    uncapped fit would exceed PF_MAX_UPSCALE (their foreground is capped,
+    so it sits smaller — an honest quality note, never a stretch), and
+    the impact-FX report the sample/QA cite.
+    """
+    report: Dict[str, Any] = {"static": [], "over_cap": [], "impact": []}
+    if fmt.width <= fmt.height:
+        return report
+    pcfg = pcfg or {}
+    zoom_end = float(pcfg.get("zoom_end", PF_ZOOM_END))
+    cap = float(pcfg.get("max_upscale", PF_MAX_UPSCALE))
+    for s in shots:
+        s["panelfit"] = True
+        s["caption_bar"] = False  # captions overlay the composed frame
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        if not pair:
+            s["layout"] = "single"
+            cards = cards[:1]
+        moving = False
+        for c in cards:
+            pid = c.get("panel")
+            p = designer.by_id.get(pid) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if pw > 0 and ph > 0:
+                c["panelfit"] = panelfit_spec(pw, ph, str(c.get("motion") or ""), fmt, pcfg)
+                uncapped = (fmt.width / pw if ph / pw >= float(pcfg.get("strip_aspect", PF_STRIP_ASPECT))
+                            else min(fmt.width / pw, fmt.height / ph))
+                if uncapped > cap and pid not in report["over_cap"]:
+                    report["over_cap"].append(pid)
+            else:
+                c["panelfit"] = {"kind": "zoom", "dir": "in", "bg": True,
+                                 "base_w": float(fmt.width), "base_h": float(fmt.height),
+                                 "zoom_end": zoom_end}
+            spec = c["panelfit"]
+            if spec["kind"] == "scroll" or abs(spec["zoom_end"] - 1.0) > 1e-9:
+                moving = True
+        s["cards"] = cards
+        if not moving:
+            report["static"].append(s.get("id"))
+        fx, rule = panelfit_impact_fx(s, pcfg)
+        s["panelfit_fx"] = fx
+        if rule:
+            report["impact"].append({"id": s.get("id"), "rule": rule,
+                                     "shake_t": fx["shake_t"], "flash_t": fx["flash_t"]})
+    return report
+
+
 # ------------------------------------------------------------------ fullframe mode
 
 # Full-frame mode ("video.mode: fullframe") drops the card entirely: every
@@ -1805,12 +1978,15 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     sfx = plan_sfx(shots, chapter_cards)
     _mode = str(vcfg.get("mode") or "classic")
     _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
+    _pf_report = {"static": [], "over_cap": [], "impact": []}
     _ff_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [],
                 "over_cap": [], "static": []}
     if _mode == "wide":
         _wide_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     elif _mode == "adaptive":
         _wide_risk = _adaptive_pass(shots, designer, fmt, vcfg.get("adaptive") or {}, vcfg.get("wide") or {})
+    elif _mode == "panelfit":
+        _pf_report = _panelfit_pass(shots, designer, fmt, vcfg.get("panelfit") or {})
     elif _mode == "fullframe":
         _ff_risk = _fullframe_pass(shots, designer, fmt, vcfg.get("fullframe") or {})
     return {
@@ -1819,6 +1995,9 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "wide_caption_risk": _wide_risk["caption_risk"],
         "wide_figure_risk": _wide_risk["figure_risk"],
         "wide_reviewer_focal_ignored": _wide_risk["reviewer_focal_ignored"],
+        "panelfit_static": _pf_report["static"],
+        "panelfit_over_cap": _pf_report["over_cap"],
+        "panelfit_impact": _pf_report["impact"],
         "fullframe_caption_risk": _ff_risk["caption_risk"],
         "fullframe_figure_risk": _ff_risk["figure_risk"],
         "fullframe_reviewer_focal_ignored": _ff_risk["reviewer_focal_ignored"],
@@ -1965,6 +2144,20 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     errs.append(f"{cw}: \"at\" ({at}s after the shot starts) must leave it on screen at least 0.2s")
             except (TypeError, ValueError):
                 errs.append(f"{cw}: \"at\" must be seconds after the shot starts")
+            _pf = c.get("panelfit")
+            if _pf is not None:
+                _pf_ok = (isinstance(_pf, dict)
+                          and _pf.get("kind") in ("zoom", "scroll")
+                          and _pf.get("dir") in (("up", "down") if _pf.get("kind") == "scroll" else ("in", "out")))
+                if _pf_ok:
+                    try:
+                        _pf_ok = (float(_pf["base_w"]) > 0 and float(_pf["base_h"]) > 0
+                                  and float(_pf["zoom_end"]) > 0)
+                    except (KeyError, TypeError, ValueError):
+                        _pf_ok = False
+                if not _pf_ok:
+                    errs.append(f"{cw}: panelfit spec must be {{kind: zoom|scroll, dir, base_w, base_h, zoom_end}} "
+                                "(video.mode: panelfit writes it; rebuild the plan with --force)")
         from .editor import validate_callout as _validate_callout
         for _co in s.get("callouts") or []:
             for _err in _validate_callout(_co):

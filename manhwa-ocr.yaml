@@ -53,20 +53,35 @@ tts:
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
-  mode: wide              # classic | wide | adaptive | fullframe. wide: every card full frame
+  mode: wide              # classic | wide | adaptive | panelfit | fullframe. wide: every card full frame
                           # height (no letterbox), min 6/16 of the frame wide (pairs exactly
                           # 8/16), captions overlay the art (no black bar). adaptive: per shot, a
                           # naturally wide panel (aspect >= adaptive.wide_threshold) gets that
                           # same wide treatment; a narrower panel keeps its classic shape but
                           # without the equal-area shrink, so it isn't forced to the same small
-                          # size as every other shape. fullframe: NO cards at all -- every shot
-                          # is a full-bleed 16:9 camera viewport panning/zooming through the
-                          # panel (see fullframe: below). Landscape only; portrait stays classic.
+                          # size as every other shape. panelfit: no cards, no cropping -- every
+                          # panel WHOLE at its native aspect over a blurred 60% self-fill,
+                          # slow-zoom 100->108% or a LINEAR top->bottom scroll for tall
+                          # strips (see panelfit: below). fullframe: NO cards at all -- every
+                          # shot is a full-bleed 16:9 camera viewport panning/zooming through
+                          # the panel (see fullframe: below). Landscape only; portrait stays
+                          # classic in both.
   wide:
     min_width_ratio: 0.375  # 6/16 of the frame wide; no thin slivers, ever
     max_upscale: 1.5        # a panel is never upscaled past this (keeps 1080p sharp)
   adaptive:
     wide_threshold: 1.333   # a panel's own aspect >= this (4:3) earns the wide treatment
+  panelfit:
+    bg_blur: 50             # Gaussian radius (px at 1080p) of the blurred self-fill background
+    bg_opacity: 0.60        # background layer opacity over black
+    zoom_end: 1.08          # slow zoom end scale (100% -> 108%; pull_out reverses)
+    strip_aspect: 1.9       # panel height/width >= this = vertical strip (fit by width + scroll)
+    max_upscale: 2.4        # foreground is never upscaled past this
+    still_limit: 0.5        # seconds: nothing stays still longer (zero-static rule)
+    fx: true                # impact FX (0.2s shake + white flash) on flagged shots
+    shake_seconds: 0.2      # screen-shake duration on an impact beat
+    shake_amplitude: 10.0   # screen-shake amplitude, px at 1080p
+    flash_frames: 3         # white-flash length at impact cuts, frames (spec: 2-4)
   fullframe:
     max_upscale: 2.4        # viewport source floor = frame / this (1920x1080 / 2.4 = 800x450 px);
                             # zoom depth is capped so no viewport ever sources from less
@@ -110,6 +125,9 @@ video:
     trim_v1: false          # Build 1 white-space trimmer: blank rows only, gutter colour
                             # detected per panel, caps + review flags recorded in panels.json
     trim_cap: 0.40          # max share of a panel's height cut from one side
+    trim_v2: false          # Rule 6 white-space eradication: full ink-bbox trim (white+black,
+                            # rows+cols) + slicing strips at large white gaps, at panel build.
+                            # The panelfit prep step (after the recap, before pair/plan).
   # Bubble/text detector (ogkalu RT-DETR v2, Apache-2.0, ONNX int8). Boxes are cached
   # per panel under .work/video/chN/boxes/. Get the model file from
   # huggingface.co/ogkalu/comic-text-and-bubble-detector (detector_int8.onnx).
