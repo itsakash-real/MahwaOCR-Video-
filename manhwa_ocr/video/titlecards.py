@@ -20,7 +20,8 @@ agent's head):
   (recaps spell numbers out for TTS). Ordinary sentences that merely
   mention an age, a week or a count never trigger — the timeline
   keyword must carry the sentence.
-* `card_duration(span)` clamps a cue's spoken span to [2.0, 3.0]s.
+* `card_duration(span)` clamps a cue's spoken span to [1.4, 2.1]s
+  (the reference's four measured cards run 1.40-2.13s; B1d F6).
 * `render_title_card(w, h, label, number, line)` draws the card with
   PIL: black field, serif label, two split-flap tiles (rounded beige
   tiles, centre seam, dark numerals), and the big line in Anton (the
@@ -40,10 +41,10 @@ from typing import Any, Dict, Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
-# Card timing (the engineering spec's 2-3s window; the plan clamps the
-# cue sentence's own duration into it).
-CARD_MIN_DUR = 2.0
-CARD_MAX_DUR = 3.0
+# Card timing: the reference's measured card window (1.40-2.13s on
+# screen); the plan clamps the cue sentence's own duration into it.
+CARD_MIN_DUR = 1.4
+CARD_MAX_DUR = 2.1
 
 # Measured geometry (fractions of frame height unless noted).
 DIGITS_BLOCK_H = 0.33        # tiles + digits block height / frame height
@@ -51,9 +52,15 @@ TILE_W_RATIO = 0.82          # one tile's width / its height
 TILE_GAP_RATIO = 0.055       # gap between the tiles / tile height
 LABEL_SIZE = 0.052           # serif label font size / frame height
 LABEL_GAP = 0.030            # label baseline to tiles top / frame height
-LINE_SIZE = 0.105            # big-line font size / frame height (shrinks to fit)
+LINE_SIZE = 0.14             # big-line font size / frame height (shrinks to fit);
+                             # the RENDERED ink measures ~12.2% of frame height at
+                             # this size (B1d F6; at 0.105 it measured only 9.3%)
 LINE_GAP = 0.048             # tiles bottom to big line top / frame height
-LINE_MAX_W = 0.66            # big line never wider than this share of frame width
+LINE_MAX_W = 0.80            # big line never wider than this share of frame width
+                             # (raised from 0.66 with LINE_SIZE: the shrink-to-fit
+                             # loop must not pull the line back under its measured
+                             # height; Anton is wider than the reference's font,
+                             # so height is the matched dimension)
 LINE_TRACKING = 0.035        # letter tracking, share of the line font size
 
 TILE_FILL = (219, 208, 182)  # split-flap beige

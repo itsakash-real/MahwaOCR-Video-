@@ -66,9 +66,10 @@ def test_detect_never_fires_on_ordinary_sentences(text):
 
 
 def test_card_duration_clamps_to_the_measured_window():
-    assert card_duration(1.2) == 2.0
-    assert card_duration(2.13) == pytest.approx(2.13)
-    assert card_duration(5.0) == 3.0
+    # The reference's four measured cards run 1.40-2.13s (B1d F6).
+    assert card_duration(0.9) == 1.4
+    assert card_duration(1.8) == pytest.approx(1.8)
+    assert card_duration(5.0) == 2.1
 
 
 # --------------------------------------------------------------- rendering
@@ -93,6 +94,18 @@ def test_render_card_pixels():
     # Big line below the tiles: white Anton caps.
     line = _region(arr, 720, 880, 300, 1620).reshape(-1, 3)
     assert np.mean(np.min(line, axis=1) > 240) > 0.01
+
+
+def test_render_card_big_line_matches_the_measured_height():
+    # F6: the reference's big line measures 12.2% of frame height
+    # (ink); B1c's measured only 9.3%. Anton is wider than the
+    # reference's font, so height is the matched dimension.
+    img = render_title_card(1920, 1080, "Age", 4, "WEEK 6 OF POSSESSION.")
+    arr = np.asarray(img).astype(int)
+    white = arr.min(axis=2) > 240                       # the line is pure white
+    rows = np.flatnonzero(white.any(axis=1))
+    assert len(rows)
+    assert (rows[-1] - rows[0] + 1) / 1080 == pytest.approx(0.122, abs=0.012)
 
 
 def test_render_card_without_line_or_label():
@@ -132,20 +145,20 @@ def test_insert_card_consumes_the_following_shots_head():
     shots = [_shot(1, 0, 6), _shot(2, 6, 12)]
     wins = [{"text": "Age 4. Week 6 of possession.", "start": 6.0, "end": 7.5}]
     out, report = insert_title_cards(shots, wins, {})
-    assert _tiles(out) == [(0.0, 6.0), (6.0, 8.0), (8.0, 12.0)]   # clamp(1.5) = 2.0s card
+    assert _tiles(out) == [(0.0, 6.0), (6.0, 7.5), (7.5, 12.0)]   # clamp(1.5) = 1.5s card
     card = out[1]
     assert card["title_card"] == {"label": "Age", "number": 4, "line": "WEEK 6 OF POSSESSION."}
     assert card["cards"] == [] and card["id"] == "S002"
-    assert report == [{"id": "S002", "at": 6.0, "duration": 2.0, "label": "Age",
+    assert report == [{"id": "S002", "at": 6.0, "duration": 1.5, "label": "Age",
                         "number": 4, "line": "WEEK 6 OF POSSESSION."}]
 
 
-def test_insert_card_long_cue_clamps_to_three_seconds():
+def test_insert_card_long_cue_clamps_to_the_measured_max():
     shots = [_shot(1, 0, 6), _shot(2, 6, 14)]
     wins = [{"text": "Age 8. Year 4 of possession.", "start": 6.0, "end": 11.0}]
     out, report = insert_title_cards(shots, wins, {})
-    assert _tiles(out) == [(0.0, 6.0), (6.0, 9.0), (9.0, 14.0)]
-    assert report[0]["duration"] == 3.0
+    assert _tiles(out) == [(0.0, 6.0), (6.0, 8.1), (8.1, 14.0)]
+    assert report[0]["duration"] == 2.1
 
 
 def test_insert_merges_an_age_fragment_with_the_next_cue():
@@ -196,10 +209,10 @@ def test_build_plan_with_a_cue_sentence_gets_a_card_shot():
                       sentences=sentences)
     cards = [s for s in plan["shots"] if s.get("title_card")]
     assert len(cards) == 1
-    # clamp(1.5) = 2.0s; the start snaps to the cue shot's own start
+    # clamp(1.5) = 1.5s; the start snaps to the cue shot's own start
     # (shots open `lead` — 0.15s — before their sentence).
     assert cards[0]["start"] == pytest.approx(3.85, abs=0.01)
-    assert cards[0]["end"] - cards[0]["start"] == pytest.approx(2.0)
+    assert cards[0]["end"] - cards[0]["start"] == pytest.approx(1.5)
     assert cards[0]["title_card"]["line"] == "WEEK 6 OF POSSESSION."
     assert plan["panelfit_title_cards"][0]["id"] == cards[0]["id"]
     # The plan still tiles the whole duration, back to back.
