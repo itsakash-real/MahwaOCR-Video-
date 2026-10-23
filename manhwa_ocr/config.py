@@ -63,7 +63,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
         "format": "16:9",           # 16:9 (1920x1080) or 9:16 (1080x1920, Shorts)
         "fps": 30,
-        "mode": "classic",          # classic | wide | adaptive | panelfit
+        "mode": "classic",          # classic | wide | adaptive | panelfit | fullframe
                                     #   wide: every card full-height, min 6/16 wide
                                     #   adaptive: per shot, a naturally wide/landscape panel gets
                                     #   the wide treatment; a narrower one keeps its classic
@@ -74,6 +74,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                     #   self-fill; standard panels slow-zoom 100->108%,
                                     #   tall strips scroll top->bottom, all LINEAR
                                     #   (the user's rendering spec; see panelfit: below)
+                                    #   fullframe: no cards at all -- every shot is a full-bleed
+                                    #   16:9 camera viewport travelling over the panel
+                                    #   (pan through tall windows, zoom inside wide ones)
         "wide": {
             "min_width_ratio": 0.375,  # 6/16 of the frame wide; no thin slivers, ever
             "max_upscale": 1.5,         # a panel is never upscaled past this (1080p sharpness)
@@ -97,6 +100,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "shake_seconds": 0.2,      # screen-shake duration on an impact beat
             "shake_amplitude": 10.0,   # screen-shake amplitude, px at 1080p
             "flash_frames": 3,         # white-flash length at impact cuts, frames (spec: 2-4)
+        },
+        "fullframe": {
+            "max_upscale": 2.4,        # zoom guardrail: a viewport's source is never smaller
+                                       # than the frame / this (1080/2.4 = a 450px source-height
+                                       # floor at 900px-wide panels); keeps full-bleed upscaling
+                                       # from cratering on deep punch-ins
+            "zoom_depth": 1.18,        # target push_in/pull_out depth when the window has room
+            "pan_travel": 1.0,         # a pan's window holds this many extra viewport lengths
+                                       # of travel beyond one viewport (1.0 = window is 2 viewports)
         },
         "crf": 20,                  # x264 quality: lower = better and bigger
         "preset": "veryfast",

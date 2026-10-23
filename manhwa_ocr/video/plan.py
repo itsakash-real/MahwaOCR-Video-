@@ -1550,6 +1550,324 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     return report
 
 
+# ------------------------------------------------------------------ fullframe mode
+
+# Full-frame mode ("video.mode: fullframe") drops the card entirely: every
+# shot is a full-bleed 1920x1080 camera viewport travelling over the panel.
+# The classic focal crop (or a fixes.json crop) says WHERE the camera looks;
+# this section resolves it into a camera path: a `window` (the panel region
+# the shot covers) plus `from`/`to` viewports -- both exactly 16:9, both
+# inside the window -- that the renderer interpolates between:
+#   * window taller than the viewport -> a vertical pan (the webtoon scroll);
+#   * window wider than the viewport  -> a horizontal pan;
+#   * window ~16:9                     -> a zoom (push_in / pull_out), or a
+#     still frame for a hand-set `hold`.
+# Timing, panels and `at` offsets are NEVER touched (the sync audit reads
+# them), so a full-frame plan audits exactly like the classic plan it was
+# derived from. Captions overlay the art (no bar), like wide mode.
+FF_ASPECT = 16.0 / 9.0
+FF_MIN_TRAVEL = 1.12    # a pan window must exceed its viewport by >=12% or it is a zoom instead
+FF_MIN_ZOOM = 1.03      # below this depth a zoom is a still frame; reported, never disguised
+FF_CAPTION_ZONE = WIDE_CAPTION_ZONE   # bottom share of the viewport the overlaid captions occupy
+# Every full-frame style parameter is a named constant (the HARDCODE-IT
+# rule: style lives in code/config, never in an agent's head). The three
+# user-facing knobs live in config (video.fullframe.*, DEFAULTS in
+# config.py); these constants are their in-code defaults and the single
+# fallback every .get() uses -- a test pins the two to each other.
+FF_MAX_UPSCALE = 2.4    # default of video.fullframe.max_upscale
+FF_ZOOM_DEPTH = 1.18    # default of video.fullframe.zoom_depth
+FF_PAN_TRAVEL = 1.0     # default of video.fullframe.pan_travel
+FF_PX_TOL = 1.0         # panel-pixel tolerance for containment / floor comparisons
+FF_CONTAIN_TOL = 0.002  # fraction tolerance for the viewport-inside-window checks
+FF_ASPECT_TOL = 0.02    # log-space tolerance of the QA gate's exact-16:9 check
+
+
+def _ff_place(f0: float, flen: float, win: float, extent: float,
+              bands: List[Tuple[float, float]]) -> float:
+    """Start coordinate for a window of length `win` on one axis: contains
+    the focal span [f0, f0+flen] when it fits (wide_crop's containment
+    clamp), centres on it when it cannot, then safe_span nudges the edges
+    off content bands outside the focal."""
+    if flen <= win:
+        lo = max(0.0, f0 + flen - win)
+        hi = min(f0, max(0.0, extent - win))
+        anchor = max(lo, min(hi, f0))
+    else:
+        lo, hi = 0.0, max(0.0, extent - win)
+        anchor = max(lo, min(hi, f0 + flen / 2.0 - win / 2.0))
+    return safe_span(extent, win, lo, hi, bands, anchor)
+
+
+def fullframe_viewport(pw: float, ph: float, box: List[float], motion: str, *,
+                       min_vp_w: float, min_vp_h: float,
+                       zoom_depth: float = FF_ZOOM_DEPTH, pan_travel: float = FF_PAN_TRAVEL,
+                       img: Image.Image | None = None
+                       ) -> Tuple[Dict[str, List[float]], Dict[str, Any]]:
+    """Resolve one card's camera path over a panel of (pw, ph) pixels.
+
+    `box` is the focal crop in panel fractions (the classic planner's crop,
+    or a fixes.json reviewer crop -- either way it defines where the camera
+    looks). `min_vp_w` / `min_vp_h` are the zoom guardrail in panel pixels:
+    no viewport shown is smaller than that when the panel can supply it
+    (config video.fullframe.max_upscale: frame 1920x1080 / FF_MAX_UPSCALE
+    = 800x450 at the default).
+
+    Returns ({"window", "from", "to"} in panel fractions, info) where info
+    carries the resolved "motion", the path "kind" ("zoom" | "pan_y" |
+    "pan_x"), and honest flags: "static" (from == to: no camera motion was
+    possible), "over_cap" (a viewport below the guardrail floor -- the
+    panel itself is too small to supply more), "focal_overflow" (the focal
+    cannot fit inside any single 16:9 viewport on this panel, so it is
+    traversed or centred, never wholly framed at once) and "caption_risk"
+    (panel text sits in the bottom caption zone of the from/to viewport).
+    """
+    try:
+        bx0, by0, bx1, by1 = (float(v) for v in box[:4])
+    except (TypeError, ValueError, IndexError):
+        bx0, by0, bx1, by1 = 0.0, 0.0, 1.0, 1.0
+    bx0 = max(0.0, min(1.0, bx0)); by0 = max(0.0, min(1.0, by0))
+    bx1 = max(bx0, min(1.0, bx1)); by1 = max(by0, min(1.0, by1))
+    fx0, fy0 = bx0 * pw, by0 * ph
+    fw, fh = max(1.0, (bx1 - bx0) * pw), max(1.0, (by1 - by0) * ph)
+    bands_y: List[Tuple[float, float]] = []
+    bands_x: List[Tuple[float, float]] = []
+    if img is not None:
+        bands_y = content_bands(img, axis="y", exclude=[(by0, by1)])
+        bands_x = content_bands(img, axis="x", exclude=[(bx0, bx1)])
+    info: Dict[str, Any] = {"motion": motion, "kind": "zoom", "static": False,
+                            "over_cap": False, "focal_overflow": False, "caption_risk": False}
+    depth_target = max(1.0, float(zoom_depth))
+    travel = max(0.0, float(pan_travel))
+
+    def zoom_path(depth_wanted: float) -> Tuple[Tuple[float, float, float, float],
+                                                Tuple[float, float, float, float]]:
+        """(outer, inner) 16:9 rects in panel pixels; outer contains the
+        focal when any 16:9 viewport on this panel can, inner is outer
+        shrunk by the (guardrail-capped) zoom depth around the focal."""
+        ow = max(fw, fh * FF_ASPECT)
+        oh = ow / FF_ASPECT
+        if oh < min_vp_h * depth_wanted:      # room to zoom AND stay above the floor
+            oh = min_vp_h * depth_wanted
+            ow = oh * FF_ASPECT
+        if ow > pw:
+            ow, oh = pw, pw / FF_ASPECT
+        if oh > ph:
+            oh, ow = ph, ph * FF_ASPECT
+        if fw > ow + FF_PX_TOL or fh > oh + FF_PX_TOL:
+            info["focal_overflow"] = True
+        x0 = _ff_place(fx0, fw, ow, pw, bands_x)
+        y0 = _ff_place(fy0, fh, oh, ph, bands_y)
+        outer = (x0, y0, ow, oh)
+        depth = min(depth_wanted, ow / max(1.0, min_vp_w), oh / max(1.0, min_vp_h))
+        depth = max(1.0, depth)
+        iw, ih = ow / depth, oh / depth
+        ix = max(x0, min(x0 + ow - iw, fx0 + fw / 2.0 - iw / 2.0))
+        iy = max(y0, min(y0 + oh - ih, fy0 + fh / 2.0 - ih / 2.0))
+        ix = safe_span(pw, iw, x0, x0 + ow - iw, bands_x, ix)
+        iy = safe_span(ph, ih, y0, y0 + oh - ih, bands_y, iy)
+        return outer, (ix, iy, iw, ih)
+
+    def pan_y_path() -> Tuple[Tuple[float, float, float, float],
+                              Tuple[float, float, float, float],
+                              Tuple[float, float, float, float]] | None:
+        """(window, first, last) for a vertical pan, or None when the panel
+        cannot give the viewport at least FF_MIN_TRAVEL of travel."""
+        vp_w = min(pw, max(fw, min_vp_w))
+        vp_h = vp_w / FF_ASPECT
+        win_h = min(ph, max(fh, vp_h * (1.0 + travel)))
+        if win_h < vp_h * FF_MIN_TRAVEL:
+            return None
+        wx = _ff_place(fx0, fw, vp_w, pw, bands_x)
+        wy = _ff_place(fy0, fh, win_h, ph, bands_y)
+        window = (wx, wy, vp_w, win_h)
+        top = (wx, wy, vp_w, vp_h)
+        bottom = (wx, wy + win_h - vp_h, vp_w, vp_h)
+        return window, top, bottom
+
+    def pan_x_path() -> Tuple[Tuple[float, float, float, float],
+                              Tuple[float, float, float, float],
+                              Tuple[float, float, float, float]] | None:
+        """(window, first, last) for a horizontal pan (pan_left semantics:
+        the camera starts on the right and travels left), or None."""
+        vp_h = min(ph, max(fh, min_vp_h))
+        vp_w = vp_h * FF_ASPECT
+        win_w = min(pw, max(fw, vp_w * (1.0 + travel)))
+        if win_w < vp_w * FF_MIN_TRAVEL:
+            return None
+        wy = _ff_place(fy0, fh, vp_h, ph, bands_y)
+        wx = _ff_place(fx0, fw, win_w, pw, bands_x)
+        window = (wx, wy, win_w, vp_h)
+        left = (wx, wy, vp_w, vp_h)
+        right = (wx + win_w - vp_w, wy, vp_w, vp_h)
+        return window, right, left   # pan_left: from = right, to = left
+
+    window = frm = to = None
+    want = motion if motion in MOTIONS else "push_in"
+    if want == "hold":
+        outer, _inner = zoom_path(1.0)
+        window = frm = to = outer
+        info["motion"] = "hold"
+    elif want in ("pan_down", "pan_up"):
+        got = pan_y_path()
+        if got is not None:
+            window, top, bottom = got
+            frm, to = (top, bottom) if want == "pan_down" else (bottom, top)
+            info["motion"], info["kind"] = want, "pan_y"
+        else:   # no travel on this panel: a zoom moves instead (wide mode's swap)
+            info["motion"] = "push_in" if want == "pan_down" else "pull_out"
+            outer, inner = zoom_path(depth_target)
+            window = outer
+            frm, to = (outer, inner) if info["motion"] == "push_in" else (inner, outer)
+    elif want in ("pan_left", "pan_right"):
+        got = pan_x_path()
+        if got is not None:
+            window, first, last = got
+            frm, to = (first, last) if want == "pan_left" else (last, first)
+            info["motion"], info["kind"] = want, "pan_x"
+        else:
+            info["motion"] = "pull_out" if want == "pan_left" else "push_in"
+            outer, inner = zoom_path(depth_target)
+            window = outer
+            frm, to = (outer, inner) if info["motion"] == "push_in" else (inner, outer)
+    else:   # push_in / pull_out
+        # A focal no 16:9 viewport on this panel can contain (a tall figure,
+        # a full-width strip section) is traversed by a scroll, not sliced
+        # by a static zoom window -- when the panel offers the travel.
+        fits = max(fw, fh * FF_ASPECT) <= pw + FF_PX_TOL and max(fh, fw / FF_ASPECT) <= ph + FF_PX_TOL
+        got = None if fits else pan_y_path()
+        if got is not None:
+            window, top, bottom = got
+            frm, to = top, bottom
+            info["motion"], info["kind"] = "pan_down", "pan_y"
+        else:
+            outer, inner = zoom_path(depth_target)
+            window = outer
+            frm, to = (outer, inner) if want == "push_in" else (inner, outer)
+            info["motion"] = want
+
+    assert window is not None and frm is not None and to is not None
+    info["static"] = frm == to
+    smallest_w = min(frm[2], to[2])
+    smallest_h = min(frm[3], to[3])
+    info["over_cap"] = smallest_w < min_vp_w - FF_PX_TOL or smallest_h < min_vp_h - FF_PX_TOL
+    if bands_y:
+        for vy0, vh in ((frm[1], frm[3]), (to[1], to[3])):
+            zone_top = (vy0 + vh * (1.0 - FF_CAPTION_ZONE)) / ph
+            zone_bot = (vy0 + vh) / ph
+            if any(b0 < zone_bot and b1 > zone_top for b0, b1 in bands_y):
+                info["caption_risk"] = True
+                break
+
+    def fin(rect: Tuple[float, float, float, float]) -> List[float]:
+        x, y, w, h = rect
+        return [round(x / pw, 4), round(y / ph, 4), round((x + w) / pw, 4), round((y + h) / ph, 4)]
+
+    win_f = fin(window)
+    out: Dict[str, List[float]] = {"window": win_f, "from": fin(frm), "to": fin(to)}
+    for key in ("from", "to"):   # rounding may push an edge a hair outside the window
+        r = out[key]
+        r[0] = max(win_f[0], min(r[0], win_f[2]))
+        r[1] = max(win_f[1], min(r[1], win_f[3]))
+        r[2] = max(r[0], min(r[2], win_f[2]))
+        r[3] = max(r[1], min(r[3], win_f[3]))
+    return out, info
+
+
+def _fullframe_style_card(c: Dict[str, Any], designer: "_Designer", pw: float, ph: float,
+                          min_vp_w: float, min_vp_h: float,
+                          fcfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite one card in place for full-frame mode: its classic crop (or
+    fixes.json focal) becomes the seed the camera path is derived from; the
+    card gains a "viewport" {window, from, to} and keeps `crop` = the window
+    so other tooling still sees the region the shot covers. Returns the
+    fullframe_viewport info dict for the pass's risk lists."""
+    pid = c.get("panel")
+    img = designer.img(pid) if pid in designer.by_id else None
+    box = list(c.get("crop") or [0, 0, 1, 1])
+    if img is not None and pid not in (designer.fixes.get("crop") or {}):
+        # Same figure hardening as wide mode: the classic focal can exclude
+        # part of the figure (head found, body cut). Grow the seed to cover
+        # the detected head AND the connected body before deriving the path
+        # (a reviewer-set crop is never second-guessed).
+        head = head_of(_panel_maps(img, designer.map_options))
+        if head.get("figure") and head.get("top") is not None and head.get("bottom") is not None:
+            top, bottom = extend_figure_range(img, float(head["top"]), float(head["bottom"]),
+                                              max_span=1.0)
+            box[1] = min(box[1], top)
+            box[3] = max(box[3], bottom)
+    vp, info = fullframe_viewport(pw, ph, box, str(c.get("motion") or "push_in"),
+                                  min_vp_w=min_vp_w, min_vp_h=min_vp_h,
+                                  zoom_depth=float(fcfg.get("zoom_depth", FF_ZOOM_DEPTH)),
+                                  pan_travel=float(fcfg.get("pan_travel", FF_PAN_TRAVEL)),
+                                  img=img)
+    c["viewport"] = vp
+    c["crop"] = list(vp["window"])
+    c["motion"] = info["motion"]
+    c["pad_y"] = 0.0
+    c["fullframe"] = True
+    info["reviewer_focal_ignored"] = bool(
+        pid in (designer.fixes.get("crop") or {}) and info.get("focal_overflow"))
+    return info
+
+
+def _fullframe_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                    fcfg: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Rewrite a classic plan for full-frame mode: every shot becomes a
+    full-bleed camera move (see fullframe_viewport). Pairs keep both cards
+    (the renderer shows them one after another, full-frame, cutting at the
+    second card's `at`); every other layout collapses to its first card.
+    caption_bar is off (captions overlay the art). Timing, panels and `at`
+    are untouched, so the sync audit sees the identical plan.
+
+    Returns panel-id lists for the honest-report fields on the plan:
+    caption_risk (text in a viewport's caption zone), figure_risk (focal
+    cannot fit one 16:9 viewport), reviewer_focal_ignored (a fixes.json
+    focal that overflowed), over_cap (viewport below the upscale floor --
+    panel too small), and static (shot ids where no camera motion was
+    possible on the source pixels available).
+    """
+    empty: Dict[str, List[str]] = {"caption_risk": [], "figure_risk": [],
+                                   "reviewer_focal_ignored": [], "over_cap": [], "static": []}
+    if fmt.width <= fmt.height:
+        return empty   # portrait formats untouched (Shorts keep the card look)
+    fcfg = fcfg or {}
+    max_upscale = max(1.0, float(fcfg.get("max_upscale", FF_MAX_UPSCALE)))
+    min_vp_w = fmt.width / max_upscale     # guardrail floors, in panel pixels
+    min_vp_h = fmt.height / max_upscale    # (same convention as wide's min_win_h)
+    risks: Dict[str, List[str]] = {k: [] for k in empty}
+    for s in shots:
+        s["fullframe"] = True
+        s["caption_bar"] = False
+        cards = s.get("cards") or []
+        pair = s.get("layout") == "pair" and len(cards) >= 2
+        if not pair:
+            s["layout"] = "single"
+            cards = cards[:1]
+        shot_static = bool(cards)
+        for c in cards:
+            pid = c.get("panel")
+            p = designer.by_id.get(pid) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if pw > 0 and ph > 0:
+                info = _fullframe_style_card(c, designer, pw, ph, min_vp_w, min_vp_h, fcfg)
+                for key in ("caption_risk", "figure_risk", "reviewer_focal_ignored", "over_cap"):
+                    if info.get(key) and pid not in risks[key]:
+                        risks[key].append(pid)
+                if not info.get("static"):
+                    shot_static = False
+            else:
+                c["pad_y"] = 0.0
+                c["fullframe"] = True
+                c["viewport"] = {"window": list(c.get("crop") or [0, 0, 1, 1]),
+                                 "from": list(c.get("crop") or [0, 0, 1, 1]),
+                                 "to": list(c.get("crop") or [0, 0, 1, 1])}
+                shot_static = False
+        if shot_static and str(s.get("id")) not in risks["static"]:
+            risks["static"].append(str(s.get("id")))
+        s["cards"] = cards
+    return risks
+
+
 def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, audio: str | None,
                vcfg: Dict[str, Any], image_for: Callable[[Dict[str, Any]], Image.Image],
                sentences: List[Dict[str, Any]] | None = None,
@@ -1661,12 +1979,16 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     _mode = str(vcfg.get("mode") or "classic")
     _wide_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": []}
     _pf_report = {"static": [], "over_cap": [], "impact": []}
+    _ff_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [],
+                "over_cap": [], "static": []}
     if _mode == "wide":
         _wide_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     elif _mode == "adaptive":
         _wide_risk = _adaptive_pass(shots, designer, fmt, vcfg.get("adaptive") or {}, vcfg.get("wide") or {})
     elif _mode == "panelfit":
         _pf_report = _panelfit_pass(shots, designer, fmt, vcfg.get("panelfit") or {})
+    elif _mode == "fullframe":
+        _ff_risk = _fullframe_pass(shots, designer, fmt, vcfg.get("fullframe") or {})
     return {
         "version": PLAN_VERSION,
         "mode": _mode,
@@ -1676,6 +1998,11 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "panelfit_static": _pf_report["static"],
         "panelfit_over_cap": _pf_report["over_cap"],
         "panelfit_impact": _pf_report["impact"],
+        "fullframe_caption_risk": _ff_risk["caption_risk"],
+        "fullframe_figure_risk": _ff_risk["figure_risk"],
+        "fullframe_reviewer_focal_ignored": _ff_risk["reviewer_focal_ignored"],
+        "fullframe_over_cap": _ff_risk["over_cap"],
+        "fullframe_static": _ff_risk["static"],
         "chapter": chapter,
         "format": vcfg.get("format", "16:9"),
         "fps": int(vcfg.get("fps", 30)),
@@ -1788,6 +2115,25 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     raise ValueError
             except (TypeError, ValueError):
                 errs.append(f"{cw}: pad_y (blurred padding above and below, in panel heights) must be 0 to {PAD_LIMIT:g}")
+            if c.get("viewport") is not None:
+                # Full-frame camera path: structural check only (the 16:9
+                # aspect itself needs the panel's pixel size -- QA in
+                # build.py checks that; here: boxes valid, from/to inside
+                # the window).
+                vp = c.get("viewport") or {}
+                try:
+                    boxes = {k: [float(v) for v in vp[k]] for k in ("window", "from", "to")}
+                    w = boxes["window"]
+                    ok = all(0 <= b[0] < b[2] <= 1 and 0 <= b[1] < b[3] <= 1 for b in boxes.values())
+                    for k in ("from", "to"):
+                        r = boxes[k]
+                        ok = ok and r[0] >= w[0] - FF_CONTAIN_TOL and r[1] >= w[1] - FF_CONTAIN_TOL \
+                            and r[2] <= w[2] + FF_CONTAIN_TOL and r[3] <= w[3] + FF_CONTAIN_TOL
+                    if not ok:
+                        raise ValueError
+                except (KeyError, TypeError, ValueError):
+                    errs.append(f"{cw}: viewport must be {{\"window\", \"from\", \"to\"}} panel-fraction boxes "
+                                f"with from/to inside the window (video.mode: fullframe)")
             if c.get("enter", "cut") not in ENTRANCES:
                 errs.append(f"{cw}: enter must be one of {', '.join(ENTRANCES)}")
             if c.get("motion", "push_in") not in MOTIONS:
