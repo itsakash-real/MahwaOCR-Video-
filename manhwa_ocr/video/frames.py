@@ -865,6 +865,16 @@ class PanelFitView:
     enters the frame (dir "down": the art moves downward).
     kind "scroll": LEGACY (pre-measurement plans only): a tall strip
     fitted by width and scrolled across the view's window.
+
+    Span slices (B1d): when a sentence split into sub-shots, each
+    sub-shot's spec is a slice of ONE span motion — a zoom carries
+    `zoom_start` (the scale the span had reached when this sub-shot
+    opens), a drift carries `drift_from`/`drift_to`/`drift_rate`
+    (signed offsets and the span's constant speed). The view replays
+    the slice in absolute time, so the seam between sub-shots is
+    position-exact and the motion never reverses; at the travel cap
+    the position HOLDS. Specs without these keys are pre-B1d plans
+    and keep the old per-shot centred math.
     """
 
     def __init__(self, panel: Image.Image, spec: Dict[str, Any], card: Dict[str, Any],
@@ -876,8 +886,25 @@ class PanelFitView:
         self.base_h = float(spec.get("base_h") or fmt.height)
         self.zoom_end = float(spec.get("zoom_end") or 1.08)
         self.zoom_rate = float(spec.get("zoom_rate") or 0.0)
+        self.zoom_start = float(spec.get("zoom_start") or 1.0)
         self.drift_frac = float(spec.get("drift_frac") or 0.0)
+        # Span-slice keys (B1d); absent on pre-B1d plans.
+        self.drift_from = spec.get("drift_from")
+        self.drift_to = spec.get("drift_to")
+        self.drift_rate = float(spec.get("drift_rate") or 0.0)
+        if self.drift_from is not None:
+            self.drift_from = float(self.drift_from)
+            self.drift_to = float(self.drift_to if self.drift_to is not None
+                                  else self.drift_from)
         self.appear = shot_start + max(0.0, float(card.get("at") or 0.0))
+        # Half a frame of slack on the appear edge: plan times are
+        # rounded to 3 decimals while frames are drawn on the f/fps
+        # grid, so a sub-shot's first frame can land a hair BEFORE
+        # its appear time — with a strict comparison that frame
+        # rendered as the background alone: one blurred frame at
+        # the seam (B1d F5). Progress clamps to 0, so the tolerance
+        # only ever shows the slice's true first position.
+        self.tol = 0.5 / max(1.0, float(fmt.fps or 30))
         self.end = shot_end
         if self.zoom_rate <= 0 and self.kind in ("zoom", "fill"):
             # Legacy specs (pre-measurement plans) carry only zoom_end:
@@ -908,13 +935,13 @@ class PanelFitView:
         self.src_w, self.src_h = self.src.size
 
     def visible(self, t: float) -> bool:
-        return t >= self.appear - 1e-9
+        return t >= self.appear - self.tol
 
     def frame(self, t: float, extra_zoom: float = 0.0) -> Image.Image:
         fmt = self.fmt
         W, H = fmt.width, fmt.height
         img = self.bg.convert("RGBA")
-        if t < self.appear - 1e-9:
+        if t < self.appear - self.tol:
             return img.convert("RGB")
         dur = max(0.01, self.end - self.appear)
         p = min(1.0, max(0.0, (t - self.appear) / dur))
@@ -927,8 +954,20 @@ class PanelFitView:
             dx = (W - disp_w) / 2.0
         elif self.kind == "drift":
             disp_w, disp_h = self.base_w, self.base_h
-            travel = self.drift_frac * H
-            off = (p - 0.5) * travel if self.dir == "down" else (0.5 - p) * travel
+            if self.drift_from is not None:
+                # Span slice (B1d): absolute offset in frame heights,
+                # moving at the span's constant rate toward drift_to,
+                # then HOLDING there — continuous at seams, never a
+                # reversal, never a slow-mo stretch.
+                off = self.drift_from + self.drift_rate * max(0.0, t - self.appear)
+                if self.drift_rate > 0:
+                    off = min(off, self.drift_to)
+                elif self.drift_rate < 0:
+                    off = max(off, self.drift_to)
+                off *= H
+            else:  # legacy centred drift (pre-B1d plans)
+                travel = self.drift_frac * H
+                off = (p - 0.5) * travel if self.dir == "down" else (0.5 - p) * travel
             dx, dy = (W - disp_w) / 2.0, (H - disp_h) / 2.0 + off
         else:  # zoom / fill: constant-RATE zoom-in, capped at zoom_end
             z = self.zoom_end
@@ -937,7 +976,7 @@ class PanelFitView:
                 # at zoom_end (the planner caps zoom_end at +50%
                 # total: past the cap the scale stays, it does not
                 # slow down and stretch the rate over the shot).
-                s = min(1.0 + self.zoom_rate * max(0.0, t - self.appear), z)
+                s = min(self.zoom_start + self.zoom_rate * max(0.0, t - self.appear), z)
             else:  # legacy zoom-out (pre-measurement plans only)
                 s = z - (z - 1.0) * p
             s *= 1.0 + extra_zoom

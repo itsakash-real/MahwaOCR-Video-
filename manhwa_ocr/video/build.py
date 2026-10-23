@@ -223,6 +223,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         # over 0.5s), panels fitted at the max-upscale cap, and the
         # impact-FX report. INFO ONLY, like the wide risks above.
         "panelfit_static": list(plan.get("panelfit_static") or []),
+        "panelfit_hold": list(plan.get("panelfit_hold") or []),
         "panelfit_over_cap": list(plan.get("panelfit_over_cap") or []),
         "panelfit_impact": list(plan.get("panelfit_impact") or []),
         "panelfit_title_cards": list(plan.get("panelfit_title_cards") or []),
@@ -669,6 +670,10 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if qa.get("panelfit_static"):
         log(f"    ! panelfit mode: {len(qa['panelfit_static'])} shot(s) would render static "
             f"(the spec forbids a still image over 0.5s): {', '.join(qa['panelfit_static'][:8])}")
+    if qa.get("panelfit_hold"):
+        log(f"    panelfit mode: {len(qa['panelfit_hold'])} sub-shot(s) sit in a travel-cap hold "
+            f"(their sentence's drift/zoom reached the measured cap and holds, per the reference): "
+            f"{', '.join(qa['panelfit_hold'][:8])}")
     if qa.get("panelfit_over_cap"):
         log(f"    ! panelfit mode: {len(qa['panelfit_over_cap'])} panel(s) fitted at the max-upscale "
             f"cap (shown smaller, never stretched): {', '.join(qa['panelfit_over_cap'][:8])}")

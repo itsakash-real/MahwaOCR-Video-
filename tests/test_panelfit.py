@@ -35,7 +35,7 @@ def test_constants_pinned_across_config_planner_renderer():
     assert pf["bg_opacity"] == plan_mod.PF_BG_OPACITY == frames_mod.PFR_BG_OPACITY == 1.0
     assert pf["fill_aspect"] == plan_mod.PF_FILL_ASPECT == 1.6
     assert pf["drift_aspect_max"] == plan_mod.PF_DRIFT_ASPECT_MAX == 0.72
-    assert pf["drift_speed"] == plan_mod.PF_DRIFT_SPEED == 0.068
+    assert pf["drift_speed"] == plan_mod.PF_DRIFT_SPEED == 0.0658
     assert pf["drift_min_travel"] == plan_mod.PF_DRIFT_MIN_TRAVEL == 0.05
     assert pf["drift_max_travel"] == plan_mod.PF_DRIFT_MAX_TRAVEL == 0.13
     assert pf["drift_headroom"] == plan_mod.PF_DRIFT_HEADROOM == 0.03
@@ -45,11 +45,11 @@ def test_constants_pinned_across_config_planner_renderer():
     assert pf["max_upscale"] == plan_mod.PF_MAX_UPSCALE == 2.4
     assert pf["still_limit"] == plan_mod.PF_STILL_LIMIT == 0.5
     assert pf["min_shot"] == plan_mod.PF_MIN_SHOT == 0.3
-    assert pf["split_above"] == plan_mod.PF_SPLIT_ABOVE == 3.5
+    assert pf["split_above"] == plan_mod.PF_SPLIT_ABOVE == 3.0
     assert pf["split_min_piece"] == plan_mod.PF_SPLIT_MIN_PIECE == 1.2
     assert pf["captions"] is False and plan_mod.PF_CAPTIONS is False
     assert pf["title_cards"] is True and plan_mod.PF_TITLE_CARDS is True
-    assert pf["tts_gap_seconds"] == plan_mod.PF_TTS_GAP == 0.20
+    assert pf["tts_gap_seconds"] == plan_mod.PF_TTS_GAP == 0.11
 
 
 def test_no_fx_constants_remain():
@@ -74,7 +74,7 @@ def test_fit_portrait_panel_by_height_zooms():
 def test_fit_narrow_pillar_drifts_oversized():
     kind, bw, bh, s = panelfit_fit(900, 2400, FMT, dur=2.0)
     assert kind == "drift"                      # aspect 0.375 < 0.72
-    # travel = clamp(0.068 * 2.0) = 0.13 -> oversize 1 + 0.13 + 0.03 = 1.16
+    # travel = clamp(0.0658 * 2.0) = 0.13 -> oversize 1 + 0.13 + 0.03 = 1.16
     assert bh == pytest.approx(1080.0 * 1.16) and bw == pytest.approx(405.0 * 1.16)
 
 
@@ -119,10 +119,10 @@ def test_fit_never_stretches(pw, ph):
 
 
 def test_drift_travel_clamped_to_measured_band():
-    assert panelfit_drift_travel(1.0) == pytest.approx(0.068)   # speed x duration
+    assert panelfit_drift_travel(1.0) == pytest.approx(0.0658)   # speed x duration
     assert panelfit_drift_travel(0.5) == pytest.approx(0.05)    # floor
     assert panelfit_drift_travel(10.0) == pytest.approx(0.13)   # cap
-    assert panelfit_drift_travel(1.47) == pytest.approx(0.068 * 1.47, abs=0.001)
+    assert panelfit_drift_travel(1.47) == pytest.approx(0.0658 * 1.47, abs=0.001)
 
 
 def test_spec_zoom_is_a_constant_rate_not_a_fixed_total():
@@ -283,15 +283,31 @@ def _boundary_y(arr):
 
 def test_render_drift_velocity_is_constant_and_small():
     # Top half red, bottom half blue: the boundary's frame y reads the
-    # drift position directly. Travel is capped at 13% of frame height
-    # (140px over the whole 8s shot), NOT a full strip traversal.
+    # drift position directly. The drift runs at the pinned SPEED
+    # (0.0658 frame-heights/s ≈ 71 px/s at 1080p), NOT a full strip
+    # traversal and NOT a slow stretch of the travel over the shot.
     img = Image.new("RGB", (900, 2400), (255, 0, 0))
     ImageDraw.Draw(img).rectangle((0, 1200, 900, 2399), fill=(0, 0, 255))
     r = _renderer(img, panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=8.0), end=8.0)
-    ys = [_boundary_y(r.frame_array(t)) for t in (3.2, 4.0, 4.8)]
+    ys = [_boundary_y(r.frame_array(t)) for t in (0.3, 1.1, 1.9)]
     assert all(y is not None for y in ys)
-    assert ys[0] - ys[1] == pytest.approx(ys[1] - ys[2], abs=3)     # constant velocity
-    assert abs(ys[2] - ys[0]) < 40                                   # ~28px in 1.6s, not ~1000px
+    assert ys[1] - ys[0] == pytest.approx(ys[2] - ys[1], abs=3)     # constant velocity
+    assert ys[2] - ys[0] == pytest.approx(plan_mod.PF_DRIFT_SPEED * 1080 * 1.6, abs=6)
+
+
+def test_render_drift_holds_at_the_travel_cap():
+    # F2: travel = speed x span, hard-capped at 13% of frame height;
+    # past the cap (~1.98s into an 8s span) the position HOLDS — it
+    # neither reverses nor creeps at a slowed rate.
+    img = Image.new("RGB", (900, 2400), (255, 0, 0))
+    ImageDraw.Draw(img).rectangle((0, 1200, 900, 2399), fill=(0, 0, 255))
+    r = _renderer(img, panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=8.0), end=8.0)
+    y12 = _boundary_y(r.frame_array(1.2))
+    y32 = _boundary_y(r.frame_array(3.2))
+    y48 = _boundary_y(r.frame_array(4.8))
+    assert y32 == pytest.approx(y48, abs=2)                        # held, exactly
+    assert y32 - y12 == pytest.approx((0.065 - (-0.065 + plan_mod.PF_DRIFT_SPEED * 1.2)) * 1080,
+                                      abs=5)                       # only the remaining travel
 
 
 def test_render_fill_shows_the_sharp_panel_at_the_corners():
@@ -440,3 +456,165 @@ def test_sync_gate_uses_the_mode_floor_for_panelfit_plans():
     rep2 = syncaudit.audit({**plan, "mode": "classic"}, {"segments": segs}, [])
     assert rep2["short_shots"] == [{"shot": "S001", "duration": 1.5}]
     assert rep2["gate"]["pass"] is False
+
+
+# ------------------------------------------------- B1d: span motion (F1/F2/F3/F5)
+
+def _one_sentence_plan(pid, seconds, text="a very long sentence that must split",
+                       panels=None):
+    vcfg = {**VCFG, "mode": "panelfit"}
+    sentences = [{"start": 0.0, "text": text, "panels": [pid], "cues": [], "emphasis": []}]
+    return build_plan(chapter="1",
+                      panels_data={"panels": panels or PANELS, "fingerprint": "pf"},
+                      duration=seconds, audio=None, vcfg=vcfg, image_for=_img_for,
+                      sentences=sentences)
+
+
+def test_split_sentence_drift_is_one_continuous_span():
+    # F1: a 7.7s sentence on a narrow panel splits into pieces; the
+    # pieces must slice ONE drift — same direction throughout, each
+    # piece opening exactly where the previous one ended.
+    plan = _one_sentence_plan("P001-02", 7.7)
+    shots = plan["shots"]
+    assert len(shots) >= 3
+    specs = [s["cards"][0]["panelfit"] for s in shots]
+    assert all(sp["kind"] == "drift" for sp in specs)
+    assert len({sp["dir"] for sp in specs}) == 1            # never a reversal
+    assert len({sp["drift_rate"] for sp in specs}) == 1    # one constant speed
+    for a, b in zip(specs, specs[1:]):
+        end_a = a["drift_from"] + a["drift_frac"]
+        assert b["drift_from"] == pytest.approx(end_a, abs=1e-3)   # seam-exact (±1 frame)
+    # The span's whole travel is the pinned speed x span, capped at
+    # 13% — the later pieces sit in the cap hold, reported as such.
+    assert sum(sp["drift_frac"] for sp in specs) == pytest.approx(
+        plan_mod.PF_DRIFT_MAX_TRAVEL * (1 if specs[0]["dir"] == "down" else -1), abs=0.01)
+    assert plan["panelfit_static"] == []
+    assert shots[0]["id"] not in plan["panelfit_hold"]
+    assert {s["id"] for s in shots[1:]} <= set(plan["panelfit_hold"])
+
+
+def test_split_sentence_zoom_is_one_continuous_span():
+    # F1 for zooms: piece 2 opens at the scale piece 1 reached
+    # (zoom_start), and every piece shares the span's zoom_end.
+    plan = _one_sentence_plan("P001-01", 7.7)
+    shots = plan["shots"]
+    assert len(shots) >= 3
+    specs = [s["cards"][0]["panelfit"] for s in shots]
+    assert all(sp["kind"] == "zoom" for sp in specs)
+    assert specs[0]["zoom_start"] == pytest.approx(1.0)
+    assert len({sp["zoom_end"] for sp in specs}) == 1
+    elapsed = 0.0
+    for s, sp in zip(shots, specs):
+        assert sp["zoom_start"] == pytest.approx(
+            min(1.0 + sp["zoom_rate"] * elapsed, sp["zoom_end"]), abs=2e-3)
+        elapsed += float(s["end"]) - float(s["start"])
+
+
+def test_consecutive_sentences_on_one_panel_keep_its_drift_direction():
+    # F1: a panel's established drift direction persists into the next
+    # sentence on the same panel; a fresh panel alternates instead.
+    panels = PANELS + [{"id": "P001-04", "width": 800, "height": 2000, "text": ""}]
+    vcfg = {**VCFG, "mode": "panelfit"}
+    sentences = [
+        {"start": 0.0, "text": "first", "panels": ["P001-02"], "cues": [], "emphasis": []},
+        {"start": 4.0, "text": "second", "panels": ["P001-02"], "cues": [], "emphasis": []},
+        {"start": 8.0, "text": "third", "panels": ["P001-04"], "cues": [], "emphasis": []},
+    ]
+    plan = build_plan(chapter="1", panels_data={"panels": panels, "fingerprint": "pf"},
+                      duration=12.0, audio=None, vcfg=vcfg, image_for=_img_for,
+                      sentences=sentences)
+    dirs = {}
+    for s in plan["shots"]:
+        c = s["cards"][0]
+        if c["panelfit"]["kind"] == "drift":
+            dirs.setdefault(c["panel"], set()).add(c["panelfit"]["dir"])
+    assert len(dirs["P001-02"]) == 1                        # never flips mid-panel
+    assert dirs["P001-02"] != dirs["P001-04"]               # alternation still lives
+
+
+def test_no_panelfit_shot_carries_horizontal_motion():
+    # F3: the mode's motion grammar is vertical drift + zoom-in only —
+    # no spec may encode a horizontal pan, in any plan the pass writes.
+    plan = _panelfit_plan()
+    for s in plan["shots"]:
+        for c in s["cards"]:
+            sp = c["panelfit"]
+            assert sp["kind"] in ("drift", "zoom", "fill")
+            assert sp["dir"] in ("down", "up", "in")
+    # Renderer level: on a drift shot a marker's x is pinned while its
+    # y travels at the pinned speed — the foreground never slides
+    # sideways. Thin cross bars as markers: in the blurred background
+    # they wash out to nothing, so the profiles read the sharp
+    # foreground alone.
+    img = Image.new("RGB", (900, 2400), (0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 1000, 899, 1008), fill=(255, 255, 255))   # horizontal bar
+    d.rectangle((400, 0, 408, 2399), fill=(255, 255, 255))    # vertical bar
+    spec = panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=4.0)
+    r = _renderer(img, spec, end=4.0)
+
+    def marker(arr):
+        crop = arr[:, 700:1220].astype(float).mean(axis=2)
+        return (700 + int(np.argmax(crop.mean(axis=0))),     # vertical bar's x
+                int(np.argmax(crop.mean(axis=1))))           # horizontal bar's y
+
+    x1, y1 = marker(r.frame_array(0.3))
+    x2, y2 = marker(r.frame_array(1.5))
+    assert x2 == pytest.approx(x1, abs=1)                    # no horizontal motion
+    assert y2 - y1 == pytest.approx(plan_mod.PF_DRIFT_SPEED * 1080 * 1.2, abs=8)
+
+
+def _sharpness(arr):
+    g = np.asarray(arr, dtype=np.float64)
+    return float(np.abs(np.diff(g, axis=1)).mean())
+
+
+def test_split_pieces_first_frames_are_never_background_only():
+    # F5 regression: plan times are rounded to 3 decimals but frames
+    # are drawn on the f/fps grid — piece 2 of this split starts at
+    # 2.567s while its first frame is drawn at 77/30 = 2.5667s. That
+    # frame used to render as the blurred background alone (measured
+    # sharpness ~0.5% of its neighbours in the B1c sample).
+    plan = _one_sentence_plan("P001-02", 7.7)
+    assert len(plan["shots"]) >= 3
+    imgs = {p["id"]: _img_for(p) for p in PANELS}
+    for s in plan["shots"]:
+        r = ShotRenderer(s, imgs, FMT)
+        f0 = int(round(float(s["start"]) * FMT.fps))
+        first = _sharpness(r.frame_array(f0 / FMT.fps))
+        second = _sharpness(r.frame_array((f0 + 1) / FMT.fps))
+        assert first >= 0.5 * second, (s["id"], first, second)
+
+
+def test_split_sentence_render_is_position_continuous_at_the_seam():
+    # F1 at the renderer: across a mid-motion seam the foreground's
+    # boundary moves by about one frame's worth of travel, in the SAME
+    # direction — no jump back to the span start, no reversal.
+    plan = _one_sentence_plan("P001-02", 3.4)
+    shots = plan["shots"]
+    assert len(shots) == 2
+    img = Image.new("RGB", (900, 2400), (255, 0, 0))
+    ImageDraw.Draw(img).rectangle((0, 1200, 900, 2399), fill=(0, 0, 255))
+    imgs = {"P001-02": img}
+    a, b = (ShotRenderer(s, imgs, FMT) for s in shots)
+    fa = int(round(float(shots[0]["end"]) * FMT.fps))
+    y_last_a = _boundary_y(a.frame_array((fa - 1) / FMT.fps))
+    y_first_b = _boundary_y(b.frame_array(fa / FMT.fps))
+    y_mid_b = _boundary_y(b.frame_array(float(shots[1]["start"]) + 0.2))
+    assert y_first_b - y_last_a == pytest.approx(
+        plan_mod.PF_DRIFT_SPEED * 1080 / FMT.fps, abs=3)
+    assert y_mid_b > y_first_b                              # still the same direction
+
+
+def test_validate_accepts_span_slices_and_rejects_opposing_drift():
+    sp = panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=1.7,
+                       span_dur=3.4, elapsed=1.7, direction="down")
+    assert sp["drift_frac"] > 0
+    assert validate(_plan_with_spec(sp), {"P001-01"}) == []
+    hold = panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=1.7,
+                         span_dur=7.7, elapsed=5.13, direction="down")
+    assert hold["drift_frac"] == 0.0 and "drift_from" in hold   # a cap-hold slice
+    assert validate(_plan_with_spec(hold), {"P001-01"}) == []
+    bad = dict(sp)
+    bad["drift_frac"] = -abs(sp["drift_frac"])                  # opposes its dir
+    assert any("panelfit" in e for e in validate(_plan_with_spec(bad), {"P001-01"}))
