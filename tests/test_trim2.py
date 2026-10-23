@@ -206,3 +206,25 @@ def test_detect_bbox_wiring_with_stub(tmp_path, monkeypatch):
         assert after.trim2["top"] == 10.0 and after.trim2["bottom"] == 5.0
         assert after.y0 == before.y0 + 10
         assert after.y1 == before.y1 - 5
+
+
+def test_detect_slices_a_merged_candidate_at_a_thin_gutter(tmp_path):
+    """B1e E1/E2 end to end: art A + a 40px white gutter + art B, where
+    B is shorter than the detector's merge_below, so detection's own
+    cleanup glues B onto A. Without trim_v2 that glued strip is ONE
+    panel (and a panelfit plan would have to drift/scroll across the
+    gutter); with trim_v2 at the 15px threshold the gutter slices it
+    back into the two true panels, in story order, gutter gone."""
+    page = Image.new("RGB", (300, 900), (255, 255, 255))
+    d = ImageDraw.Draw(page)
+    d.rectangle((10, 40, 290, 500), fill=(200, 60, 60))
+    d.rectangle((10, 541, 290, 690), fill=(60, 60, 200))
+    p = tmp_path / "page_001.png"
+    page.save(p)
+    glued, _ = panels_mod.detect([p], {})
+    assert len(glued) == 1
+    sliced, _ = panels_mod.detect([p], {"trim_v2": True})
+    assert len(sliced) == 2
+    assert sliced[0].y1 <= 501 and sliced[1].y0 >= 540   # the gutter is in neither
+    assert sliced[0].height == pytest.approx(461, abs=2)
+    assert sliced[1].height == pytest.approx(150, abs=2)

@@ -1013,3 +1013,26 @@ def test_render_drop_shadow_darkens_below_the_panel_only(monkeypatch):
     assert with_shadow[1035, 960][0] < without[1035, 960][0] - 30   # the shadow band
     assert np.array_equal(with_shadow[30, 30], without[30, 30])    # backdrop untouched
     assert tuple(with_shadow[540, 960]) == (200, 30, 30)           # the panel itself
+
+
+def test_sliced_segments_appear_as_separate_shots_in_order():
+    """B1e E2: two segments of one sliced strip, tagged by two
+    consecutive beats, plan as two separate shots in story order with
+    a hard cut between them — and no shot's spec ever spans the strip
+    as one glued asset (no traverse/drift is planned across a gutter,
+    because a single asset no longer contains one)."""
+    panels = PANELS + [{"id": "P001-08", "width": 900, "height": 700, "text": ""},
+                       {"id": "P001-09", "width": 900, "height": 500, "text": ""}]
+    plan = _hint_plan([
+        {"start": 0.0, "text": "a white feather drifts down through the dark",
+         "panels": ["P001-08"], "cues": [], "emphasis": []},
+        {"start": 4.0, "text": "but the hall holds its breath", "panels": ["P001-09"],
+         "cues": [], "emphasis": []},
+    ], duration=8.0, panels=panels)
+    shown = [(s["id"], c["panel"]) for s in plan["shots"] for c in s["cards"]]
+    first_a = min(i for i, (_, p) in enumerate(shown) if p == "P001-08")
+    first_b = min(i for i, (_, p) in enumerate(shown) if p == "P001-09")
+    assert first_a < first_b                       # story order preserved
+    for s in plan["shots"]:                        # never shown together
+        assert not {"P001-08", "P001-09"} <= {c["panel"] for c in s["cards"]}
+    assert validate(plan, {p["id"] for p in panels}) == []
