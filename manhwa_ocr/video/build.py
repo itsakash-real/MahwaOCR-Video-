@@ -34,7 +34,8 @@ from .verify import verify_chapter
 from .plan import map_options
 from .media import audio_path, ensure_gitignore, ensure_pages, list_pages, video_dir
 from .panels import _font, build_panels, load_panels, panel_image
-from .plan import PLAN_VERSION, build_plan, load_plan, plan_path, save_plan, units_from_alignment, validate
+from .plan import (FF_ASPECT, FF_ASPECT_TOL, FF_CONTAIN_TOL, PLAN_VERSION, build_plan, load_plan,
+                    plan_path, save_plan, units_from_alignment, validate)
 from .render import output_path, render
 from .storyboard import storyboard_paths, write_review_task, write_storyboard
 
@@ -103,7 +104,21 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
             x0, y0, x1, y1 = (float(v) for v in c["crop"])
             pad = float(c.get("pad_y") or 0.0)          # blurred padding above and below the crop
             aspect = ((x1 - x0) * pw) / max(1e-9, ((y1 - y0) + 2 * pad) * ph)
-            if c.get("wide_display"):
+            if c.get("fullframe"):
+                # Full-frame mode: a card's "shape" is its camera viewport
+                # -- from/to must be exactly 16:9 in panel pixels and lie
+                # inside the window. The crop itself is the window (any
+                # aspect), so the classic shape list does not apply.
+                vp = c.get("viewport") or {}
+                win = vp.get("window") or [0.0, 0.0, 1.0, 1.0]
+                ok = True
+                for _key in ("from", "to"):
+                    r = vp.get(_key) or [0.0, 0.0, 0.0, 0.0]
+                    va = ((r[2] - r[0]) * pw) / max(1e-9, (r[3] - r[1]) * ph)
+                    ok = ok and abs(math.log(va / FF_ASPECT)) <= FF_ASPECT_TOL
+                    ok = ok and r[0] >= win[0] - FF_CONTAIN_TOL and r[1] >= win[1] - FF_CONTAIN_TOL \
+                        and r[2] <= win[2] + FF_CONTAIN_TOL and r[3] <= win[3] + FF_CONTAIN_TOL
+            elif c.get("wide_display"):
                 # A wide-display card (video.mode: wide, or an adaptive-mode
                 # card its own panel earned the wide treatment) doesn't use
                 # the classic layout shapes: full frame height, width >= 6/16
@@ -161,6 +176,13 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "wide_caption_risk": list(plan.get("wide_caption_risk") or []),
         "wide_figure_risk": list(plan.get("wide_figure_risk") or []),
         "wide_reviewer_focal_ignored": list(plan.get("wide_reviewer_focal_ignored") or []),
+        # Full-frame mode only: the same honest-report treatment (see
+        # plan._fullframe_pass). INFO ONLY -- never failures.
+        "fullframe_caption_risk": list(plan.get("fullframe_caption_risk") or []),
+        "fullframe_figure_risk": list(plan.get("fullframe_figure_risk") or []),
+        "fullframe_reviewer_focal_ignored": list(plan.get("fullframe_reviewer_focal_ignored") or []),
+        "fullframe_over_cap": list(plan.get("fullframe_over_cap") or []),
+        "fullframe_static": list(plan.get("fullframe_static") or []),
         "min_shot": round(shortest, 2),
         "max_shots": max(0, int(duration // 3.0)) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
@@ -204,6 +226,12 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
                           "black_threshold": 13, "pale_heads": True, "keep_top": 0.25}[k]}
     if crop_opts:
         knobs["crop"] = crop_opts
+    # Full-frame mode is new (no legacy plans exist in it), so while it is
+    # on, the mode + its knobs always join the hash: switching the mode or
+    # a fullframe knob re-plans, exactly like a framing change should.
+    if str(vcfg.get("mode") or "classic") == "fullframe":
+        knobs["mode"] = "fullframe"
+        knobs["fullframe"] = dict(vcfg.get("fullframe") or {})
     return {
         "panels": panels_fp,
         "audio": [audio.name, st.st_size, int(st.st_mtime)] if st else None,
@@ -578,6 +606,22 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"    ! wide mode: {len(qa['wide_reviewer_focal_ignored'])} panel(s) where a fixes.json focal "
             f"crop was not used as-is (panel shown whole, or the focal doesn't fit): "
             f"{', '.join(qa['wide_reviewer_focal_ignored'][:8])}")
+    if qa.get("fullframe_figure_risk"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_figure_risk'])} panel(s) whose focal cannot fit "
+            f"inside one 16:9 viewport (the camera path traverses it instead): "
+            f"{', '.join(qa['fullframe_figure_risk'][:8])}")
+    if qa.get("fullframe_caption_risk"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_caption_risk'])} panel(s) where the overlaid caption "
+            f"may cover panel text: {', '.join(qa['fullframe_caption_risk'][:8])}")
+    if qa.get("fullframe_over_cap"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_over_cap'])} panel(s) below the upscale floor "
+            f"(panel too small to supply a bigger viewport): {', '.join(qa['fullframe_over_cap'][:8])}")
+    if qa.get("fullframe_static"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_static'])} shot(s) with no camera motion possible "
+            f"on the available pixels: {', '.join(qa['fullframe_static'][:8])}")
+    if qa.get("fullframe_reviewer_focal_ignored"):
+        log(f"    ! fullframe mode: {len(qa['fullframe_reviewer_focal_ignored'])} panel(s) where a fixes.json "
+            f"focal overflows every 16:9 viewport: {', '.join(qa['fullframe_reviewer_focal_ignored'][:8])}")
     if plan.get("chapter_cards"):
         from .editor import chapter_cards_to_timestamps as _ts
         log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))

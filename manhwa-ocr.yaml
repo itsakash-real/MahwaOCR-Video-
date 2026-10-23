@@ -53,18 +53,25 @@ tts:
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
-  mode: wide              # classic | wide | adaptive. wide: every card full frame height (no
-                          # letterbox), min 6/16 of the frame wide (pairs exactly 8/16), captions
-                          # overlay the art (no black bar). adaptive: per shot, a naturally wide
-                          # panel (aspect >= adaptive.wide_threshold) gets that same wide
-                          # treatment; a narrower panel keeps its classic shape but without the
-                          # equal-area shrink, so it isn't forced to the same small size as every
-                          # other shape. Landscape only; portrait stays classic.
+  mode: wide              # classic | wide | adaptive | fullframe. wide: every card full frame
+                          # height (no letterbox), min 6/16 of the frame wide (pairs exactly
+                          # 8/16), captions overlay the art (no black bar). adaptive: per shot, a
+                          # naturally wide panel (aspect >= adaptive.wide_threshold) gets that
+                          # same wide treatment; a narrower panel keeps its classic shape but
+                          # without the equal-area shrink, so it isn't forced to the same small
+                          # size as every other shape. fullframe: NO cards at all -- every shot
+                          # is a full-bleed 16:9 camera viewport panning/zooming through the
+                          # panel (see fullframe: below). Landscape only; portrait stays classic.
   wide:
     min_width_ratio: 0.375  # 6/16 of the frame wide; no thin slivers, ever
     max_upscale: 1.5        # a panel is never upscaled past this (keeps 1080p sharp)
   adaptive:
     wide_threshold: 1.333   # a panel's own aspect >= this (4:3) earns the wide treatment
+  fullframe:
+    max_upscale: 2.4        # viewport source floor = frame / this (1920x1080 / 2.4 = 800x450 px);
+                            # zoom depth is capped so no viewport ever sources from less
+    zoom_depth: 1.18        # target push_in / pull_out depth inside the window
+    pan_travel: 1.0         # pan window = viewport * (1 + this) along the pan axis
   crf: 20                 # quality: lower = better and bigger files
   preset: veryfast
   lead: 0.15              # panel appears this long before its sentence
