@@ -76,7 +76,7 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
                             cache.popitem(last=False)
                     images[pid] = cache[pid]
                 renderer = ShotRenderer(shot, images, fmt, {"punch": False, "shake": False, "flash": False})
-                if shot.get("panelfit"):
+                if shot.get("panelfit") or shot.get("placed"):
                     # Panel-fit shots: the COMPOSED frame (foreground over
                     # blurred background) at shot start AND end, side by
                     # side. The specs are authored at the plan's canvas
@@ -121,6 +121,10 @@ def write_storyboard(root: Path, chapter: str, plan: Dict[str, Any], log=print) 
                 _kinds = "/".join(f"{c['panelfit']['kind']}:{c['panelfit']['dir']}"
                                   for c in shot.get("cards") or [] if isinstance(c.get("panelfit"), dict))
                 style += f" · panelfit {_kinds}"
+            if shot.get("placed"):
+                _kinds = "/".join(f"{c['placed']['kind']}:{c['placed']['touches']}"
+                                  for c in shot.get("cards") or [] if isinstance(c.get("placed"), dict))
+                style += f" · placed {_kinds}"
             draw.text((x, y + thumb_h + 26), style, fill=(150, 190, 255), font=small)
             said = textwrap.shorten(shot.get("sentence") or "(no sentence: even timing)", 120, placeholder="…")
             for k, line in enumerate(textwrap.wrap(said, 48)[:2]):

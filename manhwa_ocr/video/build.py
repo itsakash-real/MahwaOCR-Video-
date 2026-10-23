@@ -100,6 +100,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     missing = [p for p in art if p not in shown]
     shape_bad = []
     pf_bad = []
+    placed_bad = []
     for s in shots:
         allowed = shapes_for(s.get("layout", "single"), fmt)
         for c in s.get("cards") or []:
@@ -109,6 +110,32 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
                 # dimensions (panel width x band height), not the whole
                 # panel's — judge its aspect against those.
                 ph = ph * max(0.0, float(c["slice"][1]) - float(c["slice"][0]))
+            _pl = c.get("placed")
+            if isinstance(_pl, dict):
+                # Placed cards are not classic shapes either: the
+                # foreground is the WHOLE panel at its native aspect,
+                # fitted at the MAXIMUM fit-inside scale (never
+                # smaller — no floating), centred, over the panel's
+                # own blurred background (flag on exactly when the
+                # panel isn't canvas-shaped).
+                try:
+                    _bw, _bh = float(_pl["base_w"]), float(_pl["base_h"])
+                    _ok = abs(math.log((_bw / _bh) / (pw / ph))) <= PF_ASPECT_TOL
+                    _scale = min(fmt.width / pw, fmt.height / ph)
+                    _ok = _ok and abs(_bw - pw * _scale) <= PF_FIT_TOL \
+                        and abs(_bh - ph * _scale) <= PF_FIT_TOL
+                    _want_touches = ("both" if abs(_bh - fmt.height) <= PF_FIT_TOL
+                                     and abs(_bw - fmt.width) <= PF_FIT_TOL
+                                     else "top_bottom" if abs(_bh - fmt.height) <= PF_FIT_TOL
+                                     else "left_right")
+                    _ok = _ok and _pl.get("touches") == _want_touches
+                    _want_bg = abs(math.log((pw / ph) / (fmt.width / fmt.height))) > PF_ASPECT_TOL
+                    _ok = _ok and bool(_pl.get("bg")) == _want_bg
+                except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                    _ok = False
+                if not _ok:
+                    placed_bad.append(f"{s.get('id')} {c['panel']}")
+                continue
             _pf = c.get("panelfit")
             if isinstance(_pf, dict):
                 # Panel-fit cards are not classic shapes: the foreground
@@ -197,6 +224,10 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     if pf_bad:
         failures.append(f"{len(pf_bad)} card(s) break the panel-fit composition rules "
                         f"(whole panel, native aspect, blurred background): {', '.join(pf_bad[:6])}")
+    if placed_bad:
+        failures.append(f"{len(placed_bad)} card(s) break the placed composition rules "
+                        f"(whole panel, native aspect, maximum fit-inside, own blurred background): "
+                        f"{', '.join(placed_bad[:6])}")
     if cs.get("bubble"):
         failures.append(f"{len(cs['bubble'])} panel(s) would show a speech bubble or caption in their card: "
                         f"{', '.join(cs['bubble'][:8])}")
@@ -268,6 +299,10 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "fullframe_reviewer_focal_ignored": list(plan.get("fullframe_reviewer_focal_ignored") or []),
         "fullframe_over_cap": list(plan.get("fullframe_over_cap") or []),
         "fullframe_static": list(plan.get("fullframe_static") or []),
+        # Placed mode only: title cards placed + motion hints ignored.
+        # INFO ONLY — composition violations are failures above.
+        "placed_title_cards": list(plan.get("placed_title_cards") or []),
+        "placed_hints_ignored": list(plan.get("placed_hints_ignored") or []),
         "min_shot": round(shortest, 2),
         "max_shots": max(0, int(duration // (1.0 if plan.get("mode") == "panelfit" else 3.0))) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
@@ -323,6 +358,9 @@ def _inputs(root: Path, chapter: str, panels_fp: str, audio: Path | None, fmt: s
     if str(vcfg.get("mode") or "classic") == "fullframe":
         knobs["mode"] = "fullframe"
         knobs["fullframe"] = dict(vcfg.get("fullframe") or {})
+    if str(vcfg.get("mode") or "classic") == "placed":
+        knobs["mode"] = "placed"
+        knobs["placed"] = dict(vcfg.get("placed") or {})
     return {
         "panels": panels_fp,
         "audio": [audio.name, st.st_size, int(st.st_mtime)] if st else None,
@@ -510,8 +548,8 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"  chapter {chapter}: imported {len(found)} page images")
     ensure_pages(sess, chapter, cfg.download, log=log)
     panels = build_panels(root, chapter, vcfg.get("panels"), log=log)
-    if vcfg.get("mode") == "panelfit" and not any(p.get("trim2") for p in panels.get("panels") or []):
-        log(f"  chapter {chapter}: ! panelfit mode expects Rule 6 pre-processing "
+    if vcfg.get("mode") in ("panelfit", "placed") and not any(p.get("trim2") for p in panels.get("panels") or []):
+        log(f"  chapter {chapter}: ! {vcfg.get('mode')} mode expects Rule 6 pre-processing "
             f"(video.panels.trim_v2) at panel build; these panels carry no trim2 record, "
             f"so white margins may reach the composed frames")
 
@@ -748,6 +786,12 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if qa.get("fullframe_reviewer_focal_ignored"):
         log(f"    ! fullframe mode: {len(qa['fullframe_reviewer_focal_ignored'])} panel(s) where a fixes.json "
             f"focal overflows every 16:9 viewport: {', '.join(qa['fullframe_reviewer_focal_ignored'][:8])}")
+    if qa.get("placed_title_cards"):
+        log(f"    placed mode: {len(qa['placed_title_cards'])} title card(s) "
+            f"(split-flap, on timeline cues)")
+    if qa.get("placed_hints_ignored"):
+        log(f"    placed mode: motion hint(s) on {len(qa['placed_hints_ignored'])} shot(s) ignored "
+            f"(this mode has no motion): {', '.join(qa['placed_hints_ignored'][:8])}")
     if plan.get("chapter_cards"):
         from .editor import chapter_cards_to_timestamps as _ts
         log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))

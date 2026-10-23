@@ -845,6 +845,22 @@ PFR_SHADOW_BLUR = 10        # (0, +20px), blur 10px, opacity 40% — layered
 PFR_SHADOW_OPACITY = 0.40   # between the blur backdrop and the foreground
 
 
+# ------------------------------------------------------------------ placed views
+#
+# Placed mode (video.mode: placed): the Panel Placement Rule — the
+# panel-fit composition with ALL motion removed. Mirror constants of
+# the planner's (plan.PL_*); placed views are PanelFitViews whose
+# kind is "placed" (see PlacedView below), so the backdrop (the
+# panel's own cover-scaled blur at FULL brightness) and the drop
+# shadow are literally panelfit's shared machinery, not a copy.
+
+PLR_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p
+PLR_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+PLR_SHADOW_DY = 20          # foreground drop shadow: black, offset (0, +20px),
+PLR_SHADOW_BLUR = 10        # blur 10px, opacity 40% — layered between the
+PLR_SHADOW_OPACITY = 0.40   # blur backdrop and the foreground
+
+
 class PanelFitView:
     """One panel composed per the measured reference style: the panel
     shown WHOLE at its native aspect — sharp, centred — over the same
@@ -890,7 +906,7 @@ class PanelFitView:
     def __init__(self, panel: Image.Image, spec: Dict[str, Any], card: Dict[str, Any],
                  shot_start: float, shot_end: float, fmt: Format):
         self.fmt = fmt
-        self.kind = spec.get("kind") if spec.get("kind") in ("zoom", "drift", "fill", "scroll", "traverse", "duo") else "zoom"
+        self.kind = spec.get("kind") if spec.get("kind") in ("zoom", "drift", "fill", "scroll", "traverse", "duo", "placed") else "zoom"
         self.dir = spec.get("dir") or ("down" if self.kind in ("scroll", "drift") else "in")
         self.base_w = float(spec.get("base_w") or fmt.width)
         self.base_h = float(spec.get("base_h") or fmt.height)
@@ -990,6 +1006,12 @@ class PanelFitView:
         dur = max(0.01, self.end - self.appear)
         p = min(1.0, max(0.0, (t - self.appear) / dur))
         dt = max(0.0, t - self.appear)
+        if self.kind == "placed":
+            # Placed mode: the panel sits CENTRED at its maximum
+            # fit-inside size for the shot's whole duration — no
+            # drift, no zoom, no traverse, and extra_zoom (a punch
+            # effect) is ignored: the returned rect is time-invariant.
+            return (W - self.base_w) / 2.0, (H - self.base_h) / 2.0, self.base_w, self.base_h
         if self.kind == "scroll":
             disp_w, disp_h = self.base_w, self.base_h
             span = H - disp_h  # <= 0 for a strip taller than the frame
@@ -1115,6 +1137,29 @@ class PanelFitView:
         return out.convert("RGB")
 
 
+class PlacedView(PanelFitView):
+    """One panel composed per the Panel Placement Rule: the panel
+    shown WHOLE at its native aspect — sharp, centred, scaled to
+    the MAXIMUM size fitting inside the frame (tall/square panels
+    touch the top and bottom walls; wider-than-frame panels touch
+    the left and right walls) — over the same panel cover-scaled,
+    heavily blurred, at FULL brightness. The backdrop, the slice-band
+    cropping and the drop shadow are PanelFitView's shared machinery,
+    inherited unchanged; the ONLY difference is placement: kind
+    "placed" makes _place() return one time-invariant centred rect,
+    so the first frame of a shot is pixel-identical to its last.
+    Entrances are always a hard cut in this mode, whatever the card
+    says — there is no fade, slide or zoom anywhere in a placed shot.
+    """
+
+    def __init__(self, panel: Image.Image, spec: Dict[str, Any], card: Dict[str, Any],
+                 shot_start: float, shot_end: float, fmt: Format):
+        super().__init__(panel, spec, card, shot_start, shot_end, fmt)
+        self.kind = "placed"
+        self.enter = "cut"
+        self.enter_dur = 0.0
+
+
 # ------------------------------------------------------------------ shot
 
 
@@ -1178,6 +1223,13 @@ class ShotRenderer:
             _specs = [c.get("panelfit") for c in cards]
             if all(isinstance(_sp, dict) for _sp in _specs):
                 self.pf_views = [PanelFitView(images[c["panel"]], _sp, c, self.start, self.end, fmt)
+                                 for c, _sp in zip(cards, _specs)]
+        # Placed mode: same shared frame path, PlacedView composition
+        # (static maximum fit-inside over the panel's own blur).
+        if shot.get("placed") and fmt.width > fmt.height and cards:
+            _specs = [c.get("placed") for c in cards]
+            if all(isinstance(_sp, dict) for _sp in _specs):
+                self.pf_views = [PlacedView(images[c["panel"]], _sp, c, self.start, self.end, fmt)
                                  for c, _sp in zip(cards, _specs)]
         # Title-card shots (Title Card Generator): no panels at all --
         # the whole shot is the split-flap card, drawn once here.

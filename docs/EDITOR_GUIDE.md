@@ -239,6 +239,10 @@ deterministic (same inputs → identical JSON).
 | `fullframe.max_upscale` | 2.4 | Viewport source floor = frame / this (800×450 px at 1080p); zoom depth caps at the floor |
 | `fullframe.zoom_depth` | 1.18 | Target push_in/pull_out depth inside the window |
 | `fullframe.pan_travel` | 1.0 | Pan window = viewport × (1 + this) along the pan axis |
+| `mode: placed` | off | Panel Placement Rule: whole panel at native aspect, centred at the maximum fit-inside scale (touches top+bottom or left+right walls) over its own full-brightness blur, NO motion, hard cuts only; see "Placed mode" below |
+| `placed.bg_blur` / `placed.bg_opacity` | 50 / 1.0 | Backdrop blur radius / opacity (full brightness, shared with panelfit) |
+| `placed.shadow_dy` / `shadow_blur` / `shadow_opacity` | 20 / 10 / 0.40 | Foreground drop shadow (shared panelfit treatment) |
+| `placed.title_cards` | `true` | Timeline cues become split-flap title cards (shared panelfit machinery) |
 | `whisper_model` | `base.en` | Use `small` for Hindi narration |
 | `require_review` | `false` | If true, render refuses unless plan approved |
 | `sync.gate_wrong` / `gate_window` / `gate_grace` | 0.05 / 0.25 / 0.2 | Sync-gate thresholds (plus: any shot <3s fails, any sentence under its tagged-coverage threshold fails, any filler failing the impact test counts as wrong-picture) |
@@ -393,6 +397,57 @@ plan records `fullframe_caption_risk`, `fullframe_figure_risk`,
 `fullframe_static` shot-id lists in the QA file for review. Timing, panels and
 the sync audit are untouched by the mode: a full-frame plan has exactly the
 classic plan's shot skeleton.
+
+## Placed mode (`video.mode: placed`)
+
+The Panel Placement Rule (user, 2026-10-24), as a mode alongside
+classic/wide/adaptive/panelfit/fullframe (existing modes untouched).
+The user rejected panelfit's presentation ("you are just scrolling
+the panels" — its traverses/drifts) and classic's floating cards, so
+this mode keeps panelfit's composition and removes ALL motion:
+
+- **Composition.** Every shot's panel (or B1f slice unit) is shown
+  WHOLE at its native aspect ratio — never stretched, never cropped —
+  sharp and CENTRED, scaled to the MAXIMUM size fitting inside the
+  1920×1080 frame (fit-inside/contain). Tall and square panels touch
+  the TOP and BOTTOM walls; panels wider than 16:9 touch the LEFT and
+  RIGHT walls. There is deliberately NO upscale cap: a cap would show
+  a small panel smaller than the maximum, i.e. floating — the defect
+  this mode exists to eliminate. The remaining frame area is the
+  panel's own cover-scaled blur (~50px) at FULL brightness (never
+  dimmed, never white/black/empty), built by the same renderer
+  machinery as panelfit, and the foreground casts the same drop
+  shadow (black, offset (0, +20px), blur 10px, opacity 40%,
+  `placed.shadow_*`) between backdrop and panel.
+- **Motion.** NONE within a shot — no traverse, no drift, no pan, no
+  zoom — and transitions are HARD CUTS only. Per-sentence motion
+  hints are IGNORED in this mode (reported in the plan/QA as
+  `placed_hints_ignored`, never an error, never applied). A placed
+  shot's first frame is pixel-identical to its last.
+- **Timing.** Not a new model: the classic planner's sentence→shot
+  mapping, `min_hold` floor, split machinery and sync audit apply
+  exactly as for classic; the plan artifact records `"mode": "placed"`
+  and every card carries a `placed` spec (`{kind: placed, base_w,
+  base_h, off_x, off_y, scale, touches}` with the motion fields pinned
+  to zero — `plan.validate()` rejects a moving placed spec, and the
+  build QA gate fails any card that is not at the exact maximum fit).
+- **Pre-processing (Rule 6).** Shared with panelfit: panel build
+  should run with `video.panels.trim_v2: true`, and B1f slice hints
+  apply — each slice unit is placed on its own band dimensions.
+  `video plan` warns when a placed build's panels carry no `trim2`
+  record.
+- **Title cards.** Shared with panelfit (`insert_title_cards`): a
+  timeline-cue sentence becomes a split-flap card shot on the
+  timeline, so the master audio is never cut. The plan/QA record
+  them as `placed_title_cards`. Captions follow the global
+  `video.captions` setting, as in classic.
+- **Storyboard** shows the composed frame at shot start and end, side
+  by side (identical, by construction). Landscape only; portrait
+  formats stay classic.
+
+Knobs (`video.placed.*`, defaults pinned in code): `bg_blur` 50,
+`bg_opacity` 1.0, `shadow_dy` 20, `shadow_blur` 10,
+`shadow_opacity` 0.40, `title_cards` true.
 
 ## `fixes.json` overrides (all in one file, `video/chapter_N.fixes.json`)
 

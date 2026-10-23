@@ -63,7 +63,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
         "format": "16:9",           # 16:9 (1920x1080) or 9:16 (1080x1920, Shorts)
         "fps": 30,
-        "mode": "classic",          # classic | wide | adaptive | panelfit | fullframe
+        "mode": "classic",          # classic | wide | adaptive | panelfit | fullframe | placed
                                     #   wide: every card full-height, min 6/16 wide
                                     #   adaptive: per shot, a naturally wide/landscape panel gets
                                     #   the wide treatment; a narrower one keeps its classic
@@ -80,6 +80,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                     #   fullframe: no cards at all -- every shot is a full-bleed
                                     #   16:9 camera viewport travelling over the panel
                                     #   (pan through tall windows, zoom inside wide ones)
+                                    #   placed: the Panel Placement Rule -- every panel
+                                    #   shown WHOLE at native aspect, centred and scaled
+                                    #   to the MAXIMUM fit inside the frame (tall/square
+                                    #   panels touch top+bottom, wider-than-16:9 panels
+                                    #   touch left+right) over its own full-brightness
+                                    #   blurred fill, with NO motion at all (no drift,
+                                    #   traverse, pan or zoom; motion hints ignored)
+                                    #   and hard cuts only (see placed: below)
         "wide": {
             "min_width_ratio": 0.375,  # 6/16 of the frame wide; no thin slivers, ever
             "max_upscale": 1.5,         # a panel is never upscaled past this (1080p sharpness)
@@ -160,6 +168,30 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # 0.11 lands the measured gap at ≈0.20s (B1d F4).
                                        # The global TTS default stays 0.35; use this
                                        # value for tts.gap_seconds for this mode.
+        },
+        "placed": {
+            # The Panel Placement Rule (user, 2026-10-24): panels are
+            # PLACED, never floated, never scrolled. The fit is the
+            # exact maximum fit-inside (contain) scale -- deliberately
+            # NO max_upscale cap here: a cap would leave a small panel
+            # smaller than the maximum, i.e. floating, which is the
+            # one thing this mode exists to eliminate.
+            "bg_blur": 50,             # Gaussian radius (px at 1080p) of the cover-scaled,
+                                       # blurred copy of the panel that fills the frame
+                                       # (shared with panelfit: same machinery, same value)
+            "bg_opacity": 1.0,         # that background layer's opacity over black:
+                                       # 1.0 = FULL brightness, no dimming, never
+                                       # white/black/empty bands
+            "shadow_dy": 20,           # the foreground's drop shadow — black,
+            "shadow_blur": 10,         # offset (0, +20px), blur 10px, opacity 40%,
+            "shadow_opacity": 0.40,    # layered between backdrop and panel (the
+                                       # backdrop itself stays at full brightness);
+                                       # shared with panelfit's treatment
+            "title_cards": True,       # timeline cues become split-flap title
+                                       # cards, via the same planner machinery
+                                       # panelfit uses (insert_title_cards; the
+                                       # master audio is never cut) — timing
+                                       # otherwise follows the classic planner
         },
         "fullframe": {
             "max_upscale": 2.4,        # zoom guardrail: a viewport's source is never smaller

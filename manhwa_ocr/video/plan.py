@@ -2102,19 +2102,160 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     return report
 
 
-def _card_shot(cue: Dict[str, Any], start: float, end: float, sentence: str) -> Dict[str, Any]:
-    """One title-card shot: no panels, just the cue it covers."""
+# ------------------------------------------------------------------ placed pass
+#
+# Placed mode (video.mode: placed) — the Panel Placement Rule (user,
+# 2026-10-24; AGENTS.md): panels are PLACED, never floated, never
+# scrolled. The user rejected panelfit's presentation ("you are just
+# scrolling the panels" — its traverses/drifts) and classic's floating
+# cards, so this mode keeps panelfit's COMPOSITION (whole panel at
+# native aspect over its own full-brightness blurred fill, drop shadow
+# layered between backdrop and panel) and removes ALL motion:
+#   * every shot's panel (or B1f slice unit) is shown WHOLE at native
+#     aspect — never stretched, never cropped — CENTRED and scaled to
+#     the MAXIMUM size fitting inside the frame (fit-inside/contain).
+#     Tall and square panels touch the TOP and BOTTOM walls; panels
+#     wider than the frame touch the LEFT and RIGHT walls. There is
+#     deliberately NO upscale cap: a cap would show a small panel
+#     smaller than the maximum, i.e. floating — the defect this mode
+#     exists to eliminate.
+#   * the remaining frame area is the panel's OWN blur at FULL
+#     brightness (the renderer's shared PanelFitView backdrop
+#     machinery) — never dimmed, never white/black/empty.
+#   * MOTION: none within a shot — no traverse, no drift, no pan, no
+#     zoom — even when a sentence carries a motion hint: hints are
+#     IGNORED in this mode (reported, never applied, never an error).
+#     Transitions are HARD CUTS only.
+#   * Timing/coverage are NOT a new model: the classic planner's
+#     sentence->shot mapping, min_hold floor and split machinery run
+#     exactly as for classic/wide/fullframe; this pass only rewrites
+#     composition. Title cards reuse panelfit's insert_title_cards
+#     machinery (shared, mode_flag="placed"): the card is a shot on
+#     the timeline, so the master audio is never cut.
+#   * Prep is shared too: Rule 6 trim_v2 + B1f slice hints reach this
+#     pass exactly as they reach panelfit (a slice unit is fitted on
+#     its own band dimensions, like any whole panel).
+# Every parameter is a named constant, pinned to the config defaults
+# (video.placed.*) and to the renderer's mirrors (frames.PLR_*) by
+# tests; the values must never live only in an agent's head.
+
+PL_BG_BLUR = 50            # background Gaussian blur radius, px at 1080p (shared with panelfit)
+PL_BG_OPACITY = 1.0        # background layer opacity over black: FULL brightness
+PL_SHADOW_DY = 20          # foreground drop shadow: black, offset (0, +20px),
+PL_SHADOW_BLUR = 10        # blur 10px, 40% opacity — under the panel only
+PL_SHADOW_OPACITY = 0.40   # (the panelfit treatment, shared machinery)
+PL_TITLE_CARDS = True      # timeline cues become split-flap title cards
+PL_FIT_TOL = 1.0           # px slack when checking a placed foreground's fit
+
+
+def placed_fit(pw: float, ph: float, fmt: Format) -> Tuple[float, float, float, float, float, str]:
+    """(base_w, base_h, scale, off_x, off_y, touches) for one panel
+    placed on the canvas: the MAXIMUM fit-inside (contain) scale,
+    centred. `touches` names the pair of frame walls the foreground
+    reaches: "top_bottom" for tall/square panels (height is the
+    limiting axis), "left_right" for panels wider than the frame,
+    "both" for an exactly frame-shaped panel. The foreground never
+    exceeds the frame and never preserves less than the panel's exact
+    aspect — the scale is a single uniform factor."""
+    pw, ph = max(1.0, float(pw)), max(1.0, float(ph))
+    scale = min(fmt.width / pw, fmt.height / ph)
+    bw, bh = pw * scale, ph * scale
+    if abs(bh - fmt.height) <= PL_FIT_TOL and abs(bw - fmt.width) <= PL_FIT_TOL:
+        touches = "both"
+    elif abs(bh - fmt.height) <= PL_FIT_TOL:
+        touches = "top_bottom"
+    else:
+        touches = "left_right"
+    return bw, bh, scale, (fmt.width - bw) / 2.0, (fmt.height - bh) / 2.0, touches
+
+
+def placed_spec(pw: float, ph: float, fmt: Format,
+                pcfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """The per-card composition spec the renderer consumes for a
+    placed shot: a static maximum fit-inside placement. The motion
+    fields are pinned to zero/neutral ON PURPOSE (zoom_rate 0,
+    zoom_end 1, drift_frac 0) so any downstream reader can verify
+    mechanically that this shot cannot move."""
+    bw, bh, scale, off_x, off_y, touches = placed_fit(pw, ph, fmt)
+    bg = True
+    if pw > 0 and ph > 0:
+        bg = abs(math.log((pw / ph) / (fmt.width / fmt.height))) > PF_ASPECT_TOL
+    return {"kind": "placed", "dir": "none", "bg": bg,
+            "base_w": round(bw, 2), "base_h": round(bh, 2),
+            "off_x": round(off_x, 2), "off_y": round(off_y, 2),
+            "scale": round(scale, 4), "touches": touches,
+            "zoom_rate": 0.0, "zoom_end": 1.0, "drift_frac": 0.0,
+            "impact": False}
+
+
+def _placed_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
+                 pcfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite classic shots into placed shots (landscape only, like
+    the wide/adaptive/panelfit passes; portrait formats stay classic).
+
+    Composition only: timing, panels, `at` offsets and layout are
+    untouched (a pair's cards each carry their own placed spec; the
+    renderer shows the latest-arrived card's placement, exactly as
+    the panelfit renderer sequences a pair). What IS normalised:
+    every shot becomes a hard cut (exit/transition "cut", card
+    entrances "cut", shot effects cleared — a shake/flash/punch has
+    no place in a mode whose promise is a still, placed panel), and
+    any per-sentence motion hint is ignored (collected into the
+    report's "hints_ignored", never an error).
+
+    Returns {"hints_ignored": [shot ids that carried a motion hint]}.
+    """
+    report: Dict[str, Any] = {"hints_ignored": []}
+    if fmt.width <= fmt.height:
+        return report
+    for s in shots:
+        s["placed"] = True
+        s["exit"] = "cut"
+        s["transition"] = "cut"
+        s["effects"] = []
+        if s.get("motion_hint"):
+            report["hints_ignored"].append(s.get("id"))
+        for c in s.get("cards") or []:
+            c["enter"] = "cut"
+            pid = c.get("panel")
+            p = designer.by_id.get(pid) or {}
+            pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
+            if isinstance(c.get("slice"), list) and len(c["slice"]) == 2:
+                # B1f: a slice is fitted on its OWN dimensions — the
+                # panel's width, the band's height — exactly as the
+                # panelfit pass fits it.
+                ph = ph * max(0.0, float(c["slice"][1]) - float(c["slice"][0]))
+            if pw > 0 and ph > 0:
+                c["placed"] = placed_spec(pw, ph, fmt, pcfg)
+            else:  # unknown panel size: the whole frame, statically
+                c["placed"] = {"kind": "placed", "dir": "none", "bg": True,
+                               "base_w": float(fmt.width), "base_h": float(fmt.height),
+                               "off_x": 0.0, "off_y": 0.0, "scale": 1.0,
+                               "touches": "both", "zoom_rate": 0.0, "zoom_end": 1.0,
+                               "drift_frac": 0.0, "impact": False}
+    return report
+
+
+def _card_shot(cue: Dict[str, Any], start: float, end: float, sentence: str,
+               mode_flag: str = "panelfit") -> Dict[str, Any]:
+    """One title-card shot: no panels, just the cue it covers.
+
+    `mode_flag` is the mode marker the shot carries ("panelfit" for
+    panel-fit plans, "placed" for placed plans — the two modes that
+    share this machinery); it defaults to "panelfit" so every existing
+    caller and plan keeps its exact shape."""
     return {"id": "CARD", "start": round(start, 3), "end": round(end, 3),
             "layout": "single", "background": "black", "cards": [],
             "exit": "cut", "transition": "cut", "effects": [], "callouts": [],
             "sentence": sentence[:300] or None,
-            "panelfit": True, "caption_bar": False,
+            mode_flag: True, "caption_bar": False,
             "title_card": {"label": cue["label"], "number": int(cue["number"]),
                            "line": cue["line"]}}
 
 
 def insert_title_cards(shots: List[Dict[str, Any]], windows: List[Dict[str, Any]] | None,
-                       pcfg: Dict[str, Any] | None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                       pcfg: Dict[str, Any] | None, *, mode_flag: str = "panelfit"
+                       ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Turn timeline-cue sentences into split-flap title-card shots.
 
     `windows` are the narration sentences ({text, start, end}). A cue
@@ -2177,7 +2318,7 @@ def insert_title_cards(shots: List[Dict[str, Any]], windows: List[Dict[str, Any]
                 new.append(s)
                 continue
             if not placed and a >= card_start - 1e-9:
-                new.append(_card_shot(cue, card_start, card_end, text))
+                new.append(_card_shot(cue, card_start, card_end, text, mode_flag))
                 placed = True
             if a < card_start - 1e-9:  # head piece survives
                 head = dict(s)
@@ -2185,7 +2326,7 @@ def insert_title_cards(shots: List[Dict[str, Any]], windows: List[Dict[str, Any]
                 if head["end"] - float(head["start"]) >= 0.2:
                     new.append(head)
                 if not placed:
-                    new.append(_card_shot(cue, card_start, card_end, text))
+                    new.append(_card_shot(cue, card_start, card_end, text, mode_flag))
                     placed = True
             if b > card_end + 1e-9:  # tail piece survives (or is absorbed)
                 if b - card_end >= 0.2:
@@ -2206,7 +2347,7 @@ def insert_title_cards(shots: List[Dict[str, Any]], windows: List[Dict[str, Any]
                             ns["end"] = round(card_end, 3)
             # a shot fully inside the card interval is consumed by it
         if not placed:
-            new.append(_card_shot(cue, card_start, card_end, text))
+            new.append(_card_shot(cue, card_start, card_end, text, mode_flag))
             new.sort(key=lambda s: float(s["start"]))
         out = new
         report.append({"at": round(card_start, 3), "duration": round(card_end - card_start, 3),
@@ -2577,6 +2718,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     by_id = {p["id"]: p for p in panels}
     st = settings or sync_mod.effective_settings(vcfg, log=lambda _msg: None)
     _pf_mode = str(vcfg.get("mode") or "classic") == "panelfit"
+    _placed_mode = str(vcfg.get("mode") or "classic") == "placed"
     _pcfg = vcfg.get("panelfit") or {}
     # B1f landmark slice hints (cues.json "slice_hints", via
     # slicehints.py): panel-fit mode only — the mode whose prep they
@@ -2591,7 +2733,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         if _sh_problems:
             raise UserError("slice_hints have problems (nothing was planned):\n  - "
                             + "\n  - ".join(_sh_problems[:8]))
-        if not _pf_mode:
+        if not (_pf_mode or _placed_mode):
             _slice_hints = {}
 
     def _expand(units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2699,6 +2841,7 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                   "traverse": [], "duo": [], "zoom_out": [], "zoom_in": []}
     _ff_risk = {"caption_risk": [], "figure_risk": [], "reviewer_focal_ignored": [],
                 "over_cap": [], "static": []}
+    _placed_report: Dict[str, Any] = {"hints_ignored": []}
     if _mode == "wide":
         _wide_risk = _wide_pass(shots, designer, fmt, vcfg.get("wide") or {})
     elif _mode == "adaptive":
@@ -2707,12 +2850,17 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         _pf_report = _panelfit_pass(shots, designer, fmt, vcfg.get("panelfit") or {})
     elif _mode == "fullframe":
         _ff_risk = _fullframe_pass(shots, designer, fmt, vcfg.get("fullframe") or {})
+    elif _mode == "placed":
+        _placed_report = _placed_pass(shots, designer, fmt, vcfg.get("placed") or {})
     _pf_title_cards: List[Dict[str, Any]] = []
-    if _mode == "panelfit":
+    _placed_title_cards: List[Dict[str, Any]] = []
+    if _mode in ("panelfit", "placed"):
         # Title Card Generator: timeline-cue sentences become card
         # shots. Windows come from the alignment segments (via
         # caption_sentences) or, on the cues path, from `sentences`
-        # (ends derived from the next sentence's start).
+        # (ends derived from the next sentence's start). Placed mode
+        # shares this machinery (mode_flag="placed"): the card is a
+        # shot on the timeline, so the master audio is never cut.
         _wins: List[Dict[str, Any]] = []
         for _w in (caption_sentences if caption_sentences is not None else sentences) or []:
             if isinstance(_w, dict) and _w.get("text") and _w.get("start") is not None:
@@ -2722,7 +2870,11 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         for _i, _w in enumerate(_wins):
             if _w["end"] is None:
                 _w["end"] = float(_wins[_i + 1]["start"]) if _i + 1 < len(_wins) else float(duration)
-        shots, _pf_title_cards = insert_title_cards(shots, _wins, vcfg.get("panelfit") or {})
+        if _mode == "panelfit":
+            shots, _pf_title_cards = insert_title_cards(shots, _wins, vcfg.get("panelfit") or {})
+        else:
+            shots, _placed_title_cards = insert_title_cards(
+                shots, _wins, vcfg.get("placed") or {}, mode_flag="placed")
     # B1f: the slice ids actually placed (empty unless slice hints ran).
     _slices_applied = [c["slice_id"] for s in shots for c in (s.get("cards") or [])
                        if c.get("slice_id")]
@@ -2743,6 +2895,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "panelfit_zoom_in": _pf_report.get("zoom_in", []),
         "panelfit_slices": _slices_applied,
         "panelfit_title_cards": _pf_title_cards,
+        "placed_title_cards": _placed_title_cards,
+        "placed_hints_ignored": _placed_report.get("hints_ignored", []),
         "fullframe_caption_risk": _ff_risk["caption_risk"],
         "fullframe_figure_risk": _ff_risk["figure_risk"],
         "fullframe_reviewer_focal_ignored": _ff_risk["reviewer_focal_ignored"],
@@ -2987,6 +3141,30 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                     errs.append(f"{cw}: panelfit spec must be {{kind: zoom|drift|fill|traverse|duo, dir, base_w, base_h, "
                                 "zoom_rate, zoom_end, drift_frac} "
                                 "(video.mode: panelfit writes it; rebuild the plan with --force)")
+            _pl = c.get("placed")
+            if _pl is not None:
+                # Placed spec: a STATIC maximum fit-inside placement.
+                # The motion fields must be exactly neutral — any
+                # nonzero rate/total is a spec this mode never writes.
+                _pl_ok = (isinstance(_pl, dict)
+                          and _pl.get("kind") == "placed"
+                          and _pl.get("dir") == "none"
+                          and _pl.get("touches") in ("top_bottom", "left_right", "both"))
+                if _pl_ok:
+                    try:
+                        _pl_ok = (float(_pl["base_w"]) > 0 and float(_pl["base_h"]) > 0
+                                  and float(_pl["scale"]) > 0
+                                  and float(_pl["off_x"]) >= 0 and float(_pl["off_y"]) >= 0
+                                  and float(_pl["zoom_rate"]) == 0.0
+                                  and float(_pl["zoom_end"]) == 1.0
+                                  and float(_pl["drift_frac"]) == 0.0)
+                    except (KeyError, TypeError, ValueError):
+                        _pl_ok = False
+                if not _pl_ok:
+                    errs.append(f"{cw}: placed spec must be {{kind: placed, dir: none, base_w, base_h, "
+                                "off_x, off_y, scale, touches: top_bottom|left_right|both, "
+                                "zoom_rate: 0, zoom_end: 1, drift_frac: 0} "
+                                "(video.mode: placed writes it; rebuild the plan with --force)")
         from .editor import validate_callout as _validate_callout
         for _co in s.get("callouts") or []:
             for _err in _validate_callout(_co):
