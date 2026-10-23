@@ -90,7 +90,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     are warnings for the QA file and the log. Nothing here judges art quality."""
     import math
 
-    from .plan import PF_ASPECT_TOL, PF_FIT_TOL
+    from .plan import PF_ASPECT_TOL, PF_DRIFT_HEADROOM, PF_DRIFT_MAX_TRAVEL, PF_FIT_TOL
 
     fmt = format_from(plan.get("format", "16:9"), int(plan.get("fps", 30)))
     dims = {p["id"]: (float(p.get("width") or 1), float(p.get("height") or 1)) for p in panels["panels"]}
@@ -115,9 +115,23 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
                 try:
                     _bw, _bh = float(_pf["base_w"]), float(_pf["base_h"])
                     _ok = abs(math.log((_bw / _bh) / (pw / ph))) <= PF_ASPECT_TOL
-                    if _pf.get("kind") == "scroll":
+                    _kind = _pf.get("kind")
+                    if _kind == "scroll":  # legacy (pre-measurement) plans only
                         _ok = _ok and _bh > fmt.height + PF_FIT_TOL and _bw <= fmt.width + PF_FIT_TOL
-                    else:
+                    elif _kind == "drift":
+                        # Height-fit pillar oversized by (travel +
+                        # headroom): never wider than the frame, and the
+                        # oversize stays inside the measured band (a
+                        # max-upscale-capped pillar may sit shorter).
+                        _max_over = 1.0 + PF_DRIFT_MAX_TRAVEL + PF_DRIFT_HEADROOM
+                        _ok = _ok and _bw <= fmt.width + PF_FIT_TOL \
+                            and _bh <= fmt.height * _max_over + PF_FIT_TOL
+                    elif _kind == "fill":
+                        # Cover-fill: at least frame-sized both ways,
+                        # with one dimension exactly the frame's.
+                        _ok = _ok and _bw >= fmt.width - PF_FIT_TOL and _bh >= fmt.height - PF_FIT_TOL \
+                            and min(abs(_bw - fmt.width), abs(_bh - fmt.height)) <= PF_FIT_TOL
+                    else:  # zoom: the whole panel fitted inside the frame
                         _ok = _ok and _bw <= fmt.width + PF_FIT_TOL and _bh <= fmt.height + PF_FIT_TOL
                     _want_bg = abs(math.log((pw / ph) / (fmt.width / fmt.height))) > PF_ASPECT_TOL
                     _ok = _ok and bool(_pf.get("bg")) == _want_bg
@@ -211,6 +225,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "panelfit_static": list(plan.get("panelfit_static") or []),
         "panelfit_over_cap": list(plan.get("panelfit_over_cap") or []),
         "panelfit_impact": list(plan.get("panelfit_impact") or []),
+        "panelfit_title_cards": list(plan.get("panelfit_title_cards") or []),
         # Full-frame mode only: the same honest-report treatment (see
         # plan._fullframe_pass). INFO ONLY -- never failures.
         "fullframe_caption_risk": list(plan.get("fullframe_caption_risk") or []),
@@ -219,7 +234,7 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         "fullframe_over_cap": list(plan.get("fullframe_over_cap") or []),
         "fullframe_static": list(plan.get("fullframe_static") or []),
         "min_shot": round(shortest, 2),
-        "max_shots": max(0, int(duration // 3.0)) if duration else 0,
+        "max_shots": max(0, int(duration // (1.0 if plan.get("mode") == "panelfit" else 3.0))) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
         "padded": cs.get("padded", []), "white_edge": cs.get("white_edge", []),
         "low_confidence_heads": cs.get("low_confidence_heads", []),
@@ -658,8 +673,11 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"    ! panelfit mode: {len(qa['panelfit_over_cap'])} panel(s) fitted at the max-upscale "
             f"cap (shown smaller, never stretched): {', '.join(qa['panelfit_over_cap'][:8])}")
     if qa.get("panelfit_impact"):
-        log(f"    panelfit mode: impact FX (0.2s shake + 3-frame flash) on "
+        log(f"    panelfit mode: impact fast zoom (+8.8%/s; no shake/flash in this mode) on "
             f"{len(qa['panelfit_impact'])} shot(s)")
+    if qa.get("panelfit_title_cards"):
+        log(f"    panelfit mode: {len(qa['panelfit_title_cards'])} title card(s) "
+            f"(split-flap, on timeline cues)")
     if qa.get("fullframe_figure_risk"):
         log(f"    ! fullframe mode: {len(qa['fullframe_figure_risk'])} panel(s) whose focal cannot fit "
             f"inside one 16:9 viewport (the camera path traverses it instead): "
