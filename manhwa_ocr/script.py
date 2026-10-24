@@ -53,6 +53,11 @@ STORY_SO_FAR_CHARS = 3000
 META_RE = re.compile(r"<!--\s*recap-meta\s*(\{.*?\})\s*-->", re.DOTALL)
 
 
+def report_path(recaps_dir: Path, chapter: str) -> Path:
+    """recaps/chapter_N.report.md — the conformance + quality report."""
+    return Path(recaps_dir) / f"chapter_{require_chapter(chapter)}.report.md"
+
+
 SCRIPT_SYSTEM = """You write narration for manhwa/manhua recap videos.
 
 Your voice: direct, present tense, conversational. You are telling a friend why \
@@ -524,6 +529,10 @@ class RecapBuilder:
         out = []
         for p in folder.glob("chapter_*.md"):
             label = p.stem[len("chapter_"):]
+            # chapter_N.brief.md / chapter_N.report.md are companions of a
+            # recap, never recaps themselves.
+            if "." in label or not label:
+                continue
             if p.stat().st_size > 0:
                 try:
                     out.append(require_chapter(label))
@@ -769,27 +778,28 @@ class RecapBuilder:
     def _select(self, chapters: List[str], force: bool) -> tuple[List[str], List[str]]:
         """Split a request into (to_write, skipped_existing). Validates input."""
         chapters = sort_chapters(require_chapter(c) for c in chapters)
-        if self._style() == "powerfantasy":
-            # The user's range rule, enforced rather than documented: a Power
-            # Fantasy range is recapped only once EVERY transcript in the
-            # range exists, so the writer holds the whole story before
-            # chapter one is written. Never recap a range piecemeal.
-            span = _range_span(chapters)
-            have = set(self.transcribed())
-            missing = [c for c in span if c not in have]
-            if missing:
-                raise UserError(
-                    f"Power Fantasy recaps are written for a whole range at once, with the full "
-                    f"story in hand — transcribe every chapter in the range first. "
-                    f"Missing transcript(s) for chapter(s) {', '.join(missing)} "
-                    f"(range {span[0]}-{span[-1]}). "
-                    f"Transcribed so far: {', '.join(self.transcribed()) or 'none'}."
-                )
+        # The owner's TRANSCRIPTS-FIRST rule, enforced rather than promised.
+        # Every lane requires the transcripts of the chapters requested; the
+        # two range-workflow lanes (their prompts carry range scope notes:
+        # "a range of chapters is one continuous film") additionally require
+        # every transcript of the range's contiguous span — requesting 2 and
+        # 4 needs 2, 3 and 4.
         have = set(self.transcribed())
-        missing = [c for c in chapters if c not in have]
-        if missing:
+        requested_missing = [c for c in chapters if c not in have]
+        if requested_missing:
             raise UserError(
-                f"No transcript for chapter(s) {', '.join(missing)}. "
+                f"No transcript for chapter(s) {', '.join(requested_missing)}. "
+                f"Transcribed so far: {', '.join(self.transcribed()) or 'none'}."
+            )
+        span = _range_span(chapters)
+        span_missing = [c for c in span if c not in have] \
+            if self._style() in ("powerfantasy", "manhwabro") else []
+        if span_missing:
+            raise UserError(
+                f"Recaps are written for a whole range at once, with the full "
+                f"story in hand — transcribe every chapter in the range first. "
+                f"Missing transcript(s) for chapter(s) {', '.join(span_missing)} "
+                f"(range {span[0]}-{span[-1]}). "
                 f"Transcribed so far: {', '.join(self.transcribed()) or 'none'}."
             )
         done = set(self.recapped())
@@ -836,8 +846,115 @@ class RecapBuilder:
             return audio
         return None
 
+    def _write_brief(self, chapter: str, minutes: float, prompt_path: Path,
+                     task_chapters: List[str]) -> Path:
+        """The persisted writing brief for one chapter: a context manifest
+        plus the exact system prompt and chapter prompt the writer was
+        given. Written at prepare time; finalize never deletes it."""
+        from .video.panels import sheet_paths
+
+        span = _range_span(task_chapters or [chapter])
+        transcribed = self.transcribed()
+        prev_recap = self.recap_path(str(int(chapter) - 1)) if chapter.isdigit() and int(chapter) > 1 else None
+        manifest = {
+            "series": self.cfg.series_name,
+            "chapter": chapter,
+            "style": self._style(),
+            "target_minutes": minutes,
+            "target_words": _target_words(minutes),
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "range": f"{span[0]}-{span[-1]}",
+            "transcripts_present": ", ".join(transcribed) or "none",
+            "transcripts_missing_in_range": [c for c in span if c not in set(transcribed)],
+            "bible_characters": len(self.memory.characters),
+            "bible_world_facts": len(self.memory.world_facts),
+            "bible_open_threads": len([t for t in self.memory.plot_threads if t.get("status") == "open"]),
+            "previous_recap_exists": bool(prev_recap and prev_recap.exists()),
+            "contact_sheets": [p.relative_to(self.workdir).as_posix()
+                               for p in sheet_paths(self.workdir, chapter)][:12],
+        }
+        out = self.recaps_dir / f"chapter_{chapter}.brief.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        body = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "(prompt missing)"
+        atomic_write_text(
+            out,
+            f"# Writing brief — {self.cfg.series_name}, chapter {chapter}\n\n"
+            f"<!-- brief-manifest " + json.dumps(manifest, ensure_ascii=False) + " -->\n\n"
+            f"Persisted at prepare time so this chapter can be regenerated with exactly\n"
+            f"the context below. Context manifest:\n\n"
+            + "\n".join(f"- {k}: {v}" for k, v in manifest.items())
+            + "\n\n---\n\n## System instruction\n\n"
+            + self._system_prompt()
+            + "\n\n---\n\n## Chapter prompt (as written to "
+            + prompt_path.relative_to(self.workdir).as_posix() + ")\n\n"
+            + body + "\n")
+        return out
+
+    def _measurement_sentences(self, narration: str) -> List[str]:
+        """Spoken sentences for quality measurement (unknown panel ids kept)."""
+        from .video.cues import parse as parse_cues
+
+        return [s["text"] for s in parse_cues(narration, None)["sentences"]]
+
+    def _quality_report(self, chapter: str, narration: str, minutes: float,
+                        lint_lines: List[str], parsed: Dict[str, Any] | None) -> "Any":
+        """Conformance + quality + grounding report for one finished chapter.
+        Saves recaps/chapter_N.report.md and recaps/chapter_N.claims.json."""
+        from . import claimcheck, recap_quality
+
+        style = self._style()
+        sentences = self._measurement_sentences(narration)
+        measured = recap_quality.measure_sentences(sentences)
+        recap_cfg = self.cfg.recap or {}
+        min_words = int(recap_cfg.get("min_words", recap_quality.MIN_WORDS))
+        max_words = int(recap_cfg.get("max_words", recap_quality.MAX_WORDS))
+        sigs = recap_quality.signals(style, measured, min_words=min_words, max_words=max_words)
+        joins = recap_quality.join_signals(sentences, style)
+        joins_warn = recap_quality.join_warnings(joins)
+        tts_warn = recap_quality.tts_readiness_warnings(sentences)
+        panels = self.panels(chapter)
+        tagged_ids: List[str] = []
+        if parsed:
+            for s in parsed.get("sentences") or []:
+                tagged_ids.extend(s.get("panels") or [])
+        panel_warn = recap_quality.panel_usability_warnings(tagged_ids, panels, self.workdir, chapter)
+
+        claims_data: Dict[str, Any] = {}
+        try:
+            index = claimcheck.TranscriptIndex(self._transcript(chapter), self.memory,
+                                               upto=chapter)
+            claims_data = claimcheck.check_sentences(sentences, index)
+            claimcheck.write_report(self.recaps_dir, chapter, claims_data)
+        except UserError:
+            claims_data = {}   # no transcript on disk (re-run of an old chapter)
+
+        report = recap_quality.ChapterReport(
+            chapter=chapter, style=style, lint_lines=list(lint_lines),
+            tagged_ratio=float(parsed["tagged_ratio"]) if parsed else 0.0,
+            same_sentences=int(parsed.get("same_sentences", 0)) if parsed else 0,
+            signals=sigs, joins=joins, join_warnings=joins_warn,
+            tts_warnings=tts_warn, panel_warnings=panel_warn,
+            claims_summary=claims_data.get("summary", {}), words=measured["words"])
+        text = report.markdown()
+        out = self.recaps_dir / f"chapter_{chapter}.report.md"
+        atomic_write_text(out, text)
+        return report
+
+    def _merge_memory_update(self, chapter: str, part: Any) -> List[str]:
+        """Bible write-back (incident 2): the writer may supply the same
+        memory_update the transcript stage uses; it goes through the SAME
+        SeriesMemory.merge, so there is one writer path and no divergence."""
+        if not isinstance(part, dict):
+            return []
+        update = part.get("memory_update")
+        if not isinstance(update, dict) or not update:
+            return []
+        notes = self.memory.merge(update, f"chapter {chapter}")
+        self.memory.save(self.workdir / "series_memory.json")
+        return notes
+
     def _write_recap(self, chapter: str, narration: str, hook: str, minutes: float,
-                     summary: str = "") -> Path | None:
+                     summary: str = "") -> tuple[Path, Dict[str, Any]] | None:
         from .video import cues
 
         audio = self._has_audio(chapter)
@@ -874,7 +991,7 @@ class RecapBuilder:
             f"<!-- recap-meta {json.dumps(meta, ensure_ascii=False)} -->\n\n"
             f"{clean}\n",
         )
-        return out
+        return out, parsed
 
     # ---------------- provider mode ----------------
 
@@ -916,9 +1033,13 @@ class RecapBuilder:
                 continue
             for msg in self._check(chapter, narration)["warnings"]:
                 self.log(f"    ! chapter {chapter}: {msg}")
-            path = self._write_recap(chapter, narration, hook, minutes, summary)
-            if path is None:
+            written_pair = self._write_recap(chapter, narration, hook, minutes, summary)
+            if written_pair is None:
                 continue
+            path, parsed = written_pair
+            report = self._quality_report(chapter, narration, minutes, [], parsed)
+            self.log(f"    report: {report_path(self.recaps_dir, chapter).name}")
+            self.log(report.markdown().rstrip())
             self.log(f"    {_count_words(narration)} words -> {path.name}")
             written.append(path)
         return written
@@ -992,12 +1113,22 @@ class RecapBuilder:
         prompts_dir = self.task_dir / "prompts"
         prompts_dir.mkdir(parents=True)
         tagged = []
+        prompt_paths: Dict[str, Path] = {}
         for chapter in todo:
             sheets = sheet_paths(self.workdir, chapter) if self.panels(chapter) else []
             if sheets:
                 tagged.append(chapter)
-            atomic_write_text(prompts_dir / f"ch{chapter}.md",
+            prompt_paths[chapter] = prompts_dir / f"ch{chapter}.md"
+            atomic_write_text(prompt_paths[chapter],
                               self._prompt_for(chapter, minutes, sheets=sheets, range_chapters=chapters))
+
+        # Persisted BRIEF artifact (incident 11): everything the writer was
+        # given for each chapter, saved next to the recap at PREPARE time so
+        # it survives the task-dir cleanup after finalize. Any chapter can be
+        # regenerated identically later from this file alone.
+        briefs = []
+        for chapter in todo:
+            briefs.append(self._write_brief(chapter, minutes, prompt_paths[chapter], todo))
 
         rel = lambda p: str(p.relative_to(self.workdir)).replace("\\", "/")  # noqa: E731
         listing = "\n".join(
@@ -1047,12 +1178,20 @@ Write `{rel(self.task_dir / 'parts.json')}`:
 ```json
 {{
   "{todo[0]}": {{"narration": "...", "hook": "the opening line",
-    "summary": "3-5 sentences: events so far, where each main character is now, open threads"}}
+    "summary": "3-5 sentences: events so far, where each main character is now, open threads",
+    "memory_update": {{"characters": [], "world_facts": [], "plot_threads": []}}}}
 }}
 ```
 
 One key per chapter listed above. If you are interrupted, finalize saves the
 chapters that are done and keeps this task open for the rest.
+
+`memory_update` is OPTIONAL and uses the same shape the transcript stage
+uses (characters / world_facts / glossary / plot_threads). When present,
+finalize merges it into series_memory.json through the same memory module,
+so what a chapter's narration establishes compounds into the bible. Skip it
+when the transcript stage already recorded everything; include it when the
+recap establishes something new (a title, a relationship, a resolved thread).
 
 Optionally add `"_intro"` (~80 words) and `"_outro"` (~60 words) for a video
 covering exactly chapters {', '.join(todo)}.
@@ -1066,6 +1205,9 @@ covering exactly chapters {', '.join(todo)}.
         atomic_write_json(self.task_dir / "plan.json", {"chapters": todo, "minutes": minutes})
         out = self.task_dir / "TASK.md"
         atomic_write_text(out, doc)
+        if briefs:
+            self.log(f"  briefs persisted (survive finalize): "
+                     + ", ".join(b.name for b in briefs))
         return out
 
     def finalize(self) -> List[Path]:
@@ -1104,9 +1246,20 @@ covering exactly chapters {', '.join(todo)}.
                 continue
             for msg in report["warnings"]:
                 self.log(f"    ! chapter {chapter}: {msg}")
-            path = self._write_recap(chapter, narration, hook, minutes, summary)
-            if path is not None:
+            written_pair = self._write_recap(chapter, narration, hook, minutes, summary)
+            if written_pair is not None:
+                path, parsed = written_pair
                 written.append(path)
+                # Quality + grounding report (incidents 1, 6, 7, 9, 10), the
+                # full text saved to recaps/chapter_N.report.md and printed.
+                qreport = self._quality_report(chapter, narration, minutes, [], parsed)
+                self.log(f"    report: {report_path(self.recaps_dir, chapter).name}")
+                self.log(qreport.markdown().rstrip())
+                # Bible write-back (incident 2): the writer's optional
+                # memory_update, through the same merge the transcript
+                # stage uses.
+                for note in self._merge_memory_update(chapter, parts.get(chapter)):
+                    self.log(f"    memory: {note}")
 
         intro, outro = str(raw.get("_intro") or ""), str(raw.get("_outro") or "")
         if intro or outro:

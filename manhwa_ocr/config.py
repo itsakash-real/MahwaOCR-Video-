@@ -304,6 +304,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         #   slang. Writes from the FULL transcript (OCR + character and panel
         #   descriptions). Full spec: docs/RECAP_STYLE_MANHWABRO.md
         "style": "default",
+        # Owner's standing length rule (pinned; the quality report warns
+        # outside this band): 3-5 minutes of speech per chapter.
+        "min_words": 560,
+        "max_words": 920,
     },
 }
 
