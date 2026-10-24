@@ -1172,9 +1172,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--folder", help="use local images instead of downloading")
     p.add_argument("--chapter")
     p.add_argument("--next", action="store_true", help="next pending chapter from the link list")
-    p.add_argument("--shards", type=int, default=1,
+    p.add_argument("--shards", type=int, default=None,
                    help="split the tile list into N shard tasks (TASK_1.md ... TASK_N.md) so several "
-                        "agents can read in parallel; assemble merges the tile_results_shard_N.json files")
+                        "agents can read in parallel; assemble merges the tile_results_shard_N.json files. "
+                        "Default: computed from pipeline.agent_shard_tiles so no reader's context is oversized")
     ws(p)
     p.set_defaults(func=cmd_prepare)
 

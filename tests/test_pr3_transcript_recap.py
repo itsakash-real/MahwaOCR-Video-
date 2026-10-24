@@ -80,6 +80,40 @@ def test_prepare_shards_clamps_to_tile_count(tmp_path):
     assert manifest["shards"]["count"] < 99
 
 
+def test_prepare_auto_shards_computed_from_tile_bound(tmp_path):
+    # shards=None (the CLI default) computes ceil(tiles / agent_shard_tiles),
+    # so no reader is ever handed an unbounded chapter of images.
+    src = tmp_path / "pages"
+    src.mkdir()
+    for i in range(2):
+        Image.new("RGB", (900, 4000), "white").save(src / f"{i + 1}.png")
+    ws = tmp_path / "ws"
+    flow = AgentFlow(load_config(series__workdir=str(ws), series__name="T",
+                                 pipeline__agent_shard_tiles=2), log=lambda *_: None)
+    flow.prepare(chapter="1", folder=src)  # no shards= -> auto
+    work = w.chapter_work_dir(ws, "1")
+    manifest = json.loads((work / "manifest.json").read_text())
+    n_tiles = len(manifest["tiles"])
+    assert n_tiles >= 4
+    expected = -(-n_tiles // 2)
+    assert manifest["shards"]["count"] == expected
+    for k in range(1, expected + 1):
+        assert (work / f"TASK_{k}.md").exists()
+    index = (work / "TASK.md").read_text()
+    assert "PARALLEL" in index
+    assert "tile_results_shard_1.json" in index
+
+
+def test_prepare_auto_shards_single_for_small_chapters(tmp_path):
+    # A chapter that fits one shard keeps the plain TASK.md workflow.
+    _, _, work, manifest = _prepared(tmp_path, pages=1)  # default bound 20 -> 1 shard
+    assert manifest["shards"]["count"] == 1
+    assert (work / "TASK.md").exists()
+    assert not (work / "TASK_1.md").exists()
+    task = (work / "TASK.md").read_text()
+    assert "Write results incrementally" in task or "incrementally" in task
+
+
 def test_assemble_merges_shard_files(tmp_path):
     flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
     tiles = manifest["tiles"]
@@ -95,6 +129,154 @@ def test_assemble_merges_shard_files(tmp_path):
     assert flow.assemble(chapter="1").exists()
     raw = (work / "raw_blocks.txt").read_text()
     assert "alpha line" in raw and "beta line" in raw
+
+
+def test_tile_progress_counts_shard_files(tmp_path):
+    # A sharded chapter writes ONLY tile_results_shard_N.json; progress tools
+    # must see them, or the chapter can never leave the "reading" stage.
+    flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
+    tiles = manifest["tiles"]
+    half = len(tiles) // 2
+    (work / "tile_results_shard_1.json").write_text(json.dumps(
+        [{"id": t["id"], "blocks": []} for t in tiles[:half]]))
+    got, total, parses = w.tile_progress(work)
+    assert parses and total == len(tiles) and got == half
+    assert w.chapter_stage(ws, "1") == w.STAGE_READ_TILES
+    (work / "tile_results_shard_2.json").write_text(json.dumps(
+        [{"id": t["id"], "blocks": []} for t in tiles[half:]]))
+    got, total, parses = w.tile_progress(work)
+    assert parses and got == total
+    assert w.chapter_stage(ws, "1") == w.STAGE_ASSEMBLE
+
+
+def test_read_tiles_instruction_is_shard_aware_and_watches_staleness(tmp_path):
+    flow, ws, work, manifest = _prepared(tmp_path, pages=2, shards=2)
+    tiles = manifest["tiles"]
+    (work / "tile_results_shard_1.json").write_text(json.dumps(
+        [{"id": t["id"], "blocks": []} for t in tiles[: len(tiles) // 2]]))
+    text = w.stage_instruction(w.STAGE_READ_TILES, "1", ws, stale_minutes=None)
+    assert "shard" in text and "parallel" in text and "TASK.md" in text
+    assert "STALLED" not in text
+    # Fresh mtime: not stale even with a threshold.
+    text = w.stage_instruction(w.STAGE_READ_TILES, "1", ws, stale_minutes=5)
+    assert "STALLED" not in text
+    # 0.001 min = 0.06s threshold; sleep past it -> stale.
+    import time as _t
+    _t.sleep(0.1)
+    text = w.stage_instruction(w.STAGE_READ_TILES, "1", ws, stale_minutes=0.001)
+    assert "STALLED" in text and "kept" in text
+
+
+# ------------------------------------------------- provider stall watchdog
+
+
+class _SleepyProvider:
+    """A provider whose calls go quiet (no completion, no exception)."""
+
+    def __init__(self, seconds: float = 1.5):
+        self.seconds = seconds
+
+    def fingerprint(self) -> str:
+        return "sleepy"
+
+    def vision(self, system, prompt, images):
+        import time
+        time.sleep(self.seconds)
+        return '{"scene": "", "blocks": []}'
+
+    def text(self, system, prompt):
+        return '{"transcript": "ok"}'
+
+
+def test_stage1_stall_watchdog_fails_loudly(tmp_path):
+    import time as _t
+
+    from manhwa_ocr.util import UserError
+
+    provider = _SleepyProvider(seconds=1.5)
+    pipe = _pipeline(tmp_path, provider, vision_batch=1)
+    pipe.cfg.pipeline["stall_minutes"] = 0.01  # 0.6s without a completion -> hang
+    tiles = _tiles(tmp_path, 3)
+    t0 = _t.perf_counter()
+    with pytest.raises(UserError) as exc:
+        pipe._read_tiles(tiles, briefing="", chapter_label="chapter 1")
+    elapsed = _t.perf_counter() - t0
+    assert "no progress" in str(exc.value)
+    assert "cached" in str(exc.value)
+    assert elapsed < 5  # it failed fast instead of waiting out the sleep
+
+
+def test_stage1_watchdog_lets_healthy_reads_finish(tmp_path):
+    provider = _SleepyProvider(seconds=0)
+    pipe = _pipeline(tmp_path, provider, vision_batch=1)
+    pipe.cfg.pipeline["stall_minutes"] = 0.01
+    tiles = _tiles(tmp_path, 3)
+    out = pipe._read_tiles(tiles, briefing="", chapter_label="chapter 1")
+    assert len(out) == 3
+    assert all("error" not in r for r in out)
+
+
+# ------------------------------------------------- landscape credits pages
+
+
+def test_build_tiles_skips_landscape_banner_pages(tmp_path):
+    src = tmp_path / "pages"
+    src.mkdir()
+    Image.new("RGB", (1532, 1024), "white").save(src / "banner.png")   # Asura-style credits
+    Image.new("RGB", (900, 4000), "white").save(src / "strip.png")     # real webtoon page
+    pages = import_pages(sorted(src.glob("*.png")), tmp_path / "out")
+    tiles = build_tiles(pages, tmp_path / "tiles")
+    assert tiles, "the portrait strip must still produce tiles"
+    assert all(t.page_index != 1 for t in tiles), "the landscape banner (page 1) must be skipped"
+    # All tiles come from the strip (page 2).
+    assert {t.page_index for t in tiles} == {2}
+
+
+def test_build_tiles_keeps_all_landscape_when_that_is_the_whole_chapter(tmp_path):
+    src = tmp_path / "pages"
+    src.mkdir()
+    Image.new("RGB", (1400, 900), "white").save(src / "1.png")
+    Image.new("RGB", (1500, 800), "white").save(src / "2.png")
+    pages = import_pages(sorted(src.glob("*.png")), tmp_path / "out")
+    tiles = build_tiles(pages, tmp_path / "tiles")
+    assert len(tiles) == 2  # nothing dropped: an all-landscape source isn't banners
+
+
+# ------------------------------------------------- per-chapter timing report
+
+
+def test_finalize_writes_per_chapter_timing_report(tmp_path):
+    import time as _t
+
+    from manhwa_ocr.timing import read as timings_read  # noqa: F401 - clarity only
+
+    flow, ws, work, manifest = _prepared(tmp_path, pages=1)  # 3 tiles, 1 shard
+    ids = [t["id"] for t in manifest["tiles"]]
+    _t.sleep(0.05)
+    (work / "tile_results.json").write_text(
+        json.dumps([{"id": i, "scene": "s", "blocks": []} for i in ids]))
+    assert flow.assemble(chapter="1").exists()
+    _t.sleep(0.05)
+    (work / "assembled.json").write_text(json.dumps(
+        {"transcript": "## Scene 1\n\n**A:** \"hello there friend\"\n" * 3,
+         "summary": "things happen", "memory_update": {}}))
+    logs: list = []
+    flow.log = logs.append
+    out = flow.finalize(chapter="1")
+    assert out.exists()
+    report_file = ws / ".work" / "timing" / "chapter_1.json"
+    assert report_file.exists(), "the report must survive the chapter scratch cleanup"
+    report = json.loads(report_file.read_text())
+    stages = report["stages_s"]
+    assert stages["prepare"] is not None and stages["prepare"] >= 0
+    assert stages["read_tiles"] is not None and stages["read_tiles"] >= 0
+    assert stages["assemble"] is not None and stages["assemble"] >= 0
+    assert stages["answer_assembly"] is not None and stages["answer_assembly"] >= 0
+    assert stages["finalize"] is not None and stages["finalize"] >= 0
+    assert stages["total"] is not None and stages["total"] >= 0
+    assert report["tiles"]["total"] == len(ids) and report["tiles"]["read"] == len(ids)
+    assert any("timing report" in str(x) for x in logs)
+    assert any("per-stage timing" in str(x) for x in logs)
 
 
 def test_assemble_shard_entry_wins_over_single_file(tmp_path):

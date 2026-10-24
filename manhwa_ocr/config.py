@@ -47,6 +47,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_height_to_slice": 1800,
         # Downscale very wide pages before slicing (keeps tiles in model's sweet spot).
         "max_width": 1100,
+        # Pages wider than tall (reader-site credits banners, e.g. AsuraScans'
+        # first page) are skipped for reading; the page file itself is kept.
+        "drop_landscape_pages": True,
     },
     "download": {
         "timeout": 60,
@@ -261,6 +264,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # Tiles per vision() call. 1 = one call per tile (the old behaviour).
         # Higher values cut round-trips; each tile is still cached separately.
         "vision_batch": 1,
+        # Agent mode: maximum tiles per shard task. prepare() splits every
+        # chapter into ceil(tiles / this) shard tasks BY DEFAULT, because one
+        # agent reading a whole chapter of ~100+ tile images in a single
+        # context is the known context-blowup failure. Shards are sized from
+        # this bound, not hardcoded.
+        "agent_shard_tiles": 20,
+        # The instruction printed in TASK.md: how many shard workers the
+        # driving agent should run at once.
+        "max_parallel_shards": 6,
+        # Provider mode watchdog: if stage-1 tile reading makes no progress
+        # for this many minutes, the run fails loudly (cached tiles are kept)
+        # instead of hanging for hours.
+        "stall_minutes": 10,
         "cache": True,
         # Near-duplicate threshold for de-duplicating text across tile overlaps.
         "dedupe_threshold": 0.86,

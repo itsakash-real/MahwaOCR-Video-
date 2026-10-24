@@ -82,11 +82,17 @@ def next_steps(sess: Session) -> List[str]:
         return lines + [f"  ! {p}" for p in problems[:5]]
 
     malformed = [p for p in problems if "malformed" in p]
+    # The reading watchdog threshold comes from the config (pipeline.stale_minutes).
+    try:
+        stale_minutes = float(load_config(find_config()).pipeline.get("stale_minutes", 30))
+    except (TypeError, ValueError, OSError, FileNotFoundError, UserError):
+        stale_minutes = 30.0
     for chapter, _ in links:
         stage = chapter_stage(sess.path, chapter)
         if stage != STAGE_DONE:
             remaining = sum(1 for c, _ in links if chapter_stage(sess.path, c) != STAGE_DONE)
-            lines = stage_instruction(stage, chapter, sess.path, sess.slug).splitlines()
+            lines = stage_instruction(stage, chapter, sess.path, sess.slug,
+                                      stale_minutes=stale_minutes).splitlines()
             lines += ["", f"({remaining} chapter(s) remaining)"]
             if malformed:
                 lines += ["", "Fix these lines in chapters.txt:"] + [f"  ! {p}" for p in malformed[:5]]
