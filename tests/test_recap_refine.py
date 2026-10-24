@@ -319,3 +319,20 @@ def test_tts_readiness_warnings_surface_the_punctuation_contract():
     warns = tts_readiness_warnings(["He was incredibly calm — and then he struck hard."])
     assert any("dash-pause" in w for w in warns)
  
+
+
+def test_report_existing_regenerates_reports_without_touching_the_recap(tmp_path):
+    ws, b = _ws(tmp_path)
+    b.prepare(["1"], 6)
+    (b.task_dir / "parts.json").write_text(json.dumps(
+        {"1": {"narration": GOOD_BRO, "hook": "h", "summary": "s"}}), encoding="utf-8")
+    b.finalize()
+    recap = ws / "recaps" / "chapter_1.md"
+    before = recap.read_text(encoding="utf-8")
+    (ws / "recaps" / "chapter_1.report.md").unlink()
+    (ws / "recaps" / "chapter_1.claims.json").unlink()
+    reports = b.report_existing(["1"])
+    assert reports and reports[0].exists()
+    assert recap.read_text(encoding="utf-8") == before
+    assert "style" in json.loads(
+        (ws / "recaps" / "chapter_1.md").read_text(encoding="utf-8").split("recap-meta ")[1].split(" -->")[0])

@@ -896,14 +896,14 @@ class RecapBuilder:
 
         return [s["text"] for s in parse_cues(narration, None)["sentences"]]
 
-    def _quality_report(self, chapter: str, narration: str, minutes: float,
-                        lint_lines: List[str], parsed: Dict[str, Any] | None) -> "Any":
+    def _quality_report(self, chapter: str, sentences: List[str], minutes: float,
+                        lint_lines: List[str], parsed: Dict[str, Any] | None,
+                        style: str | None = None) -> "Any":
         """Conformance + quality + grounding report for one finished chapter.
         Saves recaps/chapter_N.report.md and recaps/chapter_N.claims.json."""
         from . import claimcheck, recap_quality
 
-        style = self._style()
-        sentences = self._measurement_sentences(narration)
+        style = style or self._style()
         measured = recap_quality.measure_sentences(sentences)
         recap_cfg = self.cfg.recap or {}
         min_words = int(recap_cfg.get("min_words", recap_quality.MIN_WORDS))
@@ -936,9 +936,38 @@ class RecapBuilder:
             tts_warnings=tts_warn, panel_warnings=panel_warn,
             claims_summary=claims_data.get("summary", {}), words=measured["words"])
         text = report.markdown()
-        out = self.recaps_dir / f"chapter_{chapter}.report.md"
-        atomic_write_text(out, text)
+        atomic_write_text(report_path(self.recaps_dir, chapter), text)
         return report
+
+    def report_existing(self, chapters: List[str]) -> List[Path]:
+        """Re-run conformance + quality + claim reports for chapters whose
+        recaps already exist (recap --report). Nothing is rewritten."""
+        from .video.cues import load_cues
+
+        out = []
+        for chapter in sort_chapters(require_chapter(c) for c in chapters):
+            path = self.recap_path(chapter)
+            if not path.exists():
+                self.log(f"  ! chapter {chapter} has no recap; nothing to report")
+                continue
+            meta = self._read_meta(path)
+            style = str(meta.get("style") or "default")
+            parsed = load_cues(self.workdir, chapter)
+            sentences = [s["text"] for s in (parsed or {}).get("sentences") or []]
+            if not sentences:
+                self.log(f"  ! chapter {chapter} has no cues.json; sentences "
+                         "cannot be measured (old untagged recap)")
+                continue
+            minutes = float(meta.get("target_minutes") or 6)
+            lint_lines = [f"[lint] skipped: {style} lane has no script lint"
+                          if style not in ("powerfantasy", "manhwabro") else ""]
+            lint_lines = [l for l in lint_lines if l]
+            report = self._quality_report(chapter, sentences, minutes, lint_lines,
+                                          parsed, style=style)
+            self.log(f"  report: {report_path(self.recaps_dir, chapter).name}")
+            self.log(report.markdown().rstrip())
+            out.append(report_path(self.recaps_dir, chapter))
+        return out
 
     def _merge_memory_update(self, chapter: str, part: Any) -> List[str]:
         """Bible write-back (incident 2): the writer may supply the same
@@ -969,6 +998,7 @@ class RecapBuilder:
         words = _count_words(clean)
         meta = {
             "chapter": chapter,
+            "style": self._style(),
             "words": words,
             "target_minutes": minutes,
             "hook": cues.strip_tags(hook),
@@ -1037,7 +1067,8 @@ class RecapBuilder:
             if written_pair is None:
                 continue
             path, parsed = written_pair
-            report = self._quality_report(chapter, narration, minutes, [], parsed)
+            report = self._quality_report(chapter, self._measurement_sentences(narration),
+                                          minutes, [], parsed)
             self.log(f"    report: {report_path(self.recaps_dir, chapter).name}")
             self.log(report.markdown().rstrip())
             self.log(f"    {_count_words(narration)} words -> {path.name}")
@@ -1252,7 +1283,8 @@ covering exactly chapters {', '.join(todo)}.
                 written.append(path)
                 # Quality + grounding report (incidents 1, 6, 7, 9, 10), the
                 # full text saved to recaps/chapter_N.report.md and printed.
-                qreport = self._quality_report(chapter, narration, minutes, [], parsed)
+                qreport = self._quality_report(chapter, self._measurement_sentences(narration),
+                                               minutes, [], parsed)
                 self.log(f"    report: {report_path(self.recaps_dir, chapter).name}")
                 self.log(qreport.markdown().rstrip())
                 # Bible write-back (incident 2): the writer's optional

@@ -353,6 +353,14 @@ def cmd_recap(args) -> int:
     if args.cancel:
         _log("Recap task discarded." if builder.cancel() else "No recap task in progress.")
         return 0
+    if args.report:
+        recapped = builder.recapped()
+        if not recapped:
+            raise UserError("No recaps yet to report on. Write some first:  recap --chapters 1-3 --prepare")
+        chapters = expand_chapters(args.chapters) if args.chapters else recapped
+        reports = builder.report_existing(chapters)
+        _log(f"{len(reports)} report(s) regenerated.")
+        return 0
     if args.finalize:
         written = builder.finalize()
         for p in written:
@@ -1196,6 +1204,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prepare", action="store_true", help="agent mode: write prompts for the agent")
     p.add_argument("--finalize", action="store_true", help="agent mode: save what the agent wrote")
     p.add_argument("--cancel", action="store_true", help="agent mode: discard an unfinished task")
+    p.add_argument("--report", action="store_true",
+                   help="regenerate the conformance + quality + claim reports for existing recaps")
     p.add_argument("--force", action="store_true", help="rewrite existing recaps")
     ws(p)
     p.set_defaults(func=cmd_recap)
