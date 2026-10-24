@@ -1548,12 +1548,15 @@ PF_SHADOW_BLUR = 10        # fourth engine fix): black, offset (0, +20px),
 PF_SHADOW_OPACITY = 0.40   # blur 10px, 40% opacity — under the panel only
 PF_FILL_ASPECT = 1.6       # panel aspect (w/h) at/above which it fills the frame
 PF_DRIFT_ASPECT_MAX = 0.72  # pillars narrower than this drift; wider ones zoom
-PF_DRIFT_SPEED = 0.0658    # drift speed, frame-heights per second. The reference
-                           # fixes SPEED and lets travel vary (B1d F2): 3.7% of
-                           # frame WIDTH per second at 16:9 ≈ 71 px/s at 1080p
-                           # (measured band 3.2-4.3% width/s). B1c instead fixed
-                           # travel at the cap and derived speed, which measured
-                           # slow (2.2-2.9% width/s) on the sample.
+PF_DRIFT_SPEED = 0.0667    # drift speed, frame-heights per second: 72 px/s at
+                           # 1080p exactly (0.0667 * 1080 = 72.0). The reference
+                           # fixes SPEED and lets travel vary (B1d F2): 3.75% of
+                           # frame WIDTH per second at 16:9 (measured band
+                           # 3.2-4.3% width/s; direct phase-correlation reads on
+                           # the reference's clean drift shots land at 69-72 px/s,
+                           # and 72 sits dead-centre of the band). B1c instead
+                           # fixed travel at the cap and derived speed, which
+                           # measured slow (2.2-2.9% width/s) on the sample.
 PF_DRIFT_MIN_TRAVEL = 0.05  # span travel floor, share of frame height (centering/
                            # oversize for very short spans; the motion itself
                            # always runs at PF_DRIFT_SPEED and may not finish it)
@@ -1575,9 +1578,11 @@ PF_ZOOM_OUT_FAST_RATE = 0.176  # zoom-OUT rate for a blast (B1e motion hint
                            # rate, per the user's detonator->explosion ruling
 PF_ZOOM_RATE = 0.05        # zoom-in rate per second (measured band 3.6-6.5%/s)
 PF_ZOOM_RATE_IMPACT = 0.088  # impact zoom-in rate per second (measured, clash shot)
-PF_ZOOM_MAX_TOTAL = 0.50   # total zoom cap: at +50% the scale HOLDS (measured
-                           # totals top out at +46%; the cap binds only on
-                           # shots longer than the reference ever runs)
+PF_ZOOM_MAX_TOTAL = 0.45   # total zoom cap: at +45% the scale HOLDS. The
+                           # reference's measured totals top out at +46%, and
+                           # its longest zoom shots hold rather than keep
+                           # growing — the cap binds on any zoom span past
+                           # 9s (standard rate) / 5.1s (impact rate)
 PF_MAX_UPSCALE = 2.4       # quality guard: never upscale a panel past this
 PF_STILL_LIMIT = 0.5       # spec: no image still for longer than this, seconds
 PF_MIN_SHOT = 0.3          # this mode's shot floor (measured minimum shot)

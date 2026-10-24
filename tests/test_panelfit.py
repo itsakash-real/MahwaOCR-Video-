@@ -36,7 +36,7 @@ def test_constants_pinned_across_config_planner_renderer():
     assert pf["bg_opacity"] == plan_mod.PF_BG_OPACITY == frames_mod.PFR_BG_OPACITY == 1.0
     assert pf["fill_aspect"] == plan_mod.PF_FILL_ASPECT == 1.6
     assert pf["drift_aspect_max"] == plan_mod.PF_DRIFT_ASPECT_MAX == 0.72
-    assert pf["drift_speed"] == plan_mod.PF_DRIFT_SPEED == 0.0658
+    assert pf["drift_speed"] == plan_mod.PF_DRIFT_SPEED == 0.0667
     assert pf["drift_min_travel"] == plan_mod.PF_DRIFT_MIN_TRAVEL == 0.05
     assert pf["drift_max_travel"] == plan_mod.PF_DRIFT_MAX_TRAVEL == 0.13
     assert pf["drift_headroom"] == plan_mod.PF_DRIFT_HEADROOM == 0.03
@@ -45,7 +45,7 @@ def test_constants_pinned_across_config_planner_renderer():
     # B1e: the blast zoom-out rate is exactly 2x the impact zoom-in rate.
     assert pf["zoom_out_fast_rate"] == plan_mod.PF_ZOOM_OUT_FAST_RATE == 0.176
     assert plan_mod.PF_ZOOM_OUT_FAST_RATE == 2 * plan_mod.PF_ZOOM_RATE_IMPACT
-    assert pf["zoom_max_total"] == plan_mod.PF_ZOOM_MAX_TOTAL == 0.50
+    assert pf["zoom_max_total"] == plan_mod.PF_ZOOM_MAX_TOTAL == 0.45
     assert pf["max_upscale"] == plan_mod.PF_MAX_UPSCALE == 2.4
     assert pf["still_limit"] == plan_mod.PF_STILL_LIMIT == 0.5
     assert pf["min_shot"] == plan_mod.PF_MIN_SHOT == 0.3
@@ -78,7 +78,7 @@ def test_fit_portrait_panel_by_height_zooms():
 def test_fit_narrow_pillar_drifts_oversized():
     kind, bw, bh, s = panelfit_fit(900, 1400, FMT, dur=2.0)
     assert kind == "drift"                      # aspect 0.64 < 0.72, h/w 1.56 < strip
-    # travel = clamp(0.0658 * 2.0) = 0.13 -> oversize 1 + 0.13 + 0.03 = 1.16
+    # travel = clamp(0.0667 * 2.0) = 0.13 -> oversize 1 + 0.13 + 0.03 = 1.16
     assert bh == pytest.approx(1080.0 * 1.16) and bw == pytest.approx(900 * 1080 / 1400 * 1.16)
 
 
@@ -123,10 +123,10 @@ def test_fit_never_stretches(pw, ph):
 
 
 def test_drift_travel_clamped_to_measured_band():
-    assert panelfit_drift_travel(1.0) == pytest.approx(0.0658)   # speed x duration
+    assert panelfit_drift_travel(1.0) == pytest.approx(0.0667)   # speed x duration
     assert panelfit_drift_travel(0.5) == pytest.approx(0.05)    # floor
     assert panelfit_drift_travel(10.0) == pytest.approx(0.13)   # cap
-    assert panelfit_drift_travel(1.47) == pytest.approx(0.0658 * 1.47, abs=0.001)
+    assert panelfit_drift_travel(1.47) == pytest.approx(0.0667 * 1.47, abs=0.001)
 
 
 def test_spec_zoom_is_a_constant_rate_not_a_fixed_total():
@@ -134,20 +134,20 @@ def test_spec_zoom_is_a_constant_rate_not_a_fixed_total():
     assert sp["kind"] == "zoom" and sp["dir"] == "in" and sp["bg"] is True
     assert sp["zoom_rate"] == 0.05 and sp["zoom_end"] == pytest.approx(1.10)
     sp10 = panelfit_spec(900, 1200, "push_in", FMT, {}, dur=10.0)
-    assert sp10["zoom_rate"] == 0.05 and sp10["zoom_end"] == pytest.approx(1.50)
+    assert sp10["zoom_rate"] == 0.05 and sp10["zoom_end"] == pytest.approx(1.45)
     # pull_out no longer reverses: the reference never zooms out.
     assert panelfit_spec(900, 1200, "pull_out", FMT, {})["dir"] == "in"
     assert panelfit_spec(1920, 1080, "push_in", FMT, {})["bg"] is False   # canvas-shaped
 
 
 def test_spec_zoom_total_is_capped():
-    # A shot long enough that rate x duration would pass +50%: the
+    # A shot long enough that rate x duration would pass +45%: the
     # total clamps at the cap; the RATE itself is untouched (the
     # renderer holds the scale once the cap is reached).
     sp = panelfit_spec(900, 1200, "push_in", FMT, {}, dur=20.0)
-    assert sp["zoom_rate"] == 0.05 and sp["zoom_end"] == pytest.approx(1.50)
+    assert sp["zoom_rate"] == 0.05 and sp["zoom_end"] == pytest.approx(1.45)
     hit = panelfit_spec(900, 1200, "push_in", FMT, {}, dur=10.0, impact=True)
-    assert hit["zoom_rate"] == 0.088 and hit["zoom_end"] == pytest.approx(1.50)
+    assert hit["zoom_rate"] == 0.088 and hit["zoom_end"] == pytest.approx(1.45)
 
 
 def test_spec_drift_and_impact_rates():
@@ -266,13 +266,13 @@ def test_render_zoom_grows_at_the_measured_rate():
 
 
 def test_render_zoom_holds_at_the_cap():
-    # 12s at +5.0%/s: the +50% cap is reached at t=10 — the scale at
+    # 12s at +5.0%/s: the +45% cap is reached at t=9 — the scale at
     # t=10.2 and t=11.8 must be the same (a hold, not a slowed rate),
-    # and clearly larger than at t=5.
+    # and clearly larger than at t=4.
     img = Image.new("RGB", (900, 1200), (200, 40, 40))
     ImageDraw.Draw(img).rectangle((300, 400, 600, 800), fill=(40, 40, 200))
     r = _renderer(img, panelfit_spec(900, 1200, "push_in", FMT, {}, dur=12.0), end=12.0)
-    w5 = _square_half_width(r.frame_array(5.0))
+    w5 = _square_half_width(r.frame_array(4.0))
     w10 = _square_half_width(r.frame_array(10.2))
     w11 = _square_half_width(r.frame_array(11.8))
     assert w5 and w10 and w11
@@ -289,7 +289,7 @@ def _boundary_y(arr):
 def test_render_drift_velocity_is_constant_and_small():
     # Top half red, bottom half blue: the boundary's frame y reads the
     # drift position directly. The drift runs at the pinned SPEED
-    # (0.0658 frame-heights/s ≈ 71 px/s at 1080p), NOT a full strip
+    # (72 px/s at 1080p = 0.0667 frame-heights/s), NOT a full strip
     # traversal and NOT a slow stretch of the travel over the shot.
     img = Image.new("RGB", (900, 1400), (255, 0, 0))
     ImageDraw.Draw(img).rectangle((0, 700, 900, 1399), fill=(0, 0, 255))

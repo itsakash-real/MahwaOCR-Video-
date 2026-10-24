@@ -52,10 +52,12 @@ video:
                           # naturally wide panel (aspect >= adaptive.wide_threshold) gets that
                           # same wide treatment; a narrower panel keeps its classic shape but
                           # without the equal-area shrink, so it isn't forced to the same small
-                          # size as every other shape. panelfit: no cards, no cropping -- every
-                          # panel WHOLE at its native aspect over a blurred 60% self-fill,
-                          # slow-zoom 100->108% or a LINEAR top->bottom scroll for tall
-                          # strips (see panelfit: below). fullframe: NO cards at all -- every
+                          # size as every other shape. panelfit: the MEASURED reference style --
+                          # every panel WHOLE at its native aspect over its own FULL-brightness
+                          # blurred fill, LINEAR 72px/s drift (capped 140px) or constant-rate
+                          # zoom-in (+5%/s, +8.8%/s impact, capped +45%), split-flap title
+                          # cards on timeline cues, NO captions, NO shake/flash
+                          # (see panelfit: below). fullframe: NO cards at all -- every
                           # shot is a full-bleed 16:9 camera viewport panning/zooming through
                           # the panel (see fullframe: below). Landscape only; portrait stays
                           # classic in both.
@@ -65,16 +67,31 @@ video:
   adaptive:
     wide_threshold: 1.333   # a panel's own aspect >= this (4:3) earns the wide treatment
   panelfit:
-    bg_blur: 50             # Gaussian radius (px at 1080p) of the blurred self-fill background
-    bg_opacity: 0.60        # background layer opacity over black
-    zoom_end: 1.08          # slow zoom end scale (100% -> 108%; pull_out reverses)
-    strip_aspect: 1.9       # panel height/width >= this = vertical strip (fit by width + scroll)
+    # Every value pinned to the MEASURED reference video (see
+    # plan.py PF_* constants; tests pin config == planner == renderer).
+    bg_blur: 50             # Gaussian radius (px at 1080p) of the cover-scaled blur fill
+    bg_opacity: 1.0         # FULL brightness: the reference has no dimming layer
+    shadow_dy: 20           # foreground drop shadow: black, offset (0, +20px),
+    shadow_blur: 10         # blur 10px,
+    shadow_opacity: 0.40    # opacity 40% -- between blur backdrop and panel
+    fill_aspect: 1.6        # panel aspect (w/h) >= this fills the frame full-bleed
+    drift_aspect_max: 0.72  # pillars narrower than this (w/h) drift; wider zoom
+    drift_speed: 0.0667     # 72 px/s at 1080p exactly; travel is derived
+    drift_min_travel: 0.05  # a drift span's travel floor (share of frame height)
+    drift_max_travel: 0.13  # travel cap: 140px at 1080p; at the cap the panel HOLDS
+    drift_headroom: 0.03    # extra oversize so a drift never exposes a panel edge
+    zoom_rate: 0.05         # zoom-in rate +5.0%/s (constant RATE, never a fixed total)
+    zoom_rate_impact: 0.088 # impact shots zoom at +8.8%/s instead (no shake/flash)
+    zoom_out_fast_rate: 0.176  # blast zoom-OUT rate (motion hint only): 2x impact
+    zoom_max_total: 0.45    # total zoom cap: at +45% the scale holds
     max_upscale: 2.4        # foreground is never upscaled past this
-    still_limit: 0.5        # seconds: nothing stays still longer (zero-static rule)
-    fx: true                # impact FX (0.2s shake + white flash) on flagged shots
-    shake_seconds: 0.2      # screen-shake duration on an impact beat
-    shake_amplitude: 10.0   # screen-shake amplitude, px at 1080p
-    flash_frames: 3         # white-flash length at impact cuts, frames (spec: 2-4)
+    still_limit: 0.5        # seconds: nothing stays still longer while motion remains
+    min_shot: 0.3           # this mode's shot floor (measured reference minimum)
+    split_above: 3.0        # sentences longer than this split in two (median ~2s shots)
+    split_min_piece: 1.2    # smallest piece such a split may produce
+    captions: false         # NO burned-in captions in this mode (measured: none)
+    title_cards: true       # timeline cues ("Age 4" / "Week 6") become split-flap cards
+    tts_gap_seconds: 0.11   # lands the measured ~0.20s narration gap
   fullframe:
     max_upscale: 2.4        # viewport source floor = frame / this (1920x1080 / 2.4 = 800x450 px);
                             # zoom depth is capped so no viewport ever sources from less
@@ -97,11 +114,9 @@ video:
   sfx_dir: null           # P3: folder (relative to series folder) with whoosh.mp3, impact.mp3,
   # ding.mp3, sting.mp3, scratch.mp3, rumble.mp3, hit.mp3. null = no SFX; missing files render
   # silent, never fail.
-  # CapCut-style auto-captions: 3-5 words at a time, key word yellow, bottom band.
-  # Burned in at render from video/chapter_N.captions.ass. true by default for NEW
-  # builds; old plans (no captions key) render without them -- run
-  # `video captions --chapter N` to add captions to an existing plan.
-  captions: true
+  # Captions are DISABLED: the reference video carries no burned-in text
+  # (panelfit mode pins them off regardless; this makes it global).
+  captions: false
   # Gentle grade: null = off; "subtle" = contrast +5%, saturation +5%. Off by default.
   grade: null
   # Beat sync: optional beat times (seconds) to snap interior cuts to, within +/-0.15s.
@@ -118,9 +133,10 @@ video:
     trim_v1: false          # Build 1 white-space trimmer: blank rows only, gutter colour
                             # detected per panel, caps + review flags recorded in panels.json
     trim_cap: 0.40          # max share of a panel's height cut from one side
-    trim_v2: false          # Rule 6 white-space eradication: full ink-bbox trim (white+black,
-                            # rows+cols) + slicing strips at large white gaps, at panel build.
-                            # The panelfit prep step (after the recap, before pair/plan).
+    trim_v2: true           # Rule 6 white-space eradication: full ink-bbox trim (white+black,
+                            # rows+cols) + slicing strips at white/black gaps >= 15px, at panel
+                            # build. REQUIRED for panelfit mode (the composed frame must carry
+                            # no glued panels and no white margins in either layer).
   # Bubble/text detector (ogkalu RT-DETR v2, Apache-2.0, ONNX int8). Boxes are cached
   # per panel under .work/video/chN/boxes/. Get the model file from
   # huggingface.co/ogkalu/comic-text-and-bubble-detector (detector_int8.onnx).

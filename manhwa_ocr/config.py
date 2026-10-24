@@ -120,10 +120,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # full-bleed; narrower panels are height-fit pillars
             "drift_aspect_max": 0.72,  # pillars narrower than this (w/h) get a gentle
                                        # vertical drift; wider pillars get a zoom-in
-            "drift_speed": 0.0658,     # drift speed, frame-heights/second — the
-                                       # invariant (B1d F2): 3.7% of frame WIDTH/s
-                                       # at 16:9 ≈ 71 px/s at 1080p (measured band
-                                       # 3.2-4.3% width/s); travel is derived
+            "drift_speed": 0.0667,     # drift speed, frame-heights/second — the
+                                       # invariant (B1d F2): 72 px/s at 1080p
+                                       # exactly (3.75% of frame WIDTH/s at 16:9;
+                                       # measured band 3.2-4.3% width/s); travel
+                                       # is derived
             "drift_min_travel": 0.05,  # a drift SPAN's travel floor, share of frame
                                        # height (measured totals: 5-13%); motion
                                        # still runs at drift_speed throughout
@@ -149,7 +150,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # its own — it forces the zoom geometry at
                                        # "zoom_rate" above, on panels that would
                                        # otherwise drift or traverse.
-            "zoom_max_total": 0.50,    # total zoom cap: at +50% the scale holds
+            "zoom_max_total": 0.45,    # total zoom cap: at +45% the scale holds
                                        # (measured totals top out at +46%)
             "max_upscale": 2.4,        # the foreground is never upscaled past this
                                        # (readability floor for small panels)
