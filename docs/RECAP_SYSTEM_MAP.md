@@ -222,11 +222,87 @@ garbage text); (iii) incident 4's quote-split is already half-fixed
 
 ## Part 4 — What this branch changes
 
-See `git log` on `refine/recap-system` and the sections below; each commit
-is small and test-covered. No style system text (SCRIPT/SPEEDRUN/
-POWERFANTASY/MANHWABRO systems or prompts) was modified; where a fix would
-have required touching a style prompt, it is listed in the final report as
-a proposal instead.
+Shipped on `refine/recap-system` (each commit small and test-covered; run
+`git log main..refine/recap-system` for the full list):
+
+1. **Tag integrity** (`manhwa_ocr/video/cues.py`, commit "fix(recap): tag
+   integrity"): the sentence splitter now protects terminators inside
+   bracketed editing cues (the production `[LOOP: ...?]` decapitation is
+   dead), inside quoted spans (interior `?`/`!`/`.` never split a spoken
+   sentence), and quote-final terminators followed by a lowercase word
+   (including `.` — previously only `?`/`!`). `tagged_ratio` counts
+   `{same}`-anchored sentences (honest number; `same_sentences` reported).
+   `cues.check` refuses: literal cue leaks in parsed sentences, lowercase
+   fragments, and scripts under a 50% hard tagging floor.
+2. **Context guarantee + persisted brief** (`script.py`): `_select` enforces
+   TRANSCRIPTS-FIRST for every lane (requested chapters always; the
+   contiguous span for the range lanes powerfantasy + manhwabro — the
+   documented `1-4,11` selection stays valid for other lanes). `prepare`
+   writes `recaps/chapter_N.brief.md` (context manifest + the exact system
+   and chapter prompts) at prepare time; it survives finalize's cleanup, so
+   any chapter can be regenerated identically later.
+3. **Bible write-back** (`script.py`): `parts.json` entries may carry an
+   optional `memory_update` (same shape as the transcript stage's);
+   finalize merges it through the same `SeriesMemory.merge`, closing the
+   continuity loop of incident 2 with one writer path.
+4. **Conformance + quality report** (`manhwa_ocr/recap_quality.py`,
+   `recap --report`): per chapter, saved to `recaps/chapter_N.report.md`
+   and printed in full — style-lint verdict, the Phase-3-validated quality
+   signals (all warnings with measured values; lane-gated where
+   validation proved separation), seam/join reads, downstream contracts
+   (TTS punctuation surfaced at writing time, incident 6; mask-risk /
+   text-only tagged panels surfaced from the session's QA file, incident
+   9), and the claim-check summary. `recap --report --chapters N`
+   regenerates reports for existing recaps without touching them.
+5. **Claim-check** (`manhwa_ocr/claimcheck.py`): rules-based grounding
+   audit per sentence (names vs transcript/bible entities, numbers,
+   long quotes), saved to `recaps/chapter_N.claims.json`; verdicts
+   supported / flagged / no-checkable-tokens, with transcript line
+   evidence. Designed false-alarm-averse; what rules cannot judge stays a
+   review step, and the report says which sentences those are.
+6. **Spec/code sync test** (`tests/test_recap_style_sync.py`): fails when a
+   style doc and the lint disagree on gate codes, quoted banned phrases,
+   required marker phrases, named code symbols, or the pinned length band
+   (560-920, pinned identically in `recap_quality` and `config.recap`).
+7. **recap-meta now records the lane** (`"style"`), so reports on existing
+   chapters measure against the style that wrote them.
+8. **Test hygiene**: the titlecards test resolves ffmpeg the way the
+   program does (imageio-ffmpeg bundle), and the two CLI tests pin their
+   config instead of inheriting the developer's live `manhwa-ocr.yaml`.
+
+NOT changed (deliberately): no style system text (`SCRIPT/SPEEDRUN/
+POWERFANTASY/MANHWABRO` systems or prompts) was touched; owner-locked
+voices are byte-identical. Proposals that WOULD require touching style
+prompts (listed for the owner, not applied): (a) an explicit
+anti-vague-claim instruction in POWERFANTASY_SYSTEM's hype-man rule;
+(b) a punctuation contract decision reconciling speedrun's em-dash voice
+with tts_lint's dash-pause refusal (the report surfaces the conflict, the
+owner must pick a side); (c) extending the manhwabro pivot-check from
+existence to placement (cold-open length enforcement).
+
+### Acceptance evidence (all numbers from files/commands on this machine)
+
+- Side-by-side (same chapter, same facts): "A Regressor's Tale of
+  Cultivation" ch1 written through the refined manhwabro flow
+  (`recaps/chapter_1.{md,report.md,claims.json,brief.md}` + tts/cues):
+  lint PASS, tagged 100%, 881 words, chained 87.0%, long 69.6%, vague 0,
+  witness reactions 8.7/100, persona 19.6/100 — every signal ok, 0 claim
+  flags. The constructed rejected-profile control
+  (`tests/fixtures/rejected_profile_control{.md,.report.md}`), same
+  chapter, same facts: lint-green and fully grounded, but chained 0.0%,
+  long 0.0%, vague 4, reactions 2.7/100, persona 0.0 — five quality
+  warnings. The gates separate craft, not content.
+- Existing shipped chapter (`recap --report` on chronicles ch1): surfaces
+  the production `[LOOP:` leak (claim flag on the leaked pseudo-sentence),
+  15 mask-risk tagged panels from the QA file, and the over-band length
+  (935 words) — the exact downstream waste incidents 5, 6, 7, 9 described,
+  now visible at writing time on a five-year-old shipped file.
+- Bible write-back visible: regressor `series_memory.json` now carries the
+  recap-established facts (the Emperor crash, the regression) and the open
+  thread, alongside the transcript-stage facts.
+- Fresh chapter through the refined flow: the regressor ch1 above IS it
+  (brief persisted before writing, gates before saving, reports and
+  write-back after).
 
 ### Evidence commands (Part 1/2 numbers)
 

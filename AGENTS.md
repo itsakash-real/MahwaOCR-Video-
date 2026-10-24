@@ -200,6 +200,16 @@ python -m manhwa_ocr recap --session "<name>" --finalize
 Chapters that already have a recap are skipped automatically, so asking for
 `1-10` after doing `1-4` only writes 5-10. `--force` rewrites existing ones.
 
+`prepare` also persists each chapter's writing brief (`recaps/chapter_N.brief.md`,
+the exact prompts and context the writer was given; it survives finalize).
+Finalize saves, next to each recap, a conformance + quality report
+(`chapter_N.report.md`) and a grounding audit (`chapter_N.claims.json`). Read
+both: fix WARN quality signals and FLAG claims before audio is recorded. For
+recaps that already exist, `recap --report --chapters N` regenerates the two
+reports without touching the recap. Finalize may also merge an optional
+`memory_update` from parts.json into `series_memory.json` (same shape the
+transcript stage uses) — supply one when the recap establishes something new.
+
 Only one recap task exists at a time. If `--prepare` says a task is already in
 progress, **finish it with `--finalize`** — don't discard work. Use
 `recap --cancel` only if the user asks. If you're interrupted partway, finalize
