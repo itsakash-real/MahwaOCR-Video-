@@ -31,8 +31,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # Assembly and recap calls return a whole chapter of text; truncated
         # output is unparseable, so they get a much larger budget.
         "text_max_tokens": 16000,
-        "timeout": 180,
-        "max_retries": 4,
+        # Fast-fail transport: hung connections are detected early and the
+        # key pool rotates / trips to the agent fallback instead of grinding.
+        "timeout": 90,
+        "max_retries": 3,
+        # Tile payload shaping (images.encode_image): tiles are downscaled and
+        # JPEG-compressed IN MEMORY before base64 -- a ~4-11MB PNG tile lands
+        # at ~180-350KB without changing what's on disk.
+        "image_max_width": 800,
+        "image_quality": 85,
+        # Consecutive key failures before a key is disabled (circuit breaker).
+        "circuit_breaker_threshold": 3,
     },
     "slicing": {
         # Tall webtoon strips must be cut up or the model sees a thumbnail.
@@ -323,24 +332,29 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "endscreen": False,
     },
     "pipeline": {
-        # Parallel vision calls. Keep modest to respect provider rate limits.
-        "concurrency": 4,
+        # Parallel vision calls across rotated keys (keep within provider RPM).
+        "concurrency": 6,
         # Tiles per vision() call. 1 = one call per tile (the old behaviour).
         # Higher values cut round-trips; each tile is still cached separately.
-        "vision_batch": 1,
+        "vision_batch": 4,
         # Agent mode: maximum tiles per shard task. prepare() splits every
         # chapter into ceil(tiles / this) shard tasks BY DEFAULT, because one
         # agent reading a whole chapter of ~100+ tile images in a single
         # context is the known context-blowup failure. Shards are sized from
-        # this bound, not hardcoded.
-        "agent_shard_tiles": 20,
+        # this bound, not hardcoded. 10 keeps each shard small enough for the
+        # hybrid fallback to parallelize quickly.
+        "agent_shard_tiles": 10,
+        # Hybrid fallback: provider failures / missing keys shift the
+        # UNRESOLVED tiles into agent-mode TASK_k.md shards (completed tiles
+        # are preserved in tile_results.json) instead of crashing the run.
+        "hybrid_agent_fallback": True,
         # The instruction printed in TASK.md: how many shard workers the
         # driving agent should run at once.
         "max_parallel_shards": 6,
         # Provider mode watchdog: if stage-1 tile reading makes no progress
         # for this many minutes, the run fails loudly (cached tiles are kept)
         # instead of hanging for hours.
-        "stall_minutes": 10,
+        "stall_minutes": 5,
         "cache": True,
         # Near-duplicate threshold for de-duplicating text across tile overlaps.
         "dedupe_threshold": 0.86,

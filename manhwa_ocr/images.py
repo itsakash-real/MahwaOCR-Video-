@@ -405,6 +405,29 @@ def image_hash(path: Path) -> str:
     return h.hexdigest()[:24]
 
 
-def encode_image(path: Path) -> tuple[str, str]:
-    """Return (base64_data, media_type) for a tile."""
-    return base64.standard_b64encode(path.read_bytes()).decode("ascii"), "image/png"
+def encode_image(path: Path, max_width: int = 800, jpeg_quality: int = 85) -> tuple[str, str]:
+    """Return (base64_data, media_type) for a tile, JPEG-compressed in memory.
+
+    Tiles are stored on disk as lossless PNG, which is right for slicing and
+    panel work but wrong as a vision payload: a typical tile is 4-11 MB base64.
+    Downscaling to `max_width` and re-encoding as JPEG at `jpeg_quality` lands
+    the same tile at roughly 180-350 KB -- a full chapter drops from hundreds of
+    megabytes to tens, and per-tile round-trips get correspondingly faster.
+    Alpha channels are flattened onto white first (JPEG has no alpha).
+    """
+    with Image.open(path) as img:
+        if img.mode in ("RGBA", "LA", "P"):
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            background.paste(img, mask=img.split()[-1] if "A" in img.mode else None)
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        if img.width > max_width:
+            scale = max_width / float(img.width)
+            target_height = max(1, int(float(img.height) * scale))
+            img = img.resize((max_width, target_height), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+    return base64.standard_b64encode(buf.getvalue()).decode("ascii"), "image/jpeg"

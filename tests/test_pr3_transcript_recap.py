@@ -211,7 +211,7 @@ def test_stage1_watchdog_lets_healthy_reads_finish(tmp_path):
     pipe = _pipeline(tmp_path, provider, vision_batch=1)
     pipe.cfg.pipeline["stall_minutes"] = 0.01
     tiles = _tiles(tmp_path, 3)
-    out = pipe._read_tiles(tiles, briefing="", chapter_label="chapter 1")
+    out, unresolved = pipe._read_tiles(tiles, briefing="", chapter_label="chapter 1")
     assert len(out) == 3
     assert all("error" not in r for r in out)
 
@@ -361,7 +361,7 @@ def _tiles(tmp_path: Path, n: int):
 def test_vision_batch_sends_several_tiles_per_call(tmp_path):
     provider = _StubProvider()
     pipe = _pipeline(tmp_path, provider, vision_batch=2)
-    results = pipe._read_tiles(_tiles(tmp_path, 3), briefing="", chapter_label="chapter 1")
+    results, _ = pipe._read_tiles(_tiles(tmp_path, 3), briefing="", chapter_label="chapter 1")
     # Two batches (2 + 1); the two groups run concurrently, so call order is not fixed.
     assert sorted(provider.calls) == [1, 2]
     assert [r["scene"] for r in results] == ["scene tile0.png", "scene tile1.png", "scene tile2.png"]
@@ -374,7 +374,7 @@ def test_vision_batch_sends_several_tiles_per_call(tmp_path):
 def test_vision_batch_falls_back_to_one_call_per_tile(tmp_path):
     provider = _StubProvider(batch_mode="garbage")
     pipe = _pipeline(tmp_path, provider, vision_batch=2)
-    results = pipe._read_tiles(_tiles(tmp_path, 2), briefing="", chapter_label="chapter 1")
+    results, _ = pipe._read_tiles(_tiles(tmp_path, 2), briefing="", chapter_label="chapter 1")
     assert provider.calls == [2, 1, 1]  # batch failed, then one call per tile
     assert len(results) == 2 and all("scene" in r for r in results)
 

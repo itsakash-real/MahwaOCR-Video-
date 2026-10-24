@@ -16,6 +16,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from .images import Tile, build_tiles, download_images, image_hash, import_pages
 from .memory import SeriesMemory
 from .merge import flatten
 from .prompts import CHAPTER_SYSTEM, PROMPT_VERSION, TILE_SYSTEM, render_chapter_prompt, render_tile_prompt
-from .providers import Provider, build_provider
+from .providers import Provider, ProviderError, ProviderExhaustedError, build_provider
 from .scrapers import discover_pages
 from .util import UserError, atomic_write_json, atomic_write_text, extract_json, require_chapter
 from .workspace import chapter_work_dir, clean_chapter
@@ -80,7 +81,16 @@ class Pipeline:
     def __init__(self, config: Config, log: Callable[[str], None] = print):
         self.cfg = config
         self.log = log
-        self.provider: Provider = build_provider(config.provider)
+        # The provider is built lazily-tolerant: with no API keys configured
+        # (kind: auto and none set), build_provider raises ProviderExhaustedError
+        # in well under a second. That is not a crash -- the run continues, and
+        # after slicing, every tile is handed to Agent Mode shards instead.
+        try:
+            self.provider: Provider | None = build_provider(config.provider)
+        except ProviderExhaustedError as exc:
+            self.provider = None
+            log(f"  ! provider unavailable: {exc}")
+            log("  ! hybrid fallback armed: tiles will shift to Agent Mode (TASK_k.md shards)")
         self.workdir = config.workdir
         self.memory_path = self.workdir / "series_memory.json"
         self.memory = SeriesMemory.load(self.memory_path, config.series_name)
@@ -89,6 +99,8 @@ class Pipeline:
     # ---------------- caching ----------------
 
     def _cache_key(self, tile: Tile, briefing: str) -> str:
+        if self.provider is None:
+            return ""   # agent-handoff runs never read through a provider
         h = hashlib.sha256()
         h.update(image_hash(tile.path).encode())
         h.update(self.provider.fingerprint().encode())
@@ -98,7 +110,7 @@ class Pipeline:
         return h.hexdigest()[:32]
 
     def _cache_get(self, key: str) -> Dict[str, Any] | None:
-        if not self.cfg.pipeline.get("cache", True):
+        if not key or not self.cfg.pipeline.get("cache", True):
             return None
         p = self.cache_dir / f"{key}.json"
         try:
@@ -108,7 +120,7 @@ class Pipeline:
         return data if isinstance(data, dict) and "error" not in data else None
 
     def _cache_put(self, key: str, value: Dict[str, Any]) -> None:
-        if self.cfg.pipeline.get("cache", True) and "error" not in value:
+        if key and self.cfg.pipeline.get("cache", True) and "error" not in value:
             atomic_write_json(self.cache_dir / f"{key}.json", value)
 
     # ---------------- stage 1 ----------------
@@ -196,7 +208,14 @@ class Pipeline:
             results[i] = res
         return [r for r in results if r is not None]
 
-    def _read_tiles(self, tiles: List[Tile], briefing: str, chapter_label: str) -> List[Dict]:
+    def _read_tiles(self, tiles: List[Tile], briefing: str, chapter_label: str
+                    ) -> tuple[List[Dict], List[int]]:
+        """Read every tile, returning (results, unresolved_indices).
+
+        A provider unit (tile or batch) that exhausts its retries or trips the
+        key pool's circuit breaker is marked UNRESOLVED instead of crashing the
+        run: the hybrid fallback then shifts exactly those tiles to Agent Mode,
+        keeping every completed result."""
         workers = max(1, int(self.cfg.pipeline.get("concurrency", 4)))
         batch = max(1, int(self.cfg.pipeline.get("vision_batch", 1)))
         # No-progress watchdog: every completed unit (tile or batch) bumps the
@@ -205,13 +224,26 @@ class Pipeline:
         # are kept, so a re-run resumes rather than restarts.
         stall_s = max(0.0, float(self.cfg.pipeline.get("stall_minutes", 10))) * 60
         results: List[Dict[str, Any]] = [{} for _ in tiles]
+        unresolved: set[int] = set()
+        lock = threading.Lock()
         counter = {"done": 0}
+
+        if self.provider is None:
+            self.log("    ! no provider available; all tiles shift to Agent Mode")
+            return results, list(range(len(tiles)))
 
         if batch <= 1:
             def run(unit: List[tuple[int, Tile]]):
                 (i, tile) = unit[0]
-                results[i] = self._read_tile(tile, briefing, chapter_label)
-                counter["done"] += 1
+                try:
+                    results[i] = self._read_tile(tile, briefing, chapter_label)
+                except ProviderError as exc:
+                    with lock:
+                        unresolved.add(i)
+                    self.log(f"    ! {tile.label}: {exc}; shifted to Agent Mode")
+                    return
+                with lock:
+                    counter["done"] += 1
                 self.log(f"    [{counter['done']}/{len(tiles)}] {tile.label}")
 
             units: List[List[tuple[int, Tile]]] = [
@@ -219,16 +251,23 @@ class Pipeline:
             ]
         else:
             def run(unit: List[tuple[int, Tile]]):
-                out = self._read_tile_batch([t for _, t in unit], briefing, chapter_label)
+                try:
+                    out = self._read_tile_batch([t for _, t in unit], briefing, chapter_label)
+                except ProviderError as exc:
+                    with lock:
+                        unresolved.update(i for i, _ in unit)
+                    self.log(f"    ! batch of {len(unit)} tiles: {exc}; shifted to Agent Mode")
+                    return
                 for (i, _), res in zip(unit, out):
                     results[i] = res
-                counter["done"] += len(unit)
+                with lock:
+                    counter["done"] += len(unit)
                 self.log(f"    [{counter['done']}/{len(tiles)}] batch of {len(unit)} tiles")
 
             units = [list(enumerate(tiles[s:s + batch], start=s)) for s in range(0, len(tiles), batch)]
 
         if not units:
-            return results
+            return results, []
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(run, unit) for unit in units]
@@ -255,7 +294,90 @@ class Pipeline:
                 deadline = time.monotonic() + (stall_s or float("inf"))
                 for f in done:
                     f.result()  # surface worker exceptions, as pool.map did
-        return results
+        return results, sorted(unresolved)
+
+    # ---------------- hybrid fallback ----------------
+
+    def _handoff_to_agent(self, *, chapter: str, chapter_dir: Path, tiles: List[Tile],
+                          results: List[Dict], unresolved: List[int], briefing: str,
+                          download_s: float, slice_s: float) -> None:
+        """Shift unresolved tiles to Agent Mode without losing any completed work.
+
+        Writes the same files agent-mode `prepare` writes (manifest.json,
+        TASK_k.md + TASK.md index via AgentFlow's own renderers, so the two
+        paths can never drift), plus tile_results.json holding every tile the
+        API DID read -- agents then only read what actually failed. Stops with
+        a loud, actionable UserError; nothing is lost and `next` picks the
+        chapter up from the read-tiles stage."""
+        from .agentflow import AgentFlow, _write_stage_times
+
+        flow = AgentFlow(self.cfg, self.log, None)
+        pending = set(unresolved)
+
+        done_entries = []
+        for i, t in enumerate(tiles):
+            if i in pending or i >= len(results):
+                continue
+            r = results[i]
+            if not isinstance(r, dict) or "error" in r:
+                continue
+            done_entries.append({
+                "id": f"p{t.page_index:03d}_t{t.tile_index:02d}",
+                "scene": r.get("scene", ""),
+                "blocks": r.get("blocks", []),
+            })
+
+        per_shard = max(1, int(self.cfg.pipeline.get("agent_shard_tiles", 10)))
+        pending_tiles = [tiles[i] for i in unresolved]
+        shards = max(1, -(-len(pending_tiles) // per_shard)) if pending_tiles else 1
+
+        manifest = {
+            "chapter": chapter,
+            "series": self.cfg.series_name,
+            "shards": {"count": shards},
+            "tiles": [
+                {
+                    "id": f"p{t.page_index:03d}_t{t.tile_index:02d}",
+                    "path": str(t.path.relative_to(self.workdir)).replace("\\", "/"),
+                    "label": t.label,
+                    "page": t.page_index,
+                    "top": t.top,
+                    "bottom": t.bottom,
+                    "width": t.width,
+                }
+                for t in tiles
+            ],
+        }
+        atomic_write_json(chapter_dir / "manifest.json", manifest)
+        if done_entries:
+            atomic_write_json(chapter_dir / "tile_results.json", done_entries)
+        _write_stage_times(chapter_dir, download_s=download_s, slice_s=slice_s,
+                           prepared_at=time.time(), tiles_total=len(tiles))
+
+        chunk = (len(pending_tiles) + shards - 1) // shards
+        for k in range(1, shards + 1):
+            part = pending_tiles[(k - 1) * chunk: k * chunk]
+            if not part:
+                continue
+            atomic_write_text(
+                chapter_dir / f"TASK_{k}.md",
+                flow._render_task(chapter, part, briefing, chapter_dir, shard=k, total_shards=shards),
+            )
+        atomic_write_text(chapter_dir / "TASK.md",
+                          flow._render_task_index(chapter, shards, chapter_dir))
+
+        self.log(f"  [HYBRID-FALLBACK] kept {len(done_entries)}/{len(tiles)} tiles read by the API")
+        self.log(f"  [HYBRID-FALLBACK] shifted {len(pending_tiles)}/{len(tiles)} unresolved tiles "
+                 f"to Agent Mode ({shards} shard(s) of <= {per_shard} tiles)")
+        raise UserError(
+            f"Chapter {chapter}: API reading could not finish {len(pending_tiles)} of {len(tiles)} "
+            f"tiles (no keys, quota exhausted, or provider failures). {len(done_entries)} completed "
+            "tiles were PRESERVED and the rest were sharded for Agent Mode -- nothing is lost.\n"
+            f"  Shards:      {chapter_dir / 'TASK.md'}\n"
+            "  Next:        run `python -m manhwa_ocr next` and do what it says (run the TASK_k.md "
+            "shard workers in parallel), then `assemble --chapter "
+            f"{chapter}` and `finalize --chapter {chapter}`."
+        )
 
     # ---------------- stage 2 ----------------
 
@@ -300,35 +422,51 @@ class Pipeline:
             return ChapterResult(chapter, out_path.read_text(encoding="utf-8"), "", 0, 0, out_path, [])
 
         if folder:
+            t_dl = time.monotonic()
             found = list_images(Path(folder))
             if not found:
                 raise UserError(f"No .png/.jpg/.webp images found in {folder}")
             pages = import_pages(found, chapter_dir / "pages", log=self.log)
             self.log(f"  {len(pages)} pages from {folder}")
+            download_s = time.monotonic() - t_dl
         elif url:
+            t_dl = time.monotonic()
             self.log("  discovering pages...")
             urls = discover_pages(url, self.cfg.download)
             self.log(f"  {len(urls)} pages found; downloading...")
             pages = download_images(urls, chapter_dir / "pages", referer=url, config=self.cfg.download,
                                       log=self.log, cache_dir=self.workdir / ".cache" / "pages")
+            download_s = time.monotonic() - t_dl
         else:
             raise UserError("Give a chapter URL or --folder.")
 
         self.log("  slicing...")
+        t_slice = time.monotonic()
         tiles = build_tiles(pages, chapter_dir / "tiles", config=self.cfg.slicing, log=self.log)
+        slice_s = time.monotonic() - t_slice
         self.log(f"  {len(pages)} pages -> {len(tiles)} tiles")
 
         briefing = self.memory.as_briefing()
         self.log("  reading tiles...")
         t_read = time.monotonic()
-        tile_results = self._read_tiles(tiles, briefing, label)
+        tile_results, unresolved = self._read_tiles(tiles, briefing, label)
         read_s = time.monotonic() - t_read
-        failed = sum(1 for r in tile_results if "error" in r)
-        if failed:
-            raise UserError(
-                f"{failed} of {len(tiles)} tiles got unusable responses, so the chapter was not "
-                "written (it would have gaps). Re-run the same command: good tiles are cached "
-                "and only the failed ones are retried."
+        errored = [i for i, r in enumerate(tile_results)
+                   if isinstance(r, dict) and "error" in r]
+        hybrid = bool(self.cfg.pipeline.get("hybrid_agent_fallback", True))
+        if hybrid:
+            unresolved = sorted(set(unresolved) | set(errored))
+        if unresolved:
+            if not hybrid:
+                raise UserError(
+                    f"{len(unresolved)} of {len(tiles)} tiles got unusable responses, so the chapter "
+                    "was not written (it would have gaps). Re-run the same command: good tiles are "
+                    "cached and only the failed ones are retried."
+                )
+            self._handoff_to_agent(
+                chapter=chapter, chapter_dir=chapter_dir, tiles=tiles,
+                results=tile_results, unresolved=unresolved, briefing=briefing,
+                download_s=download_s, slice_s=slice_s,
             )
 
         self.log("  assembling chapter...")
@@ -367,7 +505,7 @@ class Pipeline:
             "stages_s": {"prepare": None, "read_tiles": read_s, "assemble": assemble_s,
                          "answer_assembly": None, "finalize": finalize_s,
                          "total": read_s + assemble_s + finalize_s},
-            "tiles": {"total": len(tiles), "read": len(tiles) - failed, "shards": 1},
+            "tiles": {"total": len(tiles), "read": len(tiles) - len(errored), "shards": 1},
         }
         report_file = write_chapter_report(self.workdir, chapter, report)
         self.log(render_report_table(report))
