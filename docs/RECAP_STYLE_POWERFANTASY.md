@@ -95,7 +95,8 @@ The chapter prompt (`POWERFANTASY_PROMPT` in `manhwa_ocr/script.py`) carries:
 
 ## 5. The script lint gate (`manhwa_ocr/script_lint.py`)
 
-Modeled on `video/tts_lint.py`: pure regex checks, run in the finalize path
+`lint_powerfantasy` in `manhwa_ocr/script_lint.py` (registered in
+`manhwa_ocr/config.py`, `recap.style`): pure regex checks, run in the finalize path
 (and provider-mode generate) for this style only. A failing chapter is **not
 saved** — fix the narration and re-finalize, exactly like a tag error.
 

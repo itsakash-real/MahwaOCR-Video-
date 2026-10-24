@@ -125,24 +125,62 @@ def _restore_abbrev(text: str) -> str:
     return text.replace(_DOT, ".")
 
 
-# A quoted question/exclamation whose quote closes and is followed by a
-# lowercase word is a sub-clause inside a larger sentence ('she asked,
-# "is it over?" but no one answered'), not the end of one -- SENTENCE_END
-# otherwise splits right after the closing quote, orphaning the fragment
-# from the tag/panel that opened the sentence. Protect the terminator the
-# same way _protect_abbrev protects a dot, then restore it once the split
-# is done.
-_QUOTE_BANG, _QUOTE_Q = "\u0002", "\u0003"
-_QUOTE_CONTINUATION = re.compile(r'(["“][^"”\n]{1,200}?)([?!])(["”])(?=\s+[a-z])')
+# A quoted terminator whose quote closes and is followed by a lowercase
+# word is a sub-clause inside a larger sentence ('she asked, "is it over?"
+# but no one answered', 'he mutters "fine." and keeps walking'), not the
+# end of one -- SENTENCE_END otherwise splits right after the closing
+# quote, orphaning the fragment from the tag/panel that opened the
+# sentence. Protect the terminator the same way _protect_abbrev protects
+# a dot, then restore it once the split is done. A CAPITALISED word after
+# the closing quote still splits normally (a genuine new sentence).
+_QUOTE_BANG, _QUOTE_Q, _QUOTE_DOT, _QUOTE_ELLIPSIS = "\u0002", "\u0003", "\u0007", "\u0008"
+_QUOTE_CONTINUATION = re.compile(r'(["“][^"”\n]{1,200}?)([.!?])(["”])(?=\s+[a-z])')
+_QUOTE_MAP = {".": _QUOTE_DOT, "!": _QUOTE_BANG, "?": _QUOTE_Q, "…": _QUOTE_ELLIPSIS}
 
 
 def _protect_quoted_continuation(text: str) -> str:
     return _QUOTE_CONTINUATION.sub(
-        lambda m: m.group(1) + (_QUOTE_BANG if m.group(2) == "!" else _QUOTE_Q) + m.group(3), text)
+        lambda m: m.group(1) + _QUOTE_MAP[m.group(2)] + m.group(3), text)
 
 
 def _restore_quoted_continuation(text: str) -> str:
-    return text.replace(_QUOTE_BANG, "!").replace(_QUOTE_Q, "?")
+    return (text.replace(_QUOTE_BANG, "!").replace(_QUOTE_Q, "?")
+            .replace(_QUOTE_DOT, ".").replace(_QUOTE_ELLIPSIS, "…"))
+
+
+# A terminator INSIDE a quoted span ('he shouts "what is this? is this the
+# end?" and collapses') never ends the narrator's sentence: only the span's
+# final terminator, at the closing quote, may. Mask every interior one so
+# SENTENCE_END cannot split a spoken sentence mid-quote and orphan the rest
+# of it from its panel tag. The span's last character is left alone -- the
+# continuation rule above decides it.
+def _protect_quoted_interior(text: str) -> str:
+    def _span(m: re.Match) -> str:
+        inner = m.group(2)
+        head = inner[:-1] if inner and inner[-1] in ".!?" else inner
+        head = re.sub(r"[.!?]", lambda c: _QUOTE_MAP[c.group(0)], head)
+        tail = inner[len(head):]
+        return m.group(1) + head + tail + m.group(3)
+
+    return re.sub(r'(["“])([^"”\n]*)(["”])', _span, text)
+
+
+# Bracketed editing cues ("[LOOP: ...?]", "[music]") are never sentence
+# boundaries either. SENTENCE_END's trailing class contains "]", so a cue
+# that ends in "?]" or ".]" used to split AT the cue's closing bracket,
+# decapitating the cue: its literal text leaked into cues.json as an
+# untagged pseudo-sentence (later narrated aloud by `video tts`, which
+# speaks cues.json), while stealing the tag of the sentence it preceded.
+# Mask terminators inside every bracket span so a cue can never split.
+_CUE_TERMINATORS = re.compile(r"\[[^\]\n]*\]")
+
+
+def _protect_bracket_cues(text: str) -> str:
+    def _span(m: re.Match) -> str:
+        inner = re.sub(r"[.!?…]", lambda c: _QUOTE_MAP[c.group(0)], m.group(0)[1:-1])
+        return "[" + inner + "]"
+
+    return _CUE_TERMINATORS.sub(_span, text)
 
 
 def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = False) -> Dict[str, Any]:
@@ -175,10 +213,13 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
     body = "\n".join(kept_lines)
     body = re.sub(r"\s+", " ", body).strip()
     body = _protect_abbrev(body)
+    body = _protect_bracket_cues(body)
+    body = _protect_quoted_interior(body)
     body = _protect_quoted_continuation(body)
     sentences: List[Dict[str, Any]] = []
     unknown: List[str] = []
     tagged = 0
+    same_sentences = 0
     for chunk in SENTENCE_END.split(body):
         chunk = chunk.strip()
         if not chunk:
@@ -188,8 +229,9 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
         # strip the interleaved tokens BEFORE any text is derived, so they
         # can never pollute the spoken sentence.
         chunk_hook = bool(HOOK_INLINE.search(chunk) or "\x00HOOK\x00" in chunk)
-        chunk_loops = [m.strip() for m in LOOP_MARKER.findall(chunk)]
-        chunk_loops += [m.strip() for m in re.findall(r"\x00LOOP:([^\x00]+)\x00", chunk)]
+        chunk_loops = [_restore_quoted_continuation(m).strip() for m in LOOP_MARKER.findall(chunk)]
+        chunk_loops += [_restore_quoted_continuation(m).strip()
+                        for m in re.findall(r"\x00LOOP:([^\x00]+)\x00", chunk)]
         chunk = chunk.replace("\x00HOOK\x00", "")
         chunk = re.sub(r"\x00LOOP:[^\x00]+\x00", "", chunk).strip()
         if not chunk:
@@ -231,8 +273,14 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
             cues = carry["cues"] + cues
             chunk_hook = chunk_hook or bool(carry.get("hook"))
             chunk_loops = list(carry.get("loops") or []) + chunk_loops
-        if any(p != "same" for p in panels):
+        # Honest tagging count: a sentence anchored with {same} IS anchored
+        # (it deliberately stays on the current panel), so it counts as
+        # tagged. Only sentences with no panel and no {same} are untagged.
+        same_only = "same" in panels and not any(p != "same" for p in panels)
+        if same_only or any(p != "same" for p in panels):
             tagged += 1
+        if same_only:
+            same_sentences += 1
         sentence: Dict[str, Any] = {"text": text, "panels": [p for p in panels if p != "same"],
                           "same": "same" in panels and not any(p != "same" for p in panels),
                           "cues": sorted(set(cues)), "emphasis": [e for e in emphasis if e]}
@@ -245,6 +293,7 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
     return {
         "sentences": sentences,
         "tagged_ratio": round(tagged / len(sentences), 3) if sentences else 0.0,
+        "same_sentences": same_sentences,
         "unknown_panels": sorted(set(unknown)),
     }
 
@@ -252,8 +301,14 @@ def parse(narration: str, known_panels: Set[str] | None = None, spell: bool = Fa
 SHORT_SENTENCE_WORDS = 6      # a sentence under this many words is "tiny"
 TINY_RUN = 3                  # this many tiny sentences in a row is a run
 TAGGED_MIN = 0.90
+TAGGED_HARD_FLOOR = 0.50      # below this the recap is refused, not warned about
 MIN_HOLD = 3.0                # seconds a picture stays on screen (video.min_hold)
 NARRATION_WPM = 150
+
+# A literal editing cue that survived into a parsed sentence: the bracket
+# was never closed (or was decapitated by a split), so its text would be
+# spoken aloud by `video tts`, which reads cues.json sentence by sentence.
+_CUE_LEAK_RE = re.compile(r"\[(LOOP|HOOK|music|Panel|Beat)", re.IGNORECASE)
 
 
 def _snippet(text: str, n: int = 60) -> str:
@@ -310,9 +365,32 @@ def check(narration: str, panels: List[Dict[str, Any]], *, min_hold: float = MIN
             errors.append(f"sentence {n} (\"{_snippet(s['text'])}\") is tagged {pid}, which is {kind} and is never "
                           f"shown in the video.{hint}")
 
+    # Sentence-integrity guards: an editing cue that leaked into the spoken
+    # text, and a fragment a mis-split orphaned from its panel tag. Both are
+    # hard errors -- the recording would narrate the garbage.
+    for n, s in enumerate(sentences, start=1):
+        m = _CUE_LEAK_RE.search(s["text"])
+        if m:
+            errors.append(
+                f"sentence {n} leaks a literal editing cue ({m.group(0)}...): "
+                f"\"{_snippet(s['text'])}\". The bracket was probably never closed, or it "
+                "was written on the same line as the sentence it precedes. Put "
+                "[LOOP: ...] / [HOOK] alone on their own line and close the bracket.")
+        first_word = re.match(r"[\s\"“”']*(\w)", s["text"])
+        if first_word and first_word.group(1).islower():
+            errors.append(
+                f"sentence {n} starts lowercase (\"{_snippet(s['text'])}\"): it is a fragment "
+                "split off from the sentence (and panel tag) before it. Join it back into "
+                "one sentence, or make it a full sentence with its own panel tag.")
+
     if sentences:
         ratio = parsed["tagged_ratio"]
-        if ratio < TAGGED_MIN:
+        if ratio < TAGGED_HARD_FLOOR:
+            errors.append(
+                f"only {ratio:.0%} of sentences are anchored to a panel (panels or {{same}}); "
+                f"below {TAGGED_HARD_FLOOR:.0%} the video cannot follow the narration. "
+                "Tag every spoken sentence before finalizing.")
+        elif ratio < TAGGED_MIN:
             warnings.append(f"only {ratio:.0%} of sentences name a panel (aim for 95% or more; below "
                             f"{TAGGED_MIN:.0%} the video falls back on guessing which panel goes where)")
         run: List[int] = []

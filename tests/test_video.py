@@ -174,7 +174,9 @@ def test_cues_parse_tags_cues_and_emphasis():
     assert s[1]["same"] is True
     assert s[2]["cues"] == ["impact"] and s[3]["cues"] == ["beat"]
     assert s[0]["emphasis"] == ["unfamiliar"]
-    assert data["tagged_ratio"] == 0.75
+    # Honest ratio: the {same} sentence is anchored too, so all 4 count.
+    assert data["tagged_ratio"] == 1.0
+    assert data["same_sentences"] == 1
 
 
 def test_unknown_panel_ids_are_reported_not_used():
@@ -219,7 +221,7 @@ def test_recap_writes_clean_md_tts_and_cues(tmp_path):
     prompt = b._prompt_for("1", 6)
     assert "P001-01" in prompt and "{P003-02}" in prompt  # panel list + tagging instructions
     b.prepare(["1"], 6)
-    long = NARRATION + " " + "More happens next in the story. " * 15
+    long = NARRATION + " " + "{same} More happens next in the story. " * 15
     (b.task_dir / "parts.json").write_text(json.dumps({"1": {"narration": long, "hook": "{P001-01} x"}}))
     b.finalize()
     md = (ws / "recaps" / "chapter_1.md").read_text(encoding="utf-8")
@@ -817,6 +819,11 @@ def test_clip_and_compile(tmp_path):
 @needs_ffmpeg
 def test_cli_video_build_and_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("MANHWA_SESSIONS_ROOT", str(tmp_path))
+    # pin the config: the developer's live manhwa-ocr.yaml (video.mode,
+    # recap.style, ...) must not leak into this test
+    pinned = tmp_path / "pinned.yaml"
+    pinned.write_text("output_folder: {}\n".format(tmp_path), encoding="utf-8")
+    monkeypatch.setenv("MANHWA_CONFIG", str(pinned))
     store, sess, _ = _session_with_video(tmp_path, seconds=12)   # the real config's 3 s minimum needs room
     store.activate(sess.slug)
     assert cli(["video", "build", "--chapters", "1", "--preview", "--no-sync", "--workers", "1"]) == 0

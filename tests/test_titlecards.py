@@ -339,7 +339,10 @@ def test_title_card_render_keeps_the_audio_continuous(tmp_path):
             "chapter_cards": [], "sfx": [], "captions": []}
     out = render_mod.render(sess.path, "1", plan, VCFG, preview=True,
                             workers=1, log=lambda *_: None)
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(out), "-map", "0:a",
+    # resolve ffmpeg the way the program does (PATH first, then the
+    # imageio-ffmpeg bundle) -- a bare "ffmpeg" only works when it is on PATH
+    from manhwa_ocr.video.ffmpeg import ffmpeg_exe
+    raw = subprocess.run([ffmpeg_exe(), "-v", "error", "-i", str(out), "-map", "0:a",
                           "-ac", "1", "-ar", "8000", "-f", "f32le", "-"],
                          capture_output=True, check=True).stdout
     x = np.frombuffer(raw, dtype=np.float32)

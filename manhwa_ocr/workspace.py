@@ -130,9 +130,97 @@ def _cmd(args: str, session: str | None) -> str:
     return f"python -m manhwa_ocr {args}{pin}"
 
 
-def tile_progress(work: Path) -> tuple[int, int, bool]:
-    """(tiles_with_results, total_tiles, results_file_parses).
+def results_files(work: Path) -> List[Path]:
+    """Every tile-results file a chapter may have: the single-file form plus one
+    tile_results_shard_K.json per shard. Sharded chapters write ONLY shard files,
+    so progress tools must look at all of them, not just tile_results.json."""
+    out: List[Path] = []
+    single = work / "tile_results.json"
+    if single.exists():
+        out.append(single)
+    out.extend(sorted(work.glob("tile_results_shard_*.json")))
+    return out
 
+
+def newest_result_mtime(work: Path) -> float | None:
+    """When tile results were last written, or None when nothing was written yet."""
+    mtimes = [f.stat().st_mtime for f in results_files(work)]
+    try:
+        return max(mtimes) if mtimes else None
+    except OSError:
+        return None
+
+
+def _shard_count(work: Path) -> int:
+    """How many shard tasks prepare split this chapter into (1 = unsharded)."""
+    try:
+        manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+        return max(1, int((manifest.get("shards") or {}).get("count", 1)))
+    except (OSError, ValueError, TypeError):
+        return 1
+
+
+def _shard_progress(work: Path) -> tuple[int, int]:
+    """(shard tasks whose results file covers ALL their tiles, shard tasks)."""
+    try:
+        manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+        shards = max(1, int((manifest.get("shards") or {}).get("count", 1)))
+        ids = [t["id"] for t in manifest["tiles"]]
+    except (OSError, ValueError, TypeError, KeyError):
+        return 0, 1
+    if shards <= 1:
+        return 0, 1
+    from .util import read_agent_json
+
+    chunk = (len(ids) + shards - 1) // shards
+    complete = 0
+    for k in range(1, shards + 1):
+        want = set(ids[(k - 1) * chunk: k * chunk])
+        if not want:
+            complete += 1  # an empty shard is trivially done
+            continue
+        try:
+            data = read_agent_json(work / f"tile_results_shard_{k}.json", "")
+        except Exception:  # noqa: BLE001 - missing/unparseable = not done
+            continue
+        if isinstance(data, dict):
+            lists = [v for v in data.values() if isinstance(v, list)]
+            data = lists[0] if len(lists) == 1 else []
+        have = {str(e.get("id")) for e in data if isinstance(e, dict)} if isinstance(data, list) else set()
+        if want <= have:
+            complete += 1
+    return complete, shards
+
+
+def _staleness_line(work: Path, stale_minutes: float | None) -> str:
+    """The watchdog line for a reading stage that has gone quiet, or ''.
+
+    A reader that died mid-chapter leaves the session looking 'in progress'
+    forever; this turns hours of silence into an explicit instruction to
+    restart the missing workers (finished results are kept).
+    """
+    if stale_minutes is None or stale_minutes <= 0:
+        return ""
+    newest = newest_result_mtime(work)
+    if newest is None:
+        return ""
+    from datetime import datetime
+
+    quiet_for = datetime.now().timestamp() - newest
+    if quiet_for < float(stale_minutes) * 60:
+        return ""
+    since = datetime.fromtimestamp(newest).strftime("%H:%M")
+    return (
+        f"  ! Reading looks STALLED: no tile results written since {since} "
+        f"({quiet_for / 60:.0f} min ago). Restart the shard workers that are not "
+        "finished (see TASK.md); shards already written are kept, nothing is redone."
+    )
+
+
+def tile_progress(work: Path) -> tuple[int, int, bool]:
+    """(tiles_with_results, total_tiles, results_files_parse).
+
+    Counts every results file present (single + shards); the ids are unioned.
     Never raises: this runs on every `next` and every dashboard refresh.
     """
     from .util import read_agent_json  # local import keeps workspace dependency-light
@@ -142,21 +230,27 @@ def tile_progress(work: Path) -> tuple[int, int, bool]:
         ids = [t["id"] for t in manifest["tiles"]]
     except (OSError, ValueError, KeyError, TypeError):
         return 0, 0, True
-    results_path = work / "tile_results.json"
-    if not results_path.exists():
+    files = results_files(work)
+    if not files:
         return 0, len(ids), True
-    try:
-        data = read_agent_json(results_path, "")
-    except Exception:  # noqa: BLE001 - reported as "doesn't parse"
-        return 0, len(ids), False
-    if isinstance(data, dict):
-        lists = [v for v in data.values() if isinstance(v, list)]
-        data = lists[0] if len(lists) == 1 else [{"id": k, **v} for k, v in data.items() if isinstance(v, dict)]
-    entries = [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
-    got = {str(e.get("id")) for e in entries if e.get("id") is not None}
-    if not got and len(entries) == len(ids):
-        return len(ids), len(ids), True  # id-less but complete, matched by position
-    return len(got & set(ids)), len(ids), True
+    got: set = set()
+    for path in files:
+        try:
+            data = read_agent_json(path, "")
+        except Exception:  # noqa: BLE001 - reported as "doesn't parse"
+            return 0, len(ids), False
+        if isinstance(data, dict):
+            lists = [v for v in data.values() if isinstance(v, list)]
+            data = lists[0] if len(lists) == 1 else [{"id": k, **v} for k, v in data.items() if isinstance(v, dict)]
+        entries = [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
+        file_ids = {str(e.get("id")) for e in entries if e.get("id") is not None}
+        if not file_ids and entries and files == [work / "tile_results.json"]:
+            # Entries in order with the ids left off, in the ONE file covering
+            # the whole chapter: match by position (same rule as agentflow).
+            # A shard file without ids cannot be placed, so it counts as 0.
+            file_ids = set(ids[: len(entries)]) if len(entries) <= len(ids) else set(ids)
+        got |= file_ids & set(ids)
+    return len(got), len(ids), True
 
 
 def chapter_stage(session_root: Path, chapter: str) -> str:
@@ -194,7 +288,8 @@ def clear_failure(session_root: Path, chapter: str) -> None:
 
 
 def stage_instruction(
-    stage: str, chapter: str, session_root: Path, session: str | None = None
+    stage: str, chapter: str, session_root: Path, session: str | None = None,
+    stale_minutes: float | None = None,
 ) -> str:
     """Human/agent-readable next action for a chapter."""
     work = chapter_work_dir(session_root, chapter)
@@ -219,17 +314,32 @@ def stage_instruction(
         )
     if stage == STAGE_READ_TILES:
         got, total, parses = tile_progress(work)
+        shards = _shard_count(work)
+        done_shards, total_shards = _shard_progress(work)
         if not parses:
-            state = "tile_results.json exists but is not valid JSON; fix it, keeping what is already there"
+            state = "a tile results file exists but is not valid JSON; fix it, keeping what is already there"
+        elif shards > 1:
+            state = f"{got} of {total} tiles read (shards complete: {done_shards}/{total_shards})"
         elif got:
             state = f"{got} of {total} tiles read so far; read the remaining ones and add them"
         else:
             state = f"{total} tiles waiting to be read"
-        return (
-            f"Chapter {chapter}: {state}.\n"
-            f"  Tiles and prompt:  {rel(work / 'TASK.md')}\n"
-            f"  Write results to:  {rel(work / 'tile_results.json')}"
-        )
+        lines = [f"Chapter {chapter}: {state}."]
+        if shards > 1:
+            lines.append(
+                f"  Sharded into {shards} tasks: run the TASK_k.md workers in parallel"
+                f" (up to the cap the index names); each rewrites its own"
+                " tile_results_shard_k.json incrementally. Finished shards are kept."
+            )
+            lines.append(f"  Task index:  {rel(work / 'TASK.md')}")
+        else:
+            lines.append(f"  Tiles and prompt:  {rel(work / 'TASK.md')}")
+            lines.append(f"  Write results to:  {rel(work / 'tile_results.json')}")
+        if got < total:
+            stale = _staleness_line(work, stale_minutes)
+            if stale:
+                lines.append(stale)
+        return "\n".join(lines)
     if stage == STAGE_ASSEMBLE:
         return (
             f"Chapter {chapter}: all tiles are read.\n"

@@ -285,13 +285,15 @@ def _labels_in(folder: Path) -> List[str]:
     """chapter_<label>.md files in a folder, valid labels only, in chapter order.
 
     Zero-byte files are skipped so a crashed write can't mark a chapter done.
+    chapter_N.brief.md / chapter_N.report.md are companions of a recap, not
+    recaps themselves.
     """
     if not folder.exists():
         return []
     out = []
     for p in folder.glob("chapter_*.md"):
         label = p.stem[len("chapter_"):]
-        if valid_chapter(label) and p.is_file() and p.stat().st_size > 0:
+        if "." not in label and valid_chapter(label) and p.is_file() and p.stat().st_size > 0:
             out.append(label)
     return sorted(out, key=chapter_key)
 

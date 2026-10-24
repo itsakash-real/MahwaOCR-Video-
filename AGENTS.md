@@ -149,12 +149,20 @@ python -m manhwa_ocr prepare --next        # or --chapter N, or --folder ./image
 
 That downloads, slices, and writes `<session>/chN/TASK.md`. Read that file. It
 contains the tile list, the exact prompt to apply, and where to write results.
+Chapters are auto-sharded (`TASK_1.md`...`TASK_K.md`, sized from
+`pipeline.agent_shard_tiles`): run the shard tasks **in parallel** (sub-agents,
+up to the cap the index names) — each writes its own
+`tile_results_shard_K.json` and rewrites it after every tile it reads, so an
+interrupted worker loses at most one tile and finished shards are never redone.
 Then, for that chapter:
 
-1. Read the tile images (batch a few at a time) and write `chN/tile_results.json`.
+1. Read the tile images (batch a few at a time) and write the shard results
+   files (or `chN/tile_results.json` on a single-shard chapter).
 2. `python -m manhwa_ocr assemble --chapter N` → writes `ASSEMBLE.md`.
 3. Answer that prompt into `chN/assembled.json`.
-4. `python -m manhwa_ocr finalize --chapter N` → writes the chapter, updates memory.
+4. `python -m manhwa_ocr finalize --chapter N` → writes the chapter, updates
+   memory, and prints the per-chapter timing report
+   (`.work/timing/chapter_N.json`).
 
 Then run `status` again and repeat for the next pending chapter. Process **in
 order** so series memory accumulates correctly.
@@ -191,6 +199,16 @@ python -m manhwa_ocr recap --session "<name>" --finalize
 
 Chapters that already have a recap are skipped automatically, so asking for
 `1-10` after doing `1-4` only writes 5-10. `--force` rewrites existing ones.
+
+`prepare` also persists each chapter's writing brief (`recaps/chapter_N.brief.md`,
+the exact prompts and context the writer was given; it survives finalize).
+Finalize saves, next to each recap, a conformance + quality report
+(`chapter_N.report.md`) and a grounding audit (`chapter_N.claims.json`). Read
+both: fix WARN quality signals and FLAG claims before audio is recorded. For
+recaps that already exist, `recap --report --chapters N` regenerates the two
+reports without touching the recap. Finalize may also merge an optional
+`memory_update` from parts.json into `series_memory.json` (same shape the
+transcript stage uses) — supply one when the recap establishes something new.
 
 Only one recap task exists at a time. If `--prepare` says a task is already in
 progress, **finish it with `--finalize`** — don't discard work. Use

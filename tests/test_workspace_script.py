@@ -446,6 +446,11 @@ def test_next_reports_unfinished_recap_task_first(tmp_path):
 
 def test_cli_recap_and_compile_by_session_name(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("MANHWA_SESSIONS_ROOT", str(tmp_path))
+    # pin the config: the developer's live manhwa-ocr.yaml (e.g. a global
+    # recap.style lane) must not change which lint this CLI test runs under
+    pinned = tmp_path / "pinned.yaml"
+    pinned.write_text("output_folder: {}\n".format(tmp_path), encoding="utf-8")
+    monkeypatch.setenv("MANHWA_CONFIG", str(pinned))
     assert cli_main(["start", "My Series", "https://x.com/1", "https://x.com/2"]) == 0
     sess = SessionStore(tmp_path).get("My Series")
     for c in ("1", "2"):
