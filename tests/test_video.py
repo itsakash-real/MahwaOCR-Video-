@@ -819,6 +819,11 @@ def test_clip_and_compile(tmp_path):
 @needs_ffmpeg
 def test_cli_video_build_and_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("MANHWA_SESSIONS_ROOT", str(tmp_path))
+    # pin the config: the developer's live manhwa-ocr.yaml (video.mode,
+    # recap.style, ...) must not leak into this test
+    pinned = tmp_path / "pinned.yaml"
+    pinned.write_text("output_folder: {}\n".format(tmp_path), encoding="utf-8")
+    monkeypatch.setenv("MANHWA_CONFIG", str(pinned))
     store, sess, _ = _session_with_video(tmp_path, seconds=12)   # the real config's 3 s minimum needs room
     store.activate(sess.slug)
     assert cli(["video", "build", "--chapters", "1", "--preview", "--no-sync", "--workers", "1"]) == 0
