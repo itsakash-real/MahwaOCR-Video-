@@ -146,6 +146,22 @@ def test_render_is_static_first_frame_equals_last_frame():
     assert np.array_equal(r.frame_array(0.5), r.frame_array(2.0))
 
 
+def test_render_placed_last_shot_ignores_the_video_end_fade():
+    # Regression: ShotRenderer applied the global end_fade (a 1s fade
+    # to black on the final shot) to placed shots too, breaking the
+    # mode's "first frame is pixel-identical to its last" promise on
+    # exactly the shot a viewer ends on. A placed shot must not fade.
+    img = Image.new("RGB", (900, 1200), (200, 40, 40))
+    ImageDraw.Draw(img).rectangle((300, 400, 600, 800), fill=(40, 40, 200))
+    shot = {"id": "S001", "start": 0.0, "end": 4.0, "layout": "single", "background": "blur",
+            "cards": [{"panel": "P001-01", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0.0,
+                       "motion": "push_in", "placed": placed_spec(900, 1200, FMT)}],
+            "effects": [], "placed": True, "sentence": None, "callouts": [], "exit": "fade_out"}
+    r = ShotRenderer(shot, {"P001-01": img}, FMT, video_end=4.0, end_fade=True)
+    assert r.fade_from is None
+    assert np.array_equal(r.frame_array(0.05), r.frame_array(3.99))
+
+
 def test_placed_view_place_is_time_invariant_and_touches_the_walls():
     img = Image.new("RGB", (900, 1200), (120, 90, 70))
     card = {"panel": "P001-01", "crop": [0, 0, 1, 1], "enter": "cut", "at": 0.0,
@@ -260,3 +276,170 @@ def test_qa_flags_a_floating_foreground():
                            "base_h": c["placed"]["base_h"] * 0.5}
     qa = build_mod.quality_report(plan, panels, None, 3.0)
     assert any("placed" in f for f in qa["failures"])
+
+
+# --------------------------------------------------------------- prep edge-trim
+#
+# The white-space defect: panels carry BAKED-IN white page margins
+# inside the panel image. Placed prep (plan._placed_pass) now shaves
+# every unit on all four edges before fit — reusing the wide-mode
+# detector crops.trim_blank_edges (rows directly, columns via the
+# transposed image) — records the rect in the spec, fits on the
+# trimmed bounds, and falls back to the untrimmed unit (flagged,
+# never dropped) when no art bounds can be found.
+
+
+def _textured_rect(d, box, fill=(170, 60, 50), alt=(60, 120, 160), line=(30, 25, 20)):
+    # Coarse checkerboard texture (36px cells): the trim detector
+    # analyses at 120px wide, where fine line art averages flat and
+    # (correctly) reads as no-art — the texture must survive that
+    # downscale, like real panel shading does.
+    x0, y0, x1, y1 = box
+    d.rectangle(box, fill=fill)
+    cell = 36
+    for yy in range(y0, y1 + 1, cell):
+        for xx in range(x0, x1 + 1, cell):
+            if ((xx - x0) // cell + (yy - y0) // cell) % 2:
+                d.rectangle((xx, yy, min(xx + cell - 1, x1), min(yy + cell - 1, y1)), fill=alt)
+    d.rectangle(box, outline=line, width=3)
+
+
+def _margin_img(w=600, h=800, rect=(60, 200, 540, 700)):
+    """A white panel whose textured art sits inside white margins on
+    all four sides: rect = (x0, y0, x1, y1) in pixels."""
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    _textured_rect(ImageDraw.Draw(img), rect)
+    return img
+
+
+def test_placed_trim_rect_shaves_all_four_edges():
+    rect = plan_mod.placed_trim_rect(_margin_img())
+    assert rect is not None
+    # Art bounds in fractions: (60/600, 200/800, 540/600, 700/800).
+    assert rect == pytest.approx((0.10, 0.25, 0.90, 0.875), abs=0.03)
+
+
+def test_placed_trim_rect_is_zero_when_art_touches_every_edge():
+    img = Image.new("RGB", (600, 800), (255, 255, 255))
+    _textured_rect(ImageDraw.Draw(img), (0, 0, 599, 799))
+    assert plan_mod.placed_trim_rect(img) == (0.0, 0.0, 1.0, 1.0)
+
+
+def test_placed_trim_rect_none_when_no_art_can_be_found():
+    # A mostly-white unit: the detector's no-art guard refuses, so the
+    # caller falls back instead of trimming the unit away to nothing.
+    assert plan_mod.placed_trim_rect(Image.new("RGB", (600, 800), (255, 255, 255))) is None
+
+
+def _placed_plan_custom(panels, image_for, sentences, slice_hints=None):
+    vcfg = {**VCFG, "mode": "placed"}
+    return build_plan(chapter="1", panels_data={"panels": panels, "fingerprint": "pltrim"},
+                      duration=5.0, audio=None, vcfg=vcfg, image_for=image_for,
+                      sentences=sentences, slice_hints=slice_hints)
+
+
+def _one(pid, text="one"):
+    return [{"start": 0.0, "text": text, "panels": [pid], "cues": [], "emphasis": []}]
+
+
+def test_build_plan_placed_trims_baked_in_margins_before_fit():
+    panels = [{"id": "P009-01", "width": 600, "height": 800, "text": ""}]
+    plan = _placed_plan_custom(panels, lambda p: _margin_img(), _one("P009-01"))
+    spec = plan["shots"][0]["cards"][0]["placed"]
+    # The trim rect is recorded in the plan, per unit, as fractions.
+    assert spec["trim"] == pytest.approx([0.10, 0.25, 0.90, 0.875], abs=0.03)
+    assert spec["trim_fallback"] is False
+    # Fit ran on the TRIMMED bounds (480x500 art), not the raw panel
+    # (600x800): untrimmed, base_w would be 810; trimmed it is ~1037.
+    assert spec["base_w"] == pytest.approx(480 / 500 * 1080, rel=0.06)
+    assert spec["base_h"] == pytest.approx(1080.0, rel=0.02)
+    assert spec["touches"] == "top_bottom"
+    assert plan["placed_trimmed"] == ["P009-01"]
+    assert plan["placed_trim_fallback"] == []
+    assert validate(plan, {"P009-01"}) == []
+    qa = build_mod.quality_report(plan, {"panels": panels}, None, 3.0)
+    assert not any("placed" in f for f in qa["failures"])
+    assert qa["placed_trimmed"] == ["P009-01"]
+
+
+def test_build_plan_placed_clean_panel_passes_through_untrimmed():
+    panels = [{"id": "P009-03", "width": 600, "height": 800, "text": ""}]
+    img = Image.new("RGB", (600, 800), (255, 255, 255))
+    _textured_rect(ImageDraw.Draw(img), (0, 0, 599, 799))   # art touches every edge
+    plan = _placed_plan_custom(panels, lambda p: img, _one("P009-03"))
+    spec = plan["shots"][0]["cards"][0]["placed"]
+    assert spec["trim"] == [0.0, 0.0, 1.0, 1.0]
+    assert spec["trim_fallback"] is False
+    assert plan["placed_trimmed"] == [] and plan["placed_trim_fallback"] == []
+    # Zero trim => the spec is exactly the pre-trim placed spec.
+    want = placed_spec(600, 800, FMT)
+    assert (spec["base_w"], spec["base_h"], spec["touches"]) \
+        == (want["base_w"], want["base_h"], want["touches"])
+
+
+def test_build_plan_placed_no_art_unit_falls_back_flagged_not_dropped():
+    panels = [{"id": "P009-02", "width": 600, "height": 800, "text": ""}]
+    white = Image.new("RGB", (600, 800), (255, 255, 255))
+    plan = _placed_plan_custom(panels, lambda p: white, _one("P009-02"))
+    cards = [c for s in plan["shots"] for c in s["cards"]]
+    assert [c["panel"] for c in cards] == ["P009-02"]      # kept, never dropped
+    spec = cards[0]["placed"]
+    assert spec["trim"] == [0.0, 0.0, 1.0, 1.0]            # untrimmed fallback
+    assert spec["trim_fallback"] is True
+    want = placed_spec(600, 800, FMT)                      # fitted on the whole unit
+    assert (spec["base_w"], spec["base_h"]) == (want["base_w"], want["base_h"])
+    assert plan["placed_trim_fallback"] == ["P009-02"]
+    assert plan["placed_trimmed"] == []
+    assert validate(plan, {"P009-02"}) == []
+    qa = build_mod.quality_report(plan, {"panels": panels}, None, 3.0)
+    assert not any("placed" in f for f in qa["failures"])
+    assert qa["placed_trim_fallback"] == ["P009-02"]
+
+
+def test_build_plan_placed_slice_unit_is_trimmed_after_slicing():
+    # Top band: textured art edge to edge. Bottom band: white with an
+    # inset art rect — its margins are INSIDE the band, so only a trim
+    # applied after slicing (on the band's own image) can shave them.
+    img = Image.new("RGB", (600, 1200), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    _textured_rect(d, (0, 0, 599, 599), fill=(120, 90, 70))
+    _textured_rect(d, (60, 660, 540, 1140))
+    panels = [{"id": "P001-01", "width": 600, "height": 1200, "text": ""}]
+    plan = _placed_plan_custom(panels, lambda p: img, _one("P001-01"),
+                               slice_hints={"P001-01": {"slice": [0.5]}})
+    specs = {}
+    for s in plan["shots"]:
+        for c in s["cards"]:
+            if c.get("slice"):
+                specs[tuple(c["slice"])] = c["placed"]
+    assert set(specs) == {(0.0, 0.5), (0.5, 1.0)}
+    assert specs[(0.0, 0.5)]["trim"] == [0.0, 0.0, 1.0, 1.0]
+    band = specs[(0.5, 1.0)]
+    # Band-relative art bounds: x 60..540 of 600, y 60..540 of 600.
+    assert band["trim"] == pytest.approx([0.10, 0.10, 0.90, 0.90], abs=0.04)
+    # Trimmed band is ~480x480: fitted square, touching top/bottom.
+    assert band["base_w"] == pytest.approx(1080.0, rel=0.08)
+    assert band["base_h"] == pytest.approx(1080.0, rel=0.08)
+    assert band["touches"] == "top_bottom"
+    assert plan["placed_trimmed"] == ["P001-01"]
+    assert validate(plan, {"P001-01"}) == []
+
+
+def test_validate_rejects_a_malformed_placed_trim_rect():
+    bad = {**placed_spec(900, 1200, FMT), "trim": [0.5, 0.0, 0.4, 1.0],
+           "trim_fallback": False}
+    assert any("placed" in e for e in validate(_plan_with_spec(bad), {"P001-01"}))
+
+
+def test_render_placed_uses_the_trimmed_art_for_foreground_and_backdrop():
+    img = _margin_img(rect=(90, 120, 510, 680))   # art 420x560, margins all round
+    spec = {**placed_spec(420, 560, FMT), "trim": [0.15, 0.15, 0.85, 0.85],
+            "trim_fallback": False}
+    r = _renderer(img, spec)
+    f = r.frame_array(0.1)
+    top_centre = f[2, 960].astype(int)            # foreground touches the top wall
+    assert not (top_centre[0] > 240 and top_centre[1] > 240 and top_centre[2] > 240)  # NOT the white margin
+    centre = f[540, 960].astype(int)              # an art cell of the checkerboard
+    assert centre[0] > 120 and centre[1] < 110    # the red fill cell, not white, not the alt cell
+    corner = f[10, 10].astype(int)                # backdrop: blur of the TRIMMED art
+    assert not (corner[0] > 240 and corner[1] > 240)     # never the white margin

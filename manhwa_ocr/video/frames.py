@@ -962,6 +962,26 @@ class PanelFitView:
             _y1 = int(round(_f1 * panel.height))
             if 0 <= _y0 < _y1 <= panel.height:
                 panel = panel.crop((0, _y0, panel.width, _y1))
+        # Placed mode only: the planner's unit-level edge-trim (the
+        # spec's "trim" rect, unit fractions - plan.placed_trim_rect).
+        # Cropping here, BEFORE either layer is built, means the
+        # foreground AND its own blurred backdrop are both made from
+        # the trimmed art: the panel's baked-in white margins reach
+        # neither layer. A full rect (0,0,1,1) - clean panels and the
+        # no-art fallback - crops nothing, byte-identical to before.
+        if self.kind == "placed":
+            _trim = spec.get("trim")
+            if isinstance(_trim, (list, tuple)) and len(_trim) == 4:
+                _tx0, _ty0, _tx1, _ty1 = (float(v) for v in _trim)
+                if 0.0 <= _tx0 < _tx1 <= 1.0 and 0.0 <= _ty0 < _ty1 <= 1.0 \
+                        and (_tx0, _ty0, _tx1, _ty1) != (0.0, 0.0, 1.0, 1.0):
+                    _px0 = int(round(_tx0 * panel.width))
+                    _py0 = int(round(_ty0 * panel.height))
+                    _px1 = int(round(_tx1 * panel.width))
+                    _py1 = int(round(_ty1 * panel.height))
+                    if 0 <= _px0 < _px1 <= panel.width \
+                            and 0 <= _py0 < _py1 <= panel.height:
+                        panel = panel.crop((_px0, _py0, _px1, _py1))
         pw, ph = panel.size
         # Background layer: the same panel, cover-scaled to the frame,
         # blurred, at FULL brightness (opacity 1.0 = no blend over
@@ -1272,8 +1292,12 @@ class ShotRenderer:
         except (TypeError, ValueError):
             self.darken = 0.0
         self.exit = shot.get("exit") if shot.get("exit") in EXITS else "cut"
-        self.fade_from = self.end - EXIT_FADE if self.exit == "fade_out" else None
-        if end_fade and video_end is not None and abs(video_end - self.end) < 0.05:
+        # Placed mode's promise is absolute - no fade anywhere in a
+        # placed shot (its first frame is pixel-identical to its last) -
+        # so neither an exit fade nor the video-end fade may darken one.
+        _placed = any(getattr(v, "kind", None) == "placed" for v in self.pf_views)
+        self.fade_from = self.end - EXIT_FADE if self.exit == "fade_out" and not _placed else None
+        if end_fade and not _placed and video_end is not None and abs(video_end - self.end) < 0.05:
             self.fade_from = min(self.fade_from or 1e9, self.end - 1.0)
         if self.fade_from is not None:
             self.fade_from = max(self.start, self.fade_from)  # a short last shot must not start dark

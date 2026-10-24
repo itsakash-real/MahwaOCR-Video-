@@ -118,6 +118,21 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
                 # smaller — no floating), centred, over the panel's
                 # own blurred background (flag on exactly when the
                 # panel isn't canvas-shaped).
+                # The unit is the EDGE-TRIMMED panel (the spec's trim
+                # rect, unit fractions, applied on top of any slice
+                # band above): fit, touches and the background flag
+                # are all judged on the trimmed dimensions, so the
+                # foreground this check reconstructs from the plan
+                # alone is the art bounds, never the baked-in margins.
+                _trim = _pl.get("trim")
+                if isinstance(_trim, list) and len(_trim) == 4:
+                    try:
+                        _tw = float(_trim[2]) - float(_trim[0])
+                        _th = float(_trim[3]) - float(_trim[1])
+                        if 0.0 < _tw <= 1.0 and 0.0 < _th <= 1.0:
+                            pw, ph = pw * _tw, ph * _th
+                    except (TypeError, ValueError):
+                        pass
                 try:
                     _bw, _bh = float(_pl["base_w"]), float(_pl["base_h"])
                     _ok = abs(math.log((_bw / _bh) / (pw / ph))) <= PF_ASPECT_TOL
@@ -303,6 +318,11 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         # INFO ONLY — composition violations are failures above.
         "placed_title_cards": list(plan.get("placed_title_cards") or []),
         "placed_hints_ignored": list(plan.get("placed_hints_ignored") or []),
+        # Placed mode only: units whose baked-in margins the planner's
+        # edge-trim shaved, and units placed UNTRIMMED because no art
+        # bounds could be found (the no-art fallback). INFO ONLY.
+        "placed_trimmed": list(plan.get("placed_trimmed") or []),
+        "placed_trim_fallback": list(plan.get("placed_trim_fallback") or []),
         "min_shot": round(shortest, 2),
         "max_shots": max(0, int(duration // (1.0 if plan.get("mode") == "panelfit" else 3.0))) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
@@ -792,6 +812,13 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if qa.get("placed_hints_ignored"):
         log(f"    placed mode: motion hint(s) on {len(qa['placed_hints_ignored'])} shot(s) ignored "
             f"(this mode has no motion): {', '.join(qa['placed_hints_ignored'][:8])}")
+    if qa.get("placed_trimmed"):
+        log(f"    placed mode: {len(qa['placed_trimmed'])} unit(s) edge-trimmed in prep "
+            f"(baked-in panel margins shaved before fit): {', '.join(qa['placed_trimmed'][:8])}")
+    if qa.get("placed_trim_fallback"):
+        log(f"    ! placed mode: {len(qa['placed_trim_fallback'])} unit(s) placed UNTRIMMED "
+            f"(no art bounds found; unit kept whole, never dropped): "
+            f"{', '.join(qa['placed_trim_fallback'][:8])}")
     if plan.get("chapter_cards"):
         from .editor import chapter_cards_to_timestamps as _ts
         log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))

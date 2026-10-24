@@ -2134,7 +2134,12 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
 #     the timeline, so the master audio is never cut.
 #   * Prep is shared too: Rule 6 trim_v2 + B1f slice hints reach this
 #     pass exactly as they reach panelfit (a slice unit is fitted on
-#     its own band dimensions, like any whole panel).
+#     its own band dimensions, like any whole panel). PLUS this pass's
+#     own unit-level edge-trim (placed_trim_rect, reusing the wide
+#     mode detector crops.trim_blank_edges): every unit — panel or
+#     slice band — is shaved of its baked-in white margins on all
+#     four edges before fit, because panels that never went through
+#     trim_v2 otherwise carry their page margins into every frame.
 # Every parameter is a named constant, pinned to the config defaults
 # (video.placed.*) and to the renderer's mirrors (frames.PLR_*) by
 # tests; the values must never live only in an agent's head.
@@ -2188,6 +2193,48 @@ def placed_spec(pw: float, ph: float, fmt: Format,
             "impact": False}
 
 
+def placed_trim_rect(img: Image.Image) -> Tuple[float, float, float, float] | None:
+    """The edge-trim rect for ONE placed unit, as fractions of the
+    unit (x0, y0, x1, y1): the unit's art bounds after shaving blank
+    margins off ALL FOUR edges.
+
+    Why this exists: panels carry BAKED-IN white page margins inside
+    the panel image itself. Rule 6 trim_v2 only removes them when it
+    ran at panel build (video.panels.trim_v2); a placed plan built
+    from panels without a trim2 record showed the margins as white
+    space in nearly every shot (the user's rejection of the first
+    placed chapter: "so many white space in every pages"). Frame-level
+    band checks could not see it — the white is INSIDE the foreground
+    — so the shave lives here, at unit level, in the placed prep pass:
+    after units are formed (panels + B1f slice bands), before fit.
+
+    The detector is NOT new: it is crops.trim_blank_edges — the wide
+    mode detector — reused verbatim. Its rows pass shaves the top and
+    bottom (a row is blank when it is flat-white/hard-lettering with
+    too little soft art texture, per _art_maps' thresholds, so ink and
+    textured art stop the shave); the same function run on the
+    TRANSPOSED image shaves the left and right (its rows are the
+    unit's columns). Its no-art guard carries over: when either pass
+    returns None (too little art would remain, or the kept region has
+    essentially no soft texture) this returns None and the caller
+    falls back to the UNTRIMMED unit, flagged — a story panel is
+    never trimmed away to nothing and never silently dropped.
+    A unit whose art already touches every edge returns exactly
+    (0.0, 0.0, 1.0, 1.0): zero trim, byte-identical placement.
+    """
+    box_v = trim_blank_edges(img, (0.0, 0.0, 1.0, 1.0))
+    if box_v is None:
+        return None
+    box_h = trim_blank_edges(img.transpose(Image.TRANSPOSE), (0.0, 0.0, 1.0, 1.0))
+    if box_h is None:
+        return None
+    # The transposed pass's y axis is the unit's x axis.
+    rect = (float(box_h[1]), float(box_v[1]), float(box_h[3]), float(box_v[3]))
+    if not (0.0 <= rect[0] < rect[2] <= 1.0 and 0.0 <= rect[1] < rect[3] <= 1.0):
+        return None
+    return rect
+
+
 def _placed_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
                  pcfg: Dict[str, Any]) -> Dict[str, Any]:
     """Rewrite classic shots into placed shots (landscape only, like
@@ -2203,11 +2250,15 @@ def _placed_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format
     any per-sentence motion hint is ignored (collected into the
     report's "hints_ignored", never an error).
 
-    Returns {"hints_ignored": [shot ids that carried a motion hint]}.
+    Returns {"hints_ignored": [shot ids that carried a motion hint],
+    "trimmed": [panel ids whose unit was edge-trimmed],
+    "trim_fallback": [panel ids placed untrimmed because no art
+    bounds could be found]}.
     """
-    report: Dict[str, Any] = {"hints_ignored": []}
+    report: Dict[str, Any] = {"hints_ignored": [], "trimmed": [], "trim_fallback": []}
     if fmt.width <= fmt.height:
         return report
+    trim_cache: Dict[Any, Any] = {}
     for s in shots:
         s["placed"] = True
         s["exit"] = "cut"
@@ -2220,13 +2271,55 @@ def _placed_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format
             pid = c.get("panel")
             p = designer.by_id.get(pid) or {}
             pw, ph = float(p.get("width") or 0), float(p.get("height") or 0)
-            if isinstance(c.get("slice"), list) and len(c["slice"]) == 2:
+            band = c.get("slice") if isinstance(c.get("slice"), list) \
+                and len(c["slice"]) == 2 else None
+            if band is not None:
                 # B1f: a slice is fitted on its OWN dimensions — the
                 # panel's width, the band's height — exactly as the
                 # panelfit pass fits it.
-                ph = ph * max(0.0, float(c["slice"][1]) - float(c["slice"][0]))
+                ph = ph * max(0.0, float(band[1]) - float(band[0]))
             if pw > 0 and ph > 0:
-                c["placed"] = placed_spec(pw, ph, fmt, pcfg)
+                # Edge-trim the unit BEFORE fit/place: the fit, the
+                # spec's recorded dimensions, the backdrop decision
+                # and the QA floating check all run on the TRIMMED
+                # bounds, and the rect rides in the spec so the
+                # renderer crops the same region (frames.PanelFitView)
+                # and QC can reconstruct the foreground from the plan
+                # alone. A slice unit is trimmed AFTER slicing, on the
+                # band's own image, exactly as it is fitted.
+                key = (pid, tuple(band) if band is not None else None)
+                if key not in trim_cache:
+                    rect = None
+                    try:
+                        unit = designer.img(pid)
+                        if band is not None:
+                            _y0 = int(round(float(band[0]) * unit.height))
+                            _y1 = int(round(float(band[1]) * unit.height))
+                            if 0 <= _y0 < _y1 <= unit.height:
+                                unit = unit.crop((0, _y0, unit.width, _y1))
+                        rect = placed_trim_rect(unit)
+                    except (OSError, KeyError):
+                        rect = None
+                    trim_cache[key] = rect
+                rect = trim_cache[key]
+                if rect is None:
+                    # No-art guard: fall back to the UNTRIMMED unit
+                    # and flag it — never trim a unit away to
+                    # nothing, never drop a story panel silently.
+                    c["placed"] = {**placed_spec(pw, ph, fmt, pcfg),
+                                   "trim": [0.0, 0.0, 1.0, 1.0],
+                                   "trim_fallback": True}
+                    if pid not in report["trim_fallback"]:
+                        report["trim_fallback"].append(pid)
+                    continue
+                tw = pw * (rect[2] - rect[0])
+                th = ph * (rect[3] - rect[1])
+                c["placed"] = {**placed_spec(tw, th, fmt, pcfg),
+                               "trim": [round(float(v), 4) for v in rect],
+                               "trim_fallback": False}
+                if tuple(rect) != (0.0, 0.0, 1.0, 1.0) \
+                        and pid not in report["trimmed"]:
+                    report["trimmed"].append(pid)
             else:  # unknown panel size: the whole frame, statically
                 c["placed"] = {"kind": "placed", "dir": "none", "bg": True,
                                "base_w": float(fmt.width), "base_h": float(fmt.height),
@@ -2897,6 +2990,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "panelfit_title_cards": _pf_title_cards,
         "placed_title_cards": _placed_title_cards,
         "placed_hints_ignored": _placed_report.get("hints_ignored", []),
+        "placed_trimmed": _placed_report.get("trimmed", []),
+        "placed_trim_fallback": _placed_report.get("trim_fallback", []),
         "fullframe_caption_risk": _ff_risk["caption_risk"],
         "fullframe_figure_risk": _ff_risk["figure_risk"],
         "fullframe_reviewer_focal_ignored": _ff_risk["reviewer_focal_ignored"],
@@ -3158,6 +3253,16 @@ def validate(plan: Dict[str, Any], panel_ids: set) -> List[str]:
                                   and float(_pl["zoom_rate"]) == 0.0
                                   and float(_pl["zoom_end"]) == 1.0
                                   and float(_pl["drift_frac"]) == 0.0)
+                        if "trim" in _pl:
+                            # The unit's edge-trim rect (unit
+                            # fractions): present on every spec the
+                            # placed pass writes; absent only on
+                            # pre-trim plans, which stay valid.
+                            _tr = _pl["trim"]
+                            _pl_ok = _pl_ok and isinstance(_tr, list) and len(_tr) == 4 \
+                                and 0.0 <= float(_tr[0]) < float(_tr[2]) <= 1.0 \
+                                and 0.0 <= float(_tr[1]) < float(_tr[3]) <= 1.0 \
+                                and isinstance(_pl.get("trim_fallback", False), bool)
                     except (KeyError, TypeError, ValueError):
                         _pl_ok = False
                 if not _pl_ok:
