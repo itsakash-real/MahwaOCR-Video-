@@ -168,6 +168,19 @@ def test_client_bounded_attempts_raise_typed_failure_without_key_material(tmp_pa
     assert "x-goog-api-key" not in str(exc.value)
 
 
+def test_client_paces_successive_calls_sequentially(tmp_path):
+    sleeps = []
+    times = iter([100.0, 100.0, 105.0])
+    transport = FakeTransport([ok_response({"a": 1}), ok_response({"b": 2})])
+    client = make_client(tmp_path, transport, sleep=sleeps.append,
+                         pace_seconds=5.0, clock=lambda: next(times))
+    client.generate_json([{"text": "one"}])
+    client.generate_json([{"text": "two"}])
+    # The second call waited out the rest of the 5s pacing interval;
+    # calls are issued one at a time by construction (no concurrency).
+    assert sleeps == [5.0]
+
+
 def test_client_missing_key_files_raise_typed_failure(tmp_path):
     client = gv.GeminiVisionClient(key_files=[tmp_path / "nope.key"],
                                    transport=FakeTransport([]),
@@ -376,3 +389,40 @@ def test_qc_client_failure_makes_every_frame_unknown():
     client = FakeClient(error=gv.GeminiVisionError("down"))
     out = gv.qc_frames([_frame("F1"), _frame("F2")], client=client)
     assert [v["verdict"] for v in out] == ["unknown", "unknown"]
+
+
+# --------------------------------------------------------------- lazy loading
+
+
+def test_trim_resolves_lazy_loaders_on_demand():
+    # Units may carry a zero-arg "load" callable instead of a decoded
+    # image (enumerate_placed_units does this so a whole chapter's
+    # panels are never decoded at once — that OOM-killed a real run).
+    loaded = []
+
+    def make_loader(uid):
+        def load():
+            loaded.append(uid)
+            return margin_img()
+        return load
+
+    units = [{"id": uid, "load": make_loader(uid)}
+             for uid in ("P001-01", "P002-01")]
+    client = FakeClient({"P001-01": [0.05, 0.20, 0.95, 0.92],
+                         "P002-01": [0.05, 0.20, 0.95, 0.92]})
+    doc = gv.run_vision_trim(units, client)
+    assert doc["summary"] == {"total": 2, "gemini": 2, "fallback": 0}
+    assert loaded == ["P001-01", "P002-01"]
+
+
+def test_trim_one_bad_load_falls_back_alone():
+    def bad_load():
+        raise OSError("corrupt panel file")
+
+    units = [{"id": "P001-01", "load": bad_load},
+             {"id": "P002-01", "image": margin_img()}]
+    client = FakeClient({"P002-01": [0.05, 0.20, 0.95, 0.92]})
+    doc = gv.run_vision_trim(units, client)
+    assert doc["units"]["P001-01"]["source"] == "fallback"
+    assert doc["units"]["P001-01"]["reason"] == "image_load_failed"
+    assert doc["units"]["P002-01"]["source"] == "gemini"

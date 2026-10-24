@@ -320,7 +320,12 @@ def run_vision_trim(units: List[Dict[str, Any]], client: Any, *,
     """Decide every unit's trim. NEVER raises for an API/parse failure:
     the affected units fall back to the algorithmic trim, flagged.
 
-    `units` are ``{"id": str, "image": PIL.Image}`` in story order.
+    `units` are ``{"id": str, ...}`` in story order, each carrying its
+    image either decoded (``"image"``: a PIL image) or as a zero-arg
+    ``"load"`` callable returning one. Images are resolved ONE BATCH
+    at a time and released before the next batch loads — a chapter's
+    panels are never all decoded at once (183 full-size panels held
+    simultaneously OOM-killed the first real run of this step).
     Returns the artifact document (see :func:`vision_trim_chapter` for
     its on-disk home); each unit entry is
     ``{"box": [x0, y0, x1, y1], "source": "gemini"|"fallback",
@@ -334,10 +339,10 @@ def run_vision_trim(units: List[Dict[str, Any]], client: Any, *,
     entries: Dict[str, Any] = {}
 
     def fallback(unit: Dict[str, Any], reason: str,
-                 ink: Box | None = ...) -> None:  # type: ignore[assignment]
+                 img: Any = None, ink: Box | None = ...) -> None:  # type: ignore[assignment]
         if ink is ...:  # type: ignore[comparison-overlap]
             try:
-                ink = ink_rect_fn(unit["image"])
+                ink = ink_rect_fn(img) if img is not None else None
             except Exception:  # noqa: BLE001 - a detector failure is still a fallback
                 ink = None
         box = _round_box(ink) if ink is not None else [0.0, 0.0, 1.0, 1.0]
@@ -346,35 +351,50 @@ def run_vision_trim(units: List[Dict[str, Any]], client: Any, *,
 
     for start in range(0, len(units), batch_size):
         batch = units[start:start + batch_size]
-        parts: List[Dict[str, Any]] = [_text_part(TRIM_PROMPT)]
+        # Resolve this batch's images only; they go out of scope at the
+        # end of the iteration, before the next batch is loaded.
+        loaded: List[Tuple[Dict[str, Any], Any]] = []
         for unit in batch:
-            parts.append(_text_part(f"Panel {unit['id']}:"))
-            parts.append(image_part(unit["image"]))
-        try:
-            raw = client.generate_json(parts)
-        except Exception:  # noqa: BLE001 - the chapter never blocks on the API
-            for unit in batch:
-                fallback(unit, "gemini_failure")
-            continue
-        if not isinstance(raw, dict):
-            raw = {}
-        for unit in batch:
-            box = validate_vision_box(raw.get(unit["id"]))
-            if box is None:
-                fallback(unit, "invalid_or_missing_box")
-                continue
             try:
-                ink = ink_rect_fn(unit["image"])
-            except Exception:  # noqa: BLE001
-                ink = None
-            if ink is None:
-                fallback(unit, "no_detector_ink_bounds", ink=None)
-                continue
-            if vision_box_cuts_ink(box, tuple(float(v) for v in ink)):
-                fallback(unit, "vision_box_cuts_detector_ink", ink=tuple(float(v) for v in ink))
-                continue
-            entries[unit["id"]] = {"box": _round_box(box), "source": "gemini",
-                                   "model": model}
+                img = unit["load"]() if callable(unit.get("load")) else unit["image"]
+            except Exception:  # noqa: BLE001 - one bad panel must not kill the run
+                img = None
+            if img is None:
+                fallback(unit, "image_load_failed")
+            else:
+                loaded.append((unit, img))
+        if loaded:
+            parts: List[Dict[str, Any]] = [_text_part(TRIM_PROMPT)]
+            for unit, img in loaded:
+                parts.append(_text_part(f"Panel {unit['id']}:"))
+                parts.append(image_part(img))
+            call_failed = False
+            try:
+                raw = client.generate_json(parts)
+            except Exception:  # noqa: BLE001 - the chapter never blocks on the API
+                raw, call_failed = None, True
+            if not isinstance(raw, dict):
+                raw = {}
+            for unit, img in loaded:
+                box = validate_vision_box(raw.get(unit["id"]))
+                if box is None:
+                    fallback(unit, "gemini_failure" if call_failed
+                             else "invalid_or_missing_box", img=img)
+                    continue
+                try:
+                    ink = ink_rect_fn(img)
+                except Exception:  # noqa: BLE001
+                    ink = None
+                if ink is None:
+                    fallback(unit, "no_detector_ink_bounds", img=img, ink=None)
+                    continue
+                if vision_box_cuts_ink(box, tuple(float(v) for v in ink)):
+                    fallback(unit, "vision_box_cuts_detector_ink", img=img,
+                             ink=tuple(float(v) for v in ink))
+                    continue
+                entries[unit["id"]] = {"box": _round_box(box), "source": "gemini",
+                                       "model": model}
+        del loaded
     gemini_n = sum(1 for e in entries.values() if e["source"] == "gemini")
     return {"version": 1, "kind": "vision_trim", "model": model,
             "batch_size": batch_size,
@@ -401,21 +421,30 @@ def enumerate_placed_units(root: Path, chapter: str) -> List[Dict[str, Any]]:
     hints = cues_mod.slice_hints_of(cues_mod.load_cues(root, chapter))
     norm_w = data.get("norm_width")
     fp = data.get("fingerprint")
+
+    def loader(panel: Dict[str, Any], band: Tuple[float, float] | None):
+        def load() -> Image.Image:
+            img = panel_image(root, chapter, panel, norm_w, clean=True,
+                              fingerprint=fp)
+            if band is not None:
+                y0 = int(round(band[0] * img.height))
+                y1 = int(round(band[1] * img.height))
+                if 0 <= y0 < y1 <= img.height:
+                    img = img.crop((0, y0, img.width, y1))
+            return img
+        return load
+
     units: List[Dict[str, Any]] = []
     for panel in data["panels"]:
         pid = panel["id"]
-        img = panel_image(root, chapter, panel, norm_w, clean=True, fingerprint=fp)
         spec = hints.get(pid)
         bands = kept_bands(spec) if spec else [(0.0, 1.0)]
         if len(bands) == 1 and bands[0] == (0.0, 1.0):
-            units.append({"id": pid, "panel": pid, "image": img})
+            units.append({"id": pid, "panel": pid, "load": loader(panel, None)})
             continue
         for k, (f0, f1) in enumerate(bands):
-            y0 = int(round(f0 * img.height))
-            y1 = int(round(f1 * img.height))
-            band_img = img.crop((0, y0, img.width, y1)) if 0 <= y0 < y1 <= img.height else img
             units.append({"id": slice_id(pid, k), "panel": pid,
-                          "slice": [f0, f1], "image": band_img})
+                          "slice": [f0, f1], "load": loader(panel, (f0, f1))})
     return units
 
 
