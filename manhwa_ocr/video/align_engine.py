@@ -519,7 +519,8 @@ def place_impactful(segments: List[Dict[str, Any]], panels: List[Dict[str, Any]]
 def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], vcfg: Dict[str, Any],
                      sync: str, log, settings: Dict[str, float],
                      warnings_out: List[Dict[str, str]] | None = None,
-                     audio: Path | None = None) -> tuple[List[Dict[str, Any]], str, float]:
+                     audio: Path | None = None,
+                     force: bool = False) -> tuple[List[Dict[str, Any]], str, float]:
     """Adds "start"/"end" to each sentence using whisper (cached if available),
     falling back to even spacing. This is the only I/O-dependent part.
     sync="off" skips whisper entirely (fast, deterministic estimated timing).
@@ -567,7 +568,8 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
             words = sync_mod.transcribe(audio, model=vcfg.get("whisper_model", "small.en"),
                                         language=vcfg.get("whisper_language"),
                                         initial_prompt=sync_mod.character_prompt(memory),
-                                        cache=sync_mod.timeline_path(root, chapter), log=log)
+                                        cache=sync_mod.timeline_path(root, chapter), log=log,
+                                        force=force)
             mode = "synced"
         except UserError as exc:
             _warn("whisper_transcribe_failed",
@@ -610,7 +612,8 @@ def _timed_sentences(root: Path, chapter: str, sentences: List[Dict[str, Any]], 
     return timed, mode, duration
 
 
-def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=print) -> Dict[str, Any]:
+def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=print,
+                    force: bool = False) -> Dict[str, Any]:
     root, chapter = Path(root), require_chapter(chapter)
     cue_data = cues_mod.load_cues_strict(root, chapter)
     if not cue_data:
@@ -625,7 +628,7 @@ def build_alignment(root: Path, chapter: str, cfg, *, sync: str = "auto", log=pr
     settings = sync_mod.effective_settings(vcfg, log=log)
     timing_warnings: List[Dict[str, str]] = []
     timed, sync_mode, duration = _timed_sentences(root, chapter, cue_data["sentences"], vcfg, sync, log,
-                                                  settings, warnings_out=timing_warnings)
+                                                  settings, warnings_out=timing_warnings, force=force)
 
     segments = align_sentences(cue_data["sentences"], plist,
                                override_evidence=settings["override_evidence"])

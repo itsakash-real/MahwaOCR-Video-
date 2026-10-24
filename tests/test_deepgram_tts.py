@@ -99,7 +99,9 @@ def test_deepgram_speak_sends_token_header_and_text():
     req = opener.request
     assert req.full_url.startswith("https://api.deepgram.com/v1/speak?")
     assert "model=aura-2-thalia-en" in req.full_url
-    assert f"speed={tts.DEFAULT_SPEED}" in req.full_url
+    # incident 22: an unset speed is OMITTED (non-aura-2 models reject the
+    # parameter); speed policy is resolved+validated by the caller
+    assert "speed=" not in req.full_url
     assert req.get_header("Authorization") == "Token SECRETKEY"
     assert json.loads(req.data) == {"text": "Hello world."}
 
@@ -175,13 +177,14 @@ def test_synthesize_chapter_writes_audio_manifest_and_caches(tmp_path, monkeypat
 
 
 def test_synthesize_chapter_default_speed_is_1_23(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
     _write_cues(tmp_path, texts=("One sentence.",))
     monkeypatch.setenv("DEEPGRAM_API_KEY", "SECRETKEY")
     monkeypatch.setattr(tts, "encode_m4a", lambda wav_path, out_path: out_path.write_bytes(b"m4a"))
-    tts.synthesize_chapter(tmp_path, "1", SimpleNamespace(extra={}), log=print,
-                           speak=lambda *a: _tiny_wav(0.2))
+    # an aura-2 voice with no explicit speed resolves to the tuned default.
+    # (The VOICE is never silently defaulted: without a configured model the
+    # command refuses -- tests/test_video_incidents.py, incident 2.)
+    cfg = SimpleNamespace(extra={"tts": {"model": "aura-2-thalia-en"}})
+    tts.synthesize_chapter(tmp_path, "1", cfg, log=print, speak=lambda *a: _tiny_wav(0.2))
     manifest = json.loads((tmp_path / "audio" / "chapter_1.tts.json").read_text(encoding="utf-8"))
     assert manifest["speed"] == 1.23
 
@@ -198,7 +201,7 @@ def test_changing_speed_invalidates_the_cache(tmp_path, monkeypatch):
         calls.append(text)
         return _tiny_wav(0.2)
 
-    cfg = SimpleNamespace(extra={})
+    cfg = SimpleNamespace(extra={"tts": {"model": "aura-2-thalia-en"}})
     tts.synthesize_chapter(tmp_path, "1", cfg, log=print, speed=1.0, speak=fake_speak)
     assert len(calls) == 1
 
@@ -218,7 +221,7 @@ def test_synthesize_chapter_resynthesizes_a_corrupted_cache_entry(tmp_path, monk
         calls.append(text)
         return _tiny_wav(0.2)
 
-    cfg = SimpleNamespace(extra={})
+    cfg = SimpleNamespace(extra={"tts": {"model": "aura-2-thalia-en"}})
     tts.synthesize_chapter(tmp_path, "1", cfg, log=print, speak=fake_speak)
     assert len(calls) == 1
 

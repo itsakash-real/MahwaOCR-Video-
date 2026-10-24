@@ -1,5 +1,5 @@
 ---
-trigger: model_decision
+trigger: always_on
 ---
 
 # Rules for AI agents (read first, these override everything else)

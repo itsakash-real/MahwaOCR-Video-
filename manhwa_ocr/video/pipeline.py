@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..util import UserError, atomic_write_text, require_chapter
 from ..workspace import work_root
 
-STAGE_NAMES = ["panels", "pair", "align", "plan", "verify", "sync-audit", "render"]
+STAGE_NAMES = ["panels", "pair", "align", "plan", "verify", "sync-audit", "render", "qc"]
 
 
 class Ctx:
@@ -90,7 +90,8 @@ def _pair(ctx: Ctx):
 def _align(ctx: Ctx):
     from . import align_engine
 
-    result = align_engine.build_alignment(ctx.root, ctx.chapter, ctx.cfg, log=ctx.log)
+    result = align_engine.build_alignment(ctx.root, ctx.chapter, ctx.cfg, log=ctx.log,
+                                          force=ctx.force)
     return f"{len(result['segments'])} segments ({result['sync_mode']})"
 
 
@@ -126,6 +127,16 @@ def _render(ctx: Ctx):
 
     path = vb.render_chapter(ctx.sess, ctx.chapter, ctx.cfg, log=ctx.log)
     return f"rendered {path.name}"
+
+
+def _qc(ctx: Ctx):
+    from .frameqc import qc_chapter
+
+    report = qc_chapter(ctx.root, ctx.chapter, ctx.cfg, log=ctx.log)
+    failures = report.get("failures") or []
+    if failures:
+        raise UserError("frame QC failed: " + "; ".join(failures[:6]))
+    return f"frame QC pass ({len(report.get('shots') or [])} shots)"
 
 
 def _plan_file(ctx: Ctx) -> Path:
@@ -167,6 +178,10 @@ STAGES: List[Dict[str, Any]] = [
      "inputs": lambda ctx: [_plan_file(ctx)],
      "output": lambda ctx: ctx.root / "video" / f"chapter_{ctx.chapter}.mp4",
      "run": _render},
+    {"name": "qc",
+     "inputs": lambda ctx: [ctx.root / "video" / f"chapter_{ctx.chapter}.mp4"],
+     "output": lambda ctx: ctx.root / "video" / f"chapter_{ctx.chapter}.frameqc.json",
+     "run": _qc},
 ]
 
 

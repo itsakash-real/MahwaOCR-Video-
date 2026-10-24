@@ -47,14 +47,52 @@ from .media import audio_dir
 from .tts_lint import format_report, lint_sentences
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/speak"
-DEFAULT_MODEL = "aura-2-thalia-en"
+# No DEFAULT_MODEL anymore (incident 2): the shipped chapters 1-11 were
+# narrated by a code-pinned voice (aura-2-thalia-en) because the series
+# config's tts section never reached this module under --config. A build
+# now REFUSES until the config in force names a voice; the resolved voice
+# is echoed at synthesis time and recorded in the manifest.
 DEFAULT_GAP_SECONDS = 0.35
 # A touch faster than natural reads less like a performance, more like a
 # narrator moving the story along -- picked after listening to 1.2/1.23/1.25/1.3
 # samples of an Aura-2 voice side by side. Only Aura-2 models accept it.
 DEFAULT_SPEED = 1.23
+SPEED_MIN, SPEED_MAX = 0.7, 1.5   # Aura-2 models only (incident 22)
 SAMPLE_RATE = 24000
 DEFAULT_KEY_FILE = "~/.config/manhwa/deepgram.key"
+
+
+def resolve_voice_and_speed(model: str | None, speed: float | None
+                            ) -> tuple[str, float | None]:
+    """Validate the resolved voice + speed (incidents 2 and 22).
+
+    - model None -> UserError: the voice is a critical value and is never
+      silently defaulted again.
+    - speed is valid ONLY on aura-2 models, and only inside 0.7-1.5. On a
+      non-aura-2 model an explicitly-set speed refuses; an unset speed is
+      OMITTED from the API call (the old code sent the aura-2 speed
+      unconditionally).
+    """
+    if not model:
+        raise UserError(
+            "No TTS voice configured. Add a `tts:` section with `model:` to the config in "
+            "force (manhwa-ocr.yaml, or the series config passed with --config), e.g.\n"
+            "  tts:\n"
+            "    model: aura-2-odysseus-en\n"
+            "    speed: 1.35\n"
+            "The voice is never silently defaulted: chapters 1-11 shipped with the wrong "
+            "narrator because a code default silently won (incident 2).")
+    speed_set = speed is not None
+    if str(model).startswith("aura-2"):
+        speed = DEFAULT_SPEED if speed is None else float(speed)
+        if not (SPEED_MIN - 1e-9) <= speed <= (SPEED_MAX + 1e-9):
+            raise UserError(f"tts.speed {speed:g} is outside the Aura-2 range "
+                            f"{SPEED_MIN:g}-{SPEED_MAX:g}. Pick a value in range.")
+        return model, speed
+    if speed_set:
+        raise UserError(f"tts.speed is only supported by Aura-2 models; {model} is not one. "
+                        "Remove `speed` from the tts config (or pass a different voice).")
+    return model, None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -106,10 +144,14 @@ def load_api_key(cfg_tts: dict, key_file: str | None = None) -> str:
 
 
 def deepgram_speak(text: str, model: str, api_key: str, *,
-                   speed: float = DEFAULT_SPEED, opener=None) -> bytes:  # noqa: ANN001 - urllib opener
-    """One sentence -> WAV bytes (linear16, mono) from Deepgram's /v1/speak."""
+                   speed: float | None = None, opener=None) -> bytes:  # noqa: ANN001 - urllib opener
+    """One sentence -> WAV bytes (linear16, mono) from Deepgram's /v1/speak.
+
+    `speed=None` OMITS the parameter entirely (non-Aura-2 models reject it;
+    the old code sent the Aura-2 default unconditionally — incident 22)."""
     url = (f"{DEEPGRAM_URL}?model={model}&encoding=linear16"
-           f"&sample_rate={SAMPLE_RATE}&container=wav&speed={speed}")
+           f"&sample_rate={SAMPLE_RATE}&container=wav"
+           + (f"&speed={speed}" if speed is not None else ""))
     body = json.dumps({"text": text}).encode("utf-8")
     request = urllib.request.Request(url, data=body, method="POST")
     request.add_header("Content-Type", "application/json")
@@ -191,14 +233,24 @@ def synthesize_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], No
     """Synthesize a chapter's narration into audio/chapter_N.m4a. Returns that path."""
     cfg_tts = {}
     if cfg is not None:
-        cfg_tts = (getattr(cfg, "extra", None) or {}).get("tts") or {}
-    model = model or cfg_tts.get("model") or DEFAULT_MODEL
+        # First-class `tts:` section (config.py); `extra` keeps working for
+        # configs written before it existed.
+        cfg_tts = dict(getattr(cfg, "tts", None) or {})
+        if not cfg_tts:
+            cfg_tts = (getattr(cfg, "extra", None) or {}).get("tts") or {}
+    model, speed = resolve_voice_and_speed(
+        model or cfg_tts.get("model"), speed if speed is not None else cfg_tts.get("speed"))
     gap = float(cfg_tts.get("gap_seconds", DEFAULT_GAP_SECONDS))
-    speed = float(speed if speed is not None else cfg_tts.get("speed", DEFAULT_SPEED))
+    log(f"  tts voice: {model} (speed {speed if speed is not None else 'n/a'}, gap {gap:g}s)")
     sentences = load_sentences(root, chapter)
     issues = lint_sentences(sentences)
-    if issues:
-        raise UserError(format_report(issues))
+    errors = [i for i in issues if i.severity == "error"]
+    warnings = [i for i in issues if i.severity == "warning"]
+    if warnings:
+        for w in warnings:
+            log(f"  ! tts-lint warning: sentence {w.n} [{w.code}]: {w.message}")
+    if errors:
+        raise UserError(format_report(errors))
     api_key = load_api_key(cfg_tts, key_file)
     speak = speak or (lambda text, mdl, key: deepgram_speak(text, mdl, key, speed=speed))
 

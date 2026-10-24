@@ -243,6 +243,8 @@ deterministic (same inputs → identical JSON).
 | `placed.bg_blur` / `placed.bg_opacity` | 50 / 1.0 | Backdrop blur radius / opacity (full brightness, shared with panelfit) |
 | `placed.shadow_dy` / `shadow_blur` / `shadow_opacity` | 20 / 10 / 0.40 | Foreground drop shadow (shared panelfit treatment) |
 | `placed.title_cards` | `true` | Timeline cues become split-flap title cards (shared panelfit machinery) |
+| `placed.captions` | `false` | Pinned off: a placed panel touches the bottom wall, so captions would sit on art |
+| `endscreen` | `false` | Write `chapter_N.endscreen.json` + `.watch_next.txt` at plan time (opt-in; `video endscreen` writes them on demand regardless) |
 | `whisper_model` | `base.en` | Use `small` for Hindi narration |
 | `require_review` | `false` | If true, render refuses unless plan approved |
 | `sync.gate_wrong` / `gate_window` / `gate_grace` | 0.05 / 0.25 / 0.2 | Sync-gate thresholds (plus: any shot <3s fails, any sentence under its tagged-coverage threshold fails, any filler failing the impact test counts as wrong-picture) |
@@ -439,11 +441,20 @@ this mode keeps panelfit's composition and removes ALL motion:
 - **Title cards.** Shared with panelfit (`insert_title_cards`): a
   timeline-cue sentence becomes a split-flap card shot on the
   timeline, so the master audio is never cut. The plan/QA record
-  them as `placed_title_cards`. Captions follow the global
-  `video.captions` setting, as in classic.
+  them as `placed_title_cards`. Captions are pinned OFF in this mode
+  (`placed.captions: false`, like panelfit — a placed panel touches
+  the bottom wall by rule, so burned captions could only sit on the
+  art; set `video.captions` + `placed.captions: true` to override
+  deliberately).
 - **Storyboard** shows the composed frame at shot start and end, side
   by side (identical, by construction). Landscape only; portrait
   formats stay classic.
+- **Rendered-frame QC.** `video render` (and the pipeline's `qc`
+  stage) pixel-check the finished MP4 per shot: white margins INSIDE
+  the foreground, wall contact, and zero motion — the user's three
+  rejections, measured on the delivered frames
+  (`video/chapter_N.frameqc.json`; strict failures stop the delivery
+  unless `--force`).
 
 Knobs (`video.placed.*`, defaults pinned in code): `bg_blur` 50,
 `bg_opacity` 1.0, `shadow_dy` 20, `shadow_blur` 10,

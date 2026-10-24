@@ -21,7 +21,12 @@ import re
 from dataclasses import dataclass
 
 _DIGIT = re.compile(r"\d")
-_DASH_PAUSE = re.compile(r"\s[-–—]{1,2}\s|--")
+_DOUBLE_HYPHEN = "--"
+# A spaced en/em dash (" - ", " – ", " — "): the recap house style — a
+# WARNING, never a refusal (incident 22: the hard gate refused most existing
+# recaps because the em dash is core to the style). A bare double hyphen is
+# separate and stays an error.
+_SPACED_DASH_PAUSE = re.compile(r"\s[-–—]\s")
 _ELLIPSIS = re.compile(r"\.\.\.|…")
 _DOUBLE_PUNCT = re.compile(r"[!?.,]{2,}")
 _TERMINAL = re.compile(r"[.!?][\"'’”)\]]*$")
@@ -36,6 +41,14 @@ class LintIssue:
     message: str
     fix: str
     text: str
+    # "error" refuses synthesis; "warning" is logged and synthesis continues
+    # (incident 22: the spaced em/en dash is the recap house style, so it
+    # warns; a double hyphen "--" is never intended and stays an error).
+    severity: str = "error"
+
+    @property
+    def is_error(self) -> bool:
+        return self.severity == "error"
 
 
 def _quote_balance_issue(text: str) -> str | None:
@@ -62,12 +75,17 @@ def lint_sentence(n: int, text: str) -> list[LintIssue]:
             "Contains a raw digit; Aura's number reading is inconsistent.",
             "Spell the number out in words.", text))
 
-    if _DASH_PAUSE.search(text) or "--" in text:
+    if "--" in text:
         issues.append(LintIssue(
             n, "dash-pause",
-            "Uses a dash as a sentence-break stand-in; Aura reads a wandering "
-            "dash as a stumble or an unnatural pause.",
+            "Uses a double hyphen as a sentence-break stand-in; Aura reads it as a stumble.",
             "Replace with a period or comma, or rewrite as two sentences.", text))
+    elif _SPACED_DASH_PAUSE.search(text):
+        issues.append(LintIssue(
+            n, "dash-pause",
+            "Uses a spaced en/em dash; if Aura stumbles on this sentence, split it.",
+            "House style keeps the em dash; split the sentence only if the read is bad.",
+            text, severity="warning"))
 
     if _ELLIPSIS.search(text):
         issues.append(LintIssue(

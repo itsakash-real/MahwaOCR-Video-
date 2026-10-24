@@ -66,7 +66,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
         "format": "16:9",           # 16:9 (1920x1080) or 9:16 (1080x1920, Shorts)
         "fps": 30,
-        "mode": "classic",          # classic | wide | adaptive | panelfit | fullframe | placed
+        # None = not chosen in any config layer: every reader resolves it to
+        # "classic", but the build-start echo marks it DEFAULTED (incident 1:
+        # a shipped chapter rendered in classic mode when wide was intended,
+        # because --config never read the repo yaml that set it).
+        "mode": None,               # classic | wide | adaptive | panelfit | fullframe | placed
                                     #   wide: every card full-height, min 6/16 wide
                                     #   adaptive: per shot, a naturally wide/landscape panel gets
                                     #   the wide treatment; a narrower one keeps its classic
@@ -187,7 +191,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # white/black/empty bands
             "shadow_dy": 20,           # the foreground's drop shadow — black,
             "shadow_blur": 10,         # offset (0, +20px), blur 10px, opacity 40%,
-            "shadow_opacity": 0.40,    # layered between backdrop and panel (the
+            "shadow_opacity": 0.40,    # layered between backdrop and panel; the
                                        # backdrop itself stays at full brightness);
                                        # shared with panelfit's treatment
             "title_cards": True,       # timeline cues become split-flap title
@@ -195,6 +199,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # panelfit uses (insert_title_cards; the
                                        # master audio is never cut) — timing
                                        # otherwise follows the classic planner
+            # Incident 12: a placed panel touches the BOTTOM wall by rule, so
+            # burned-in captions can only sit ON the art. Pin them OFF like
+            # panelfit does; a series that wants captions sets
+            # video.captions + placed.captions: true deliberately.
+            "captions": False,
         },
         "gemini_vision": {
             # Gemini Vision prep/QC (video/gemini_vision.py): `video
@@ -306,6 +315,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "hook": {"target_seconds": 30.0, "min_seconds": 20.0, "max_seconds": 45.0, "seed": 7},
         "whisper_model": "small.en",
         "whisper_language": None,   # e.g. "hi" for Hindi narration (use a multilingual model)
+        # Incident 23: end-screen metadata (chapter_N.endscreen.json +
+        # .watch_next.txt) is written only when a series opts in. The current
+        # series rule is no intro/outro pieces at all; `video endscreen`
+        # still writes them on demand.
+        "endscreen": False,
     },
     "pipeline": {
         # Parallel vision calls. Keep modest to respect provider rate limits.
@@ -332,6 +346,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # Delete a chapter's downloaded pages and tiles once its transcript is
         # written. These are the bulk of disk use. Set false while iterating.
         "cleanup": True,
+    },
+    # Narration synthesis (`video tts`). `model` deliberately has NO default
+    # here: a build must never silently fall back to a code-pinned voice
+    # (incident 2). synthesis refuses with a fix-it message until the config
+    # in force names one. speed applies to aura-2 models only (0.7-1.5) and
+    # is OMITTED from the API call for any other model (incident 22).
+    "tts": {
+        "model": None,
+        "speed": None,
+        "gap_seconds": 0.35,
+        "key_file": None,
     },
     "recap": {
         # Narration voice for recap writing ("default", "speedrun", "powerfantasy"
@@ -370,6 +395,11 @@ class Config:
     pipeline: Dict[str, Any] = field(default_factory=dict)
     video: Dict[str, Any] = field(default_factory=dict)
     recap: Dict[str, Any] = field(default_factory=dict)
+    # Narration TTS (Deepgram Aura). First-class so a config that omits it
+    # can be DETECTED and refused at synthesis time (incident 2: chapters
+    # 1-11 shipped narrated by the code-default voice although another
+    # voice was configured in the repo yaml, which --config never read).
+    tts: Dict[str, Any] = field(default_factory=dict)
     # Top-level YAML sections this build doesn't know about (e.g. a section
     # written by a newer build's config). Kept, not dropped, so a config
     # file shared between checkouts never crashes load_config -- only code
@@ -494,14 +524,52 @@ def output_folder(config_path: str | Path | None = None) -> Path | None:
     return (folder if folder.is_absolute() else Path(path).resolve().parent / folder).resolve()
 
 
-def load_config(path: str | Path | None = None, **overrides: Any) -> Config:
-    """Load config from YAML, layering defaults -> file -> env -> kwargs."""
+def resolve_config_chain(explicit: str | Path | None) -> "list[Path]":
+    """The config layers an explicit ``--config`` inherits (incident 1):
+    the program folder's yaml, then the current folder's — each only when it
+    exists and is a different file. Empty when there is no explicit config,
+    and empty when the explicit path IS the ``MANHWA_CONFIG`` pin (that env
+    var is an isolation override: hermetic tests pin it so the developer's
+    live yaml never leaks into them)."""
+    if not explicit:
+        return []
+    ex = Path(explicit).expanduser()
+    env_cfg = os.environ.get("MANHWA_CONFIG")
+    if env_cfg:
+        try:
+            if Path(env_cfg).expanduser().resolve() == ex.resolve():
+                return []
+        except OSError:
+            pass
+    out: "list[Path]" = []
+    for base in (PROGRAM_CONFIG, Path.cwd() / CONFIG_FILENAME):
+        try:
+            if base.is_file() and base.resolve() != ex.resolve() \
+                    and base.resolve() not in {b.resolve() for b in out}:
+                out.append(base)
+        except OSError:
+            pass
+    return out
+
+
+def load_config(path: str | Path | None = None, *, base_layers: "list[Path] | None" = None,
+                **overrides: Any) -> Config:
+    """Load config from YAML, layering defaults -> base_layers -> file -> env -> kwargs.
+
+    ``base_layers`` is how an explicit ``--config <series>.yaml`` inherits the
+    working/program yaml's keys (incident 1: a series config used to silently
+    drop the repo yaml's ``video.mode`` / ``min_hold`` / ``tts`` back to code
+    defaults — a shipped chapter rendered in classic mode when wide was
+    intended). ``resolve_config_chain()`` builds the list; only the CLI's
+    ``--config`` passes one, so every other loader keeps single-file
+    semantics (and ``MANHWA_CONFIG`` stays an isolation override for tests).
+    """
     # Deep copy: nested sections (video.panels, download.headers) must never be
     # shared with DEFAULT_CONFIG, or one run's overrides leak into the next.
     data = copy.deepcopy(DEFAULT_CONFIG)
 
-    if path:
-        p = Path(path).expanduser()
+    def _merge_file(p: Path) -> None:
+        nonlocal data
         if not p.exists():
             raise FileNotFoundError(f"Config file not found: {p}")
         try:
@@ -516,6 +584,11 @@ def load_config(path: str | Path | None = None, **overrides: Any) -> Config:
 
             raise UserError(f"{p} should contain sections like 'provider:' and 'slicing:'.")
         data = _deep_merge(data, {k: v for k, v in loaded.items() if isinstance(v, dict)})
+
+    for _base in (base_layers or []):
+        _merge_file(Path(_base).expanduser())
+    if path:
+        _merge_file(Path(path).expanduser())
 
     env_map = {
         ("provider", "kind"): "MANHWA_PROVIDER",
@@ -550,3 +623,47 @@ def write_example_config(dest: str | Path) -> Path:
     with p.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(DEFAULT_CONFIG, fh, sort_keys=False, default_flow_style=False)
     return p
+
+
+def effective_video_settings(cfg: "Config | Dict[str, Any]") -> Dict[str, Any]:
+    """The resolved values a video build actually runs with (incidents 1-3):
+    every build-start echo prints these, so a defaulted mode/voice/whisper
+    model is seen BEFORE hours of work, not after a wrong render.
+
+    Keys whose resolution fell back to a code default are reported with
+    ``defaulted: True`` so the echo can mark them (``video tts`` refuses a
+    defaulted voice outright — see tts.resolve_voice_and_speed).
+    """
+    vcfg = (cfg.video if hasattr(cfg, "video") else cfg.get("video")) or {}
+    tcfg = (cfg.tts if hasattr(cfg, "tts") else cfg.get("tts")) or {}
+    if not tcfg and hasattr(cfg, "extra"):
+        tcfg = (getattr(cfg, "extra", None) or {}).get("tts") or {}
+    mode = vcfg.get("mode")
+    whisper = vcfg.get("whisper_model")
+    return {
+        "mode": {"value": mode or "classic", "defaulted": mode is None},
+        "format": vcfg.get("format", "16:9"),
+        "min_hold": vcfg.get("min_hold", 3.0),
+        "fps": int(vcfg.get("fps", 30)),
+        "whisper_model": {"value": whisper or "small.en", "defaulted": whisper is None},
+        "tts_model": {"value": tcfg.get("model"), "defaulted": not tcfg.get("model")},
+        "tts_speed": tcfg.get("speed"),
+        "tts_gap_seconds": tcfg.get("gap_seconds", 0.35),
+        "captions": vcfg.get("captions", True),
+        "endscreen": bool(vcfg.get("endscreen", False)),
+    }
+
+
+def format_effective_video(cfg: "Config | Dict[str, Any]") -> str:
+    """One-line-per-setting echo block for build logs."""
+    s = effective_video_settings(cfg)
+
+    def mark(entry: Any) -> str:
+        if isinstance(entry, dict) and entry.get("defaulted"):
+            return f"{entry['value']}  [DEFAULTED - not set in any config; set it explicitly]"
+        return entry["value"] if isinstance(entry, dict) else entry
+
+    return ("effective video config: mode={mode} format={format} min_hold={min_hold:g}s "
+            "fps={fps} whisper={whisper_model} captions={captions} endscreen={endscreen}\n"
+            "effective tts config:    voice={tts_model} speed={tts_speed} gap={tts_gap_seconds:g}s"
+            ).format(**{k: mark(v) for k, v in s.items()})

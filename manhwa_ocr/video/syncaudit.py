@@ -230,20 +230,37 @@ def gate_from_report(report: Dict[str, Any], st: Dict[str, Any] | None = None) -
 
 def audit(plan: Dict[str, Any], alignment: Dict[str, Any], words: List[Dict[str, Any]], *,
           audio: Dict[str, Any] | None = None, timeline: Dict[str, Any] | None = None,
-          settings: Dict[str, float] | None = None, text_only: Iterable[str] = ()) -> Dict[str, Any]:
+          settings: Dict[str, float] | None = None, text_only: Iterable[str] = (),
+          substitutions: Dict[str, str] | None = None) -> Dict[str, Any]:
     """The pure check: plan + alignment + cached whisper words in, report dict out.
 
     `audio` is {"duration", "speech_end"} of the real recording (None if missing),
     `timeline` the cache facts ({"present", "fresh", "model", "configured_model", ...}),
-    `settings` the effective sync/hold settings (sync.effective_settings).
+    `settings` the effective sync/hold settings (sync.effective_settings),
+    `substitutions` maps dropped panel id -> shown panel id (the plan's
+    recorded drop substitutions, incident 6): a sentence tagged with a
+    dropped panel is judged against the panel the plan actually shows,
+    instead of failing its original tag at 0% coverage forever.
     """
     st = {**sync_mod.SYNC_DEFAULTS, **(settings or {})}
     text_only = set(text_only)
+    if substitutions is None:
+        # Single source of truth: the plan's own recorded substitutions.
+        substitutions = {str(e.get("dropped")): str(e.get("shown"))
+                         for e in (plan.get("substitutions") or [])
+                         if isinstance(e, dict) and e.get("dropped") and e.get("shown")}
+    subs = dict(substitutions or {})
     shots = sorted([s for s in (plan.get("shots") or [])], key=lambda s: float(s["start"]))
     segments = [s for s in (alignment.get("segments") or [])
                 if float(s.get("end", 0)) > float(s.get("start", 0))]
     if not shots or not segments:
         raise UserError("The plan or alignment has no shots/segments to audit.")
+    if subs:
+        # Judge reality: a recorded substitution replaces the dropped tag in
+        # every judging path below (expected sets, ownership, coverage). The
+        # report's "expected" fields then name what the plan really shows.
+        segments = [{**s, "tagged_panels": [subs.get(p, p) for p in (s.get("tagged_panels") or [])]}
+                    if s.get("tagged_panels") else s for s in segments]
 
     sh_starts = [float(s["start"]) for s in shots]
     seg_starts = [float(s["start"]) for s in segments]
@@ -682,7 +699,10 @@ def make_report(root: Path, chapter: str, cfg, log: Callable = print) -> Dict[st
         audio_facts = {"name": audio.name, "duration": round(float(timing["duration"]), 3),
                        "speech_end": round(float(timing["speech_end"]), 3)}
 
-    report = audit(plan, alignment, words, audio=audio_facts, timeline=tl, settings=st, text_only=text_only)
+    report = audit(plan, alignment, words, audio=audio_facts, timeline=tl, settings=st, text_only=text_only,
+                   substitutions={str(e.get("dropped")): str(e.get("shown"))
+                                  for e in (plan.get("substitutions") or [])
+                                  if isinstance(e, dict) and e.get("dropped") and e.get("shown")})
     report["chapter"] = chapter
     try:
         atomic_write_text(audit_path(root, chapter), json.dumps(report, indent=1, ensure_ascii=False))

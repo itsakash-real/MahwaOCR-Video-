@@ -7,18 +7,13 @@
 output_folder: "../ManhwaRecaps"
 
 provider:
-  # anthropic | gemini | openai | ollama
-  #   "openai" works for ANY OpenAI-compatible endpoint:
-  #   OpenRouter, Groq, Together, LM Studio, vLLM, DeepSeek, etc.
   kind: openai
-  vision_model: deepseek-flash
-  # Cheaper text-only model for chapter assembly. null = reuse vision_model.
-  text_model: deepseek-chat
-  base_url: https://api.deepseek.com
-  api_key_env: DEEPSEEK_API_KEY
-  temperature: 0.0        # keep at 0 for reproducible runs
-  max_tokens: 4096        # per tile
-  text_max_tokens: 16000  # chapter assembly and recaps
+  vision_model: gpt-4o-mini
+  text_model: null
+  api_key_env: OPENAI_API_KEY
+  temperature: 0.0
+  max_tokens: 4096
+  text_max_tokens: 16000
   timeout: 180
   max_retries: 4
 
@@ -41,19 +36,17 @@ download:
     User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36
 
 tts:
-  # Deepgram Aura voice for `video tts`. aura-2-orion-en: calm, approachable
-  # American male -- picked for a gentle recap narrator, not a trailer/news
-  # voice. Override per command with --voice.
-  model: aura-2-orion-en
-  # A touch faster than natural reads less like a performance, more like a
-  # narrator moving the story along. Chosen after comparing 1.2/1.23/1.25/1.3
-  # by ear. Aura-2 models only (0.7-1.5). Override per command with --speed.
-  speed: 1.23
+  model: aura-2-odysseus-en
+  speed: 1.3
+  gap_seconds: 0.11
+
+recap:
+  style: manhwabro
 
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
   fps: 30
-  mode: wide              # classic | wide | adaptive | panelfit | fullframe. wide: every card full frame
+  mode: panelfit          # classic | wide | adaptive | panelfit | fullframe
                           # height (no letterbox), min 6/16 of the frame wide (pairs exactly
                           # 8/16), captions overlay the art (no black bar). adaptive: per shot, a
                           # naturally wide panel (aspect >= adaptive.wide_threshold) gets that
@@ -182,7 +175,7 @@ video:
     model: null           # null = the provider's vision_model (deepseek-flash by default)
 
 pipeline:
-  concurrency: 4          # parallel vision calls
+  concurrency: 1          # sequential to stay within free-tier RPM limits
   cache: true             # cache per image+prompt; re-runs are nearly free
   dedupe_threshold: 0.86  # similarity above which overlapping text is merged
   cleanup: true           # delete pages/tiles once a chapter's transcript exists

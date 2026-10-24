@@ -17,6 +17,7 @@ sentences, the same panel tagged again later, and jumps backwards.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import textwrap
 from collections import OrderedDict
@@ -44,6 +45,32 @@ def task_dir(root: Path, chapter: str) -> Path:
 
 def pairs_path(root: Path, chapter: str) -> Path:
     return task_dir(root, chapter) / "pairs.json"
+
+
+def substitutions_path(root: Path, chapter: str) -> Path:
+    """Where `video plan` records dropped-panel substitutions (incident 6):
+    `video pair --apply` consumes this file into cues.json so the alignment
+    and the sync audit judge the panel that actually shows, not the tag
+    that was dropped."""
+    return task_dir(root, chapter) / "substitutions.json"
+
+
+def load_substitutions(root: Path, chapter: str) -> Dict[str, Dict[str, Any]]:
+    """{"dropped panel id": {"shown": id, "reason": str}} from the plan-time
+    substitution record, when one exists and is still applicable."""
+    path = substitutions_path(root, chapter)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    subs = data.get("substitutions") if isinstance(data, dict) else None
+    if not isinstance(subs, list):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for entry in subs:
+        if isinstance(entry, dict) and entry.get("dropped") and entry.get("shown"):
+            out[str(entry["dropped"])] = {"shown": str(entry["shown"]), "reason": str(entry.get("reason") or "")}
+    return out
 
 
 def _need(root: Path, chapter: str):
@@ -214,6 +241,16 @@ def write_task(root: Path, chapter: str, session: str | None = None, log=print) 
         return s.get("panels") or []
 
     pairs: Dict[str, Any] = {str(n): _entry(s) for n, s in enumerate(cue_data["sentences"], start=1)}
+    # Incident 4 (numbering trap): every key's sentence TEXT rides along, so
+    # an editor (human or agent) can verify a key against its words without
+    # opening a sheet; `--apply` refuses the file when cues.json changed
+    # since it was written (the sha below), because re-segmented sentences
+    # renumber everything and an edit keyed on the old numbering lands on
+    # the WRONG sentence.
+    pairs["_sentences"] = {str(n): (s.get("text") or "")[:90]
+                           for n, s in enumerate(cue_data["sentences"], start=1)}
+    pairs["_cues_sha"] = hashlib.sha256(
+        cues_mod.cues_path(root, chapter).read_bytes()).hexdigest()[:16]
     # B1f: the chapter's landmark slice hints ride along as a note key
     # (like _suggestions) so the editor can adjust them in the same
     # file; unlike _suggestions, --apply DOES write this one back into
@@ -428,7 +465,15 @@ def validate_pairs(pairs: Any, sentence_count: int, by_id: Dict[str, Any]) -> Li
 
 
 def apply(root: Path, chapter: str, log=print) -> int:
-    """Put the tags from pairs.json into the cues. Returns how many sentences changed."""
+    """Put the tags from pairs.json into the cues. Returns how many sentences changed.
+
+    Incident 4 guard: refuses when cues.json changed since `video pair` wrote
+    pairs.json — sentence numbering is segmentation-dependent, and an edit
+    keyed on stale numbering changes the WRONG sentence.
+    Incident 6 path: consumes the plan's recorded drop substitutions
+    (substitutions.json) into cues.json in the same pass, so a dropped
+    mask-risk panel's sentences are re-tagged to the panel that actually
+    shows — the one-command official substitution path."""
     cue_data, panels = _need(root, chapter)
     path = pairs_path(root, chapter)
     if not path.exists():
@@ -436,6 +481,15 @@ def apply(root: Path, chapter: str, log=print) -> int:
     pairs = read_agent_json(path, "pairs.json")
     if not isinstance(pairs, dict):
         raise UserError(f"{path} must be an object: sentence number -> list of panel ids.")
+    stamped_sha = pairs.get("_cues_sha")
+    if isinstance(stamped_sha, str):
+        current_sha = hashlib.sha256(cues_mod.cues_path(root, chapter).read_bytes()).hexdigest()[:16]
+        if current_sha != stamped_sha:
+            raise UserError(
+                f"{path.name} was written against an older cues.json (its sentences were re-split or "
+                f"re-finalized since), so the sentence numbers no longer mean what the editor saw.\n"
+                f"Re-run:  python -m manhwa_ocr video pair --chapter {chapter}   and re-apply your "
+                f"changes against the fresh numbering (check each key's text in _sentences).")
     # B1f: "_slice_hints" is extracted BEFORE the note keys are stripped
     # — it is the one "_" key --apply acts on (it lands in cues.json,
     # next to the motion hints it was modelled on). The raw document
@@ -473,6 +527,12 @@ def apply(root: Path, chapter: str, log=print) -> int:
             if s.get("panels") != ids:
                 s["panels"] = ids
                 changed += 1
+            if ids and s.get("same"):
+                # The {same} flip, made one-command (the documented trap fix:
+                # a sentence the pairing surface gives panels to is, by
+                # definition, no longer "same panel as before").
+                s["same"] = False
+                changed += 1
             if has_motion:
                 if motion is None:
                     if "motion" in s:
@@ -483,6 +543,26 @@ def apply(root: Path, chapter: str, log=print) -> int:
                     changed += 1
     if errors:
         raise UserError("pairs.json has problems, nothing was changed:\n  " + "\n  ".join(errors[:12]))
+    # Incident 6: consume the plan's recorded drop substitutions. A dropped
+    # (mask-risk) panel's sentences are re-tagged to the panel the plan
+    # actually shows, in cues.json itself — the next `video align` then
+    # judges reality and the sync audit passes instead of failing the
+    # original tag at 0%.
+    subs = load_substitutions(root, chapter)
+    if subs:
+        for n, s in enumerate(sentences, start=1):
+            new_tags = [subs.get(pid, {}).get("shown", pid) if pid in subs else pid
+                        for pid in (s.get("panels") or [])]
+            new_tags = list(dict.fromkeys(new_tags))
+            if new_tags != (s.get("panels") or []):
+                dropped = [pid for pid in (s.get("panels") or []) if pid in subs]
+                log(f"  sentence {n}: substitution applied, {', '.join(dropped)} -> "
+                    f"{', '.join(subs[pid]['shown'] for pid in dropped)} "
+                    f"({'; '.join(subs[pid]['reason'] for pid in dropped)})")
+                s["panels"] = new_tags
+                changed += 1
+        substitutions_path(root, chapter).unlink(missing_ok=True)
+        log("  substitutions consumed into cues.json (re-run video align next)")
     tagged = sum(1 for s in sentences if s.get("panels"))
     cue_data["tagged_ratio"] = round(tagged / max(1, len(sentences)), 3)
     atomic_write_text(cues_mod.cues_path(root, chapter), json.dumps(cue_data, indent=1, ensure_ascii=False))

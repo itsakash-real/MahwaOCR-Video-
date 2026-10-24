@@ -198,6 +198,36 @@ def _audio_graph(has_music: bool, duration: float, volume: float,
     return ";".join(parts)
 
 
+def _acquire_render_lock(out: Path) -> Path:
+    """One renderer per output file, ever (incident 23): two renders that
+    target the same MP4 corrupt it (each writes the same .part.mp4 and the
+    player caches by filename). A lock file with O_CREAT|O_EXCL refuses the
+    second render; a lock older than LOCK_STALE_HOURS is stale debris."""
+    lock = out.with_name(out.stem + ".rendering.lock")
+    import time as _time
+
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, f"pid={os.getpid()} started={_time.time():.0f}\n".encode())
+        os.close(fd)
+        return lock
+    except FileExistsError:
+        try:
+            age_h = (_time.time() - lock.stat().st_mtime) / 3600.0
+        except OSError:
+            age_h = 0.0
+        if age_h >= LOCK_STALE_HOURS:
+            lock.unlink(missing_ok=True)
+            return _acquire_render_lock(out)
+        raise UserError(
+            f"Another render appears to be writing {out.name} (lock {lock.name} is "
+            f"{age_h:.1f}h old). Two renders on one output corrupt it. Wait for the "
+            f"other render, or delete the lock if you are certain none is running.") from None
+
+
+LOCK_STALE_HOURS = 6.0
+
+
 def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any], *, preview: bool = False,
            workers: int = 0, log: Callable[[str], None] = print, name: str | None = None,
            panels_data: Dict[str, Any] | None = None) -> Path:
@@ -210,9 +240,25 @@ def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any],
 
     cache = _cache_dir(root, chapter, preview, name)
     cache.mkdir(parents=True, exist_ok=True)
+    out = output_path(root, chapter, preview, name)
+    out.parent.mkdir(parents=True, exist_ok=True)   # the lock lives beside the output
+    lock = _acquire_render_lock(out)  # incident 23: one renderer per output file
+    try:
+        return _render_locked(root, chapter, plan, vcfg, preview=preview, workers=workers,
+                              log=log, name=name, panels_data=panels_data,
+                              jobs=jobs, cache=cache, out=out)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _render_locked(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any], *, preview: bool,
+                   workers: int, log: Callable[[str], None], name: str | None,
+                   panels_data: Dict[str, Any], jobs: List[Dict[str, Any]], cache: Path,
+                   out: Path) -> Path:
+    fmt = Format(*jobs[0]["fmt"])
     todo = [j for j in jobs if not Path(j["out"]).exists()]
     log(f"  {len(jobs)} shots, {len(jobs) - len(todo)} cached, rendering {len(todo)} at "
-        f"{fmt.width}x{fmt.height}{' (preview)' if preview else ''}")
+        f"{jobs[0]['fmt'][0]}x{jobs[0]['fmt'][1]}{' (preview)' if preview else ''}")
 
     started = time.time()
     if todo:
@@ -234,7 +280,6 @@ def render(root: Path, chapter: str, plan: Dict[str, Any], vcfg: Dict[str, Any],
     listing = cache / "concat.txt"
     listing.write_text("".join(f"file '{Path(j['out']).name}'\n" for j in jobs), encoding="utf-8")
 
-    out = output_path(root, chapter, preview, name)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.stem + ".part.mp4")
     duration = float(plan["duration"])

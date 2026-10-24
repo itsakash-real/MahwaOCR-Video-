@@ -685,6 +685,9 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"  ! {len(report['visible_patches'])} panel(s) with a visible painted patch: "
             + ", ".join(d['panel'] for d in report['visible_patches'][:12]))
     align_cov = None
+    # Incident 6: dropped-panel substitutions recorded on the plan (the sync
+    # audit credits them; `video pair --apply` consumes them into cues.json).
+    plan_substitutions: List[Dict[str, str]] = []
     # P3: hook / open-loop status comes from the same cues.json the plan uses.
     cues_data = cues_mod.load_cues_strict(root, chapter)
     hook_info = None
@@ -719,6 +722,18 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
             log(f"  ! tagged panel {_sub['dropped']} was dropped ({_sub['reason']}) -- sentence "
                 f"\"{_sub['sentence']}\" now shows {_sub['shown']} instead. Re-pair it (video pair) "
                 f"if {_sub['shown']} doesn't fit, rather than discovering this at the sync gate.")
+        if _dropped_subs:
+            # The substitution record: the plan carries it (the sync audit
+            # credits it), and `video pair --apply` consumes it into
+            # cues.json so the next alignment judges reality.
+            from ..workspace import work_root as _work_root
+
+            plan_substitutions = [{"dropped": s["dropped"], "shown": s["shown"], "reason": s["reason"]}
+                                  for s in _dropped_subs]
+            atomic_write_text(
+                Path(_work_root(root)) / "video" / f"ch{chapter}" / "substitutions.json",
+                json.dumps({"chapter": chapter, "substitutions": plan_substitutions}, indent=1,
+                           ensure_ascii=False))
         align_cov = alignment.get("coverage")
         queue = alignment.get("review_queue") or []
         # P2: timing warnings ride with the plan (see build_plan), so status/QA/render
@@ -747,6 +762,13 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
                       fixes=fixes, settings=sync_settings, root=root)
     plan["inputs"] = inputs
     plan["generated_hash"] = _shots_hash(plan)
+    plan["substitutions"] = plan_substitutions
+    if not plan_substitutions:
+        # no substitutions in this plan: drop a stale record so a later
+        # `pair --apply` never re-tags from an older build's substitutions
+        from ..workspace import work_root as _work_root
+
+        (Path(_work_root(root)) / "video" / f"ch{chapter}" / "substitutions.json").unlink(missing_ok=True)
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
@@ -757,13 +779,16 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
                         + f"\nDetails: video/chapter_{chapter}.qa.json")
     save_plan(root, chapter, plan)
     # P5: end-screen spec + WATCH NEXT block ride with every plan (native
-    # YouTube cards only; never burned into pixels). Override warnings are
-    # logged here too, next to the other plan-time warnings.
-    from .shorts import build_end_screen as _build_end_screen
-    _es = _build_end_screen(float(plan["duration"]), chapter,
-                            series_name=getattr(sess, "name", None) or sess.slug)
-    atomic_write_text(endscreen_path(root, chapter), json.dumps(_es, indent=1, ensure_ascii=False))
-    atomic_write_text(watch_next_path(root, chapter), _es["watch_next"] + "\n")
+    # YouTube cards only; never burned into pixels) — OPT-IN since incident
+    # 23: the current series rule is no intro/outro pieces at all, so the
+    # metadata is written only when video.endscreen is true (the explicit
+    # `video endscreen` command still writes it on demand).
+    if vcfg.get("endscreen"):
+        from .shorts import build_end_screen as _build_end_screen
+        _es = _build_end_screen(float(plan["duration"]), chapter,
+                                series_name=getattr(sess, "name", None) or sess.slug)
+        atomic_write_text(endscreen_path(root, chapter), json.dumps(_es, indent=1, ensure_ascii=False))
+        atomic_write_text(watch_next_path(root, chapter), _es["watch_next"] + "\n")
     log(f"  chapter {chapter}: {len(plan['shots'])} shots, {mode_note}")
     for _w in plan.get("override_warnings") or []:
         log(f"    ! override ignored: {_w}")
@@ -977,7 +1002,23 @@ def render_chapter(sess, chapter: str, cfg, *, preview: bool = False, workers: i
             f"To render anyway, pass --force to render.")
     if plan.get("panels_fingerprint") and plan["panels_fingerprint"] != panels.get("fingerprint"):
         log("  ! panels were re-detected since this plan was made; shots still reference valid ids, rendering anyway")
-    return render(root, chapter, plan, cfg.video, preview=preview, workers=workers, log=log)
+    path = render(root, chapter, plan, cfg.video, preview=preview, workers=workers, log=log)
+    # Phase-4 fix 4: the gate of record measures the RENDERED frames. Strict
+    # (placed) violations stop the delivery unless the same --force escape as
+    # the sync gate is set; the FULL report is on disk either way.
+    from .frameqc import qc_chapter
+    try:
+        qc_report = qc_chapter(root, chapter, cfg, log=log, preview=preview)
+    except UserError as exc:
+        log(f"  ! frame QC could not run: {exc}")
+        qc_report = {"pass": None}
+    if qc_report.get("pass") is False and not allow_sync_fail:
+        raise UserError(
+            f"Chapter {chapter}'s rendered video violates the placement rules (frame QC):\n  - "
+            + "\n  - ".join(qc_report.get("failures") or [])[:1200]
+            + f"\nFull report: video/chapter_{chapter}.frameqc.json"
+            + "\nFix the cause (usually panel prep/trim) and re-render; --force skips this gate.")
+    return path
 
 
 def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "auto", fmt: str | None = None,
@@ -993,7 +1034,8 @@ def build(sess, chapters: List[str], cfg, *, force: bool = False, sync: str = "a
             continue
         try:
             if cues_mod.load_cues_strict(sess.path, chapter):
-                _align_result = align_engine.build_alignment(sess.path, chapter, cfg, sync=sync, log=log)
+                _align_result = align_engine.build_alignment(sess.path, chapter, cfg, sync=sync,
+                                                             log=log, force=force)
                 # P2: timing warnings are action, not trivia — log each with
                 # its fix here (align), in the plan/QA (make_plan), and in
                 # the render refusal, so estimated timing is never silent.

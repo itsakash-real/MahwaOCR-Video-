@@ -1144,11 +1144,21 @@ def wide_crop(pw: float, ph: float, box: List[float], min_win_h: float,
                 return [0.0, 0.0, 1.0, 1.0], info
             _, top, _, bottom = trimmed
             bands = (content_bands(img, axis="y", exclude=[(by0, by1)])
-                    + content_bands(img, axis="x", exclude=[(bx0, bx1)]))
+                     + content_bands(img, axis="x", exclude=[(bx0, bx1)]))
             info["edge_text"] = any(
                 (b0 <= WIDE_EDGE_MARGIN or b1 >= 1 - WIDE_EDGE_MARGIN)
                 and max(b0, top) < min(b1, bottom)
                 for b0, b1 in bands)
+            # Incident 12: captions overlay the art in wide mode, and a whole
+            # panel cannot dodge its own bottom band. Text inside the bottom
+            # caption zone of the kept region is flagged (a reviewer fixes it
+            # with a fixes.json crop or accepts the collision knowingly) —
+            # previously ONLY windowed cards got this check, so whole-panel
+            # cards carried covered bottom text structurally, silently.
+            zone = (bottom - top) * WIDE_CAPTION_ZONE
+            info["caption_risk"] = any(
+                b0 < bottom and b1 > bottom - zone and max(b0, top) < min(b1, bottom)
+                for b0, b1 in content_bands(img, axis="y", exclude=[]))
         return [0.0, top, 1.0, bottom], info
     subj_w, subj_h = (bx1 - bx0) * pw, (by1 - by0) * ph
     grow = 1.0 + 2.0 * WIDE_HEADROOM
@@ -2993,6 +3003,11 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     if _pf_mode and not bool(_pcfg.get("captions", PF_CAPTIONS)):
         # Measured reference style: NO burned-in captions in this mode.
         # The mode's pin wins over the generic video.captions switch.
+        _captions_on = False
+    if _placed_mode and not bool((vcfg.get("placed") or {}).get("captions", False)):
+        # Incident 12: a placed panel touches the BOTTOM wall by rule, so
+        # burned-in captions can only sit ON the art. Pin them OFF like
+        # panelfit (default false; a series opts in deliberately).
         _captions_on = False
     _captions = []
     if _captions_on:

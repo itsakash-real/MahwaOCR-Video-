@@ -1,0 +1,188 @@
+# Settings for manhwa-ocr. Used from any folder you run commands in.
+
+# Where everything you make goes: one folder per series, holding transcripts,
+# page images, recap scripts, your narration audio and the videos.
+# Relative paths are relative to this file, so "../ManhwaRecaps" is a folder
+# next to the program folder. Keep the program and your output apart.
+output_folder: "../ManhwaRecaps"
+
+provider:
+  # anthropic | gemini | openai | ollama
+  #   "openai" works for ANY OpenAI-compatible endpoint:
+  #   OpenRouter, Groq, Together, LM Studio, vLLM, DeepSeek, etc.
+  kind: openai
+  vision_model: deepseek-flash
+  # Cheaper text-only model for chapter assembly. null = reuse vision_model.
+  text_model: deepseek-chat
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.0        # keep at 0 for reproducible runs
+  max_tokens: 4096        # per tile
+  text_max_tokens: 16000  # chapter assembly and recaps
+  timeout: 180
+  max_retries: 4
+
+slicing:
+  # The most important section. Webtoon strips are ~900x16000; sent whole, a
+  # vision model receives them at roughly 110px wide and text becomes a guess.
+  enabled: true
+  target_height: 2200     # tile height in px (optimized for modern vision models)
+  overlap: 280            # overlap so bubbles spanning a cut survive intact
+  snap_to_gutter: true    # cut at flat rows between panels, not through art
+  gutter_search: 350      # how far to hunt for a clean cut (wider search avoids speech bubbles)
+  min_height_to_slice: 2600
+  max_width: 1100
+
+download:
+  timeout: 60
+  max_retries: 3
+  delay: 0.25             # politeness pause between pages
+  headers:
+    User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36
+
+tts:
+  # Deepgram Aura voice for `video tts`. aura-2-orion-en: calm, approachable
+  # American male -- picked for a gentle recap narrator, not a trailer/news
+  # voice. Override per command with --voice.
+  model: aura-2-orion-en
+  # A touch faster than natural reads less like a performance, more like a
+  # narrator moving the story along. Chosen after comparing 1.2/1.23/1.25/1.3
+  # by ear. Aura-2 models only (0.7-1.5). Override per command with --speed.
+  speed: 1.23
+
+video:
+  format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
+  fps: 30
+  mode: wide              # classic | wide | adaptive | panelfit | fullframe. wide: every card full frame
+                          # height (no letterbox), min 6/16 of the frame wide (pairs exactly
+                          # 8/16), captions overlay the art (no black bar). adaptive: per shot, a
+                          # naturally wide panel (aspect >= adaptive.wide_threshold) gets that
+                          # same wide treatment; a narrower panel keeps its classic shape but
+                          # without the equal-area shrink, so it isn't forced to the same small
+                          # size as every other shape. panelfit: no cards, no cropping -- every
+                          # panel WHOLE at its native aspect over a blurred 60% self-fill,
+                          # slow-zoom 100->108% or a LINEAR top->bottom scroll for tall
+                          # strips (see panelfit: below). fullframe: NO cards at all -- every
+                          # shot is a full-bleed 16:9 camera viewport panning/zooming through
+                          # the panel (see fullframe: below). Landscape only; portrait stays
+                          # classic in both.
+  wide:
+    min_width_ratio: 0.375  # 6/16 of the frame wide; no thin slivers, ever
+    max_upscale: 1.5        # a panel is never upscaled past this (keeps 1080p sharp)
+  adaptive:
+    wide_threshold: 1.333   # a panel's own aspect >= this (4:3) earns the wide treatment
+  panelfit:
+    bg_blur: 50             # Gaussian radius (px at 1080p) of the blurred self-fill background
+    bg_opacity: 0.60        # background layer opacity over black
+    zoom_end: 1.08          # slow zoom end scale (100% -> 108%; pull_out reverses)
+    strip_aspect: 1.9       # panel height/width >= this = vertical strip (fit by width + scroll)
+    max_upscale: 2.4        # foreground is never upscaled past this
+    still_limit: 0.5        # seconds: nothing stays still longer (zero-static rule)
+    fx: true                # impact FX (0.2s shake + white flash) on flagged shots
+    shake_seconds: 0.2      # screen-shake duration on an impact beat
+    shake_amplitude: 10.0   # screen-shake amplitude, px at 1080p
+    flash_frames: 3         # white-flash length at impact cuts, frames (spec: 2-4)
+  fullframe:
+    max_upscale: 2.4        # viewport source floor = frame / this (1920x1080 / 2.4 = 800x450 px);
+                            # zoom depth is capped so no viewport ever sources from less
+    zoom_depth: 1.18        # target push_in / pull_out depth inside the window
+    pan_travel: 1.0         # pan window = viewport * (1 + this) along the pan axis
+  crf: 20                 # quality: lower = better and bigger files
+  preset: veryfast
+  lead: 0.15              # panel appears this long before its sentence
+  min_shot: 1.0           # recap pacing: ~2.7s average shot, 1-5s range
+  max_shot: 5.0
+  min_hold: 1.5           # no picture stays up for less than this (seconds)
+  target_shot: 2.7        # average seconds per shot (recap channels: about 2.7)
+  pair_ratio: 0.3         # share of even-timed shots shown as two cards side by side
+  workers: 0              # parallel renders; 0 = all your CPU cores
+  effects: {shake: true, punch: false, flash: false, end_fade: false}   # calm by default
+  music: null             # P3: null = use music/bed.mp3 in the series folder when it exists
+                          # (drop a royalty-free loop there), else render music-free. Ducks under narration.
+  music_volume: 0.22      # 15-25% under narration; sidechain lets it rise toward 60-80% when no narration
+  music_fade: 0.5         # music fade in/out, seconds (>= 0.3s)
+  sfx_dir: null           # P3: folder (relative to series folder) with whoosh.mp3, impact.mp3,
+  # ding.mp3, sting.mp3, scratch.mp3, rumble.mp3, hit.mp3. null = no SFX; missing files render
+  # silent, never fail.
+  # CapCut-style auto-captions: 3-5 words at a time, key word yellow, bottom band.
+  # Burned in at render from video/chapter_N.captions.ass. true by default for NEW
+  # builds; old plans (no captions key) render without them -- run
+  # `video captions --chapter N` to add captions to an existing plan.
+  captions: true
+  # Gentle grade: null = off; "subtle" = contrast +5%, saturation +5%. Off by default.
+  grade: null
+  # Beat sync: optional beat times (seconds) to snap interior cuts to, within +/-0.15s.
+  # null = no beat sync (cuts stay exactly on their sentences); or drop
+  # {"beats": [...]} as music/beats.json (from any beat-detection tool).
+  beats: null
+  # Panel detection edges. Rows at a panel's top/bottom that are all white (gray above
+  # white_threshold) or all near-black (below black_threshold) are gutter and are trimmed off.
+  # Existing panels.json files are not re-detected on their own: run `video panels --force`.
+  panels:
+    tighten_edges: true
+    white_threshold: 242
+    black_threshold: 13
+    trim_v1: false          # Build 1 white-space trimmer: blank rows only, gutter colour
+                            # detected per panel, caps + review flags recorded in panels.json
+    trim_cap: 0.40          # max share of a panel's height cut from one side
+    trim_v2: false          # Rule 6 white-space eradication: full ink-bbox trim (white+black,
+                            # rows+cols) + slicing strips at large white gaps, at panel build.
+                            # The panelfit prep step (after the recap, before pair/plan).
+  # Bubble/text detector (ogkalu RT-DETR v2, Apache-2.0, ONNX int8). Boxes are cached
+  # per panel under .work/video/chN/boxes/. Get the model file from
+  # huggingface.co/ogkalu/comic-text-and-bubble-detector (detector_int8.onnx).
+  detector:
+    model: ""               # "" = ~/.config/manhwa/models/ogkalu-detector-int8.onnx (or $MANHWA_DETECTOR_MODEL)
+    threshold: 0.35
+  # Card framing: cards keep the panel's full width and slide a vertical window; a panel too wide
+  # for any allowed shape is shown whole on blurred padding. false = the old zoomed side-cropping.
+  crop:
+    full_width: true
+    min_width_kept: 0.9     # last-resort bubble avoidance may narrow a card, never below this
+  # Heads the skin-colour test cannot see (white/silver hair, gray skin). Such panels are listed
+  # under "low_confidence_heads" in video/chapter_N.verify.json for a reviewer.
+  heads:
+    pale: true
+    keep_top: 0.25          # a figure but no located head: a card never starts this far down the panel (0 = off)
+  # `video intro`: a short trailer in front of the series, built from panels of any chapter
+  # (intro/intro.json + audio/chapter_0.mp3; start with `video intro --prepare`).
+  intro:
+    min_hold: 2.0           # shortest time a picture stays up (the chapter videos use min_hold above)
+    pair_ratio: 0.5         # share of neighbouring panels shown as a staggered pair
+    darken: 0.15            # darker grade, 0 (off) to 0.6
+    backdrop: blur          # always the blurred panel behind the cards, never black bars
+    beat_effects: [shake, flash]   # on sentences marked "beat": true in intro.json
+  tts:
+    spell_numbers: true     # new recaps/chapter_N.tts.txt spell digits out (99 -> ninety nine)
+  sync:
+    # Narration sync. `video sync-audit` checks a finished plan against these;
+    # `video build` refuses to render when the match gates fail.
+    min_segment: 0.25    # anti-collapse guard for sentence starts only (NOT a shot floor;
+                         # the 3.0s shot floor is video.min_hold + the sync gate, see below)
+    max_late: 0.3        # a cut may start at most this long after its sentence starts
+    lead: 0.2            # hard early bound: a cut may lead its sentence by at most this
+    max_hold: 8.0        # a single picture held longer than this is split by a slide-in
+    max_unmatched: 6.0   # speech whisper couldn't match for this long stops the build
+    override_evidence: 20  # OCR-overlap score above which a tag/OCR disagreement is flagged (the tag still shows)
+    gate_wrong: 0.05     # build gate: most wrong-picture time (another sentence's panel on
+                         # screen, or a filler that fails the impact test) allowed overall.
+                         # PROVISIONAL - will be set from the calibrated after-distribution.
+    gate_window: 0.25    # build gate: most wrong-picture time allowed in any five-second window
+    gate_grace: 0.2      # build gate: extra lateness tolerated before a cut fails
+    # The gate ALSO fails on: any shot under 3.0s, any sentence whose tagged
+    # panel covers less than its threshold (80% for <=8s sentences, 60% for
+    # longer ones), and any filler that fails the impact test.
+  whisper_model: base.en  # base.en is faster; use a multilingual model (e.g. small) for Hindi narration
+  whisper_language: null  # e.g. "hi"
+  # true: a chapter's video must be approved (video review, or video approve) before rendering
+  require_review: false
+  # The AI review (video review): the same provider as above, or set model: here.
+  review:
+    max_rounds: 3
+    model: null           # null = the provider's vision_model (deepseek-flash by default)
+
+pipeline:
+  concurrency: 4          # parallel vision calls
+  cache: true             # cache per image+prompt; re-runs are nearly free
+  dedupe_threshold: 0.86  # similarity above which overlapping text is merged
+  cleanup: true           # delete pages/tiles once a chapter's transcript exists

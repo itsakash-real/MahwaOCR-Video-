@@ -148,10 +148,14 @@ def _mono16k(path: Path) -> "Any":
 
 def transcribe(audio: Path, *, model: str = "small.en", language: str | None = None,
                initial_prompt: str | None = None, cache: Path | None = None,
-               log=print) -> List[Dict[str, Any]]:
-    """[{"w": word, "start": s, "end": s}, ...] for the whole recording."""
+               log=print, force: bool = False) -> List[Dict[str, Any]]:
+    """[{"w": word, "start": s, "end": s}, ...] for the whole recording.
+
+    ``force=True`` (incident 18) re-transcribes even on a cache key match:
+    ``video pipeline --force`` is a true from-scratch cascade. The fresh
+    result is written back to the cache either way."""
     key = {"audio": file_hash(audio), "model": model, "language": language}
-    if cache and cache.exists():
+    if cache and cache.exists() and not force:
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
             if data.get("key") == key and data.get("words"):

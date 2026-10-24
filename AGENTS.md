@@ -283,11 +283,14 @@ python -m manhwa_ocr video build   --chapter N --session "<name>"   # 3. align +
 python -m manhwa_ocr video verify  --chapter N --session "<name>"   # 4. non-AI check of every drawn panel
 python -m manhwa_ocr video review  --chapter N --session "<name>"   # 5. vision reviewer: review, fix, rebuild, repeat
 python -m manhwa_ocr video approve --chapter N --session "<name>"   # 6. approve this exact plan
-python -m manhwa_ocr video render  --chapter N --session "<name>"   # 7. 1080p MP4
+python -m manhwa_ocr video render  --chapter N --session "<name>"   # 7. 1080p MP4 (+ rendered-frame QC)
+python -m manhwa_ocr video qc      --chapter N --session "<name>"   # 8. re-run the frame QC on demand
 ```
 
 `video build --chapters 1-7` does steps 3 and 7 for many chapters at once, with no agent review.
-Check a chapter's state with `video status --session "<name>"`.
+`video pipeline --chapter N` runs the whole ladder (panels → pair → align → plan →
+verify → sync-audit → render → qc) resumable, with per-stage timing in
+`.work/video/chN/pipeline.json`.
 
 ### What the tool does, in order (all deterministic)
 
@@ -316,7 +319,14 @@ Check a chapter's state with `video status --session "<name>"`.
    FAILS the sync gate — never fixed by stealing time from neighbours. Unshown panels are
    NOT a failure. QA reports tagged coverage per sentence, filler shots/seconds, min shot,
    and panels shown/total (info only).
-5. **Render** (`video render`): 1080p MP4.
+5. **Render** (`video render`): 1080p MP4. After the encode, the
+   **rendered-frame QC** pixel-checks the finished MP4 per shot — white
+   margins inside the foreground, wall contact, zero motion for placed
+   shots — and writes `video/chapter_N.frameqc.json` (full report, never
+   truncated). A strict placed-mode violation stops the delivery; bands
+   that carry art or are the art's own white (SFX overflow, foam, a logo's
+   canvas) are reviewer notes, never failures. One renderer per output
+   file: a second render targeting the same MP4 refuses (lock file).
 
 ### Where each kind of fix goes (this decides whether it survives a rebuild)
 

@@ -142,7 +142,7 @@ def test_pipeline_from_stage_forces_rerun(tmp_path):
         _touch(tmp_path / f"{name}.out", when=now)
     summary = pipeline.run_pipeline(_sess(tmp_path), "1", None, stages=stages,
                                     from_stage="verify", log=lambda *a: None)
-    assert calls == ["verify", "sync-audit", "render"]
+    assert calls == ["verify", "sync-audit", "render", "qc"]
     assert summary["outcome"] == "ok"
 
 

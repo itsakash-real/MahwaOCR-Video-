@@ -90,15 +90,22 @@ def _session(args, *, required: bool = True):
 
 
 def _load_cfg(args, **extra):
-    """Config for a command. Output always goes to a session unless --workdir is given."""
+    """Config for a command. Output always goes to a session unless --workdir is given.
+
+    An explicit --config layers over the working/program yaml (incident 1):
+    resolve_config_chain builds the base layers; MANHWA_CONFIG stays an
+    isolation override, so hermetic tests are unaffected."""
+    from .config import resolve_config_chain
+
     workdir = getattr(args, "workdir", None)
     series = getattr(args, "series", None)
     sess = None
     if not workdir:
         sess = _session(args)
         workdir, series = str(sess.path), series or sess.name
-    cfg = load_config(find_config(getattr(args, "config", None)), series__name=series,
-                      series__workdir=workdir, **extra)
+    explicit = getattr(args, "config", None)
+    cfg = load_config(find_config(explicit), base_layers=resolve_config_chain(explicit),
+                      series__name=series, series__workdir=workdir, **extra)
     return cfg, sess
 
 
@@ -636,6 +643,13 @@ def cmd_video(args) -> int:
     if sess is None:
         raise UserError("Video works per series: use --session or `session use`.")
     action = args.action
+    # Phase-4 fix 1 (incidents 1-3): the effective config is echoed BEFORE
+    # any heavy work, with defaulted criticals marked, so a wrong mode or a
+    # code-defaulted voice is seen up front instead of after a render.
+    if action in {"plan", "sync", "build", "render", "pipeline", "tts", "align", "pair", "qc"}:
+        from .config import format_effective_video
+        for line in format_effective_video(cfg).splitlines():
+            _log(line)
 
     def chapters(default_all: bool = True) -> list:
         spec = args.chapters or args.chapter
@@ -884,6 +898,23 @@ def cmd_video(args) -> int:
             _log(f"=== Chapter {c} ===")
             syncaudit.run(sess.path, c, cfg, log=_log)
         return 0
+
+    if action == "qc":
+        # Phase-4 fix 4: pixel QC on the RENDERED video (white margins inside
+        # the foreground, wall contact, no-motion for placed shots). Full
+        # report: video/chapter_N.frameqc.json.
+        from .video.frameqc import qc_chapter
+
+        failed = False
+        for c in chapters(default_all=False):
+            _log(f"=== Chapter {c} ===")
+            try:
+                report = qc_chapter(sess.path, c, cfg, log=_log, preview=args.preview)
+                failed = failed or report.get("pass") is False
+            except UserError as exc:
+                _log(f"  Error: {exc}")
+                failed = True
+        return 2 if failed else 0
 
     if action == "tts":
         from .video import sync as sync_mod
@@ -1243,7 +1274,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "vision-trim", "pipeline", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render", "pipeline",
+    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "vision-trim", "pipeline", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "qc", "storyboard", "render", "pipeline",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
@@ -1259,7 +1290,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="start", type=float, help="clip start, seconds")
     p.add_argument("--to", dest="end", type=float, help="clip end, seconds")
     p.add_argument("--from-stage", dest="from_stage",
-                   choices=["panels", "pair", "align", "plan", "verify", "sync-audit", "render"],
+                   choices=["panels", "pair", "align", "plan", "verify", "sync-audit", "render", "qc"],
                    help="pipeline: resume at this stage (it and everything after it re-run)")
     p.add_argument("--workers", type=int, default=0, help="parallel renders (default: half your CPU cores)")
     p.add_argument("--count", type=int, default=3, help="shorts: how many Shorts to cut (default 3)")
@@ -1273,13 +1304,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prepare", action="store_true",
                    help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
     p.add_argument("--audio", help="hook/previously: narration audio file, e.g. audio/chapter_0.mp3")
-    p.add_argument("--voice", help="tts: Deepgram voice model (default: tts.model config or aura-2-thalia-en)")
+    p.add_argument("--voice", help="tts: Deepgram voice model (required unless tts.model is set in the config; there is no silent default)")
     p.add_argument("--key-file", dest="key_file",
                    help="tts: file holding the Deepgram API key (default: DEEPGRAM_API_KEY env, else ~/.config/manhwa/deepgram.key)")
     p.add_argument("--no-verify", dest="no_verify", action="store_true",
                    help="tts: skip the automatic whisper-based audio self-check after synthesizing")
     p.add_argument("--speed", type=float,
-                   help="tts: playback speed, Aura-2 models only (default: tts.speed config or 1.23)")
+                   help="tts: playback speed, Aura-2 models only, 0.7-1.5 (default: tts.speed config or 1.23 on aura-2; omitted for other models)")
     p.add_argument("--script", help="hook/previously: narration script, one sentence per line")
     p.add_argument("--cues", help="hook/previously: cues.json file with the narration sentences (alternative to --script); a sentence may pin its panels with a \"panels\" list of refs like \"ch2:P010-14\"")
     p.add_argument("--auto", action="store_true",

@@ -90,5 +90,7 @@ def test_synthesize_chapter_refuses_on_lint_issues(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPGRAM_API_KEY", "SECRETKEY")
 
     with pytest.raises(UserError, match="TTS-readiness issue"):
-        tts_mod.synthesize_chapter(tmp_path, "1", SimpleNamespace(extra={}), log=print,
+        tts_mod.synthesize_chapter(
+            tmp_path, "1", SimpleNamespace(extra={"tts": {"model": "aura-2-thalia-en"}}),
+            log=print,
                                    speak=lambda *a: (_ for _ in ()).throw(AssertionError("should not be called")))
