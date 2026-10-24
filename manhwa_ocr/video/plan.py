@@ -37,6 +37,7 @@ from .crops import (_panel_maps, content_bands, extend_figure_range, head_of, is
                     text_bands, trim_blank_edges,
                     is_system_window, safe_span, tone)
 from .cropcache import crop_key, load_crop, store_crop
+from .gemini_vision import validate_vision_box
 from .verify import find_pair_safe_shape, pick_card
 from .editor import (PAN_DIRECTIONS, SFX_ALL, _inset_card, _inset_crop, build_chapter_cards, extract_callout,
                      pacing_qa, plan_sfx, resolve_beats, resolve_music, snap_cuts_to_beats, split_long_shots)
@@ -2236,7 +2237,8 @@ def placed_trim_rect(img: Image.Image) -> Tuple[float, float, float, float] | No
 
 
 def _placed_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format,
-                 pcfg: Dict[str, Any]) -> Dict[str, Any]:
+                 pcfg: Dict[str, Any],
+                 vision_trim: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Rewrite classic shots into placed shots (landscape only, like
     the wide/adaptive/panelfit passes; portrait formats stay classic).
 
@@ -2250,12 +2252,27 @@ def _placed_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format
     any per-sentence motion hint is ignored (collected into the
     report's "hints_ignored", never an error).
 
+    Vision trim (gemini_vision.py): when `vision_trim` carries an
+    entry for a unit (keyed by slice id for a slice unit, else the
+    panel id) with source "gemini" and a valid box, that box IS the
+    unit's trim rect — it was already sanity-clamped against the
+    algorithmic ink bounds when the artifact was written, and it rides
+    through the exact same spec mechanism ("trim") as an algorithmic
+    rect, recorded per card as trim_source "gemini". An entry marked
+    "fallback" (or a gemini entry whose box no longer validates) runs
+    the algorithmic trim below instead. With no artifact/entry the
+    pass is exactly the pre-vision pass.
+
     Returns {"hints_ignored": [shot ids that carried a motion hint],
     "trimmed": [panel ids whose unit was edge-trimmed],
     "trim_fallback": [panel ids placed untrimmed because no art
-    bounds could be found]}.
+    bounds could be found],
+    "vision_trimmed": [unit ids placed on a Gemini vision box],
+    "vision_fallback": [unit ids whose vision entry fell back to the
+    algorithmic trim]}.
     """
-    report: Dict[str, Any] = {"hints_ignored": [], "trimmed": [], "trim_fallback": []}
+    report: Dict[str, Any] = {"hints_ignored": [], "trimmed": [], "trim_fallback": [],
+                              "vision_trimmed": [], "vision_fallback": []}
     if fmt.width <= fmt.height:
         return report
     trim_cache: Dict[Any, Any] = {}
@@ -2288,26 +2305,46 @@ def _placed_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format
                 # alone. A slice unit is trimmed AFTER slicing, on the
                 # band's own image, exactly as it is fitted.
                 key = (pid, tuple(band) if band is not None else None)
+                unit_id = str(c.get("slice_id") or pid)
                 if key not in trim_cache:
                     rect = None
-                    try:
-                        unit = designer.img(pid)
-                        if band is not None:
-                            _y0 = int(round(float(band[0]) * unit.height))
-                            _y1 = int(round(float(band[1]) * unit.height))
-                            if 0 <= _y0 < _y1 <= unit.height:
-                                unit = unit.crop((0, _y0, unit.width, _y1))
-                        rect = placed_trim_rect(unit)
-                    except (OSError, KeyError):
-                        rect = None
-                    trim_cache[key] = rect
-                rect = trim_cache[key]
+                    source = "algorithmic"
+                    vision_state = None
+                    entry = (vision_trim or {}).get(unit_id) if vision_trim else None
+                    if isinstance(entry, dict) and entry.get("source") == "gemini":
+                        vbox = validate_vision_box(entry.get("box"))
+                        if vbox is not None:
+                            rect, source, vision_state = vbox, "gemini", "used"
+                        else:
+                            vision_state = "fallback"
+                    elif isinstance(entry, dict):
+                        # An artifact entry that is not a usable gemini
+                        # decision: the algorithmic trim decides instead.
+                        vision_state = "fallback"
+                    if rect is None:
+                        try:
+                            unit = designer.img(pid)
+                            if band is not None:
+                                _y0 = int(round(float(band[0]) * unit.height))
+                                _y1 = int(round(float(band[1]) * unit.height))
+                                if 0 <= _y0 < _y1 <= unit.height:
+                                    unit = unit.crop((0, _y0, unit.width, _y1))
+                            rect = placed_trim_rect(unit)
+                        except (OSError, KeyError):
+                            rect = None
+                    trim_cache[key] = (rect, source, vision_state)
+                rect, source, vision_state = trim_cache[key]
+                if vision_state == "used" and unit_id not in report["vision_trimmed"]:
+                    report["vision_trimmed"].append(unit_id)
+                if vision_state == "fallback" and unit_id not in report["vision_fallback"]:
+                    report["vision_fallback"].append(unit_id)
                 if rect is None:
                     # No-art guard: fall back to the UNTRIMMED unit
                     # and flag it — never trim a unit away to
                     # nothing, never drop a story panel silently.
                     c["placed"] = {**placed_spec(pw, ph, fmt, pcfg),
                                    "trim": [0.0, 0.0, 1.0, 1.0],
+                                   "trim_source": "fallback",
                                    "trim_fallback": True}
                     if pid not in report["trim_fallback"]:
                         report["trim_fallback"].append(pid)
@@ -2316,6 +2353,7 @@ def _placed_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Format
                 th = ph * (rect[3] - rect[1])
                 c["placed"] = {**placed_spec(tw, th, fmt, pcfg),
                                "trim": [round(float(v), 4) for v in rect],
+                               "trim_source": source,
                                "trim_fallback": False}
                 if tuple(rect) != (0.0, 0.0, 1.0, 1.0) \
                         and pid not in report["trimmed"]:
@@ -2787,7 +2825,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
                settings: Dict[str, float] | None = None,
                root: Path | None = None,
                caption_sentences: List[Dict[str, Any]] | None = None,
-               slice_hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
+               slice_hints: Dict[str, Any] | None = None,
+               vision_trim: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Turn already-decided panel timing into shots. When `alignment_units` is
     given (the normal path: chapter_N.alignment.json via units_from_alignment()),
     this function makes no panel decisions of its own - it only lays out,
@@ -2944,7 +2983,14 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
     elif _mode == "fullframe":
         _ff_risk = _fullframe_pass(shots, designer, fmt, vcfg.get("fullframe") or {})
     elif _mode == "placed":
-        _placed_report = _placed_pass(shots, designer, fmt, vcfg.get("placed") or {})
+        # Vision trim decisions (gemini_vision.py): accept either the
+        # whole artifact document ({"units": {...}}) or its units map.
+        _vt: Dict[str, Any] | None = None
+        if isinstance(vision_trim, dict) and vision_trim:
+            _vt = vision_trim.get("units") if isinstance(vision_trim.get("units"), dict) \
+                else vision_trim
+        _placed_report = _placed_pass(shots, designer, fmt, vcfg.get("placed") or {},
+                                      vision_trim=_vt)
     _pf_title_cards: List[Dict[str, Any]] = []
     _placed_title_cards: List[Dict[str, Any]] = []
     if _mode in ("panelfit", "placed"):
@@ -2992,6 +3038,8 @@ def build_plan(*, chapter: str, panels_data: Dict[str, Any], duration: float, au
         "placed_hints_ignored": _placed_report.get("hints_ignored", []),
         "placed_trimmed": _placed_report.get("trimmed", []),
         "placed_trim_fallback": _placed_report.get("trim_fallback", []),
+        "placed_vision_trimmed": _placed_report.get("vision_trimmed", []),
+        "placed_vision_fallback": _placed_report.get("vision_fallback", []),
         "fullframe_caption_risk": _ff_risk["caption_risk"],
         "fullframe_figure_risk": _ff_risk["figure_risk"],
         "fullframe_reviewer_focal_ignored": _ff_risk["reviewer_focal_ignored"],

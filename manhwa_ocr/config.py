@@ -193,6 +193,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                                        # master audio is never cut) — timing
                                        # otherwise follows the classic planner
         },
+        "gemini_vision": {
+            # Gemini Vision prep/QC (video/gemini_vision.py): `video
+            # vision-trim` asks Gemini for each placed unit's art box,
+            # sanity-clamped against the algorithmic ink trim, and the
+            # QC helper judges rendered frames against the placement
+            # rule. The model and pacing are pinned here (mirrored by
+            # the module's GEMINI_* constants and tests). Key FILES are
+            # named — never a key value: keys are read from these files
+            # at call time and rotated across calls, exactly like the
+            # Deepgram key-file pattern, and never logged or stored.
+            "model": "gemini-2.5-flash",  # vision-capable, on the keys' verified list
+            "batch_size": 6,              # labelled images per call (storyboard grouping)
+            "max_attempts": 6,            # bounded total attempts per call, across keys
+            "key_files": ["~/.config/manhwa/gemini-1.key",
+                          "~/.config/manhwa/gemini-2.key",
+                          "~/.config/manhwa/gemini-3.key"],
+        },
         "fullframe": {
             "max_upscale": 2.4,        # zoom guardrail: a viewport's source is never smaller
                                        # than the frame / this (1080/2.4 = a 450px source-height
