@@ -282,11 +282,16 @@ def test_qa_flags_a_floating_foreground():
 #
 # The white-space defect: panels carry BAKED-IN white page margins
 # inside the panel image. Placed prep (plan._placed_pass) now shaves
-# every unit on all four edges before fit — reusing the wide-mode
-# detector crops.trim_blank_edges (rows directly, columns via the
-# transposed image) — records the rect in the spec, fits on the
-# trimmed bounds, and falls back to the untrimmed unit (flagged,
-# never dropped) when no art bounds can be found.
+# every unit on all four edges before fit — plan.placed_trim_rect,
+# a STRICT pure-blank-margin shave (a row/column is trimmable only
+# when it is near-white with essentially zero dark pixels) — records
+# the rect in the spec, fits on the trimmed bounds, and falls back
+# to the untrimmed unit (flagged, never dropped) when no art bounds
+# can be found. A white band carrying a speech bubble is content,
+# never a margin: the wide-mode shaver (crops.trim_blank_edges)
+# cuts bubble bands BY DESIGN and must not be reused on whole
+# placed units — measured on Solo ch1 it would have amputated
+# dialogue on 87 of 103 trimmed units.
 
 
 def _textured_rect(d, box, fill=(170, 60, 50), alt=(60, 120, 160), line=(30, 25, 20)):
@@ -329,6 +334,26 @@ def test_placed_trim_rect_none_when_no_art_can_be_found():
     # A mostly-white unit: the detector's no-art guard refuses, so the
     # caller falls back instead of trimming the unit away to nothing.
     assert plan_mod.placed_trim_rect(Image.new("RGB", (600, 800), (255, 255, 255))) is None
+
+
+def test_placed_trim_rect_keeps_a_speech_bubble_band():
+    # A white panel whose top band carries a speech bubble (black
+    # outline + lettering) over white, art below: the bubble is
+    # content. The trim may shave only the PURE white above the
+    # bubble (rows 0..~29 here) and must stop at the bubble — the
+    # wide-mode bubble shaver would have cut the whole band.
+    img = Image.new("RGB", (600, 800), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.ellipse((170, 30, 430, 170), outline=(10, 10, 10), width=5)
+    for i, y in enumerate(range(70, 140, 22)):  # lettering-like marks
+        d.rectangle((230, y, 370 - 30 * (i % 2), y + 9), fill=(10, 10, 10))
+    _textured_rect(d, (0, 300, 599, 799))
+    rect = plan_mod.placed_trim_rect(img)
+    assert rect is not None
+    assert rect[1] <= 0.06          # only the pure white above the bubble went
+    assert rect[1] < 30 / 800 + 0.03
+    assert rect[3] == 1.0           # art band below untouched
+    assert rect[0] == 0.0 and rect[2] == 1.0
 
 
 def _placed_plan_custom(panels, image_for, sentences, slice_hints=None):

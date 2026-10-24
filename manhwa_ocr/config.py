@@ -203,7 +203,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             # named — never a key value: keys are read from these files
             # at call time and rotated across calls, exactly like the
             # Deepgram key-file pattern, and never logged or stored.
-            "model": "gemini-2.5-flash",  # vision-capable, on the keys' verified list
+            "model": "gemini-3.5-flash",  # live flash on the keys (2.5-flash 404s for new users)
             "batch_size": 6,              # labelled images per call (storyboard grouping)
             "max_attempts": 6,            # bounded total attempts per call, across keys
             "key_files": ["~/.config/manhwa/gemini-1.key",

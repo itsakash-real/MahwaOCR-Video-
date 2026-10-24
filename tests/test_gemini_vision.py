@@ -102,7 +102,7 @@ class FakeClient:
     def __init__(self, payload=None, error=None):
         self.payload = payload
         self.error = error
-        self.model = "gemini-2.5-flash"
+        self.model = "gemini-3.5-flash"
         self.calls = []
 
     def generate_json(self, parts):
@@ -117,7 +117,7 @@ class FakeClient:
 
 def test_config_pins_match_module_constants():
     cfg = load_config().video["gemini_vision"]
-    assert cfg["model"] == gv.GEMINI_VISION_MODEL == "gemini-2.5-flash"
+    assert cfg["model"] == gv.GEMINI_VISION_MODEL == "gemini-3.5-flash"
     assert cfg["batch_size"] == gv.GEMINI_BATCH_SIZE == 6
     assert cfg["max_attempts"] == gv.GEMINI_MAX_ATTEMPTS == 6
     assert [p.rsplit("/", 1)[-1] for p in cfg["key_files"]] == \
@@ -138,8 +138,11 @@ def test_client_rotation_order_across_keys(tmp_path):
                                    "dummy-key-3", "dummy-key-1"]
     # JSON response mode + the pinned endpoint/model, on every call.
     for call in transport.calls:
-        assert call["url"].endswith("/models/gemini-2.5-flash:generateContent")
+        assert call["url"].endswith("/models/gemini-3.5-flash:generateContent")
         assert call["payload"]["generationConfig"]["responseMimeType"] == "application/json"
+        # Thinking is disabled: a mechanical box/QC task must not pay
+        # thinking latency (measured ~2.5x on 3.8-flash, 2026-10-24).
+        assert call["payload"]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
 
 
 def test_client_retry_and_rotate_on_429_then_success(tmp_path):
@@ -227,7 +230,7 @@ def test_trim_parses_a_wellformed_response_and_batches_storyboard_style():
     entry = doc["units"]["P001-01"]
     assert entry["source"] == "gemini"
     assert entry["box"] == [0.05, 0.2, 0.95, 0.92]
-    assert entry["model"] == "gemini-2.5-flash" and "reason" not in entry
+    assert entry["model"] == "gemini-3.5-flash" and "reason" not in entry
     assert doc["summary"] == {"total": 1, "gemini": 1, "fallback": 0}
     # Storyboard grouping: one call; the prompt part first, then a text
     # label carrying the unit id immediately before its image part.
@@ -284,7 +287,7 @@ def test_chapter_artifact_written_without_any_key_material(tmp_path, monkeypatch
     assert "x-goog-api-key" not in text
     written = json.loads(text)
     assert written == doc
-    assert written["chapter"] == "1" and written["model"] == "gemini-2.5-flash"
+    assert written["chapter"] == "1" and written["model"] == "gemini-3.5-flash"
     assert written["units"]["P001-01"]["source"] == "gemini"
     # load_vision_trim hands planning exactly the units map.
     assert gv.load_vision_trim(root, "1") == written["units"]
@@ -318,7 +321,7 @@ def _placed_plan(vision_trim):
 
 def test_plan_consumes_a_vision_box_through_the_trim_spec():
     vision = {"P009-01": {"box": [0.05, 0.20, 0.95, 0.92],
-                          "source": "gemini", "model": "gemini-2.5-flash"}}
+                          "source": "gemini", "model": "gemini-3.5-flash"}}
     plan = _placed_plan(vision)
     spec = plan["shots"][0]["cards"][0]["placed"]
     assert spec["trim"] == [0.05, 0.2, 0.95, 0.92]
@@ -335,7 +338,7 @@ def test_plan_consumes_a_vision_box_through_the_trim_spec():
 def test_plan_fallback_entry_runs_the_algorithmic_trim():
     ink = plan_mod.placed_trim_rect(margin_img())
     vision = {"P009-01": {"box": list(ink), "source": "fallback",
-                          "model": "gemini-2.5-flash", "reason": "gemini_failure"}}
+                          "model": "gemini-3.5-flash", "reason": "gemini_failure"}}
     plan = _placed_plan(vision)
     spec = plan["shots"][0]["cards"][0]["placed"]
     assert spec["trim"] == pytest.approx(list(ink), abs=1e-4)

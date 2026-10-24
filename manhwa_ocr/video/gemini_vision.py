@@ -62,7 +62,14 @@ from ..workspace import work_root
 # defaults and asserted equal by tests — the values must never live
 # only in an agent's head).
 
-GEMINI_VISION_MODEL = "gemini-2.5-flash"   # vision-capable, on the keys' verified list
+GEMINI_VISION_MODEL = "gemini-3.5-flash"   # vision-capable flash, live on these keys.
+# Pin history: gemini-2.5-flash was pinned first, but the API now
+# answers 404 "no longer available to new users" for it (and for
+# gemini-2.5-pro) on these keys — measured 2026-10-24. gemini-3.8-flash
+# (the API's suggested replacement) answered but took ~44-108s/call
+# and returned 503 high-demand repeatedly; gemini-3.5-flash answered
+# the same storyboard batches in ~7s with boxes that matched the
+# pixel cross-check on every raced panel.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_KEY_FILES = ("~/.config/manhwa/gemini-1.key",
                     "~/.config/manhwa/gemini-2.key",
@@ -213,7 +220,11 @@ class GeminiVisionClient:
         payload = {
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": 0.0,
-                                 "responseMimeType": "application/json"},
+                                 "responseMimeType": "application/json",
+                                 # Mechanical box/QC task: thinking only
+                                 # adds latency (measured ~2.5x on
+                                 # 3.8-flash) and no accuracy here.
+                                 "thinkingConfig": {"thinkingBudget": 0}},
         }
         last = "no attempt was made"
         for attempt in range(self.max_attempts):

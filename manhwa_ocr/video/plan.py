@@ -2152,6 +2152,9 @@ PL_SHADOW_BLUR = 10        # blur 10px, 40% opacity — under the panel only
 PL_SHADOW_OPACITY = 0.40   # (the panelfit treatment, shared machinery)
 PL_TITLE_CARDS = True      # timeline cues become split-flap title cards
 PL_FIT_TOL = 1.0           # px slack when checking a placed foreground's fit
+_PLACED_NEAR_WHITE = 242   # a pixel with every channel >= this is near-white
+_PLACED_BLANK_DARK = 0.001  # a row/col is blank when <=0.1% of its pixels are not near-white
+_PLACED_TRIM_CAP = 0.40    # one edge never shaves more than 40% of the unit
 
 
 def placed_fit(pw: float, ph: float, fmt: Format) -> Tuple[float, float, float, float, float, str]:
@@ -2209,28 +2212,62 @@ def placed_trim_rect(img: Image.Image) -> Tuple[float, float, float, float] | No
     — so the shave lives here, at unit level, in the placed prep pass:
     after units are formed (panels + B1f slice bands), before fit.
 
-    The detector is NOT new: it is crops.trim_blank_edges — the wide
-    mode detector — reused verbatim. Its rows pass shaves the top and
-    bottom (a row is blank when it is flat-white/hard-lettering with
-    too little soft art texture, per _art_maps' thresholds, so ink and
-    textured art stop the shave); the same function run on the
-    TRANSPOSED image shaves the left and right (its rows are the
-    unit's columns). Its no-art guard carries over: when either pass
-    returns None (too little art would remain, or the kept region has
-    essentially no soft texture) this returns None and the caller
-    falls back to the UNTRIMMED unit, flagged — a story panel is
-    never trimmed away to nothing and never silently dropped.
-    A unit whose art already touches every edge returns exactly
+    WHAT COUNTS AS A MARGIN HERE — read before touching this: only
+    PURE BLANK rows/columns (near-white, essentially zero dark pixels)
+    are shaved. A white band carrying a speech bubble is CONTENT in
+    placed mode — the bubble's outline and lettering stop the shave,
+    so the band is kept whole. This is deliberately NOT the wide-mode
+    detector (crops.trim_blank_edges): that function classifies
+    bubble/caption bands as trimmable BY DESIGN ("cutting into a
+    bubble is intentional" — a wide window can drop/substitute the
+    panel instead). Reusing it on whole placed units (the first
+    version of this function did) amputated dialogue bubbles on
+    87 of Solo ch1's 103 trimmed units — measured 2026-10-24 by
+    classifying the removed bands' dark-pixel share; e.g. P006-05's
+    "trim" removed both of the panel's speech bubbles. The Gemini
+    vision pass had it right: for bubble-band panels the art box is
+    the full unit.
+
+    A row/column is blank when at most ``_PLACED_BLANK_DARK`` of its
+    pixels are non-near-white (any channel below
+    ``_PLACED_NEAR_WHITE``). Each edge shaves at most
+    ``_PLACED_TRIM_CAP`` of the unit. The no-art guard carries over:
+    when the kept region would fall below 30% of the unit on either
+    axis (an all-white unit keeps ~nothing), this returns None and
+    the caller falls back to the UNTRIMMED unit, flagged — a story
+    panel is never trimmed away to nothing and never silently
+    dropped. A unit whose content touches every edge returns exactly
     (0.0, 0.0, 1.0, 1.0): zero trim, byte-identical placement.
     """
-    box_v = trim_blank_edges(img, (0.0, 0.0, 1.0, 1.0))
-    if box_v is None:
+    import numpy as np
+
+    small = img.convert("RGB")
+    if max(small.size) > 480:  # fractions are scale-invariant; cap the analysis cost
+        scale = 480 / max(small.size)
+        small = small.resize((max(1, round(small.width * scale)),
+                              max(1, round(small.height * scale))))
+    arr = np.asarray(small).astype(int)
+    if arr.ndim != 3 or arr.shape[0] < 4 or arr.shape[1] < 4:
         return None
-    box_h = trim_blank_edges(img.transpose(Image.TRANSPOSE), (0.0, 0.0, 1.0, 1.0))
-    if box_h is None:
-        return None
-    # The transposed pass's y axis is the unit's x axis.
-    rect = (float(box_h[1]), float(box_v[1]), float(box_h[3]), float(box_v[3]))
+    nonwhite = arr.min(axis=2) < _PLACED_NEAR_WHITE
+    row_dark = nonwhite.mean(axis=1)
+    col_dark = nonwhite.mean(axis=0)
+
+    def run(frac: Any, cap: int) -> int:
+        n = 0
+        while n < min(cap, len(frac)) and float(frac[n]) <= _PLACED_BLANK_DARK:
+            n += 1
+        return n
+
+    h, w = arr.shape[0], arr.shape[1]
+    top = run(row_dark, int(_PLACED_TRIM_CAP * h))
+    bottom = run(row_dark[::-1], int(_PLACED_TRIM_CAP * h))
+    left = run(col_dark, int(_PLACED_TRIM_CAP * w))
+    right = run(col_dark[::-1], int(_PLACED_TRIM_CAP * w))
+    if (h - top - bottom) < 0.30 * h or (w - left - right) < 0.30 * w:
+        return None  # no-art guard: kept region too small to be a panel
+    rect = (round(left / w, 4), round(top / h, 4),
+            round((w - right) / w, 4), round((h - bottom) / h, 4))
     if not (0.0 <= rect[0] < rect[2] <= 1.0 and 0.0 <= rect[1] < rect[3] <= 1.0):
         return None
     return rect
