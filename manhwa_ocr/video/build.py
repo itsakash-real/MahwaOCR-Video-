@@ -323,6 +323,10 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
         # bounds could be found (the no-art fallback). INFO ONLY.
         "placed_trimmed": list(plan.get("placed_trimmed") or []),
         "placed_trim_fallback": list(plan.get("placed_trim_fallback") or []),
+        # Placed + Gemini Vision: units placed on a vision box, and
+        # units whose vision entry fell back to the algorithmic trim.
+        "placed_vision_trimmed": list(plan.get("placed_vision_trimmed") or []),
+        "placed_vision_fallback": list(plan.get("placed_vision_fallback") or []),
         "min_shot": round(shortest, 2),
         "max_shots": max(0, int(duration // (1.0 if plan.get("mode") == "panelfit" else 3.0))) if duration else 0,
         "head_risk": cs.get("head_risk", []), "side_cut": cs.get("side_cut", []),
@@ -601,6 +605,16 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     if _peek_hints:
         inputs["slice_hints"] = hashlib.sha256(
             json.dumps(_peek_hints, sort_keys=True).encode()).hexdigest()[:12]
+    # Gemini Vision trim decisions (.work/video/ch<N>/vision_trim.json,
+    # from `video vision-trim`): a changed artifact must invalidate a
+    # cached plan on its own, like slice hints above. Absent artifact =
+    # no key, so vision-free chapters keep identical inputs.
+    from .gemini_vision import load_vision_trim, vision_trim_path
+
+    _vision_trim = load_vision_trim(root, chapter)
+    if _vision_trim is not None:
+        inputs["vision_trim"] = hashlib.sha256(
+            vision_trim_path(root, chapter).read_bytes()).hexdigest()[:12]
 
     existing_file = plan_path(root, chapter)
     if existing_file.exists() and not force:
@@ -726,6 +740,7 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     plan = build_plan(chapter=chapter, panels_data=panels, duration=duration, audio=rel_audio,
                       vcfg={**vcfg, "format": fmt}, alignment_units=units, alignment_meta=meta,
                       slice_hints=cues_mod.slice_hints_of(cues_data),
+                      vision_trim=_vision_trim,
                       caption_sentences=_caption_sentences,
                       image_for=lambda p: panel_image(root, chapter, p, norm_w, clean=True,
                                                       fingerprint=panels.get("fingerprint")),
@@ -819,6 +834,14 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
         log(f"    ! placed mode: {len(qa['placed_trim_fallback'])} unit(s) placed UNTRIMMED "
             f"(no art bounds found; unit kept whole, never dropped): "
             f"{', '.join(qa['placed_trim_fallback'][:8])}")
+    if qa.get("placed_vision_trimmed"):
+        log(f"    placed mode: {len(qa['placed_vision_trimmed'])} unit(s) placed on a Gemini "
+            f"vision trim box (clamped against the algorithmic ink bounds): "
+            f"{', '.join(qa['placed_vision_trimmed'][:8])}")
+    if qa.get("placed_vision_fallback"):
+        log(f"    placed mode: {len(qa['placed_vision_fallback'])} unit(s) whose vision trim "
+            f"entry fell back to the algorithmic trim: "
+            f"{', '.join(qa['placed_vision_fallback'][:8])}")
     if plan.get("chapter_cards"):
         from .editor import chapter_cards_to_timestamps as _ts
         log("    chapter cards: " + "; ".join(_ts(plan["chapter_cards"])))

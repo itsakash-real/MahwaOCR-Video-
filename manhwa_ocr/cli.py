@@ -777,6 +777,23 @@ def cmd_video(args) -> int:
                 _log(f"    {cand['panel']}: {cand['text'][:70]}")
         return 0
 
+    if action == "vision-trim":
+        # Gemini Vision trim decisions for placed prep: per placed unit
+        # (storyboard batches of ~6), the art bounding box under the
+        # user's no-white-space rule, sanity-clamped vs the algorithmic
+        # ink trim. Writes .work/video/ch<N>/vision_trim.json, which
+        # `video plan` then consumes; any API failure falls back per
+        # unit, flagged in the artifact — the chapter never blocks.
+        from .video.gemini_vision import vision_trim_chapter
+
+        gv = cfg.video.get("gemini_vision") or {}
+        for c in chapters(default_all=False):
+            rep = vision_trim_chapter(sess.path, c, vcfg=gv)
+            s = rep["summary"]
+            _log(f"  chapter {c}: vision trim: {s['gemini']} gemini / {s['fallback']} "
+                 f"fallback of {s['total']} unit(s)  ->  .work/video/ch{c}/vision_trim.json")
+        return 0
+
     if action == "ocr-draft":
         # Build 3b: per-panel OCR draft grouped by detector bubble boxes.
         from .video.ocrcheck import draft_chapter
@@ -1215,7 +1232,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
-    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "pipeline", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render", "pipeline",
+    p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "vision-trim", "pipeline", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "storyboard", "render", "pipeline",
                                       "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
