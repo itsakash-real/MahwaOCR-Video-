@@ -499,7 +499,11 @@ def _rows(spec):
 
 
 def _sentence(i, words=14):
-    return " ".join(f"word{i}x{k}" for k in range(words)) + "."
+    # Capitalised start: cues.check refuses sentences that begin lowercase
+    # (mis-split fragments), and this fixture must not trip that guard.
+    parts = [f"word{i}x{k}" for k in range(words)]
+    parts[0] = parts[0].capitalize()
+    return " ".join(parts) + "."
 
 
 def _tagged(tags, words=14):
@@ -514,7 +518,7 @@ def test_tag_on_a_text_only_panel_is_an_error_naming_sentence_panel_and_nearest_
     msg = report["errors"][0]
     assert "sentence 2" in msg and "P001-02" in msg and "text-only" in msg
     assert "{P001-03}" in msg, "the nearest drawn panel (the later one on a tie) is suggested"
-    assert "word2x0" in msg                                   # the sentence is quoted
+    assert "Word2x0" in msg                                 # the sentence is quoted
 
 
 def test_tag_on_a_credits_panel_is_an_error():
@@ -554,7 +558,7 @@ def test_warns_on_a_run_of_three_tiny_sentences_but_not_two():
 
 def test_warns_about_digits_and_says_what_will_happen():
     panels = _rows("DDDD")
-    narration = _tagged(["P001-01", "P001-02", "P001-03", "P001-04"], words=14).replace("word1x0", "99")
+    narration = _tagged(["P001-01", "P001-02", "P001-03", "P001-04"], words=14).replace("Word1x0", "99")
     on = cues_mod.check(narration, panels, spell=True)["warnings"]
     off = cues_mod.check(narration, panels, spell=False)["warnings"]
     assert any("contains digits (99)" in w and "spelled out" in w for w in on)
@@ -626,7 +630,10 @@ def test_finalize_rejects_a_tag_on_a_text_only_panel_and_keeps_the_task_open(tmp
 def test_finalize_warns_but_still_saves(tmp_path):
     ws, b, logs = _series(tmp_path, "DDDD")
     b.prepare(["1"], 6)
-    narration = " ".join([f"{{P001-01}} {_sentence(1, 14)}", "Rem.", "Ram.", "Emilia.", f"{{P001-02}} {_sentence(2, 14)}"] * 3)
+    # 2 panel-tagged + 3 tiny ({same} keeps them anchored: below TAGGED_MIN
+    # so the warning fires, above the 50% hard floor so the chapter saves)
+    narration = " ".join([f"{{P001-01}} {_sentence(1, 14)}", "Rem.", "{same} Ram.", "{same} Emilia.",
+                          f"{{P001-02}} {_sentence(2, 14)}"] * 3)
     _parts(b, {"1": narration})
     assert [p.name for p in b.finalize()] == ["chapter_1.md"]
     joined = "\n".join(logs)
