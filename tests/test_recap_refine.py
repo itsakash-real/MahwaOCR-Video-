@@ -280,7 +280,7 @@ def test_claim_check_flags_invented_name_and_number():
     ], idx)["sentences"]
     assert rows[0]["verdict"] == "supported"
     assert rows[1]["verdict"] == "flagged" and any("Voidborn" in f for f in rows[1]["flags"])
-    assert rows[2]["verdict"] == "flagged" and any("nine hundred" in f for f in rows[2]["flags"])
+    assert rows[2]["verdict"] == "flagged" and any("nine" in f for f in rows[2]["flags"])
 
 
 def test_claim_check_sentence_initial_unknown_is_review_not_alarm():

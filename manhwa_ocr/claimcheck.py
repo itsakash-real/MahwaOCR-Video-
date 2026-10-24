@@ -197,6 +197,11 @@ def check_sentences(sentences: List[str], index: TranscriptIndex) -> Dict[str, A
 
         for m in _NUMBER_TOKEN_RE.finditer(spelled):
             tok = m.group(0)
+            if tok == "one":
+                # bare "one" is usually a casual pronoun ("in one bite",
+                # "no one"), not a countable claim -- checking it would
+                # false-alarm constantly, so it is not checked
+                continue
             if index.match_number(tok):
                 anchors.append(f"number: {tok}")
                 evidence_lines += index.lines_with(tok)
