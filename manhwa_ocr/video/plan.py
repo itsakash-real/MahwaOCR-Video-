@@ -1564,15 +1564,7 @@ PF_DRIFT_MAX_TRAVEL = 0.13  # span travel cap, share of frame height: at the cap
                            # the panel HOLDS position — never reverses, never
                            # slows down to stretch the travel over the span
 PF_DRIFT_HEADROOM = 0.03   # fg oversize beyond the travel (edges never show)
-PF_STRIP_ASPECT = 1.6      # panel height/width at/above which a panel is a
-                           # STRIP — panels.TALL_RATIO, the codebase's existing
-                           # strip threshold (kept out of the config defaults
-                           # deliberately; a test pins the two together).
-                           # B1e (the user's locked ruling, shot 6 of their
-                           # second-by-second analysis): a strip no longer
-                           # drift-caps like the reference's short pillars —
-                           # it TRAVERSES, a deliberate linear slide from the
-                           # top of the art to the bottom across the span.
+PF_MAX_UPSCALE = 2.4       # quality guard: never upscale a panel past this
 PF_ZOOM_OUT_FAST_RATE = 0.176  # zoom-OUT rate for a blast (B1e motion hint
                            # "zoom_out_fast"): exactly 2x the impact zoom-in
                            # rate, per the user's detonator->explosion ruling
@@ -1583,7 +1575,6 @@ PF_ZOOM_MAX_TOTAL = 0.45   # total zoom cap: at +45% the scale HOLDS. The
                            # its longest zoom shots hold rather than keep
                            # growing — the cap binds on any zoom span past
                            # 9s (standard rate) / 5.1s (impact rate)
-PF_MAX_UPSCALE = 2.4       # quality guard: never upscale a panel past this
 PF_STILL_LIMIT = 0.5       # spec: no image still for longer than this, seconds
 PF_MIN_SHOT = 0.3          # this mode's shot floor (measured minimum shot)
 PF_SPLIT_ABOVE = 3.0       # sentences longer than this split into two shots
@@ -1648,11 +1639,6 @@ def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
                  force: str | None = None) -> Tuple[str, float, float, float]:
     """(kind, base_w, base_h, scale) for one panel on the canvas.
 
-    "traverse": a STRIP (height/width >= PF_STRIP_ASPECT) fitted BY
-    WIDTH at the capped scale, so it stands taller than the frame and
-    can slide from its top to its bottom (B1e E4). When even the
-    width-fit leaves it no taller than the frame it degrades to the
-    ordinary fits below.
     "fill": aspect >= PF_FILL_ASPECT — the panel cover-fills the whole
     frame (full-bleed; cropped by the frame, never letterboxed). Only
     when the cover scale fits under the upscale cap: a wide-but-tiny
@@ -1660,10 +1646,13 @@ def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
     capped pillar fit instead (over blur, smaller, never stretched).
     "drift": a narrow pillar (aspect < PF_DRIFT_ASPECT_MAX), height-fit
     and oversized by (travel + headroom) so its gentle vertical drift
-    never exposes a panel edge.
+    never exposes a panel edge. TALL STRIPS route here too — the
+    measured reference never width-fits a strip or flies through it
+    (its pillars are 504-1020px wide at 1080p, drifting at ~72px/s);
+    the old width-fit traverse (B1e E4) is gone (refmatch 2026-10-24).
     "zoom": a wider pillar, height-fit exactly; it zoom-ins by rate.
-    `force="zoom"` (a per-sentence motion hint, B1e E5) skips the strip
-    and drift routing and returns the plain zoom geometry.
+    `force="zoom"` (a per-sentence motion hint, B1e E5) skips the drift
+    routing and returns the plain zoom geometry.
     All fits preserve the panel's aspect exactly and cap the scale at
     PF_MAX_UPSCALE (a capped pillar sits smaller; never a stretch).
     """
@@ -1671,13 +1660,8 @@ def panelfit_fit(pw: float, ph: float, fmt: Format, *, dur: float = 2.0,
     cap = max(0.1, float(pcfg.get("max_upscale", PF_MAX_UPSCALE)))
     fill_aspect = float(pcfg.get("fill_aspect", PF_FILL_ASPECT))
     drift_max = float(pcfg.get("drift_aspect_max", PF_DRIFT_ASPECT_MAX))
-    strip_aspect = float(pcfg.get("strip_aspect", PF_STRIP_ASPECT))
     pw, ph = max(1.0, float(pw)), max(1.0, float(ph))
     aspect = pw / ph
-    if force != "zoom" and ph / pw >= strip_aspect:
-        s = min(fmt.width / pw, cap)
-        if ph * s > fmt.height + 0.5:
-            return "traverse", pw * s, ph * s, s
     if aspect >= fill_aspect:
         s_cover = max(fmt.width / pw, fmt.height / ph)
         if s_cover <= cap:

@@ -130,7 +130,7 @@ CONTACT_CASES = [  # (pw, ph, kind, wall pair it must touch)
     (900, 1200, "zoom", "tb"),      # height-fit pillar: base_h == 1080
     (900, 1400, "drift", "tb"),     # oversized pillar: taller than the frame
     (2000, 900, "fill", "both"),    # cover: fills every wall
-    (900, 2400, "traverse", "lr"),  # width-fit strip: base_w == 1920
+    (900, 2400, "drift", "tb"),     # tall strip: height-fit + travel, never width-fit
 ]
 
 
@@ -178,7 +178,7 @@ ROUTING_CASES = [  # (pw, ph, expected kind)
     (900, 1400, "drift"),
     (900, 1200, "zoom"),
     (1600, 1000, "fill"),     # aspect exactly 1.6
-    (900, 2400, "traverse"),  # tall strip: the vertical family's full slide
+    (900, 2400, "drift"),     # tall strip: the drift family, never a fly-through
 ]
 
 

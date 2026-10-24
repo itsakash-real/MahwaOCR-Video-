@@ -200,7 +200,7 @@ def _plan_with_spec(spec):
 def test_validate_accepts_good_specs_of_every_kind():
     for spec in (panelfit_spec(900, 1200, "push_in", FMT, {}),
                  panelfit_spec(900, 1400, "pan_down", FMT, {}),
-                 panelfit_spec(900, 2400, "pan_down", FMT, {}),   # a strip -> traverse (B1e)
+                 panelfit_spec(900, 2400, "pan_down", FMT, {}),   # a tall strip -> drift
                  panelfit_spec(2000, 900, "push_in", FMT, {})):
         assert validate(_plan_with_spec(spec), {"P001-01"}) == []
 
@@ -668,58 +668,61 @@ def test_clip_starting_mid_span_keeps_the_motion_phase():
 
 # --------------------------------------- B1e: traverse (E4) / anchoring (E6)
 
-def test_strip_threshold_is_the_codebase_tall_ratio():
-    # The strip class is the codebase's existing one (panels.TALL_RATIO),
-    # not a second threshold invented for this mode.
-    from manhwa_ocr.video import panels as panels_mod
-    assert plan_mod.PF_STRIP_ASPECT == panels_mod.TALL_RATIO == 1.6
-
-
-def test_fit_strip_traverses_width_fit():
+def test_fit_tall_strip_drifts_height_fit():
+    # Refmatch (2026-10-24): the reference NEVER width-fits a strip or
+    # flies through it — its tall panels are height-fit pillars that
+    # drift like every other narrow panel (measured pillars 504-1020px
+    # wide at 1080p, ~72px/s). The old width-fit traverse is gone.
     kind, bw, bh, s = panelfit_fit(900, 2400, FMT, dur=2.0)
-    assert kind == "traverse"                       # h/w 2.67 >= strip threshold
-    assert bw == pytest.approx(1920.0)               # fitted BY WIDTH
-    assert bh == pytest.approx(2400 * 1920 / 900)    # taller than the frame
-    # A strip whose width-fit leaves it no taller than the frame
-    # degrades to the ordinary fits (nothing to traverse).
-    kind2, *_ = panelfit_fit(200, 320, FMT, dur=2.0)   # h/w exactly 1.6, tiny
-    assert kind2 != "traverse"
+    assert kind == "drift"                       # aspect 0.375 < 0.72
+    assert bh == pytest.approx(1080.0 * 1.16)    # height-fit + travel + headroom
+    assert bw == pytest.approx(900 * 1080 / 2400 * 1.16)   # a NARROW pillar
+    assert bw < 700                              # inside the reference's pillar band
+    # A panel at the drift/zoom boundary is unaffected.
+    kind2, *_ = panelfit_fit(900, 1200, FMT, dur=2.0)
+    assert kind2 == "zoom"
 
 
-def test_spec_traverse_span_slices_arrive_at_the_bottom():
+def test_spec_tall_strip_is_a_drift_span_slice():
+    # A tall strip plans exactly like any narrow pillar: one drift span
+    # sliced across the sentence's sub-shots (no traverse, ever).
     sp = panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=3.0, span_dur=6.0, elapsed=0.0)
-    assert sp["kind"] == "traverse" and sp["dir"] == "down"
-    total = (sp["base_h"] - FMT.height) / FMT.height
-    assert sp["traverse_from"] == pytest.approx(0.0)          # top anchor
-    assert sp["traverse_to"] == pytest.approx(-total, abs=1e-3)   # bottom anchor
-    assert sp["traverse_rate"] == pytest.approx(-total / 6.0, abs=1e-3)  # arrives at the END
+    assert sp["kind"] == "drift" and sp["dir"] == "down"
+    assert sp["drift_rate"] == pytest.approx(plan_mod.PF_DRIFT_SPEED)
     mid = panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=3.0, span_dur=6.0, elapsed=3.0)
-    assert mid["traverse_from"] == pytest.approx(-total / 2, abs=1e-3)
+    # The span's travel capped at 13% (140px) at ~1.95s: the mid slice
+    # sits in the cap HOLD at drift_to, not past it.
+    assert mid["drift_from"] == pytest.approx(sp["drift_to"], abs=1e-3)
     adv = plan_mod.panelfit_advance_slice(sp, 3.0)
-    assert adv["traverse_from"] == pytest.approx(mid["traverse_from"], abs=1e-3)
+    assert adv["drift_from"] == pytest.approx(mid["drift_from"], abs=1e-3)
     assert validate(_plan_with_spec(sp), {"P001-01"}) == []
     assert validate(_plan_with_spec(mid), {"P001-01"}) == []
 
 
-def test_render_traverse_anchors_top_then_bottom():
-    # E4+E6 at the renderer: the first frame shows the art's TOP at the
-    # frame's top wall; the last frame shows the art's BOTTOM at the
-    # bottom wall — a deliberate full traverse, not the drift's cap.
+def test_render_tall_strip_is_a_drifting_pillar_never_a_fly_through():
+    # Refmatch: a 900x2400 strip renders as a NARROW height-fit pillar
+    # (whole art inside the frame height, drifting) — the frame walls
+    # are never exposed and the pillar never spans the full width.
     img = Image.new("RGB", (900, 2400), (255, 0, 0))
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, 900, 59), fill=(0, 255, 0))          # the art's top strip
     d.rectangle((0, 2340, 900, 2399), fill=(255, 0, 255))    # the art's bottom strip
     spec = panelfit_spec(900, 2400, "pan_down", FMT, {}, dur=6.0)
+    assert spec["kind"] == "drift" and spec["base_w"] < 700   # narrow pillar spec
     r = _renderer(img, spec, end=6.0)
     f0 = r.frame_array(0.05)
-    assert tuple(f0[4, 960]) == (0, 255, 0)        # art top AT the top wall
-    assert tuple(f0[540, 960]) == (255, 0, 0)
+    # The drift walks the art's 173px of overflow gently (140px travel):
+    # at the down-start the art's BOTTOM band is on screen; by the span's
+    # end the art has moved down and its TOP band is on screen. The whole
+    # art passes the frame — slowly, never a fly-through.
+    assert ((f0[:, :, 2] > 200) & (f0[:, :, 0] > 200)).any(), "art bottom visible at span start"
     f1 = r.frame_array(5.95)
-    assert tuple(f1[1075, 960]) == (255, 0, 255)   # art bottom AT the bottom wall
-    assert tuple(f1[540, 960]) == (255, 0, 0)
+    sharp_green = np.flatnonzero(((f1[:, :, 1] > 250) & (f1[:, :, 0] < 80)).any(axis=0))
+    assert sharp_green.size, "art top visible at span end"
+    assert (sharp_green[-1] - sharp_green[0]) < 900           # narrow pillar on screen
 
 
-def test_build_plan_strip_sentence_traverses():
+def test_build_plan_strip_sentence_drifts():
     panels = PANELS + [{"id": "P001-05", "width": 900, "height": 2400, "text": ""}]
     vcfg = {**VCFG, "mode": "panelfit"}
     sentences = [{"start": 0.0, "text": "the girl among the explosives",
@@ -728,8 +731,8 @@ def test_build_plan_strip_sentence_traverses():
                       duration=5.0, audio=None, vcfg=vcfg, image_for=_img_for,
                       sentences=sentences)
     specs = [c["panelfit"] for s in plan["shots"] for c in s["cards"]]
-    assert specs and all(sp["kind"] == "traverse" for sp in specs)
-    assert set(plan["panelfit_traverse"]) == {s["id"] for s in plan["shots"]}
+    assert specs and all(sp["kind"] == "drift" for sp in specs)
+    assert plan["panelfit_traverse"] == []               # no fly-throughs, ever
     assert validate(plan, {p["id"] for p in panels}) == []
     qa = build_mod.quality_report(plan, {"panels": panels}, None, 3.0)
     assert not any("panel-fit" in f for f in qa["failures"])
