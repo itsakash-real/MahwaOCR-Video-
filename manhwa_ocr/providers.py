@@ -98,7 +98,20 @@ class ResilientKeyPool:
         self.lock = threading.Lock()
         self.circuit_breaker_threshold = max(1, int(circuit_breaker_threshold))
         self.max_wait = max_wait
+        self.last_failures: List[str] = []   # recent classifications, for diagnostics
         self._load(provider_configs)
+
+    def _note(self, what: str) -> None:
+        with self.lock:
+            self.last_failures.append(what)
+            del self.last_failures[:-8]
+
+    def state(self) -> str:
+        with self.lock:
+            bits = [f"{s.provider_kind}:{'OFF' if s.disabled else 'ok'}/strikes={s.consecutive_failures}"
+                    for s in self.slots] or ["no slots loaded (env empty?)"]
+            recent = ("; recent: " + ", ".join(self.last_failures[-3:])) if self.last_failures else ""
+            return f"[{', '.join(bits)}]{recent}"
 
     def _load(self, provider_configs: List[Dict[str, Any]]) -> None:
         for cfg in provider_configs:
@@ -122,20 +135,25 @@ class ResilientKeyPool:
             with self.lock:
                 active = [s for s in self.slots if not s.disabled]
                 if not active:
-                    raise ProviderExhaustedError(
-                        "No healthy API keys available (none configured, or all "
-                        "cooldown/disabled). Falling back to Agent Mode."
+                    exhausted = True
+                else:
+                    exhausted = False
+                    now = time.monotonic()
+                    candidates = sorted(
+                        ((max(s.cooldown_until, s.last_used + s.min_interval), s) for s in active),
+                        key=lambda item: item[0],
                     )
-                now = time.monotonic()
-                candidates = sorted(
-                    ((max(s.cooldown_until, s.last_used + s.min_interval), s) for s in active),
-                    key=lambda item: item[0],
+                    soonest, best = candidates[0]
+                    if soonest <= now:
+                        best.last_used = now
+                        return best
+                    wait = soonest - now
+            if exhausted:
+                # state() takes the lock itself: call it OUTSIDE the with-block
+                raise ProviderExhaustedError(
+                    "No healthy API keys available (none configured, or all "
+                    f"cooldown/disabled). Pool state: {self.state()}"
                 )
-                soonest, best = candidates[0]
-                if soonest <= now:
-                    best.last_used = now
-                    return best
-                wait = soonest - now
             if time.monotonic() + wait > deadline:
                 raise ProviderExhaustedError(
                     f"Every API key is cooling down for another {wait:.0f}s (past the "
@@ -144,10 +162,12 @@ class ResilientKeyPool:
             time.sleep(min(wait, 1.0))
 
     def report_success(self, slot: KeyState) -> None:
+        self._note("success")
         with self.lock:
             slot.consecutive_failures = 0
 
     def report_rate_limit(self, slot: KeyState, retry_after: Optional[float] = None) -> None:
+        self._note(f"429/402-cooldown({retry_after:.0f}s)" if retry_after else "429/402-cooldown")
         with self.lock:
             wait = retry_after if (retry_after and retry_after > 0) else 15.0
             slot.cooldown_until = time.monotonic() + wait + random.uniform(1.0, 3.5)
@@ -155,12 +175,14 @@ class ResilientKeyPool:
             if slot.consecutive_failures >= self.circuit_breaker_threshold * 2:
                 slot.disabled = True
 
-    def report_fatal(self, slot: KeyState) -> None:
+    def report_fatal(self, slot: KeyState, why: str = "401/403") -> None:
         """Auth/billing failures (401/402/403): the key is dead, disable now."""
+        self._note(f"fatal-disable({why})")
         with self.lock:
             slot.disabled = True
 
-    def report_error(self, slot: KeyState) -> None:
+    def report_error(self, slot: KeyState, why: str = "5xx/net") -> None:
+        self._note(f"error({why})")
         with self.lock:
             slot.consecutive_failures += 1
             slot.cooldown_until = time.monotonic() + (2 ** min(slot.consecutive_failures, 6))
@@ -240,16 +262,16 @@ class Provider(ABC):
                 if status == 429:
                     self.pool.report_rate_limit(slot, _retry_after_seconds(exc))
                 elif status in (401, 403):
-                    self.pool.report_fatal(slot)
+                    self.pool.report_fatal(slot, f"auth({status})")
                 elif status == 402 and _retry_after_seconds(exc) is not None:
                     # OpenRouter's in-flight budget returns 402 WITH a
                     # Retry-After ("wait for in-flight requests to settle")
                     # while the key is perfectly alive: cooldown, not kill.
                     self.pool.report_rate_limit(slot, _retry_after_seconds(exc))
                 elif status == 402:
-                    self.pool.report_fatal(slot)   # genuinely out of credit, no retry hint
+                    self.pool.report_fatal(slot, "credit(402)")   # out of credit, no retry hint
                 else:
-                    self.pool.report_error(slot)
+                    self.pool.report_error(slot, f"http({status})" if status else type(exc).__name__)
                     if status is None or status >= 500:
                         time.sleep(min(2 ** attempt, 8))   # transient network / 5xx
         raise ProviderError(f"{label} failed after {self.attempts} attempts: {last}")
