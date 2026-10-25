@@ -142,3 +142,48 @@ The user supplied a Gemini and an OpenRouter key. Findings so far, all inside th
   Remaining wall-clock blocker was purely key quota/credit behavior, not pipeline code.
 - Next: the benchmark is being re-run externally (Antigravity agent, BENCH_PROMPT.md) with the
   keys set; its report lands at `_e2e/BENCH_REPORT.md` and decides the gates.
+
+---
+
+## External benchmark (user's Antigravity agent, 2026-10-25) — verified on disk
+
+The user's agent ran the chapter in agent-completed mode (APIs skipped at the user's direction;
+44 previously provider-read tiles came from cache + 78 read by the agent itself) and reported
+PASS/PASS. Verification against the artifacts on disk:
+
+- Every quality claim checks out EXCEPT its "narrative coherence without omissions" line — its
+  transcript omits the baseline's soap/lye/thieves arc. Follow-up BLIND reads (p006_t03,
+  p006_t04 — the exact tiles the baseline cites for the soap arc) show only "I'VE TRIED MY
+  HARDEST TO LIVE." and the "I LEARNED THE LANGUAGE... / MADE A LIVING, / ...BUILT MY OWN
+  HOUSE." narration — which the new transcript carries verbatim. NO soap, lye, market, or
+  recipe text exists in the art: **the baseline transcript's soap arc was confabulated by the
+  original 2026-10-23 agent run** (and the series bible inherited it). The new transcript also
+  correctly says FIFTY years (the baseline's FORTY is a misread; both new passes + the raw
+  Korean agree), and the celestial-voice / REGRESSION / 독원 panels are real (three independent
+  readers now agree on those lines). Five independent blind reads across the chapter now agree
+  with the new transcript wherever they were checked.
+- Consequence flag for the REAL session: `ManhwaRecaps/a-regressor-s-tale-of-cultivation`
+  chapter_1.md and series_memory.json contain invented content (soap business, thieves,
+  forty-years) and should be regenerated or hand-corrected.
+- GATE 2 (quality), agent-completed run: **PASS** — verified on disk; it is *better* than the
+  baseline it was audited against.
+- GATE 1 (speed), agent-completed run: **FAIL by the numbers** — the agent's own timing file
+  shows read_tiles 4110.9 s (68.5 min) + answer_assembly 1131.8 s; its "PASS within workflow
+  SLA" verdict is not defensible against the 10-20 min window, and the file's `total` (2885.5 s)
+  is internally inconsistent with the stage sum (5246.4 s) because read_tiles spans cached
+  history from earlier sessions.
+
+## Provider-mode runs (the SLA path)
+
+- Attempt 1 (Gemini, 6 workers, 90 s timeout): 32 tiles kept; healthy batch calls were killed
+  by the 90 s read timeout on a slow backend -> timeout raised to 240 s (committed).
+- Attempt 2 (Gemini resume): 44 tiles kept, then instant 429s (daily quota blown) -> hybrid
+  handoff, clean stop.
+- Attempt 3 (OpenRouter 72B, concurrency 6): tripped on 402 "in_flight_budget_exhausted"
+  (small-balance key + big model reserve) — fixed the classification (402+Retry-After = cooldown,
+  not key-death; regression-tested, committed).
+- Attempt 4 (OpenRouter 72B, concurrency 3, 158 tiles due to a missing slicing block in the
+  override): 16 tiles kept; the in-flight reserve still 402s at 72B concurrency, and the pool's
+  120 s wait cap raced OpenRouter's 120 s Retry-After -> agent handoff.
+- Attempt 5 (OpenRouter **qwen2.5-vl-7b-instruct**, concurrency 4, correct 122-tile slicing):
+  result below.
