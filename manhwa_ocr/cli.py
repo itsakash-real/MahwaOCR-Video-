@@ -1248,7 +1248,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("recap", help="write recap narration, one file per chapter")
     p.add_argument("--chapters", help="e.g. 3, or 1-4, or 1-4,11 (default: all transcribed)")
-    p.add_argument("--minutes", type=float, default=6.0, help="target minutes per chapter")
+    p.add_argument("--minutes", type=float, default=6.5,
+                    help="target minutes of FINISHED narration per chapter "
+                         "(the word budget scales with the configured TTS speed; "
+                         "finalize refuses a recap under recap.min_minutes or over recap.max_minutes)")
     p.add_argument("--prepare", action="store_true", help="agent mode: write prompts for the agent")
     p.add_argument("--finalize", action="store_true", help="agent mode: save what the agent wrote")
     p.add_argument("--cancel", action="store_true", help="agent mode: discard an unfinished task")

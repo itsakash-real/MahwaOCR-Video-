@@ -917,7 +917,8 @@ class RecapBuilder:
             "chapter": chapter,
             "style": self._style(),
             "target_minutes": minutes,
-            "target_words": _target_words(minutes),
+            "tts_speed": float((self.cfg.tts or {}).get("speed") or 1.0),
+            "target_words": _target_words(minutes, (self.cfg.tts or {}).get("speed") or 1.0),
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "range": f"{span[0]}-{span[-1]}",
             "transcripts_present": ", ".join(transcribed) or "none",
@@ -1232,7 +1233,8 @@ class RecapBuilder:
         doc = f"""# Recap task — {self.cfg.series_name}
 
 Write recap-video narration for {len(todo)} chapter(s): {', '.join(todo)}.
-About {_target_words(minutes)} words each (~{minutes:g} minutes read aloud).
+About {_target_words(minutes, (self.cfg.tts or {}).get("speed") or 1.0)} words each
+(~{minutes:g} minutes of finished narration at the configured TTS speed).
 
 ---
 
