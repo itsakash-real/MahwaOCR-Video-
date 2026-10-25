@@ -209,7 +209,12 @@ class Provider(ABC):
         self.image_quality = int(cfg.get("image_quality", 85) or 85)
         if self.KEYED:
             self.pool = ResilientKeyPool(
-                [dict(cfg)], circuit_breaker_threshold=int(cfg.get("circuit_breaker_threshold", 3))
+                [dict(cfg)], circuit_breaker_threshold=int(cfg.get("circuit_breaker_threshold", 3)),
+                # How long a worker waits out cooldowns (429 Retry-After,
+                # OpenRouter in-flight budget) before declaring exhaustion and
+                # handing its tiles to Agent Mode. Small-balance keys need
+                # headroom above OpenRouter's 120s in-flight Retry-After.
+                max_wait=float(cfg.get("key_wait_seconds", 120)),
             )
         else:
             self.pool = None  # type: ignore[assignment]

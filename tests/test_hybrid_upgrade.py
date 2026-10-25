@@ -388,3 +388,19 @@ def test_inflight_budget_402_is_a_cooldown_not_a_kill(monkeypatch):
     except Exception:
         pass
     assert not p2.pool.has_active_keys()
+
+
+def test_key_wait_seconds_is_configurable(monkeypatch):
+    """provider.key_wait_seconds widens the pool's cooldown patience (needed
+    for OpenRouter's 120s in-flight Retry-After on small-balance keys)."""
+    import time as _t
+
+    monkeypatch.setenv("TEST_KEYS", "k1")
+    from manhwa_ocr.providers import build_provider
+
+    p = build_provider({"kind": "openai", "api_key_env": "TEST_KEYS",
+                        "base_url": "https://x.example", "key_wait_seconds": 300})
+    assert p.pool.max_wait == 300
+    p2 = build_provider({"kind": "openai", "api_key_env": "TEST_KEYS",
+                         "base_url": "https://x.example"})
+    assert p2.pool.max_wait == 120.0
