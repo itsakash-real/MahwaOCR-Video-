@@ -478,3 +478,29 @@ def test_runtime_failover_switches_to_next_auto_candidate(tmp_path, monkeypatch)
     result = pipe.run_chapter(chapter="1", folder=pages, keep_work=True)
     assert (ws / "chapter_1.md").exists()
     assert calls["vision"] >= 1        # the second provider did the reading
+
+
+def test_kind_agent_disables_providers_entirely(tmp_path):
+    """provider.kind: agent = agent-only mode by choice: no API attempt at all,
+    tiles shift to TASK_k.md shards instantly."""
+    import pytest as _pytest
+
+    with _pytest.raises(ProviderExhaustedError, match="agent"):
+        build_provider({"kind": "agent"})
+
+    from manhwa_ocr.config import load_config as lc
+
+    pages = _bench_dir(tmp_path)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cfg = lc(series__workdir=str(ws), series__name="AgentDefault",
+             provider__kind="agent", pipeline__stall_minutes=1,
+             slicing__target_height=500, slicing__min_height_to_slice=600)
+    logs = []
+    pipe = Pipeline(cfg, log=logs.append)
+    assert pipe.provider is None            # armed for agent mode, no crash
+    with _pytest.raises(UserError, match="Agent Mode"):
+        pipe.run_chapter(chapter="1", folder=pages, keep_work=True)
+    work = ws / ".work" / "ch1"
+    assert (work / "TASK.md").exists()
+    assert len(list(work.glob("TASK_*.md"))) >= 1

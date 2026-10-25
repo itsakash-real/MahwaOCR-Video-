@@ -7,15 +7,12 @@
 output_folder: "../ManhwaRecaps"
 
 provider:
-  kind: auto             # auto: first kind whose key env is set (gemini ->
-                         # openrouter -> nvidia -> openai -> anthropic); with no
-                         # keys anywhere the pipeline shifts tiles to Agent Mode
+  kind: agent            # AGENT MODE BY DEFAULT: no API calls at all; every
+                         # chapter's tiles go straight to TASK_k.md shards for
+                         # parallel sub-agent reading. To use an API instead set
+                         # kind: auto (first key env that is set wins) or a
+                         # specific kind (gemini/openai/openrouter/nvidia/...).
   vision_model: gemini-3.8-flash
-  fallback_providers:    # tried (in order) only when the primary kind fails/exhausts
-    - kind: openrouter
-      vision_model: qwen/qwen-2.5-vl-72b-instruct
-      api_key_env: OPENROUTER_API_KEY
-    - kind: agent        # ultimate fallback: zero API keys, TASK_k.md shards
   api_key_env: GEMINI_API_KEY   # one key or a comma-separated rotation list
   temperature: 0.0
   max_tokens: 4096

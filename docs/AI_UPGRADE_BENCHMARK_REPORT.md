@@ -250,3 +250,17 @@ total_credits: 0, provider mode cannot complete until either (a) OpenRouter is t
 
     python -m manhwa_ocr run --chapter 2 --folder _e2e/pages \
         --session "A Regressor's Tale of Cultivation" --config _e2e/bench-gemini.yaml
+
+---
+
+## Addendum 4 (2026-10-25): owner decision — agent mode is the default
+
+The user has chosen agent-first operation: `provider.kind: agent` is now a first-class mode
+(build_provider refuses instantly, the pipeline arms the hybrid path, and every tile shifts to
+TASK_k.md shards in seconds -- no API attempt at all), and the sandbox `manhwa-ocr.yaml` now
+ships `kind: agent` with the OpenRouter fallback chain removed. Verified live: a run with no
+keys present slices, shards 122 tiles, and stops with instructions in seconds; suite
+1195 passed. Consequence for the gates: the provider-mode SLA leg is closed BY CHOICE -- agent
+mode is the operating default, its measured chapter time stands (~68-103 min on this box at the
+3-subagent cap), and GATE 1's 10-20-minute window applies only if an API is ever re-enabled
+(`kind: auto` + a funded key). All provider machinery remains in the code, dormant and tested.

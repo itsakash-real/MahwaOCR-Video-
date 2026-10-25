@@ -578,6 +578,14 @@ def build_provider(cfg: Dict[str, Any], skip: "set[tuple[str, str]] | None" = No
     already tried and burned at RUN time -- kind:auto then resolves to the
     next candidate instead (runtime cross-provider failover)."""
     kind = (cfg.get("kind") or "gemini").lower()
+    if kind == "agent":
+        # Agent-only mode, by choice: no API attempt is made at all. The
+        # pipeline arms its hybrid path and every tile goes straight to
+        # TASK_k.md shards (<1s), exactly like the no-keys case.
+        raise ProviderExhaustedError(
+            "Provider mode is disabled (provider.kind: agent): running in agent "
+            "mode; tiles shift straight to TASK_k.md shards."
+        )
     if kind == "auto":
         for entry in _auto_candidates(cfg):
             if skip and (entry.get("kind"), entry.get("api_key_env")) in skip:
