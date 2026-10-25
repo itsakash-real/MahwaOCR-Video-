@@ -486,7 +486,7 @@ PROVIDERS = {
 # Every entry pins its own model, so a cfg-level vision_model never leaks into
 # a provider it doesn't belong to.
 AUTO_KINDS: List[Dict[str, Any]] = [
-    {"kind": "gemini", "api_key_env": "GEMINI_API_KEY", "vision_model": "gemini-2.0-flash",
+    {"kind": "gemini", "api_key_env": "GEMINI_API_KEY", "vision_model": "gemini-3.8-flash",
      "rpm_limit": 14},
     {"kind": "openrouter", "api_key_env": "OPENROUTER_API_KEY",
      "base_url": "https://openrouter.ai/api/v1", "vision_model": "qwen/qwen-2.5-vl-72b-instruct",
