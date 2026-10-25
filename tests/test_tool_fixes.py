@@ -600,7 +600,8 @@ def _series(tmp_path, spec="DTDD", labels=("1",), spell=None):
         (media / "panels.json").write_text(json.dumps({"version": 4, "chapter": c, "fingerprint": "x",
                                                        "norm_width": 100, "pages": ["a.png"], "panels": rows}),
                                            encoding="utf-8")
-    overrides = {"series__workdir": str(ws), "series__name": "T"}
+    overrides = {"series__workdir": str(ws), "series__name": "T",
+                 "recap__min_minutes": 0, "recap__max_minutes": 0}
     cfg = load_config(**overrides)
     if spell is not None:
         cfg.video["tts"] = {"spell_numbers": spell}

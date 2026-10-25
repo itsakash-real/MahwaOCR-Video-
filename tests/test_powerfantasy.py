@@ -58,7 +58,8 @@ def _workspace(tmp_path: Path, style="powerfantasy", labels=("1", "2", "3")):
             f"Then it escalates in chapter {c}.\n\n## Scene 2\n\nA rival appears in chapter {c}.\n",
             encoding="utf-8",
         )
-    cfg = load_config(series__workdir=str(ws), series__name="T", recap__style=style)
+    cfg = load_config(series__workdir=str(ws), series__name="T", recap__style=style,
+                      recap__min_minutes=0, recap__max_minutes=0)
     return cfg, RecapBuilder(cfg, log=lambda *_: None)
 
 

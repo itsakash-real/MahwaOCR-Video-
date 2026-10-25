@@ -49,6 +49,12 @@ tts:
 
 recap:
   style: manhwabro
+  # Narration length CONTRACT: a chapter recap must render as roughly its
+  # target minutes of finished audio (the --minutes target scales the word
+  # budget with the TTS speed above). finalize REFUSES a recap whose
+  # estimated narration runs under min_minutes or over max_minutes.
+  min_minutes: 6.0         # hard floor (the 3-minute-chapter bug is dead)
+  max_minutes: 8.0         # hard cap
 
 video:
   format: "16:9"          # "16:9" for YouTube, "9:16" for Shorts
@@ -199,6 +205,10 @@ video:
   whisper_language: null  # e.g. "hi"
   # true: a chapter's video must be approved (video review, or video approve) before rendering
   require_review: false
+  # Text-card ruling: lettering-only panels (dramatic one-liners, SFX captions,
+  # system boxes — white or black canvas) are NEVER shown. The build hard-fails
+  # a plan that shows one; set true only for a series that is genuinely all text.
+  allow_text_panels: false
   # The AI review (video review): the same provider as above, or set model: here.
   review:
     max_rounds: 3

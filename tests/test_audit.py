@@ -375,7 +375,9 @@ def _recap_ready(tmp_path, labels=("1", "2")):
     ws.mkdir()
     for c in labels:
         (ws / f"chapter_{c}.md").write_text(f"# {c}\n\nThings happen in chapter {c}.\n")
-    return RecapBuilder(load_config(series__workdir=str(ws), series__name="T"), log=lambda *_: None, session="t")
+    return RecapBuilder(load_config(series__workdir=str(ws), series__name="T",
+                                    recap__min_minutes=0, recap__max_minutes=0),
+                           log=lambda *_: None, session="t")
 
 
 def test_reprepare_never_wipes_an_unfinished_recap_task(tmp_path):

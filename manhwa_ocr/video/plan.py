@@ -91,6 +91,15 @@ def _pick(rng: random.Random, weights, avoid: str | None = None) -> str:
 # ------------------------------------------------------------------ timing units
 
 
+def _is_text_card(p: Dict[str, Any]) -> bool:
+    """A panel the video must never show: the classic text-only flags
+    (captions, blank pages, credits) plus the text-card detector's
+    `text_dominant` (lettering-only panels, white or black canvas — the
+    user's standing ruling). Selection treats them identically; the build
+    QA gate is the backstop."""
+    return bool(p.get("text_only") or p.get("text_dominant"))
+
+
 def even_units(panels: List[Dict[str, Any]], duration: float, vcfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """No tags: every drawn panel, in story order, shares the narration's length.
     Longer and text-heavier panels get a little more time. Nothing is dropped:
@@ -98,7 +107,7 @@ def even_units(panels: List[Dict[str, Any]], duration: float, vcfg: Dict[str, An
     and hold_groups() packs them into shots under the cut budget."""
     if not panels:
         raise UserError("No panels to put in the video.")
-    art = [p for p in panels if not p.get("text_only")] or list(panels)
+    art = [p for p in panels if not _is_text_card(p)] or list(panels)
     weights = [1.0 + min(len(p.get("text") or ""), 300) / 150 + (0.4 if p.get("tall") else 0) for p in art]
     total = sum(weights) or 1.0
     units, t = [], 0.0
@@ -116,7 +125,7 @@ def _nearest_art(panels: List[Dict[str, Any]], index: int, avoid: set, reach: in
     forward) that isn't text-only and isn't in `avoid`."""
     for d in range(1, reach + 1):
         for j in (index + d, index - d):
-            if 0 <= j < len(panels) and not panels[j].get("text_only") and panels[j]["id"] not in avoid:
+            if 0 <= j < len(panels) and not _is_text_card(panels[j]) and panels[j]["id"] not in avoid:
                 return panels[j]["id"]
     return None
 
@@ -149,7 +158,7 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
     known = {p["id"] for p in panels}
     index = {p["id"]: i for i, p in enumerate(panels)}
     lead = float(vcfg.get("lead", 0.15))
-    first_art = next((p["id"] for p in panels if not p.get("text_only")), panels[0]["id"])
+    first_art = next((p["id"] for p in panels if not _is_text_card(p)), panels[0]["id"])
     current: List[str] = [first_art]
     units: List[Dict[str, Any]] = []
 
@@ -172,7 +181,7 @@ def synced_units(panels: List[Dict[str, Any]], sentences: List[Dict[str, Any]], 
         end = duration if i + 1 >= len(sentences) else max(start, float(sentences[i + 1]["start"]) - lead)
         ids: List[str] = []
         for p in (x for x in s.get("panels") or [] if x in known):
-            if panels[index[p]].get("text_only"):
+            if _is_text_card(panels[index[p]]):
                 if panels[index[p]].get("credits"):
                     continue                      # scanlator pages are never part of the story
                 p = _nearest_art(panels, index[p], set(ids) | set(current)) or ""

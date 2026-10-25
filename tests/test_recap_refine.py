@@ -146,7 +146,8 @@ def _ws(tmp_path, style="manhwabro", labels=("1", "2"), logs=None):
             f"# Ch {c}\n\n## Scene 1 -- duel\n\n**Mikail:** \"Fight me.\"\n\n"
             f"*(Mikail, silver hair, catches a fire lance and crushes it; the arena goes silent.)*\n",
             encoding="utf-8")
-    cfg = load_config(series__workdir=str(ws), series__name="T", recap__style=style)
+    cfg = load_config(series__workdir=str(ws), series__name="T", recap__style=style,
+                      recap__min_minutes=0, recap__max_minutes=0)
     return ws, RecapBuilder(cfg, log=(logs.append if logs is not None else (lambda *_: None)))
 
 

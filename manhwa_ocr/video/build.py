@@ -85,7 +85,7 @@ def qa_path(root: Path, chapter: str) -> Path:
 
 
 def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict[str, Any] | None,
-                   min_hold: float) -> Dict[str, Any]:
+                   min_hold: float, allow_text_panels: bool = False) -> Dict[str, Any]:
     """Objective checks on a finished plan. `failures` stop the build; the rest
     are warnings for the QA file and the log. Nothing here judges art quality."""
     import math
@@ -242,6 +242,21 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
     failures = []
     if shape_bad:
         failures.append(f"{len(shape_bad)} card(s) are not one of the allowed shapes: {', '.join(shape_bad[:6])}")
+    # The text-card ruling (the user's "never show a lettering panel, white
+    # or black" — pairing TASK, plan art filters and panels.text_dominant
+    # all feed this): a text card in the PLAN is a hard failure, because it
+    # means a sentence got paired to lettering while drawn panels existed.
+    if not allow_text_panels:
+        _rows = {p["id"]: p for p in panels.get("panels") or []}
+        text_shown = sorted({c["panel"] for s in shots for c in s.get("cards") or []
+                             if _rows.get(c["panel"], {}).get("text_only")
+                             or _rows.get(c["panel"], {}).get("text_dominant")})
+        if text_shown:
+            failures.append(
+                f"{len(text_shown)} shown panel(s) are text cards (bubbles/captions/SFX lettering): "
+                f"{', '.join(text_shown[:8])} — re-pair those sentences to drawn panels "
+                f"(pairs.json, then video pair --apply and video plan --force), or set "
+                f"video.allow_text_panels: true only for a series that is genuinely all text cards")
     if pf_bad:
         failures.append(f"{len(pf_bad)} card(s) break the panel-fit composition rules "
                         f"(whole panel, native aspect, blurred background): {', '.join(pf_bad[:6])}")
@@ -778,7 +793,8 @@ def make_plan(sess, chapter: str, cfg, *, force: bool = False, sync: str = "auto
     errs = validate(plan, {p["id"] for p in panels["panels"]})
     if errs:
         raise UserError("Internal error: generated plan is invalid:\n  " + "\n  ".join(errs[:5]))
-    qa = quality_report(plan, panels, align_cov, sync_settings["min_hold"])
+    qa = quality_report(plan, panels, align_cov, sync_settings["min_hold"],
+                        allow_text_panels=bool(vcfg.get("allow_text_panels", False)))
     atomic_write_text(qa_path(root, chapter), json.dumps(qa, indent=1, ensure_ascii=False))
     if qa["failures"]:
         raise UserError(f"Chapter {chapter} can't be built yet:\n  - " + "\n  - ".join(qa["failures"])

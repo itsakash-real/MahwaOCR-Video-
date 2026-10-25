@@ -217,7 +217,8 @@ def test_recap_writes_clean_md_tts_and_cues(tmp_path):
     ws.mkdir()
     (ws / "chapter_1.md").write_text("# 1\n\nThings happen in chapter one.\n")
     _strip(pages_dir(ws, "1"))
-    b = RecapBuilder(load_config(series__workdir=str(ws), series__name="T"), log=lambda *_: None)
+    b = RecapBuilder(load_config(series__workdir=str(ws), series__name="T",
+                                 recap__min_minutes=0, recap__max_minutes=0), log=lambda *_: None)
     prompt = b._prompt_for("1", 6)
     assert "P001-01" in prompt and "{P003-02}" in prompt  # panel list + tagging instructions
     b.prepare(["1"], 6)

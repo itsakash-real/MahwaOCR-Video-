@@ -31,8 +31,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 # ---- pinned thresholds (validated 2026-10-24; see module docstring) -------
-MIN_WORDS = 560          # owner's standing rule: 3-5 min of speech per chapter
-MAX_WORDS = 920
+# MIN/MAX_WORDS: the report's word-band WARNs, matched to the narration
+# length CONTRACT (2026-10-25 user ruling: 6-8 FINISHED minutes; finalize
+# refuses outside it, speed-aware — see script._length_contract_errors).
+# 6 min x 150 wpm x 1.3 speed = 1170; 8 x 150 x 1.3 = 1560.
+MIN_WORDS = 1170
+MAX_WORDS = 1560
 CHAINED_MIN_PCT = 20.0   # validated: control 0.0 vs real recaps 24.2-84.1
 LONG_SENT_MIN_PCT = 5.0  # validated: control 0.0 vs real recaps 7.6-79.5
 VAGUE_MAX = 1            # validated: control 4 vs real 0 / reference 0

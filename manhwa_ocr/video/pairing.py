@@ -118,6 +118,9 @@ def check(root: Path, chapter: str) -> List[str]:
                 problems.append(f"sentence {n}: {pid} is a credits page")
             elif p.get("text_only"):
                 problems.append(f"sentence {n}: {pid} is text only (bubbles/lettering); tag the drawn panel next to it")
+            elif p.get("text_dominant"):
+                problems.append(f"sentence {n}: {pid} is a text card (lettering-only panel, white or black "
+                                "canvas); tag the drawn panel next to it")
             if pid in seen and seen[pid] < n - 1:
                 problems.append(f"sentence {n}: {pid} was already shown at sentence {seen[pid]} (repeat)")
             seen[pid] = n

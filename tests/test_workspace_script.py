@@ -39,7 +39,8 @@ def _page(dirpath: Path, name: str = "p1.png") -> Path:
 
 def _flow(tmp_path: Path):
     ws = tmp_path / "ws"
-    cfg = load_config(series__workdir=str(ws), series__name="T")
+    cfg = load_config(series__workdir=str(ws), series__name="T",
+                      recap__min_minutes=0, recap__max_minutes=0)
     return ws, AgentFlow(cfg, log=lambda *_: None)
 
 
@@ -91,7 +92,8 @@ def test_finalize_keep_preserves_scratch(tmp_path):
 def test_cleanup_disabled_in_config(tmp_path):
     pages = _page(tmp_path / "pages")
     ws = tmp_path / "ws"
-    cfg = load_config(series__workdir=str(ws), series__name="T")
+    cfg = load_config(series__workdir=str(ws), series__name="T",
+                      recap__min_minutes=0, recap__max_minutes=0)
     cfg.pipeline["cleanup"] = False
     flow = AgentFlow(cfg, log=lambda *_: None)
     flow.prepare(chapter="1", folder=pages)
@@ -210,7 +212,8 @@ def _transcripts(tmp_path: Path, labels=("1", "2", "3")):
             "# Ch {0}\n\n## Scene 1\n\nSomething happens in chapter {0}.\n".format(c),
             encoding="utf-8",
         )
-    cfg = load_config(series__workdir=str(ws), series__name="T")
+    cfg = load_config(series__workdir=str(ws), series__name="T",
+                      recap__min_minutes=0, recap__max_minutes=0)
     return cfg, RecapBuilder(cfg, log=lambda *_: None)
 
 
@@ -436,7 +439,8 @@ def test_next_reports_unfinished_recap_task_first(tmp_path):
     s.add_links(["https://x.com/1"])
     (s.path / "chapter_1.md").write_text("# x\n\nbody\n")
     RecapBuilder(
-        load_config(series__workdir=str(s.path), series__name="A"), log=lambda *_: None
+        load_config(series__workdir=str(s.path), series__name="A",
+                    recap__min_minutes=0, recap__max_minutes=0), log=lambda *_: None
     ).prepare(["1"], 6)
     assert "recap task" in next_steps(s)[0].lower()
 
@@ -457,7 +461,8 @@ def test_cli_recap_and_compile_by_session_name(tmp_path, monkeypatch, capsys):
         (sess.path / f"chapter_{c}.md").write_text(f"# {c}\n\nbody\n")
 
     assert cli_main(["recap", "--session", "My Series", "--chapters", "1-2", "--prepare"]) == 0
-    _answer(RecapBuilder(load_config(series__workdir=str(sess.path)), log=lambda *_: None), ["1", "2"])
+    _answer(RecapBuilder(load_config(series__workdir=str(sess.path), recap__min_minutes=0,
+                             recap__max_minutes=0), log=lambda *_: None), ["1", "2"])
     assert cli_main(["recap", "--session", "My Series", "--finalize"]) == 0
     assert sess.recaps() == ["1", "2"]
 

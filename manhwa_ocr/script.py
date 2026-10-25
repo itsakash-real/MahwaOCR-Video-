@@ -178,7 +178,10 @@ Return only valid JSON. No preamble, no markdown fences."""
 SCRIPT_PROMPT = """{briefing_block}{previous_block}{panel_block}
 Series: "{series}"
 Chapter: {chapter}
-Target length: about {words} words (~{minutes} minutes read aloud)
+Target length: about {words} words - about {minutes} minutes of finished narration at this
+series' {speed}x narration speed. This length is a CONTRACT, not a cap: cover every main
+beat of the chapter in story order; never compress the plot to finish early. The finalizer
+REFUSES a chapter whose estimated narration runs under recap.min_minutes or over recap.max_minutes.
 
 Here is the chapter transcript to work from:
 
@@ -243,7 +246,10 @@ the film flows straight from the previous chapter into this one."""
 POWERFANTASY_PROMPT = """{briefing_block}{range_block}{previous_block}{panel_block}
 Series: "{series}"
 Chapter: {chapter}
-Target length: about {words} words (~{minutes} minutes read aloud)
+Target length: about {words} words - about {minutes} minutes of finished narration at this
+series' {speed}x narration speed. This length is a CONTRACT, not a cap: cover every main
+beat of the chapter in story order; never compress the plot to finish early. The finalizer
+REFUSES a chapter whose estimated narration runs under recap.min_minutes or over recap.max_minutes.
 
 {scope_note}
 
@@ -310,7 +316,10 @@ flows straight from the previous chapter into this one."""
 MANHWABRO_PROMPT = """{briefing_block}{previous_block}{panel_block}
 Series: "{series}"
 Chapter: {chapter}
-Target length: about {words} words (~{minutes} minutes read aloud)
+Target length: about {words} words - about {minutes} minutes of finished narration at this
+series' {speed}x narration speed. This length is a CONTRACT, not a cap: cover every main
+beat of the chapter in story order; never compress the plot to finish early. The finalizer
+REFUSES a chapter whose estimated narration runs under recap.min_minutes or over recap.max_minutes.
 
 {scope_note}
 
@@ -420,8 +429,36 @@ def _panel_listing(panels: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _target_words(minutes: float) -> int:
-    return int(minutes * WORDS_PER_MINUTE)
+def _target_words(minutes: float, speed: float = 1.0) -> int:
+    """The narration word budget for `minutes` of AUDIO. The base rate is
+    the slow-read WORDS_PER_MINUTE; the configured TTS speed multiplies
+    it, so `--minutes 6.5` at speed 1.3 budgets ~1267 words and renders
+    as 6.5 actual minutes. (The old speed-blind budget was the "3-minute
+    chapter" bug: a 6-minute target at 900 words rendered in 3.1.)"""
+    return int(minutes * WORDS_PER_MINUTE * max(0.5, float(speed)))
+
+
+def _length_contract_errors(words: int, speed: float, min_minutes: float,
+                            max_minutes: float) -> List[str]:
+    """The finalize length gate, as error strings (empty = within the
+    contract). `words` are spoken words; the estimated narration minutes
+    are words / (WORDS_PER_MINUTE x TTS speed). `min_minutes`/`max_minutes`
+    of 0 disable that bound."""
+    out: List[str] = []
+    speed = max(0.5, float(speed))
+    est = words / (WORDS_PER_MINUTE * speed)
+    if min_minutes > 0 and est < min_minutes:
+        out.append(
+            f"narration is ~{est:.1f} minutes at the {speed:g}x narration speed "
+            f"({words} spoken words) — below the {min_minutes:g}-minute floor "
+            f"(recap.min_minutes). The length is a contract, not a cap: cover every "
+            f"main beat of the chapter in story order instead of compressing the plot.")
+    if max_minutes > 0 and est > max_minutes:
+        out.append(
+            f"narration is ~{est:.1f} minutes at the {speed:g}x narration speed "
+            f"({words} spoken words) — over the {max_minutes:g}-minute cap "
+            f"(recap.max_minutes). Tighten the prose or split the chapter.")
+    return out
 
 
 def _count_words(text: str) -> int:
@@ -737,6 +774,8 @@ class RecapBuilder:
     def _prompt_for(self, chapter: str, minutes: float, *, sheets: List[Path] | None = None,
                     range_chapters: List[str] | None = None) -> str:
         chapter = require_chapter(chapter)
+        speed = float((self.cfg.tts or {}).get("speed") or 1.0)
+        words = _target_words(minutes, speed)
         if self._style() == "powerfantasy":
             return POWERFANTASY_PROMPT.format(
                 briefing_block=self._briefing_block(),
@@ -745,8 +784,9 @@ class RecapBuilder:
                 panel_block=self._panel_block(chapter, sheets),
                 series=self.cfg.series_name,
                 chapter=chapter,
-                words=_target_words(minutes),
+                words=words,
                 minutes=minutes,
+                speed=f"{speed:g}",
                 scope_note=self._scope_note(chapter, range_chapters),
                 transcript=self._transcript(chapter),
             )
@@ -759,8 +799,9 @@ class RecapBuilder:
                 panel_block=self._panel_block(chapter, sheets),
                 series=self.cfg.series_name,
                 chapter=chapter,
-                words=_target_words(minutes),
+                words=words,
                 minutes=minutes,
+                speed=f"{speed:g}",
                 scope_note=self._scope_note(chapter, range_chapters),
                 transcript=self._transcript(chapter),
             )
@@ -770,8 +811,9 @@ class RecapBuilder:
             panel_block=self._panel_block(chapter, sheets),
             series=self.cfg.series_name,
             chapter=chapter,
-            words=_target_words(minutes),
+            words=words,
             minutes=minutes,
+            speed=f"{speed:g}",
             transcript=self._transcript(chapter),
         )
 
@@ -832,8 +874,22 @@ class RecapBuilder:
         from .video import cues
 
         vcfg = self.cfg.video or {}
-        return cues.check(narration, self.panels(chapter), min_hold=float(vcfg.get("min_hold", cues.MIN_HOLD)),
-                          wpm=WORDS_PER_MINUTE, spell=self._spell_numbers())
+        out = cues.check(narration, self.panels(chapter), min_hold=float(vcfg.get("min_hold", cues.MIN_HOLD)),
+                         wpm=WORDS_PER_MINUTE, spell=self._spell_numbers())
+        # Narration length is a CONTRACT (the user's ruling after the
+        # 3-minute chapter): the recap must render as roughly its target
+        # minutes of audio — never a compressed summary. Estimated from the
+        # spoken words at the configured TTS speed (the speed-blind word
+        # budget was the whole bug); recap.min_minutes / recap.max_minutes
+        # bound it, 0 disables a bound.
+        rcfg = self.cfg.recap or {}
+        lo = float(rcfg.get("min_minutes", 6.0) or 0)
+        hi = float(rcfg.get("max_minutes", 8.0) or 0)
+        if lo > 0 or hi > 0:
+            speed = max(0.5, float((self.cfg.tts or {}).get("speed") or 1.0))
+            out["errors"].extend(_length_contract_errors(
+                _count_words(cues.strip_tags(narration)), speed, lo, hi))
+        return out
 
     def _has_audio(self, chapter: str) -> Path | None:
         """The chapter's recorded audio, when its recap or tts file already exists: the recording

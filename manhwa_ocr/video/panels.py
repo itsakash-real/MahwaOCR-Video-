@@ -37,6 +37,15 @@ SHEET_PER_PAGE = 12
 WHITE_THRESHOLD = 242    # a row whose pixels are (almost) all brighter than this is white gutter
 BLACK_THRESHOLD = 13     # ... or all darker than this, near-black gutter
 EDGE_ROW_SHARE = 0.985   # share of a row's pixels that must be white/black for it to count
+# Text-card detection (the user's ruling: a panel that is only lettering —
+# dramatic one-liners, SFX captions, system messages — never appears in the
+# video, whether its canvas is white or black). Two signals, either flags it:
+TEXT_MIDTONE_MAX = 0.18  # under this share of MIDDLE-TONE pixels the panel's ink
+                         # is bimodal (pure white around pure black glyphs) — the
+                         # bodytrim canvas test's same insight, panel-wide. A real
+                         # scene (snow included) carries continuous midtones.
+TEXT_STRIP_MIN_HEIGHT = 120.0  # a strip shorter than this at norm width is a
+                               # one-line caption bar, never a story panel
 
 
 @dataclass
@@ -208,6 +217,23 @@ def _segments(y0: float, y1: float, pages: List[_Page]) -> List[Dict[str, Any]]:
                     "y0": int(round((a - p.offset) * scale)), "y1": int(round((b - p.offset) * scale)),
                     "page_w": p.w})
     return out
+
+
+def _text_card_flag(img: Image.Image, height_norm: float, figure: float,
+                    figure_min: float) -> bool:
+    """True when the panel is a TEXT CARD the video must never show (the
+    user's ruling: lettering-only panels — white or black canvas — stay out).
+    Either signal flags it: bimodal ink with no character drawn (giant
+    glyphs/SFX/system boxes on plain canvas — the bodytrim midtone insight,
+    panel-wide; a real scene, snow included, carries continuous midtones),
+    or a one-line caption strip too short to hold a shot."""
+    if height_norm < TEXT_STRIP_MIN_HEIGHT:
+        return True
+    if figure >= figure_min:
+        return False   # a character is drawn here: art, whatever the palette
+    from .bodytrim import _midtone
+
+    return float(_midtone(img).mean()) < TEXT_MIDTONE_MAX
 
 
 def _trim_x(img: Image.Image, norm_w: int) -> tuple[float, float]:
@@ -634,8 +660,13 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
             img = panel_image(root, chapter, row, norm_w)
             row["art"], row["crop_art"] = art_score(img), crop_art(img)
             row["figure"] = figure_share(img)
+            # Text-card ruling: lettering-only panels never appear in the
+            # video (the pairing TASK, the plan's art filters and the build
+            # QA gate all enforce it; docs in the TEXT_MIDTONE_MAX comment).
+            row["text_dominant"] = _text_card_flag(img, row["height"], row["figure"], FIGURE_MIN)
         except OSError:
             row["art"], row["crop_art"], row["figure"] = 1.0, 1.0, 1.0
+            row["text_dominant"] = False   # unreadable panel: never silently excluded
         # Credits/promo pages (scanlator names, "Read at ...") are never shown.
         row["credits"] = bool(edge_pages & _pages_of(row)) and looks_like_credits(row.get("text") or "")
         # A panel with a character in it is art even when it has little
@@ -699,6 +730,9 @@ def write_sheets(root: Path, chapter: str, data: Dict[str, Any], log=print) -> L
                 pass
             tag = f"{p['id']}{'  (tall)' if p.get('tall') else ''}"
             draw.text((cx + 10, cy + 4), tag, fill=(255, 214, 90), font=font)
+            if p.get("text_dominant"):
+                draw.text((cx + cell_w - 12 - draw.textlength("TEXT CARD", font=font), cy + 4),
+                          "TEXT CARD", fill=(240, 90, 90), font=font)
             if p.get("text_only"):
                 note = "CREDITS - not used" if p.get("credits") else "TEXT - don't use"
                 draw.text((cx + cell_w - 12 - draw.textlength(note, font=font), cy + 4), note,

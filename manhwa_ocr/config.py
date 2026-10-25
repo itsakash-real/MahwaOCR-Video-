@@ -264,6 +264,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "trim_v2": False,       # Rule 6: full ink-bbox trim (white+black, rows+cols) +
                                     # white/black-gap slicing, at panel build (opt-in; panelfit prep)
         },
+        # Text-card ruling: lettering-only panels (bubbles/captions/SFX one-liners,
+        # white or black canvas) are never shown; the build QA gate hard-fails a
+        # plan that shows one. true only for a series that is genuinely all text.
+        "allow_text_panels": False,
         # Bubble/text detector (Build 4/3 shared step): ogkalu RT-DETR, Apache-2.0.
         # "model": path to the ONNX file ("" = ~/.config/manhwa/models/ or $MANHWA_DETECTOR_MODEL)
         "detector": {
@@ -393,10 +397,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         #   slang. Writes from the FULL transcript (OCR + character and panel
         #   descriptions). Full spec: docs/RECAP_STYLE_MANHWABRO.md
         "style": "default",
-        # Owner's standing length rule (pinned; the quality report warns
-        # outside this band): 3-5 minutes of speech per chapter.
-        "min_words": 560,
-        "max_words": 920,
+        # Narration length CONTRACT (the user's ruling after the 3-minute
+        # chapter): a recap must render as roughly its target minutes of
+        # finished audio — 6-7 minutes typical, 8 hard max. finalize REFUSES
+        # a chapter outside this band (estimated from spoken words at the
+        # configured TTS speed); 0 disables a bound. min_words/max_words are
+        # the report's word-band WARNs at the default 1.3x speed
+        # (6 min x 150 wpm x 1.3 = 1170; 8 x 150 x 1.3 = 1560).
+        "min_minutes": 6.0,
+        "max_minutes": 8.0,
+        "min_words": 1170,
+        "max_words": 1560,
     },
 }
 

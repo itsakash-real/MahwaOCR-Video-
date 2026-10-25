@@ -98,10 +98,11 @@ def test_style_docs_name_real_code_symbols():
 
 
 def test_length_band_is_pinned_in_one_place():
-    """The owner's word band (560-920) must stay identical in the quality
+    """The narration length contract (6-8 finished minutes at the default
+    1.3x speed = 1170-1560 words) must stay identical in the quality
     module's constants and the config defaults."""
-    assert recap_quality.MIN_WORDS == DEFAULT_CONFIG["recap"]["min_words"] == 560
-    assert recap_quality.MAX_WORDS == DEFAULT_CONFIG["recap"]["max_words"] == 920
+    assert recap_quality.MIN_WORDS == DEFAULT_CONFIG["recap"]["min_words"] == 1170
+    assert recap_quality.MAX_WORDS == DEFAULT_CONFIG["recap"]["max_words"] == 1560
 
 
 def test_speedrun_doc_claims_the_machinery_it_relies_on():
