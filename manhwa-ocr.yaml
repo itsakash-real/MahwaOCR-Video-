@@ -20,7 +20,8 @@ provider:
   temperature: 0.0
   max_tokens: 4096
   text_max_tokens: 16000
-  timeout: 90            # detect hung connections early; fail fast to fallback
+  timeout: 240           # batched 4-image vision calls can take >90s on slow backends;
+                         # the pipeline stall watchdog still catches true hangs
   max_retries: 3
   image_max_width: 800   # tiles are downscaled + JPEG-compressed in memory on
   image_quality: 85      # encode: ~4-11MB PNG payloads become ~180-350KB
