@@ -933,6 +933,12 @@ class PanelFitView:
             self.drift_to = float(self.drift_to if self.drift_to is not None
                                   else self.drift_from)
         self.appear = shot_start + max(0.0, float(card.get("at") or 0.0))
+        # Rule 7 (hard cuts only): this mode's entrance is ALWAYS a cut,
+        # whatever the card says — including fade_in on pre-rule plans.
+        # The planner forces enter="cut" too; this is the render-level
+        # guarantee so a legacy plan can never blend.
+        self.enter = "cut"
+        self.enter_dur = 0.0
         # Half a frame of slack on the appear edge: plan times are
         # rounded to 3 decimals while frames are drawn on the f/fps
         # grid, so a sub-shot's first frame can land a hair BEFORE
@@ -949,8 +955,6 @@ class PanelFitView:
             # A SLICED spec's rate is signed on purpose (B1e zoom-out
             # hints store it negative) — never "derive" over it.
             self.zoom_rate = max(0.0, self.zoom_end - 1.0) / max(0.01, self.end - self.appear)
-        self.enter = card.get("enter") if card.get("enter") in ENTRANCES else "cut"
-        self.enter_dur = ENTER_DUR[self.enter]
         # B1f: a landmark-slice card shows ONE band of its panel: crop
         # the image to the band (panel-height fractions) before either
         # layer is built, so the slice composes exactly like a panel of
@@ -1160,12 +1164,6 @@ class PanelFitView:
             return img.convert("RGB")
         out = Image.alpha_composite(img, self.shadow_layer(t, extra_zoom))
         out = Image.alpha_composite(out, self.fg_layer(t, extra_zoom))
-        if self.enter == "fade_in" and t < self.appear + self.enter_dur:
-            # The only blended entrance in this mode: fade in from the
-            # blurred background alone. Every other entrance is a cut —
-            # no cross-dissolves anywhere near action.
-            k = ease_in_out((t - self.appear) / max(1e-6, self.enter_dur))
-            out = Image.blend(img, out, k)
         return out.convert("RGB")
 
 
@@ -1307,9 +1305,12 @@ class ShotRenderer:
         # Placed mode's promise is absolute - no fade anywhere in a
         # placed shot (its first frame is pixel-identical to its last) -
         # so neither an exit fade nor the video-end fade may darken one.
+        # Rule 7 extends that to every panelfit shot: hard cuts only, no
+        # intro/outro fade, whatever the config's effects block says.
         _placed = any(getattr(v, "kind", None) == "placed" for v in self.pf_views)
-        self.fade_from = self.end - EXIT_FADE if self.exit == "fade_out" and not _placed else None
-        if end_fade and not _placed and video_end is not None and abs(video_end - self.end) < 0.05:
+        _no_fade = _placed or bool(self.shot.get("panelfit"))
+        self.fade_from = self.end - EXIT_FADE if self.exit == "fade_out" and not _no_fade else None
+        if end_fade and not _no_fade and video_end is not None and abs(video_end - self.end) < 0.05:
             self.fade_from = min(self.fade_from or 1e9, self.end - 1.0)
         if self.fade_from is not None:
             self.fade_from = max(self.start, self.fade_from)  # a short last shot must not start dark

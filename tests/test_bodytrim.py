@@ -259,6 +259,52 @@ def test_panels_version_bumped_for_the_body_pass():
     assert PANELS_VERSION >= 6
 
 
+# --------------------------------------------------------------- rule 7 polish
+
+def test_panelfit_pass_forces_hard_cuts():
+    # Rule 7: no entrance, no effects in panelfit mode, whatever the
+    # classic designer picked for the card.
+    from types import SimpleNamespace
+    from manhwa_ocr.video.frames import Format
+    from manhwa_ocr.video.plan import _panelfit_pass
+    shots = [{"id": "S1", "start": 0.0, "end": 2.0, "layout": "single",
+              "sentence": "he turns.", "motion_hint": None,
+              "cards": [{"panel": "P1", "enter": "slide_left"}],
+              "effects": [{"type": "shake", "t": 0.5}]}]
+    designer = SimpleNamespace(by_id={"P1": {"width": 600.0, "height": 1080.0}},
+                               fixes={})
+    _panelfit_pass(shots, designer, Format(width=1920, height=1080, fps=30), {})
+    assert shots[0]["cards"][0]["enter"] == "cut"
+    assert shots[0]["cards"][0]["panelfit"]["kind"] == "drift"  # aspect 0.56 < 0.72
+    assert shots[0]["effects"] == []
+
+
+def test_panelfit_view_cuts_regardless_of_card_enter():
+    # Render-level guarantee: even a legacy plan carrying fade_in can
+    # never blend a panelfit card in.
+    from manhwa_ocr.video.frames import Format, PanelFitView
+    img = Image.new("RGB", (600, 1080), (90, 90, 90))
+    spec = {"kind": "zoom", "base_w": 600.0, "base_h": 1080.0,
+            "zoom_end": 1.0, "zoom_rate": 0.0}
+    view = PanelFitView(img, spec, {"panel": "P", "enter": "fade_in", "at": 0.0},
+                        0.0, 2.0, Format(width=1920, height=1080, fps=30))
+    assert view.enter == "cut" and view.enter_dur == 0.0
+
+
+def test_panelfit_last_shot_never_fades_out():
+    # Rule 7: no outro fade in panelfit mode even when the config asks
+    # for end_fade and this is the video's final shot.
+    from manhwa_ocr.video.frames import Format, ShotRenderer
+    img = Image.new("RGB", (600, 1080), (120, 120, 120))
+    shot = {"id": "S", "start": 0.0, "end": 2.0, "panelfit": True,
+            "cards": [{"panel": "P", "enter": "cut",
+                       "panelfit": {"kind": "zoom", "base_w": 600.0, "base_h": 1080.0,
+                                    "zoom_end": 1.0, "zoom_rate": 0.0}}]}
+    r = ShotRenderer(shot, {"P": img}, Format(width=1920, height=1080, fps=30),
+                     effects_on={"end_fade": True}, video_end=2.0, end_fade=True)
+    assert r.fade_from is None
+
+
 # --------------------------------------------------------------- rotate fix
 
 def test_fixes_rotate_validation():

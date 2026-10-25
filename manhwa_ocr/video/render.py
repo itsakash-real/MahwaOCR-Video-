@@ -114,7 +114,10 @@ def _jobs(root: Path, chapter: str, plan: Dict[str, Any], panels_data: Dict[str,
     from .plan import shot_frame_bounds
     bounds = shot_frame_bounds(shots, fmt.fps, duration)
     effects_on = {k: bool(v) for k, v in (plan.get("effects_enabled") or vcfg.get("effects") or {}).items()}
-    end_fade = effects_on.get("end_fade", True)
+    # Rule 7 (hard cuts only): NO outro fade unless the config explicitly
+    # asks for one — the old default of True faded every chapter's last
+    # shot when the effects key was missing.
+    end_fade = effects_on.get("end_fade", False)
     crf = int(vcfg.get("crf", 20)) + (6 if preview else 0)
     preset = "ultrafast" if preview else str(vcfg.get("preset", "veryfast"))
     cache = _cache_dir(root, chapter, preview, name)

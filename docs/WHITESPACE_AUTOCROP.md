@@ -103,22 +103,24 @@ Rules already shipped in earlier builds (evidence in code/tests):
 
 | Rule | Where it lives |
 |---|---|
+| 1 never float, art touches walls | height-fit of the body; capped pillars sit smaller (quality guard, flagged over_cap) |
 | 2 no scroll/traverse | traverse deleted (b0f8360); strips height-fit + drift **or** zoom |
 | 3 whole, native aspect | `panelfit_fit` — never stretched; upscale cap only |
+| 4 zero white space | body pass (this document) + frameqc v3 failing panelfit white bands |
 | 5 backdrop + shadow | `PFR_BG_BLUR 50 / OPACITY 1.0 / SHADOW_DY 20 / BLUR 10 / OPACITY .40`, test-pinned |
 | 6 card bg rotation | deterministic 80/10/10 (9904dcf) for modes that still use cards |
-| 7 hard cuts | panelfit pass forces `enter="cut"`, `effects=[]`; no end fade in this mode |
+| 7 hard cuts only | **enforced three ways (polish pass)**: `_panelfit_pass` forces `enter="cut"` and strips effects after impact detection; `PanelFitView` renders every card as a cut even on legacy plans; `end_fade` defaults OFF and panelfit shots are exempt from exit/video-end fades |
 | 8 ink-bbox trim | `trim_v2` (on) |
 | 9 slice at gaps ≥15px | `slice_gaps` (white **and** black, B1f) |
-| 10 edge-trim, fallback+flag | this document (body pass guards) + placed `trim_fallback` |
-| 11 never animate/blur white margins | backdrop is built from the (now body-cropped) art |
+| 10 edge-trim, fallback+flag | body pass guards + placed `trim_fallback` |
+| 11 never animate/blur white margins | backdrop is built from the body-cropped art |
 | 12 landmark cut points | `slicehints.py` (user-written slice hints) |
 | 13–18 pacing/coverage gates | sync gate: shot floor, coverage 80/60, filler impact test, panels-shown info-only |
-| 19–22 pairing rules | `pairing.py` + pairs/cues re-pair requirement (tests) |
+| 19–22 pairing rules | `pairing.py` + pairs/cues re-pair requirement; bubble-only panels leave via re-pairing |
 | 23 title cards = overlays | `titlecards.py` renders on the timeline; master audio never touched |
 | 29 gate order | pipeline: panels→pair→align→plan→verify→sync-audit→render→qc; approve gate before render when `require_review` |
-| 30–32 rendered-frame QC | `frameqc.py` per-shot first/mid/last decode; inside-foreground margins; MP4 is the arbiter |
-| 33 config printed, no silent defaults | plan meta prints effective values + warns on missing keys (plan.py); config.py refuses silent fallbacks |
+| 30–32 rendered-frame QC | `frameqc.py` v3: every shot's start/mid/end decoded; margins inside the foreground at the first AND last frame; panelfit is strict; the MP4 is the arbiter |
+| 33 config printed, no silent defaults | the `video` command prologue echoes the effective config (with `[DEFAULTED]` marks) before plan/build/render/pipeline/pair/qc; config.py refuses silent fallbacks |
 
 Countered, with reasons (the user allows counters):
 

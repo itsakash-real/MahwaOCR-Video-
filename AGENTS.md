@@ -294,6 +294,13 @@ verify → sync-audit → render → qc) resumable, with per-stage timing in
 
 ### What the tool does, in order (all deterministic)
 
+0. **White-space auto-crop** (at panel build, always on): every panel is
+   trimmed to its art body — the drawn border box, or the dense-art span
+   for unbordered panels — so overflowing SFX/bubbles stop keeping their
+   white or black canvas inside the frame (docs/WHITESPACE_AUTOCROP.md).
+   Guards never cut real art; each panel's decision is the `body` record
+   in `panels.json`, previewable with `video trim --chapter N`. Bubbles
+   inked OVER the art can only be hidden by a hand slice hint (table below).
 1. **Align** (`video align`): decides which panel shows for each sentence, from the recap's tags
    and the narration's timing. Writes `video/chapter_N.alignment.json`. A sentence that carries
    several tags followed by an untagged one is reported by `video pair` (and by align's
@@ -333,7 +340,8 @@ verify → sync-audit → render → qc) resumable, with per-stage timing in
 | You want to change | Edit this | Then |
 |---|---|---|
 | Which picture a sentence shows | the recap's tags (`recaps/chapter_N.cues.json`) or `pairs.json` | `video pair --apply`, `video align`, `video plan --force` |
-| Framing: drop a panel, head position, exact crop, a shot's background, how a card enters, a chapter-card title, a callout's text | `video/chapter_N.fixes.json` (`drop`, `face`, `crop`, `shot`, `chapter_cards`, `callouts`) | `video plan --force` |
+| Framing: drop a panel, head position, exact crop, a shot's background, how a card enters, stand a sideways-drawn panel upright, a chapter-card title, a callout's text | `video/chapter_N.fixes.json` (`drop`, `face`, `crop`, `shot`, `rotate` — degrees 90/180/270 clockwise, panelfit mode only, `chapter_cards`, `callouts`) | `video plan --force` |
+| Cut a panel to a chosen band (hide an art-internal bubble/caption, widen a too-tall strip, a 16:9 window) | `_slice_hints` in `.work/video/chN/pairs.json` (`{"P012-03": {"discard": [[0.0, 0.13], [0.82, 1.0]]}}`, fractions of panel height) | `video pair --apply`, `video plan --force` |
 | Anything else about presentation | nothing by hand | change a setting in `manhwa-ocr.yaml` |
 
 `video/chapter_N.plan.json` is **presentation only**. `video plan --force` rebuilds it from the

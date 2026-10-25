@@ -1982,11 +1982,18 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
     for s in shots:
         s["panelfit"] = True
         s["caption_bar"] = False  # this mode burns no captions at all
+        # Rule 7 (hard cuts only): no entrance in this mode — every card
+        # arrives on a cut, whatever the classic designer picked. (The
+        # shot's effects list is stripped at the END of the pass: it
+        # carries the {impact}/{reveal} beat markers impact detection
+        # reads on the way.)
         cards = s.get("cards") or []
         pair = s.get("layout") == "pair" and len(cards) >= 2
         if not pair:
             s["layout"] = "single"
             cards = cards[:1]
+        for c in cards:
+            c["enter"] = "cut"
         s["cards"] = cards
     # Group the split pieces: same sentence text AND same panel list,
     # back to back. Shots without a sentence (fillers) never group.
@@ -2107,6 +2114,12 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
         if not group_moving:
             report["static"].extend(s.get("id") for s in gshots)
         prev_dirs = group_dirs
+    # Rule 7 (hard cuts only): the beat markers have done their job —
+    # impact detection above read the {impact}/{reveal} shake/flash cues
+    # out of this list — and this mode renders no shake and no flash, so
+    # the plan carries no effects at all.
+    for s in shots:
+        s["effects"] = []
     # A hold entry only means something when the span itself never
     # moved; a fully static span is already reported as static.
     report["hold"] = [i for i in report["hold"] if i not in set(report["static"])]
