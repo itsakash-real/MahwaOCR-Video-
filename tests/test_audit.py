@@ -520,7 +520,9 @@ def test_failed_tile_responses_are_not_cached(tmp_path, monkeypatch):
 
         def vision(self, *a):
             Flaky.calls += 1
-            return "rate limited, try later" if Flaky.calls == 1 else '{"scene": "s", "blocks": []}'
+            # Fails the batched read AND its one-at-a-time retry (vision_batch
+            # defaults to 4 now); every later call succeeds.
+            return "rate limited, try later" if Flaky.calls <= 2 else '{"scene": "s", "blocks": []}'
 
         def text(self, *a):
             return '{"transcript": "## Scene 1\\n\\nA long enough transcript.", "memory_update": {}}'
@@ -532,9 +534,16 @@ def test_failed_tile_responses_are_not_cached(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     pipe = pl.Pipeline(load_config(series__workdir=str(ws), series__name="T"), log=lambda *_: None)
 
-    with pytest.raises(UserError, match="unusable"):
+    # Hybrid fallback (on by default): the unusable tile shifts to Agent Mode
+    # instead of the old hard "unusable responses" stop -- same guarantee that
+    # the chapter is never marked done with a gap, and the failed response was
+    # never cached, so the retry really retries.
+    with pytest.raises(UserError, match="Agent Mode"):
         pipe.run_chapter(chapter="1", folder=src)
     assert not (ws / "chapter_1.md").exists()  # never marked done with a gap
+    assert (ws / ".work" / "ch1" / "TASK.md").exists()   # shards were prepared
+    cache_files = list((ws / ".cache").glob("*.json")) if (ws / ".cache").exists() else []
+    assert cache_files == []            # the failed response was never cached
     pipe.run_chapter(chapter="1", folder=src)  # retry actually retries
     assert (ws / "chapter_1.md").exists()
 
