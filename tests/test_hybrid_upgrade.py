@@ -332,3 +332,58 @@ def test_full_success_skips_the_handoff_entirely(tmp_path):
     result = pipe.run_chapter(chapter="1", folder=pages, keep_work=True)
     assert (ws / "chapter_1.md").exists()
     assert "Scene 1" in result.transcript
+
+
+def test_inflight_budget_402_is_a_cooldown_not_a_kill(monkeypatch):
+    """OpenRouter returns 402 WITH Retry-After while the key is alive (its
+    in-flight credit reserve is busy): the pool must cool down and keep the
+    key, not disable it. A bare 402 (real out-of-credit) still kills."""
+    import manhwa_ocr.providers as prov
+
+    monkeypatch.setenv("TEST_KEYS", "k1")
+    state = {"calls": 0}
+
+    class Resp:
+        def __init__(self, code, headers=None):
+            self.status_code = code
+            self.headers = headers or {}
+
+        def raise_for_status(self):
+            import requests
+
+            raise requests.HTTPError(f"{code}", response=self)
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            r = Resp(402, {"Retry-After": "1"})   # in-flight budget: cooldown
+            return r
+        return Resp(200)
+
+    monkeypatch.setattr(prov, "_SESSION", type("S", (), {"post": staticmethod(fake_post)})())
+    p = build_provider({"kind": "openai", "api_key_env": "TEST_KEYS",
+                        "base_url": "https://x.example", "rpm_limit": 600,
+                        "max_retries": 3, "timeout": 5})
+    out = p.text("sys", "prompt")
+    assert out == "ok"
+    assert p.pool.has_active_keys()          # survived the 402 cooldown
+
+    # bare 402 without Retry-After = real billing death -> key disabled
+    state["calls"] = 0
+    monkeypatch.setenv("TEST_KEYS", "k1")
+    p2 = build_provider({"kind": "openai", "api_key_env": "TEST_KEYS",
+                         "base_url": "https://x.example", "rpm_limit": 600,
+                         "max_retries": 1, "timeout": 5})
+
+    def fake_post2(url, headers=None, json=None, timeout=None):
+        return Resp(402)
+
+    monkeypatch.setattr(prov, "_SESSION", type("S", (), {"post": staticmethod(fake_post2)})())
+    try:
+        p2.text("sys", "prompt")
+    except Exception:
+        pass
+    assert not p2.pool.has_active_keys()

@@ -234,8 +234,15 @@ class Provider(ABC):
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status == 429:
                     self.pool.report_rate_limit(slot, _retry_after_seconds(exc))
-                elif status in (401, 402, 403):
+                elif status in (401, 403):
                     self.pool.report_fatal(slot)
+                elif status == 402 and _retry_after_seconds(exc) is not None:
+                    # OpenRouter's in-flight budget returns 402 WITH a
+                    # Retry-After ("wait for in-flight requests to settle")
+                    # while the key is perfectly alive: cooldown, not kill.
+                    self.pool.report_rate_limit(slot, _retry_after_seconds(exc))
+                elif status == 402:
+                    self.pool.report_fatal(slot)   # genuinely out of credit, no retry hint
                 else:
                     self.pool.report_error(slot)
                     if status is None or status >= 500:
