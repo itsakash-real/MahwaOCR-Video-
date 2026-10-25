@@ -241,10 +241,10 @@ unreachable (read timeouts) during this window, and OpenRouter remains at total_
 ## Addendum 3 (2026-10-25 ~12:04 IST): Gemini daily quota = the final wall
 
 User's re-run banked 28 more provider tiles (chapter-2 shard of the benchmark session, cache now
-74 entries). A gentle-profile rerun (rpm_limit 8, concurrency 2, breaker 6, key_wait 300) then
-confirmed the free tier is exhausted for the day: every batch call returns 429 Too Many Requests;
-the pool behaved exactly as designed (3 retry attempts with cooldowns, disable only after
-12 rate-limit strikes, ~7 min of patience) before the hybrid handoff. With OpenRouter at
+74 entries). A gentle-profile rerun (rpm_limit 8, concurrency 2, breaker 6, key_wait 300) then ground
+out 64 MORE provider tiles (92/122 total kept across resumes) before the day's quota fully
+hardened into 429s; the pool behaved exactly as designed (cooldowns ridden patiently, disable
+only after 12 rate-limit strikes, ~7 min of grace) before handing the last 30 tiles to shards. With OpenRouter at
 total_credits: 0, provider mode cannot complete until either (a) OpenRouter is topped up, or
 (b) Gemini's free-tier quota resets (midnight Pacific = 12:30 IST). One command finishes it:
 
