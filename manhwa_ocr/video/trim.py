@@ -188,6 +188,27 @@ def trim_report(root: Path, chapter: str, *, cap_share: float = DEFAULT_CAP) -> 
             "flags": res.flags,
             "removed_min_share": round(res.purity, 4),
         })
+    # The art-body pass (v3, docs/WHITESPACE_AUTOCROP.md) is applied at panel
+    # build and recorded per panel. Report BOTH: what the panel already
+    # carries (its `body` record) and what a fresh computation would still
+    # shave — so the report previews the pass on sessions built before it
+    # and reads as a no-op on sessions it already cropped.
+    from .bodytrim import compute_body
+
+    body_rows = []
+    for p in data["panels"]:
+        b = p.get("body") or {}
+        img = panel_image(root, chapter, p, data["norm_width"])
+        fresh = compute_body(img)
+        body_rows.append({
+            "panel": p["id"],
+            "recorded": bool(b.get("top") or b.get("bottom") or b.get("left") or b.get("right")),
+            "recorded_cuts": {k: b.get(k, 0.0) for k in ("top", "bottom", "left", "right")},
+            "recorded_flags": list(b.get("flags") or []),
+            "fresh_cut_top": fresh.cut_top, "fresh_cut_bottom": fresh.cut_bottom,
+            "fresh_cut_left": fresh.cut_left, "fresh_cut_right": fresh.cut_right,
+            "fresh_flags": list(fresh.flags),
+        })
     report = {
         "chapter": chapter,
         "cap_share": cap_share,
@@ -195,6 +216,19 @@ def trim_report(root: Path, chapter: str, *, cap_share: float = DEFAULT_CAP) -> 
         "trimmed": sum(1 for r in rows if r["cut_top_px"] or r["cut_bottom_px"]),
         "flagged": sum(1 for r in rows if r["flags"]),
         "rows": rows,
+        "body": {
+            "note": "art-body (border-box) pass (docs/WHITESPACE_AUTOCROP.md): 'recorded' = "
+                    "applied at panel build (cuts in normalized units at norm_width); "
+                    "'fresh' = what the pass would still shave from the current panel "
+                    "image, in px",
+            "panels": len(body_rows),
+            "recorded_cropped": sum(1 for r in body_rows if r["recorded"]),
+            "would_crop_now": sum(1 for r in body_rows
+                                  if r["fresh_cut_top"] or r["fresh_cut_bottom"]
+                                  or r["fresh_cut_left"] or r["fresh_cut_right"]),
+            "flagged": sum(1 for r in body_rows if r["recorded_flags"] or r["fresh_flags"]),
+            "rows": body_rows,
+        },
     }
     out = work_root(root) / "video" / f"ch{chapter}" / "trim_report.json"
     out.parent.mkdir(parents=True, exist_ok=True)

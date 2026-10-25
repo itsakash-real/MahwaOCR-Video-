@@ -41,10 +41,11 @@ import numpy as np
 from ..util import UserError, atomic_write_text, require_chapter
 from .ffmpeg import ffmpeg_exe
 from .media import video_dir
+from .panels import load_panels
 from .plan import load_plan, plan_path
 from .render import output_path
 
-FRAMEQC_VERSION = 2
+FRAMEQC_VERSION = 3
 NEAR_WHITE = 242          # every channel >= this counts as near-white (placed_trim_rect's value)
 MARGIN_BAND = 0.06        # outer share of the foreground rect each edge check covers
 WHITE_FAIL = 0.55         # a margin band this near-white is suspected white space
@@ -54,6 +55,7 @@ INK_FREE = 0.005          # a band with under this share of ink pixels carries n
 TRIM_CAP = 0.40           # mirrors plan._PLACED_TRIM_CAP: a trim rect edge here means the shave hit its cap
 MOTION_FAIL = 3.0         # mean abs diff (0-255) allowed inside a NO-MOTION (placed) shot
 PLAN_W, PLAN_H = 1920, 1080  # the canvas placed specs are authored on
+FIT_TOL = 2.0             # px: a fitted dimension within this of the frame counts as touching the wall
 
 
 def frameqc_path(root: Path, chapter: str) -> Path:
@@ -89,18 +91,106 @@ def _ink_share(arr: np.ndarray) -> float:
     return float((arr.min(axis=2) < INK_DARK).mean())
 
 
+# ---------------------------------------------------------------- panelfit
+#
+# Panel-fit shots (video.mode: panelfit — this repo's standard) move, so
+# the placed-mode motion check does not apply; their white-space exposure
+# does. The renderer anchors the foreground CENTRE at the spec's base
+# size and grows it by the zoom interpolation, so the rect is exact at
+# the shot's first frame (and, for zooming kinds, at its last). A drift's
+# base is oversized vertically by construction (a panel edge must never
+# show), so only its side bands are ever visible. White semantics are
+# the placed mode's, keyed on the art-body record (bodytrim.py): a panel
+# whose body record shows a completed two-sided crop is GUARANTEED free
+# of canvas margin on that axis, so an ink-free white band at a wall the
+# fit touches is a record/render divergence — a real bug, and a failure.
+# Everywhere else (white art, capped shaves, no-border panels, body_trim
+# off) the band stays a reviewer note: pixels cannot separate foam from
+# a margin.
+
+Y_BLOCKERS = {"no_border", "min_keep", "multi_art", "capped_top", "capped_bottom"}
+X_BLOCKERS = {"no_border_x", "min_keep_x", "multi_art_x", "capped_left", "capped_right"}
+
+
+def _axis_guaranteed(body: Dict[str, Any], sides: tuple) -> bool:
+    """True when the body pass completed a two-sided crop on the axis that
+    owns `sides` — prep guarantees no canvas margin remains there."""
+    if not isinstance(body, dict) or not body:
+        return False
+    flags = set(body.get("flags") or [])
+    if sides and sides[0] in ("top", "bottom"):
+        return float(body.get("top") or 0) > 0 and float(body.get("bottom") or 0) > 0 \
+            and not (flags & Y_BLOCKERS)
+    return float(body.get("left") or 0) > 0 and float(body.get("right") or 0) > 0 \
+        and not (flags & X_BLOCKERS)
+
+
+def _panelfit_rects(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The foreground rects to measure for one panelfit card, on the plan
+    canvas: {"at": "start"|"end", "x","y","w","h"}. Centre-anchored like
+    the renderer; zooming kinds are measured at zoom_start and zoom_end,
+    a drift at its constant (vertically oversized) base."""
+    kind = spec.get("kind")
+    bw, bh = float(spec.get("base_w") or 0), float(spec.get("base_h") or 0)
+    if bw <= 0 or bh <= 0:
+        return []
+
+    def rect(k: float) -> Dict[str, Any]:
+        w, h = bw * k, bh * k
+        return {"x": (PLAN_W - w) / 2.0, "y": (PLAN_H - h) / 2.0, "w": w, "h": h}
+
+    if kind in ("zoom", "fill"):
+        zs = float(spec.get("zoom_start") or 1.0)
+        ze = max(zs, float(spec.get("zoom_end") or 1.0))
+        return [{"at": "start", **rect(zs)}, {"at": "end", **rect(ze)}]
+    if kind == "drift":
+        return [{"at": "start", **rect(1.0)}, {"at": "end", **rect(1.0)}]
+    return []  # traverse/duo/legacy: geometry is not centre-anchored; notes only
+
+
+def _rect_regions(f: np.ndarray, r: Dict[str, Any], scale: float) -> Dict[str, np.ndarray] | None:
+    """The outer margin bands of a plan-canvas rect, clamped to the decoded
+    frame. A side's band is measured whenever that edge lies inside the
+    frame (a floating capped pillar's top edge counts); an edge bled past
+    the frame shows interior art, not the foreground's own edge, and is
+    omitted."""
+    ih, iw = f.shape[:2]
+    x0, y0 = int(round(r["x"] * scale)), int(round(r["y"] * scale))
+    x1, y1 = int(round((r["x"] + r["w"]) * scale)), int(round((r["y"] + r["h"]) * scale))
+    cx0, cy0, cx1, cy1 = max(0, x0), max(0, y0), min(iw, x1), min(ih, y1)
+    if cx1 - cx0 < 8 or cy1 - cy0 < 8:
+        return None
+    band = max(1, int(round(MARGIN_BAND * min(x1 - x0, y1 - y0))))
+    out: Dict[str, np.ndarray] = {}
+    if y0 >= -FIT_TOL:
+        out["top"] = f[cy0:cy0 + band, cx0:cx1]
+    if y1 <= ih + FIT_TOL:
+        out["bottom"] = f[cy1 - band:cy1, cx0:cx1]
+    if x0 >= -FIT_TOL:
+        out["left"] = f[cy0:cy1, cx0:cx0 + band]
+    if x1 <= iw + FIT_TOL:
+        out["right"] = f[cy0:cy1, cx1 - band:cx1]
+    return out or None
+
+
 def _shot_failures(shot: Dict[str, Any], frames: Dict[str, np.ndarray],
-                   scale: float) -> Dict[str, Any]:
+                   scale: float, bodies: Dict[str, Dict[str, Any]] | None = None) -> Dict[str, Any]:
     """The per-shot checks. `frames` = {"start","mid","end"} RGB arrays.
+    `bodies` maps panel id -> its art-body record (bodytrim.py), which
+    decides whether a white band at a touching wall is a defect (prep
+    had guaranteed that axis clean) or the art's own white.
 
     White-space semantics (measured on the regressor ch1 pilot): a near-white
     edge band is a DEFECT only when the prep pass could not guarantee the
-    unit's art bounds — a trim FALLBACK unit (placed untrimmed) or a shave
-    that hit its 40% cap on that side (margin possibly left behind). Art that
-    is legitimately white at its edge (soap foam, a logo's own canvas) and
-    bands carrying art (SFX overflowing a margin, diagonal panel borders) are
-    reviewer NOTES — prep already judged them content, and no pixel metric
-    can separate foam from a page margin."""
+    unit's art bounds — a trim FALLBACK unit (placed untrimmed), a shave
+    that hit its 40% cap on that side (margin possibly left behind), or —
+    panelfit — a body record claiming a completed crop while the rendered
+    frame still shows an ink-free white band at a wall the fit touches
+    (a record/render divergence). Art that is legitimately white at its
+    edge (soap foam, a logo's own canvas) and bands carrying art (SFX
+    overflowing a margin, diagonal panel borders) are reviewer NOTES —
+    prep already judged them content, and no pixel metric can separate
+    foam from a page margin."""
     checks: Dict[str, Any] = {"white_margins": None, "wall_touch": None, "motion": None}
     fails: List[str] = []
     notes: List[str] = []
@@ -191,6 +281,42 @@ def _shot_failures(shot: Dict[str, Any], frames: Dict[str, np.ndarray],
         if motion > MOTION_FAIL:
             fails.append(f"placed shot moves (mean frame diff {motion:.1f} > {MOTION_FAIL:g}; "
                          "placed panels never move)")
+    if shot.get("panelfit") and not strict:
+        for c in shot.get("cards") or []:
+            spec = c.get("panelfit")
+            if not isinstance(spec, dict):
+                continue
+            pid = str(c.get("panel") or "")
+            body = (bodies or {}).get(pid) or {}
+            for r in _panelfit_rects(spec):
+                f = frames.get(r["at"])
+                if f is None:
+                    continue
+                regions = _rect_regions(f, r, scale)
+                if not regions:
+                    continue
+                margins = {k: _near_white_share(v) for k, v in regions.items()}
+                inks = {k: _ink_share(v) for k, v in regions.items()}
+                checks.setdefault("panelfit_margins", {})[f"{pid}@{r['at']}"] = \
+                    {k: round(v, 4) for k, v in margins.items()}
+                for side, white in margins.items():
+                    if white <= WHITE_FAIL:
+                        continue
+                    if inks[side] < INK_FREE:
+                        # Wall contact is not required: a capped pillar floats,
+                        # and white canvas at ITS edge is the same rejection.
+                        if _axis_guaranteed(body, (side,)):
+                            fails.append(
+                                f"white margin inside the panelfit foreground ({pid} {side}="
+                                f"{white:.0%} at {r['at']}, ink-free, body crop was applied) — "
+                                "record/render divergence")
+                        else:
+                            notes.append(f"{pid} {side} band {white:.0%} near-white, ink-free — "
+                                         "art is white at its edge, or the body pass could not "
+                                         f"guarantee this axis (flags: {body.get('flags') or 'none'})")
+                    else:
+                        notes.append(f"{pid} {side} band {white:.0%} white but carries art "
+                                     f"(ink {inks[side]:.1%}) — content, kept whole")
     return {"checks": checks, "failures": fails, "notes": notes}
 
 
@@ -222,6 +348,8 @@ def qc_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], None] = pr
     failures: List[str] = []
     notes: List[str] = []
     strict_shots = 0
+    pdata = load_panels(root, chapter) or {}
+    bodies = {str(p.get("id")): (p.get("body") or {}) for p in pdata.get("panels", [])}
     for shot in plan.get("shots") or []:
         start, end = float(shot["start"]), float(shot["end"])
         dur = max(0.0, end - start)
@@ -231,8 +359,9 @@ def qc_chapter(root: Path, chapter: str, cfg, *, log: Callable[[str], None] = pr
         if not got:
             rows.append({"id": shot.get("id"), "error": "no frames decoded"})
             continue
-        row = {"id": shot.get("id"), "start": round(start, 3), "end": round(end, 3), **_shot_failures(shot, got, scale)}
-        if shot.get("placed"):
+        row = {"id": shot.get("id"), "start": round(start, 3), "end": round(end, 3),
+               **_shot_failures(shot, got, scale, bodies)}
+        if shot.get("placed") or shot.get("panelfit"):
             strict_shots += 1
             for f in row["failures"]:
                 failures.append(f"{shot.get('id')}: {f}")

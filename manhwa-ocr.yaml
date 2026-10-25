@@ -137,6 +137,13 @@ video:
                             # rows+cols) + slicing strips at white/black gaps >= 15px, at panel
                             # build. REQUIRED for panelfit mode (the composed frame must carry
                             # no glued panels and no white margins in either layer).
+    body_trim: true         # White-space auto-crop v3: crop every panel to its drawn border
+                            # box (the art body) so overflowing SFX/bubbles stop keeping their
+                            # white canvas inside the frame — the "white strips up and down"
+                            # rejection (docs/WHITESPACE_AUTOCROP.md). Guards never cut art:
+                            # min-keep 55%/axis, 40% side cap, dense-art fallback, all flagged
+                            # per panel in panels.json (the `body` record) and in the
+                            # `video trim` report. false = the pre-v3 framing exactly.
   # Bubble/text detector (ogkalu RT-DETR v2, Apache-2.0, ONNX int8). Boxes are cached
   # per panel under .work/video/chN/boxes/. Get the model file from
   # huggingface.co/ogkalu/comic-text-and-bubble-detector (detector_int8.onnx).

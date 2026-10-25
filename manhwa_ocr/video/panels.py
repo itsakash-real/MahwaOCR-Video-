@@ -29,7 +29,7 @@ from ..util import UserError, atomic_save_image, atomic_write_text, require_chap
 from ..workspace import work_root
 from .media import list_pages, media_dir
 
-PANELS_VERSION = 4
+PANELS_VERSION = 5
 ANALYSIS_WIDTH = 240     # rows are summarised at this width; plenty for gutter finding
 MAX_PANEL_RATIO = 3.2    # height/width beyond which a gutterless stretch gets split
 TALL_RATIO = 1.6         # height/width at which a panel scrolls instead of zooming
@@ -53,6 +53,7 @@ class Panel:
     text: str = ""
     trim: Dict[str, Any] = field(default_factory=dict)  # Build 1 v1 record, when enabled
     trim2: Dict[str, Any] = field(default_factory=dict)  # Rule 6 v2 record, when enabled
+    body: Dict[str, Any] = field(default_factory=dict)  # art-body (border box) record, when enabled
 
     @property
     def height(self) -> float:
@@ -87,6 +88,12 @@ def _settings(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
         "trim_v1": bool(cfg.get("trim_v1", False)),
         "trim_cap": min(0.9, max(0.05, float(cfg.get("trim_cap", 0.40)))),
         "trim_v2": bool(cfg.get("trim_v2", False)),
+        # White-space auto-crop v3 (docs/WHITESPACE_AUTOCROP.md): crop each
+        # panel to its drawn border box — the art body — so overflowing
+        # SFX/bubbles stop keeping their white canvas inside the frame.
+        # ON by default (the user's ruling: hardcoded); set false to keep
+        # the pre-v3 framing exactly.
+        "body_trim": bool(cfg.get("body_trim", True)),
     }
 
 
@@ -364,6 +371,39 @@ def detect(pages_paths: List[Path], cfg: Dict[str, Any] | None = None) -> tuple[
             sliced_any = True
         else:
             panels.append(panel)
+    if s["body_trim"]:
+        # White-space auto-crop v3: crop each final panel (pieces included)
+        # to its drawn border box — the art body. Overflowing SFX/bubbles sit
+        # on the page's white canvas OUTSIDE that box; every row-based trimmer
+        # stops at their ink, which is how white bands reached the frame
+        # (docs/WHITESPACE_AUTOCROP.md). Runs after the piece split so each
+        # piece gets its own box, and before id renumbering so ids stay
+        # canonical when a crop moves a panel's start page.
+        from .bodytrim import compute_body
+
+        files = {p.path.name: p.path for p in pages}
+        for panel in panels:
+            try:
+                strip = _stitch(panel, files)
+            except OSError:
+                continue  # leave untouched; build_panels already flags read failures
+            res = compute_body(strip)
+            vs = norm_w / max(1, strip.width)
+            panel.body = {"top": round(res.cut_top * vs, 1),
+                          "bottom": round(res.cut_bottom * vs, 1),
+                          "left": round(res.cut_left * vs, 1),
+                          "right": round(res.cut_right * vs, 1),
+                          "flags": list(res.flags)}
+            if res.cut_top or res.cut_bottom:
+                panel.y0 = float(panel.y0 + res.cut_top * vs)
+                panel.y1 = float(panel.y1 - res.cut_bottom * vs)
+                panel.segments = _segments(panel.y0, panel.y1, pages) or panel.segments
+            if res.cut_left or res.cut_right:
+                nx0 = max(panel.x0, res.cut_left * vs)
+                nx1 = min(panel.x1, float(norm_w) - res.cut_right * vs)
+                if nx1 - nx0 >= 0.05 * norm_w:
+                    panel.x0, panel.x1 = nx0, nx1
+            panel.tall = bool(panel.height / max(1.0, panel.width) > TALL_RATIO)
     if sliced_any:
         # Slicing inserted panels: renumber ids canonically (per start
         # page, in story order) so every id still matches P<page>-<nn>.
@@ -514,7 +554,7 @@ def _fingerprint(pages: List[Path], s: Dict[str, Any]) -> str:
     # would shift framing under recordings that already exist). `video panels --force`
     # re-detects with tightening.
     defaults = {"tighten_edges": True, "white_threshold": WHITE_THRESHOLD, "black_threshold": BLACK_THRESHOLD,
-                "trim_v1": False, "trim_cap": 0.40, "trim_v2": False}
+                "trim_v1": False, "trim_cap": 0.40, "trim_v2": False, "body_trim": True}
     keyed = {k: v for k, v in s.items() if defaults.get(k, object()) != v}
     h = hashlib.sha256(json.dumps({"v": PANELS_VERSION, **keyed}, sort_keys=True).encode())
     for p in pages:
@@ -588,6 +628,8 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
             row.pop("trim", None)
         if not row.get("trim2"):
             row.pop("trim2", None)
+        if not row.get("body"):
+            row.pop("body", None)
         try:
             img = panel_image(root, chapter, row, norm_w)
             row["art"], row["crop_art"] = art_score(img), crop_art(img)
@@ -613,6 +655,7 @@ def build_panels(root: Path, chapter: str, cfg: Dict[str, Any] | None = None, *,
         "fingerprint": fp,
         "norm_width": norm_w,
         "tight": bool(s["tighten_edges"]),
+        "body_trim": bool(s["body_trim"]),
         "pages": [p.name for p in pages],
         "panels": rows,
     }
