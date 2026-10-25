@@ -264,3 +264,16 @@ keys present slices, shards 122 tiles, and stops with instructions in seconds; s
 mode is the operating default, its measured chapter time stands (~68-103 min on this box at the
 3-subagent cap), and GATE 1's 10-20-minute window applies only if an API is ever re-enabled
 (`kind: auto` + a funded key). All provider machinery remains in the code, dormant and tested.
+
+---
+
+## MERGED (2026-10-25, owner decision)
+
+Merged into the main project directory (branch `feature/panel-ink-trim` at the time; merge
+commits 4dc934c + the page-image removal sync). Yaml conflict resolved as: upgrade version +
+the owner's in-flight `video.panels.body_trim: true` preserved. Owner's uncommitted WIP files
+untouched. Full suite on the merged checkout: **1220 passed, 1 skipped, 1 deselected**
+(known test_audit env failure). Cleanup done: benchmark sessions, bench configs, logs and the
+key-bearing .env removed from the sandbox; 14 licensed chapter-page images that had been
+committed to the branch by the external run are removed from tracking (strip from history
+before ever pushing). The sandbox worktree and branch are kept for reference.
