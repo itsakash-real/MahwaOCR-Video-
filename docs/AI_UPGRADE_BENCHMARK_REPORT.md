@@ -221,3 +221,17 @@ names itself in one log line. The blocking variable is key funding, not code.
 5. Pool-state diagnostics: every `ProviderExhaustedError` now carries slot
    health/strikes/last-3-failure-classifications -- the zero-credit cause was named by
    exactly this line after three blind attempts.
+
+---
+
+## Addendum 2 (2026-10-25, user-driven runs)
+
+The user's own runs (v6 with OpenRouter only; then Gemini-key run that still had the dead
+OpenRouter key set in the same shell) exposed a real gap: kind:auto fell through candidates only
+at CONSTRUCTION time, so a candidate that died on its FIRST call (bare 402, zero credit)
+never handed over to the next one. Fixed: `build_provider(cfg, skip=...)` + a runtime failover
+in `run_chapter` -- when the resolved provider's pool dies having read ZERO tiles, the next
+auto candidate is built and the tiles retried once before the agent handoff. Mid-chapter deaths
+(partial reads) intentionally do NOT switch providers (attribution consistency); the hybrid
+handoff owns that case. Regression-tested. Also confirmed live: the Gemini endpoint was fully
+unreachable (read timeouts) during this window, and OpenRouter remains at total_credits: 0.
