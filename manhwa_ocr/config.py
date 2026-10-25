@@ -16,16 +16,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "workdir": "./out",
     },
     "provider": {
-        # one of: anthropic | gemini | openai | ollama
+        # one of: gemini | anthropic | openai | ollama
         # "openai" works for anything OpenAI-compatible: OpenRouter, LM Studio,
         # vLLM, Groq, together.ai, local proxies.
-        "kind": "anthropic",
-        "vision_model": "claude-haiku-4-5-20251001",
+        "kind": "gemini",
+        "vision_model": "gemini-2.5-flash",
         # Text-only model for chapter synthesis + memory updates (cheaper).
         # Leave null to reuse vision_model.
         "text_model": None,
         "base_url": None,
-        "api_key_env": "ANTHROPIC_API_KEY",
+        "api_key_env": "GEMINI_API_KEY",
         "temperature": 0.0,
         "max_tokens": 4096,
         # Assembly and recap calls return a whole chapter of text; truncated
@@ -465,7 +465,7 @@ CONFIG_FILENAME = "manhwa-ocr.yaml"
 
 
 def _family(kind: str | None) -> str:
-    kind = (kind or "anthropic").lower()
+    kind = (kind or "gemini").lower()
     return _ALIASES.get(kind, kind)
 
 
