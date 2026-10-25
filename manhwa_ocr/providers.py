@@ -212,6 +212,10 @@ class Provider(ABC):
     # False for local backends like Ollama that use plain retries.
     KEYED = True
 
+    # Set by build_provider when kind:auto picked this entry:
+    # (kind, api_key_env). Runtime failover skips this entry on the next try.
+    auto_entry: "tuple[str, str] | None" = None
+
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
         self.vision_model = cfg.get("vision_model")
@@ -569,15 +573,22 @@ _KIND_BASE_URLS = {
 }
 
 
-def build_provider(cfg: Dict[str, Any]) -> Provider:
-    kind = (cfg.get("kind") or "anthropic").lower()
+def build_provider(cfg: Dict[str, Any], skip: "set[tuple[str, str]] | None" = None) -> Provider:
+    """Build the provider for `cfg`. `skip` names (kind, api_key_env) entries
+    already tried and burned at RUN time -- kind:auto then resolves to the
+    next candidate instead (runtime cross-provider failover)."""
+    kind = (cfg.get("kind") or "gemini").lower()
     if kind == "auto":
         for entry in _auto_candidates(cfg):
+            if skip and (entry.get("kind"), entry.get("api_key_env")) in skip:
+                continue
             try:
                 entry = {**entry}
                 if not entry.get("base_url") and _KIND_BASE_URLS.get(entry.get("kind", "")):
                     entry["base_url"] = _KIND_BASE_URLS[entry["kind"]]
-                return PROVIDERS[entry["kind"]](entry)
+                provider = PROVIDERS[entry["kind"]](entry)
+                provider.auto_entry = (entry.get("kind"), entry.get("api_key_env"))
+                return provider
             except ProviderExhaustedError:
                 continue   # raced past the env check (e.g. whitespace-only key)
         raise ProviderExhaustedError(

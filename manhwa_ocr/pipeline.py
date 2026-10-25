@@ -296,6 +296,37 @@ class Pipeline:
                     f.result()  # surface worker exceptions, as pool.map did
         return results, sorted(unresolved)
 
+    def _read_tiles_with_failover(self, tiles: List[Tile], briefing: str,
+                                  chapter_label: str) -> tuple[List[Dict], List[int]]:
+        """Read tiles with RUNTIME cross-provider failover: when the resolved
+        provider's key pool dies having read NOTHING (zero-credit 402 on the
+        first call, quota wall, dead endpoint), kind:auto rebuilds from the
+        next candidate and retries the unread tiles before giving up. A pool
+        that dies mid-chapter (partial reads) does NOT switch -- switching
+        providers mid-chapter risks inconsistent speaker attribution, so the
+        hybrid agent handoff owns that case instead."""
+        results, unresolved = self._read_tiles(tiles, briefing, chapter_label)
+        if not unresolved or any(r for r in results):
+            return results, unresolved   # healthy, or partial: hybrid owns it
+        if (str(self.cfg.provider.get("kind") or "")).lower() != "auto":
+            return results, unresolved
+        if self.provider is None:
+            return results, unresolved
+        pool = getattr(self.provider, "pool", None)
+        if pool is None or pool.has_active_keys():
+            return results, unresolved   # did not die of key exhaustion
+        skip = {self.provider.auto_entry} if self.provider.auto_entry else set()
+        try:
+            nxt = build_provider({**self.cfg.provider}, skip=skip)
+        except ProviderExhaustedError:
+            return results, unresolved
+        if nxt is None or nxt.auto_entry in skip:
+            return results, unresolved
+        self.log(f"  ! provider {self.provider.auto_entry} died with 0 tiles read; "
+                 f"switching to {nxt.auto_entry} and retrying")
+        self.provider = nxt
+        return self._read_tiles(tiles, briefing, chapter_label)
+
     # ---------------- hybrid fallback ----------------
 
     def _handoff_to_agent(self, *, chapter: str, chapter_dir: Path, tiles: List[Tile],
@@ -449,7 +480,7 @@ class Pipeline:
         briefing = self.memory.as_briefing()
         self.log("  reading tiles...")
         t_read = time.monotonic()
-        tile_results, unresolved = self._read_tiles(tiles, briefing, label)
+        tile_results, unresolved = self._read_tiles_with_failover(tiles, briefing, label)
         read_s = time.monotonic() - t_read
         errored = [i for i, r in enumerate(tile_results)
                    if isinstance(r, dict) and "error" in r]

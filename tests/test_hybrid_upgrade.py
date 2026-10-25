@@ -4,6 +4,7 @@ that preserves completed tiles and shards the remainder."""
 
 import base64
 import json
+import types
 import time
 from pathlib import Path
 
@@ -404,3 +405,76 @@ def test_key_wait_seconds_is_configurable(monkeypatch):
     p2 = build_provider({"kind": "openai", "api_key_env": "TEST_KEYS",
                          "base_url": "https://x.example"})
     assert p2.pool.max_wait == 120.0
+
+
+def test_runtime_failover_switches_to_next_auto_candidate(tmp_path, monkeypatch):
+    """A provider that dies on its FIRST call (zero-credit 402) with zero
+    tiles read must hand over to the next kind:auto candidate instead of
+    falling straight to agent shards."""
+    from manhwa_ocr import pipeline as pl
+    from manhwa_ocr.config import load_config as lc
+    from manhwa_ocr.providers import ProviderExhaustedError
+
+    calls = {"built": 0}
+
+    class DeadPool:
+        def vision(self, *a):
+            raise ProviderExhaustedError("credit(402)")
+
+        def text(self, *a):
+            raise AssertionError("should not assemble")
+
+        def fingerprint(self):
+            return "dead:1:0.0"
+
+    class Good:
+        auto_entry = ("openai", "OPENAI_API_KEY")
+
+        def vision(self, system, prompt, images):
+            calls.setdefault("vision", 0)
+            calls["vision"] += 1
+            import json as _json
+
+            return _json.dumps([{"scene": "s", "blocks": []}] * len(images))
+
+        def text(self, system, prompt):
+            import json as _json
+
+            return _json.dumps({"transcript": "## Scene 1 -- ok\n\nBody text.",
+                                "summary": "s", "memory_update": {}})
+
+        def fingerprint(self):
+            return "good:1:0.0"
+
+    dead = DeadPool()
+    dead.auto_entry = ("gemini", "GEMINI_API_KEY")
+    dead.pool = types.SimpleNamespace(has_active_keys=lambda: False)  # burned pool
+
+    def fake_build(cfg, skip=None):
+        calls["built"] += 1
+        if not skip:
+            return dead            # initial kind:auto resolution
+        assert skip == {("gemini", "GEMINI_API_KEY")}
+        return Good()              # runtime failover: next candidate
+
+    monkeypatch.setattr(pl, "build_provider", fake_build)
+    pages = _bench_dir(tmp_path)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cfg = lc(series__workdir=str(ws), series__name="Failover",
+             provider__kind="auto",
+             pipeline__stall_minutes=1,
+             slicing__target_height=500, slicing__min_height_to_slice=600)
+    pipe = pl.Pipeline.__new__(pl.Pipeline)          # skip real __init__ provider build
+    pipe.cfg = cfg
+    pipe.log = lambda *_: None
+    pipe.workdir = ws
+    pipe.memory_path = ws / "series_memory.json"
+    from manhwa_ocr.memory import SeriesMemory
+
+    pipe.memory = SeriesMemory.load(pipe.memory_path, "Failover")
+    pipe.cache_dir = ws / ".cache"
+    pipe.provider = dead
+    result = pipe.run_chapter(chapter="1", folder=pages, keep_work=True)
+    assert (ws / "chapter_1.md").exists()
+    assert calls["vision"] >= 1        # the second provider did the reading
