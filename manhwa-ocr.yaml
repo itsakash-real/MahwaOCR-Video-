@@ -7,13 +7,9 @@
 output_folder: "../ManhwaRecaps"
 
 provider:
-  kind: agent            # AGENT MODE BY DEFAULT: no API calls at all; every
-                         # chapter's tiles go straight to TASK_k.md shards for
-                         # parallel sub-agent reading. To use an API instead set
-                         # kind: auto (first key env that is set wins) or a
-                         # specific kind (gemini/openai/openrouter/nvidia/...).
-  vision_model: gemini-3.8-flash
-  api_key_env: GEMINI_API_KEY   # one key or a comma-separated rotation list
+  kind: gemini           # Set to gemini to use the multi-key API pool
+  vision_model: gemini-3.5-flash
+  api_key_env: GEMINI_API_KEY
   temperature: 0.0
   max_tokens: 4096
   text_max_tokens: 16000
@@ -215,7 +211,7 @@ video:
     model: null           # null = the provider's vision_model (deepseek-flash by default)
 
 pipeline:
-  concurrency: 6               # parallel provider workers (multi-key / paid tiers)
+  concurrency: 4               # 4 parallel workers (avoids IP-level spike filters while keeping high speed)
   vision_batch: 4              # tiles per API request; cuts HTTP overhead 4x
   agent_shard_tiles: 10        # agent-mode shard size for the hybrid fallback
   hybrid_agent_fallback: true  # failed/unread tiles -> TASK_k.md shards, never a crash
