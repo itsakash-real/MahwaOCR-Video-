@@ -187,3 +187,37 @@ PASS/PASS. Verification against the artifacts on disk:
   120 s wait cap raced OpenRouter's 120 s Retry-After -> agent handoff.
 - Attempt 5 (OpenRouter **qwen2.5-vl-7b-instruct**, concurrency 4, correct 122-tile slicing):
   result below.
+
+---
+
+## FINAL VERDICTS (2026-10-25, after key testing)
+
+| Gate | Mode | Verdict | Evidence |
+|---|---|---|---|
+| GATE 1 (10-20 min) | agent-completed | **FAIL** | its own timing file: read_tiles 4110.9 s + answer_assembly 1131.8 s |
+| GATE 1 (10-20 min) | provider | **UNRUNNABLE on today's keys** | Gemini: daily quota blown after 8-12 vision calls (44 tiles banked first, at ~60 s of reading for 32 of them -- the SLA pace is real when quota exists). OpenRouter: `total_credits: 0` -- the key's grant is spent; 4-tile batch calls get a bare 402 (no Retry-After) and are correctly classified as fatal by the new pool diagnostics (`Pool state: [openrouter:OFF/strikes=0]; recent: fatal-disable(credit(402))]`) |
+| GATE 2 (quality) | agent-completed | **PASS (verified)** | all claims checked on disk; 5 independent blind reads confirm the transcript, including its corrections of the baseline (fifty not forty; soap arc never existed in the art) |
+| GATE 2 (quality) | provider | not produced | no full provider transcript exists (see GATE 1) |
+
+**Merge: NOT performed** -- the user's rule requires both gates to pass, and GATE 1 has no
+passing mode today. Everything is staged for the moment a funded key exists:
+
+    # with credit on OpenRouter (or a fresh Gemini day):
+    cd C:\Users\akash\Documents\manhwaOCR_sandbox
+    export MANHWA_SESSIONS_ROOT=..._e2e_sessions  # as in BENCH_PROMPT.md
+    python -m manhwa_ocr run --chapter 1 --folder _e2e/pages --session "Provider Bench v6"
+
+The upgrade branch itself (`perf/ai-hybrid-upgrade`) is merge-ready on code quality:
+1193 tests green, every resilience path validated live under real failures (quota storms,
+in-flight budget 402s, slow-backend timeouts, zero-credit), and each failure mode now
+names itself in one log line. The blocking variable is key funding, not code.
+
+## Hardening earned during the key runs (all committed + tested)
+
+1. `gemini-2.0-flash` -> `gemini-3.8-flash` (the retired id 404s on the live API).
+2. Provider `timeout` 90 -> 240 s (healthy 4-image batch calls exceed 90 s on slow backends).
+3. 402-with-Retry-After (OpenRouter in-flight budget) is a cooldown, not key-death.
+4. `provider.key_wait_seconds` knob (default 120) to ride out in-flight cooldowns.
+5. Pool-state diagnostics: every `ProviderExhaustedError` now carries slot
+   health/strikes/last-3-failure-classifications -- the zero-credit cause was named by
+   exactly this line after three blind attempts.
