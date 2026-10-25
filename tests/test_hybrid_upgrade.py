@@ -351,7 +351,7 @@ def test_inflight_budget_402_is_a_cooldown_not_a_kill(monkeypatch):
         def raise_for_status(self):
             import requests
 
-            raise requests.HTTPError(f"{code}", response=self)
+            raise requests.HTTPError(f"{self.status_code}", response=self)
 
         def json(self):
             return {"choices": [{"message": {"content": "ok"}}]}
