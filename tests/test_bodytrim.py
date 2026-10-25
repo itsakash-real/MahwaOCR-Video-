@@ -134,7 +134,40 @@ def test_side_cap_clamps_an_enormous_sfx_band():
     assert res.cut_bottom == 10
 
 
-def test_unbordered_webtoon_block_crops_to_the_dense_art_span():
+def test_black_canvas_band_and_bubble_text_crop_as_canvas():
+    # The P002-13 class (user rejection, picture 8): art, then a speech
+    # bubble on white canvas, then a SOLID BLACK band below it. Black is
+    # canvas (Rule 8: pure-black rows are gutter) and bubble text is
+    # bimodal ink — both crop; only continuous midtones are art.
+    arr = _canvas(600)
+    arr[60:420, :] = np.random.default_rng(12).integers(
+        60, 200, size=(360, 400, 3), dtype=np.uint8)
+    for x in range(120, 290, 14):          # bubble outline + big text block
+        arr[450:500, x:x + 3] = (10, 10, 10)
+    arr[462:488, 140:280] = (10, 10, 10)
+    arr[520:600, :] = (5, 5, 5)            # solid black canvas band
+    res = compute_body(_pil(arr))
+    assert (res.cut_top, res.cut_bottom) == (60, 180)
+    assert "dense_span" in res.flags
+
+
+def test_bubble_between_two_art_blocks_is_never_amputated():
+    # Two dense art blocks with a bubble zone between them: the span runs
+    # first-run-start to last-run-end, so both blocks stay and only the
+    # outer canvas crops — the bubble in the middle is interior content.
+    arr = _canvas(600)
+    arr[40:120, :] = np.random.default_rng(13).integers(
+        60, 200, size=(80, 400, 3), dtype=np.uint8)
+    for x in range(140, 270, 14):          # bubble between the two arts
+        arr[150:210, x:x + 3] = (10, 10, 10)
+    arr[240:560, :] = np.random.default_rng(14).integers(
+        60, 200, size=(320, 400, 3), dtype=np.uint8)
+    res = compute_body(_pil(arr))
+    assert (res.cut_top, res.cut_bottom) == (40, 40)
+    assert "dense_span" in res.flags
+
+
+
     # The common webtoon shape (regressor P002-06): no drawn border — a
     # block of art with bubbles floating on white canvas above and below.
     # The dense-span fallback crops to the art; the bubble zones are all
@@ -223,10 +256,45 @@ def test_panels_version_bumped_for_the_body_pass():
     # The version is part of the fingerprint: every existing session
     # re-detects once when it upgrades, picking up the body crops.
     from manhwa_ocr.video.panels import PANELS_VERSION
-    assert PANELS_VERSION >= 5
+    assert PANELS_VERSION >= 6
 
 
-# --------------------------------------------------------------- frameqc v3
+# --------------------------------------------------------------- rotate fix
+
+def test_fixes_rotate_validation():
+    from manhwa_ocr.video import fixes as fixes_mod
+    dims = {"P012-08": (800.0, 1321.0)}
+    clean, problems = fixes_mod.validate(
+        {"version": 1, "rotate": [{"panel": "P012-08", "degrees": 90}]}, dims)
+    assert problems == [] and clean["rotate"] == {"P012-08": 90}
+    _, problems = fixes_mod.validate(
+        {"version": 1, "rotate": [{"panel": "P012-08", "degrees": 45}]}, dims)
+    assert any("degrees" in p for p in problems)
+    _, problems = fixes_mod.validate(
+        {"version": 1, "rotate": [{"panel": "NOPE", "degrees": 90}]}, dims)
+    assert any("unknown panel" in p for p in problems)
+
+
+def test_panelfit_rotate_turns_the_art_before_the_layers():
+    # 90° clockwise: the source's LEFT edge becomes the TOP edge. The
+    # sharp foreground (and its blur backdrop) both show the rotated art.
+    from manhwa_ocr.video.frames import Format, PanelFitView
+    arr = np.zeros((400, 800, 3), np.uint8)
+    arr[:, :400] = (200, 30, 30)      # left half red, right half blue
+    arr[:, 400:] = (30, 60, 200)
+    img = Image.fromarray(arr, "RGB")
+    # rotated 90° CW: 800x400 -> 400x800; height-fit: base 540x1080
+    spec = {"kind": "zoom", "base_w": 540.0, "base_h": 1080.0,
+            "zoom_end": 1.0, "zoom_rate": 0.0}
+    view = PanelFitView(img, spec, {"panel": "P", "rotate": 90},
+                        0.0, 2.0, Format(width=1920, height=1080, fps=30))
+    assert view.src_w == 540 and view.src_h == 1080
+    frame = np.asarray(view.frame(1.0))
+    assert tuple(frame[100, 960]) == (200, 30, 30)      # top: was the left edge
+    assert tuple(frame[1000, 960]) == (30, 60, 200)     # bottom: was the right
+
+
+
 
 PLAN_SHOT = {"id": "S001", "panelfit": True,
              "cards": [{"panel": "P001-01",

@@ -29,7 +29,7 @@ from ..util import UserError, atomic_save_image, atomic_write_text, require_chap
 from ..workspace import work_root
 from .media import list_pages, media_dir
 
-PANELS_VERSION = 5
+PANELS_VERSION = 6
 ANALYSIS_WIDTH = 240     # rows are summarised at this width; plenty for gutter finding
 MAX_PANEL_RATIO = 3.2    # height/width beyond which a gutterless stretch gets split
 TALL_RATIO = 1.6         # height/width at which a panel scrolls instead of zooming

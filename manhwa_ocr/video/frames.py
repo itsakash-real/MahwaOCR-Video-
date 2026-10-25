@@ -982,6 +982,18 @@ class PanelFitView:
                     if 0 <= _px0 < _px1 <= panel.width \
                             and 0 <= _py0 < _py1 <= panel.height:
                         panel = panel.crop((_px0, _py0, _px1, _py1))
+        # fixes.json "rotate" (panelfit only): the source drew this panel
+        # sideways. Applied AFTER the slice-band crop (bands are cut on the
+        # unrotated panel) and BEFORE either layer is built — the blurred
+        # backdrop rotates with it, and the plan already fitted the rotated
+        # art's dimensions (90/270 swap base_w/base_h).
+        _rot = int(card.get("rotate") or 0)
+        if _rot == 90:
+            panel = panel.transpose(Image.ROTATE_270)     # 90° clockwise
+        elif _rot == 180:
+            panel = panel.transpose(Image.ROTATE_180)
+        elif _rot == 270:
+            panel = panel.transpose(Image.ROTATE_90)      # 270° clockwise
         pw, ph = panel.size
         # Background layer: the same panel, cover-scaled to the frame,
         # blurred, at FULL brightness (opacity 1.0 = no blend over

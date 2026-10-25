@@ -110,6 +110,12 @@ def quality_report(plan: Dict[str, Any], panels: Dict[str, Any], align_cov: Dict
                 # dimensions (panel width x band height), not the whole
                 # panel's — judge its aspect against those.
                 ph = ph * max(0.0, float(c["slice"][1]) - float(c["slice"][0]))
+            if c.get("rotate") in (90, 270):
+                # fixes.json "rotate" (panelfit): the card's fit runs on
+                # the ROTATED art's dimensions, so this check judges it
+                # against the swapped aspect too. (Placed cards never
+                # carry the marker — rotation is panelfit-only.)
+                pw, ph = ph, pw
             _pl = c.get("placed")
             if isinstance(_pl, dict):
                 # Placed cards are not classic shapes either: the

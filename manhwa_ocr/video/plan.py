@@ -2036,6 +2036,17 @@ def _panelfit_pass(shots: List[Dict[str, Any]], designer: "_Designer", fmt: Form
                     # the panel's width, the band's height — through
                     # the same fit/spec logic as any whole panel.
                     ph = ph * max(0.0, float(c["slice"][1]) - float(c["slice"][0]))
+                rot = int((designer.fixes.get("rotate") or {}).get(pid) or 0)
+                if rot:
+                    # fixes.json "rotate": the source drew this panel
+                    # sideways. The fit runs on the ROTATED art's
+                    # dimensions (90/270 swap the axes); the renderer
+                    # turns the image before either layer is built, so
+                    # geometry and pixels agree. Slice bands are cut on
+                    # the unrotated panel and rotated whole.
+                    c["rotate"] = rot
+                    if rot in (90, 270):
+                        pw, ph = ph, pw
                 if pw > 0 and ph > 0:
                     force = "zoom" if hint in ("zoom_in", "zoom_out", "zoom_out_fast") else None
                     kind = panelfit_fit(pw, ph, fmt, dur=span, pcfg=pcfg, force=force)[0]

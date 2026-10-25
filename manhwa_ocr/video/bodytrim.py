@@ -30,13 +30,15 @@ Detection (per axis, independent):
   likewise, sampled inside the y box when one was found (a side border
   only spans its box's rows).
 - DENSE-SPAN fallback (unbordered webtoon panels — the common case):
-  art is a contiguous block of rows whose content share (pixels not
-  near-white) is >= DENSE_ROW_SHARE; bubbles and SFX on the canvas are
-  sparse, well under half of a row. The body = first dense run's start
-  to last dense run's end (middle dips — snow bands, pale art — never
-  split the crop). A discarded outer zone is accepted only when EVERY
-  row in it stays under FALLBACK_ZONE_MAX content: anything textured
-  (snow art, pale scenes) refuses the cut on that side
+  art rows carry continuous MIDDLE-TONES (>= DENSE_ROW_SHARE share of
+  pixels that are neither canvas-white nor canvas-black); bubbles and
+  SFX on canvas are bimodal — pure white around pure black glyphs — and
+  solid black bands are pure black, so all of them classify as canvas
+  no matter how much ink they hold. The body = first dense run's start
+  to last dense run's end (middle dips never split the crop). A
+  discarded outer zone is accepted only when EVERY row in it stays
+  under ZONE_MIDTONE_MAX midtone: anything with real tonal structure
+  (snow art, grass, pale scenes) refuses the cut on that side
   (`zone_not_canvas`) instead of risking amputation.
 
 Guards — art is never destroyed (the user's rule 10):
@@ -72,11 +74,18 @@ LINE_SHARE = 0.75       # share of a row/column that must be border ink to quali
                         # ~84%), so art rows/columns never masquerade as borders
 LINE_THICK_FRAC = 0.012 # a border band is at most this share of the axis long
 LINE_THICK_MIN = 4      # ... and never thicker than this many px
-WHITE_MIN = 242         # a pixel is canvas when its darkest channel >= this
-DENSE_ROW_SHARE = 0.45  # a row/column this full of content is art, not canvas;
-                        # bubbles/SFX/text sit far below, snow-art rows above
-FALLBACK_ZONE_MAX = 0.35  # a discarded dense-span zone must be bubble-sparse on
-                        # EVERY row — anything fuller refuses the cut on that side
+WHITE_MIN = 242         # a pixel is canvas-white when its darkest channel >= this
+BLACK_MAX = 13          # ... or canvas-black when its brightest channel <= this
+                        # (mirrors panels' white/black thresholds). Canvas is
+                        # BOTH: a solid black band below a bubble is gutter,
+                        # exactly like the user's Rule 8 says.
+DENSE_ROW_SHARE = 0.45  # a row/column this full of MIDDLE-TONE pixels is art;
+                        # bubbles/SFX on canvas are pure white + pure black with
+                        # nothing between, snow/grass are continuous midtones
+ZONE_MIDTONE_MAX = 0.15 # a discarded dense-span zone must have every row under
+                        # this midtone share: real tonal structure (art) refuses
+                        # the cut on that side; pure white/black + sparse black
+                        # glyph rows pass — bubble bands and black canvas crop
 DENSE_RUN_ROWS = 8      # floor for a dense run's length (scaled with the axis)
 MIN_KEEP_SHARE = 0.55   # the body must keep at least this share of each axis
 MIN_KEEP_PX = 24        # ... and at least this many px (mirrors trim.py)
@@ -136,28 +145,39 @@ def _long_runs(mask: np.ndarray, min_len: int) -> List[tuple[int, int]]:
             if b - a >= min_len]
 
 
+def _midtone(arr: np.ndarray) -> np.ndarray:
+    """Boolean mask of MIDDLE-TONE pixels: neither canvas-white nor
+    canvas-black. Art carries continuous midtones; bubbles, SFX strokes
+    and solid canvas bands are bimodal (pure white around pure black)."""
+    rgb = np.asarray(arr.convert("RGB"), dtype=np.uint8)
+    return (rgb.min(axis=2) < WHITE_MIN) & (rgb.max(axis=2) > BLACK_MAX)
+
+
 def _side_cuts(arr: np.ndarray, *, vertical: bool) -> tuple[int, int, List[str]]:
     """(cut_open, cut_close, flags) for one axis. vertical=True works on rows
     (top/bottom), False on columns (left/right). Border path first; the
-    dense-art-span fallback covers unbordered panels."""
+    dense-art-span fallback covers unbordered panels. All row/column
+    classification is on the MIDTONE share — the bimodal canvas rows
+    (white fill + black glyph, solid black band) classify as canvas even
+    though they are full of ink."""
     g = np.asarray(arr.convert("L"), dtype=np.uint8)
-    content = np.asarray(arr.convert("RGB"), dtype=np.uint8).min(axis=2) < WHITE_MIN
+    tone = _midtone(arr)
     if not vertical:
-        g, content = g.T, content.T
+        g, tone = g.T, tone.T
     h, w = g.shape
     if h < 2 * MIN_KEEP_PX or w < 8:
         return 0, 0, []
     mid = g[:, w // 20: w - w // 20] if w >= 20 else g
     share = (mid < DARK_MAX).mean(axis=1)
-    content_share = content.mean(axis=1)
+    tone_share = tone.mean(axis=1)
     flags: List[str] = []
     cut_open = cut_close = 0
     outer = _outer_bands(_bands(share, h), h)
     if outer is not None:
         top, bottom = outer
         cut_open, cut_close = top, h - bottom
-        if _dense_art_run(content_share, 0, cut_open) or \
-                _dense_art_run(content_share, h - cut_close, h):
+        if _dense_art_run(tone_share, 0, cut_open) or \
+                _dense_art_run(tone_share, h - cut_close, h):
             flags.append("multi_art")
             cut_open = cut_close = 0
     else:
@@ -165,16 +185,17 @@ def _side_cuts(arr: np.ndarray, *, vertical: bool) -> tuple[int, int, List[str]]
     if not cut_open and not cut_close:
         # Dense-art-span fallback (unbordered panels): the body is the span
         # from the first to the last dense art run; each discarded zone must
-        # be bubble-sparse canvas on EVERY row, else that side alone is
-        # refused (the other side can still crop).
-        runs = _long_runs(content_share >= DENSE_ROW_SHARE,
+        # be canvas on EVERY row (midtone under the zone floor — bubble text
+        # and solid black bands pass, snow/grass/scene art refuses), else
+        # that side alone is refused.
+        runs = _long_runs(tone_share >= DENSE_ROW_SHARE,
                           max(DENSE_RUN_ROWS, int(round(0.004 * h))))
         if runs:
             cut_open, cut_close = runs[0][0], h - runs[-1][1]
-            if (content_share[:cut_open] > FALLBACK_ZONE_MAX).any():
+            if (tone_share[:cut_open] > ZONE_MIDTONE_MAX).any():
                 flags.append("zone_not_canvas")
                 cut_open = 0
-            if (content_share[h - cut_close:] > FALLBACK_ZONE_MAX).any():
+            if (tone_share[h - cut_close:] > ZONE_MIDTONE_MAX).any():
                 flags.append("zone_not_canvas")
                 cut_close = 0
             if cut_open or cut_close:

@@ -8,11 +8,16 @@ video/chapter_N.fixes.json, and nothing else. The plan reads it:
      "face": [{"panel": "P017-02", "top": 0.12, "bottom": 0.46}],
      "crop": [{"panel": "P018-05", "shape": "3:4", "box": [0.0, 0.10, 0.6, 0.85]}],
      "shot": [{"panel": "P019-01", "background": "black", "enter": "fade_in"}],
+     "rotate": [{"panel": "P012-08", "degrees": 90}],
      "chapter_cards": [{"shot_id": "S012", "title": "The Exam That Kills"}],
      "callouts": [{"shot_id": "S007", "text": "SS-RANK"}]}
 
 "shot" overrides how a panel is presented: "background" (blur or black) applies to the shot whose
 first card is that panel, "enter" (how the card arrives) to that panel's card. Both are optional.
+"rotate" turns a panel that the source drew sideways upright: "degrees" is CLOCKWISE (90, 180 or
+270), applied to the panel image before either panelfit layer is built, with the fit dimensions
+swapped to match. Panelfit mode only — classic cards ignore it. Slice hints (cues.json) cut the
+UNROTATED panel; the kept band is then rotated whole.
 Everything a person or agent could once only change by hand-editing chapter_N.plan.json (a drop,
 a head position, a crop, a background, an entrance) belongs here, because `video plan --force`
 rebuilds the plan and re-applies this file every time. The plan itself is presentation only.
@@ -45,9 +50,14 @@ def fixes_path(root: Path, chapter: str) -> Path:
 
 def empty() -> Dict[str, Any]:
     return {"version": VERSION, "drop": [], "face": [], "crop": [], "shot": [],
+            "rotate": [],
             # P5: reviewer overrides for chapter-card titles and callout text,
             # keyed by shot id (e.g. "S012"). See shorts.validate_override_entry.
             "chapter_cards": [], "callouts": []}
+
+
+ROTATE_DEGREES = (90, 180, 270)   # clockwise; the only sideways corrections a
+                                  # panel can need — anything else is a stretch
 
 
 def _shape(value: Any) -> float | None:
@@ -71,11 +81,23 @@ def validate(data: Any, panel_dims: Dict[str, Tuple[float, float]]) -> Tuple[Dic
      "shot": {pid: {"background": ..., "enter": ...}}}."""
     problems: List[str] = []
     clean: Dict[str, Any] = {"drop": {}, "face": {}, "crop": {}, "shot": {},
-                             "chapter_cards": {}, "callouts": {}}
+                             "rotate": {}, "chapter_cards": {}, "callouts": {}}
     if not isinstance(data, dict):
         return clean, ["the file must be a JSON object"]
     if data.get("version", VERSION) != VERSION:
         problems.append(f"version must be {VERSION}")
+
+    for i, e in enumerate(data.get("rotate") or []):
+        pid = e.get("panel") if isinstance(e, dict) else None
+        if pid not in panel_dims:
+            problems.append(f"rotate[{i}]: unknown panel {pid!r}")
+            continue
+        deg = e.get("degrees")
+        if isinstance(deg, bool) or deg not in ROTATE_DEGREES:
+            problems.append(f"rotate[{i}] ({pid}): degrees must be one of "
+                            f"{', '.join(str(d) for d in ROTATE_DEGREES)} (clockwise)")
+            continue
+        clean["rotate"][pid] = int(deg)
 
     for i, e in enumerate(data.get("drop") or []):
         pid = e.get("panel") if isinstance(e, dict) else None
