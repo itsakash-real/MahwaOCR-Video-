@@ -121,3 +121,24 @@ available vision path invents panels at a rate GATE 2 cannot accept.
    verification of a random tile sample per shard (the audit that caught
    everything above), and re-shard at 10 tiles (already the new default)
    across as many workers as the platform allows.
+
+---
+
+## Addendum (2026-10-25, after keys were provided)
+
+The user supplied a Gemini and an OpenRouter key. Findings so far, all inside the sandbox:
+
+- Gemini key is VALID but `gemini-2.0-flash` is retired on the live API -> model id updated to
+  `gemini-3.8-flash` (yaml + AUTO_KINDS, committed). A single-tile probe read the contested
+  p002_t08 title card CORRECTLY (matches blind ground truth).
+- Live provider runs then exposed two real transport issues, both fixed and unit-tested:
+  1. Batched 4-image vision calls on slow backends exceed 90s -> provider `timeout` raised to
+     240s (pipeline stall watchdog still bounds hangs).
+  2. **OpenRouter 402 "in_flight_budget_exhausted"** (small-balance key + 6-way concurrency)
+     carries a Retry-After and means "wait", not "key dead" -> `providers._keyed_post` now
+     treats 402-with-Retry-After as a cooldown; bare 402 still disables. Regression test added.
+- The hybrid machinery proved itself live: three mid-run key trips each PRESERVED the completed
+  tiles (32 -> 44 across resumes), sharded only the remainder, and stopped cleanly in ~1 min.
+  Remaining wall-clock blocker was purely key quota/credit behavior, not pipeline code.
+- Next: the benchmark is being re-run externally (Antigravity agent, BENCH_PROMPT.md) with the
+  keys set; its report lands at `_e2e/BENCH_REPORT.md` and decides the gates.
