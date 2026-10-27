@@ -79,7 +79,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # "classic", but the build-start echo marks it DEFAULTED (incident 1:
         # a shipped chapter rendered in classic mode when wide was intended,
         # because --config never read the repo yaml that set it).
-        "mode": None,               # classic | wide | adaptive | panelfit | fullframe | placed
+        "mode": None,               # classic | wide | adaptive | panelfit | fullframe | placed | framepipe
+                                    #   framepipe: the Genius Knight movie mode (see
+                                    #   video/framepipe.py + docs/GENIUS_MOVIE_STYLE.md)
+                                    #   — 1920x1080 full-bleed, Solo rotation, hard
+                                    #   cuts, approved cuts only. It is the DEFAULT
+                                    #   for long-form movie builds (`video movie`),
+                                    #   regardless of this setting; it never changes
+                                    #   the classic/wide/panelfit/placed renderers
+                                    #   or the Shorts path.
                                     #   wide: every card full-height, min 6/16 wide
                                     #   adaptive: per shot, a naturally wide/landscape panel gets
                                     #   the wide treatment; a narrower one keeps its classic
@@ -214,6 +222,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             # panelfit does; a series that wants captions sets
             # video.captions + placed.captions: true deliberately.
             "captions": False,
+        },
+        "movie": {
+            # Genius Knight movie mode (user order 2026-10-27: replace main
+            # with this style). Implemented in video/framepipe.py; these
+            # are the pinned defaults for `video movie` builds only.
+            # CORRECTION (2026-10-27): the session's genius-knight.yaml
+            # still said mode panelfit / tts 1.35 -- that file is stale.
+            # The delivered movie used framepipe at 1.3, not panelfit
+            # at 1.35; do not copy that yaml alone.
+            "mode": "framepipe",      # the mode `video movie` always uses
+            "format": "16:9",
+            "fps": 30,
+            "width": 1920,
+            "height": 1080,
+            "captions": False,         # no burned captions
+            "title_cards": False,      # no title cards
+            "endscreen": False,        # no endscreen
+            "intro": False,            # no intro anywhere
+            "outro": False,            # no outro / chapter breaks
+            "fades": False,            # hard cuts only
+            "tts_model": "aura-2-odysseus-en",
+            "tts_speed": 1.3,
+            "zoom_span": 0.05,         # zooms 1.00 <-> 1.05, centred
+            "slide_px": 115,           # slide travel, output pixels
+            "rotation": ["zoom_in", "slide_up", "slide_down", "zoom_out"],
+            "cut_width": 900,          # approved cuts are exactly 900 wide
         },
         "gemini_vision": {
             # Gemini Vision prep/QC (video/gemini_vision.py): `video

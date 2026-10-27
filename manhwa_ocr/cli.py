@@ -637,6 +637,31 @@ def cmd_memory(args) -> int:
 
 
 def cmd_video(args) -> int:
+    # Genius Knight movie mode is session-independent: shots + audio +
+    # cuts are given explicitly, so it must not require an active series.
+    # All other video actions still go through _load_cfg below.
+    if args.action == "movie":
+        from .video import framepipe as fp_mod
+
+        if args.concat_inputs:
+            if not args.out:
+                raise UserError("movie concat needs --out")
+            inputs = [s.strip() for s in args.concat_inputs.split(",") if s.strip()]
+            fp_mod.concat_movies(inputs, args.out)
+            _log(f"Wrote continuous movie (stream-copy concat, no breaks): {args.out}")
+            return 0
+        if not args.shots or not args.audio or not args.out:
+            raise UserError("movie needs --shots <shots.json> --audio <narration.wav> --out <movie.mp4> [--cuts-dir <dir>] [--total <seconds>]")
+        shots = fp_mod.shots_from_json(args.shots)
+        n = fp_mod.render_movie(shots, args.audio, args.out, total_seconds=args.total, cuts_dir=args.cuts_dir)
+        rows = fp_mod.gate_first_mid_last(args.out, shots)
+        flagged = [r for r in rows if r["flag_near_white_gt30"]]
+        _log(f"movie: {len(shots)} shots, {n} frames -> {args.out}")
+        _log(f"gate first/mid/last: {len(rows)} shots checked, all 1920x1080; near-white >30%: {len(flagged)} flagged (review, not a silent pass)")
+        for r in flagged:
+            _log(f"  FLAG near-white {r['panel']} sentence={r['sentence']} share={r['near_white']:.3f}")
+        return 0
+
     from .video import build as vb
 
     cfg, sess = _load_cfg(args)
@@ -1278,7 +1303,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
     p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "vision-trim", "pipeline", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "qc", "storyboard", "render", "pipeline",
-                                      "build", "clip", "compile", "verify", "review", "approve", "intro", "hook", "previously",
+                                      "build", "clip", "compile", "movie", "verify", "review", "approve", "intro", "hook", "previously",
                                       "shorts", "endscreen", "captions"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
@@ -1307,6 +1332,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prepare", action="store_true",
                    help="intro: write a template intro/intro.json and contact sheets of every chapter's drawn panels")
     p.add_argument("--audio", help="hook/previously: narration audio file, e.g. audio/chapter_0.mp3")
+    p.add_argument("--shots", help="movie: shots JSON file (list of {src, y0, win_h, start, end, sentence, panel})")
+    p.add_argument("--out", help="movie: output MP4 path")
+    p.add_argument("--cuts-dir", dest="cuts_dir", help="movie: approved cuts directory; shots outside it are a hard fail")
+    p.add_argument("--total", type=float, help="movie: total narration seconds (frame allocation target)")
+    p.add_argument("--concat-inputs", dest="concat_inputs", help="movie: comma-separated chapter MP4s to concat into one continuous movie")
     p.add_argument("--voice", help="tts: Deepgram voice model (required unless tts.model is set in the config; there is no silent default)")
     p.add_argument("--key-file", dest="key_file",
                    help="tts: file holding the Deepgram API key (default: DEEPGRAM_API_KEY env, else ~/.config/manhwa/deepgram.key)")
