@@ -18,6 +18,7 @@ import os
 import shutil
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from PIL import Image
@@ -76,6 +77,74 @@ def _sec_to_filename_time(sec: float) -> str:
     mins = int(sec // 60)
     secs = int(sec % 60)
     return f"{mins:02d}m{secs:02d}s"
+
+
+def _parse_panel_key(pid: str) -> tuple:
+    clean = pid.split(":")[-1].replace("P", "")
+    parts = clean.split("-")
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        return (int(parts[0]), int(parts[1]))
+    return (9999, 9999)
+
+
+def _sanitize_shots(
+    shots: List[Dict[str, Any]],
+    panels_data: Dict[str, Any],
+    strict_order: bool = True,
+    log: Callable[[str], None] = print,
+) -> List[Dict[str, Any]]:
+    """Guarantee images strictly move forward in story order and never jump backwards."""
+    if not strict_order:
+        return shots
+
+    panels_list = panels_data.get("panels", [])
+    order_map = {p.get("id"): idx for idx, p in enumerate(panels_list) if p.get("id")}
+
+    sanitized = []
+    max_seen_idx = -1
+    max_seen_key = (-1, -1)
+    last_valid_card = None
+    jumps_fixed = 0
+
+    for shot_idx, shot in enumerate(shots, start=1):
+        s_copy = dict(shot)
+        cards = s_copy.get("cards") or []
+        if not cards:
+            sanitized.append(s_copy)
+            continue
+
+        card = dict(cards[0])
+        pid = card.get("panel", "")
+
+        is_backward = False
+        if pid in order_map:
+            curr_idx = order_map[pid]
+            if max_seen_idx != -1 and curr_idx < max_seen_idx:
+                is_backward = True
+            else:
+                max_seen_idx = curr_idx
+                last_valid_card = card
+        else:
+            curr_key = _parse_panel_key(pid)
+            if max_seen_key != (-1, -1) and curr_key < max_seen_key:
+                is_backward = True
+            else:
+                max_seen_key = curr_key
+                last_valid_card = card
+
+        if is_backward and last_valid_card:
+            prev_pid = last_valid_card.get("panel")
+            jumps_fixed += 1
+            log(f"  [Strict Order] Shot #{shot_idx}: Prevented backward jump from {prev_pid} back to {pid}. Holding {prev_pid}.")
+            card["panel"] = prev_pid
+            card["crop"] = last_valid_card.get("crop", card.get("crop"))
+
+        s_copy["cards"] = [card] + cards[1:]
+        sanitized.append(s_copy)
+
+    if jumps_fixed:
+        log(f"[Strict Order] Automatically fixed {jumps_fixed} backward jumps! Timeline is now 100% forward-moving.")
+    return sanitized
 
 
 def _find_plan(series_dir: Path, chapter: str) -> Optional[Path]:
@@ -138,6 +207,7 @@ def export_chapter(
     *,
     fmt: str | None = None,
     out_dir: str | Path | None = None,
+    strict_order: bool = True,
     log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
     """Export chapter alignment and panels to external editor formats."""
@@ -160,7 +230,7 @@ def export_chapter(
         except Exception:
             pass
 
-    shots = plan.get("shots", [])
+    shots = _sanitize_shots(plan.get("shots", []), panels_data, strict_order=strict_order, log=log)
     if not shots:
         raise UserError(f"Plan for chapter {c} contains no shots.")
 
@@ -188,7 +258,7 @@ def export_chapter(
             start_sec = float(shot.get("start", 0.0))
             end_sec = float(shot.get("end", 0.0))
             dur_sec = max(0.01, end_sec - start_sec)
-            sentence = shot.get("sentence", "").strip()
+            sentence = (shot.get("sentence") or "").strip()
 
             cards = shot.get("cards") or []
             card = cards[0] if cards else {}
@@ -221,6 +291,13 @@ def export_chapter(
             else:
                 blank = Image.new("RGB", (1920, 1080), (30, 30, 30))
                 blank.save(img_path, format="PNG")
+
+            # Stagger file timestamp (2 seconds per image) so Android gallery sorts chronologically
+            base_time = 1767225600 + (idx * 2)
+            try:
+                os.utime(img_path, (base_time, base_time))
+            except Exception:
+                pass
 
             csv_rows.append({
                 "Index": idx,

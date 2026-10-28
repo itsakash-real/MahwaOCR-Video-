@@ -85,3 +85,26 @@ def test_universal_folder_export(tmp_path: Path):
     srt_content = (export_folder / "timeline.srt").read_text(encoding="utf-8")
     assert "First sentence here." in srt_content
     assert "Second sentence here." in srt_content
+
+
+def test_strict_order_sanitization():
+    from manhwa_ocr.video.export import _sanitize_shots
+    panels_data = {
+        "panels": [
+            {"id": "P001-01"},
+            {"id": "P001-02"},
+            {"id": "P002-01"},
+            {"id": "P003-01"},
+        ]
+    }
+    shots = [
+        {"cards": [{"panel": "P001-01"}]},
+        {"cards": [{"panel": "P002-01"}]},
+        {"cards": [{"panel": "P001-02"}]},  # backward jump!
+        {"cards": [{"panel": "P003-01"}]},
+    ]
+    sanitized = _sanitize_shots(shots, panels_data, strict_order=True)
+    assert sanitized[0]["cards"][0]["panel"] == "P001-01"
+    assert sanitized[1]["cards"][0]["panel"] == "P002-01"
+    assert sanitized[2]["cards"][0]["panel"] == "P002-01"  # held forward panel
+    assert sanitized[3]["cards"][0]["panel"] == "P003-01"

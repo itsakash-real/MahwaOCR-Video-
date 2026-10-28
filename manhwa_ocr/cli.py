@@ -1181,7 +1181,7 @@ def cmd_video(args) -> int:
     if action == "export":
         from .video.export import export_chapter
         for c in chapters(default_all=False):
-            export_chapter(sess.path, c, fmt=args.format, out_dir=args.out, log=_log)
+            export_chapter(sess.path, c, fmt=args.format, out_dir=args.out, strict_order=not getattr(args, "allow_backward", False), log=_log)
         return 0
     return 1
 
@@ -1318,6 +1318,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict", action="store_true",
                    help="render: stop if any sentence is flagged for review (default: warn only)")
     p.add_argument("--format", choices=["16:9", "9:16", "capcut", "folder", "all"], help="video shape or export format (default: 16:9 / all)")
+    p.add_argument("--allow-backward", action="store_true", help="export: allow backward panel jumps (default: strict forward order enforced)")
     p.add_argument("--no-sync", dest="no_sync", action="store_true", help="don't transcribe the audio")
     p.add_argument("--duration", type=float, help="plan without audio, for this many seconds")
     p.add_argument("--pages", help="folder of page images to use for this chapter")

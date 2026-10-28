@@ -171,3 +171,24 @@ Provide this information to the user when completing an export:
 | CapCut draft not found on PC | CapCut Desktop is not installed in standard `%LOCALAPPDATA%` path. | The universal folder export is still created at `<session>/export/chapter_N/`. Direct the user to import the folder or set a custom path. |
 | User requests changes to panel choice | A sentence shows the wrong character/moment. | Edit `.work/video/chN/pairs.json`, run `python -m manhwa_ocr video pair --chapter N --apply`, re-align, re-plan, and re-export. |
 
+
+---
+
+## Required Agent Delivery Format & Honest Residues Reporting
+
+When completing `video export`, agents must provide a clear report following this exact structure:
+
+### 1. Ready-to-Open Status (CapCut Desktop)
+Emphasize to the user that **manual CSV duration adjustment is NOT needed in CapCut Desktop**:
+> *"In CapCut Desktop, you do NOT need to manually import images or adjust clip durations from CSV! The project `Recap_<SERIES>_Ch<N>` is already generated under Drafts with all panels placed, pre-cropped, and trimmed at the exact second and microsecond mark on the timeline."*
+
+### 2. Mobile Import Instructions (InShot & CapCut Mobile)
+Explain the fallback for mobile editors:
+> *"To import in **InShot**: use the Photo tab to import the `images/` folder in order (they are sorted `001_...`, `002_...`), add `narration.<ext>`, and use `timeline.srt` / `timeline.csv` as your timing reference."*
+> *"To edit on **CapCut Mobile**: simply click the Cloud Space icon on the draft card in CapCut Desktop to back it up, then open CapCut Mobile and tap 'Edit' under Space."*
+
+### 3. Honest Residues & Alignment Audit
+Audit the alignment and report any residues so the creator knows what to expect:
+- **Total Shots Aligned**: e.g., *"94 shots mapped across 160 panels."*
+- **Unanchored / Interpolated Sentences**: List any sentence numbers whose word timestamps had to be interpolated from their neighbours (e.g. *"Sentences 8, 9, 13 were interpolated from adjacent cues; nudge them in CapCut if any feels off."*).
+- **Trailing Silence**: Report the exact audio length vs timeline duration (e.g. *"The timeline ends at 462.7s against the 464.68s audio, leaving a 1.98s trailing tail of silence."*).
