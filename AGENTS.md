@@ -273,6 +273,27 @@ memory of it from earlier in the conversation, even if you built an earlier
 chapter a few messages ago. The `/build-chapter` skill does this
 automatically; if asked directly instead, go read that file now.
 
+### External Editor Export (CapCut Desktop, CapCut Mobile, InShot, Premiere)
+
+If exporting to an external video editor (CapCut, InShot, Premiere Pro, DaVinci Resolve)
+instead of rendering an MP4 with the built-in ffmpeg renderer:
+**Read `docs/EXTERNAL_EDITOR_EXPORT_WORKFLOW.md` in full.**
+
+**DO NOT RENDER.** In this flow, agents do NOT run `video verify`, `video review`, `video approve`,
+`video render`, or `video qc`. All creative visual effects, zooms, transitions, captions,
+and rendering happen in CapCut or InShot. Your job stops at `video export`:
+
+```bash
+python -m manhwa_ocr video pair   --chapter N --session "<name>"          # 1. check picture <-> sentence mapping
+python -m manhwa_ocr video pair   --chapter N --apply --session "<name>"  # 2. apply fixes from pairs.json
+python -m manhwa_ocr video align  --chapter N --session "<name>"          # 3. align voice timestamps
+python -m manhwa_ocr video plan   --chapter N --force --session "<name>"  # 4. plan shots and crops
+python -m manhwa_ocr video export --chapter N --format all --session "<name>" # 5. export CapCut draft & universal folder
+```
+After `video export`, **STOP** and tell the user the project is ready for CapCut or InShot.
+
+### Legacy Built-in MP4 Rendering (ffmpeg)
+
 Once the user has recorded `audio/chapter_N.mp3` (or `.wav`, `.m4a`), make the video
 with these commands. Use the routine in this order, one chapter at a time:
 

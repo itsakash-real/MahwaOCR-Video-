@@ -51,7 +51,8 @@ duplicate it.
 | 3b | TTS-readiness lint | `video tts` runs this automatically and REFUSES the whole chapter if anything's flagged (digits, dash/ellipsis-as-pause, stacked punctuation, unterminated sentence, unbalanced quotes, run-on >30 words) — see `manhwa_ocr/video/tts_lint.py` |
 | 4 | TTS synthesis | `video tts` (CLI) |
 | 4b | Audio self-check | `video tts` runs this automatically after synthesis (`--no-verify` to skip): re-transcribes the audio with the same whisper engine `video align` uses and flags any sentence whose heard words don't match the script, or whose seconds-per-word is a duration outlier (truncation/corruption) — see `manhwa_ocr/video/tts_verify.py`. Flags are a "go listen to this one" signal, not proof of a bug; whisper mishears real speech sometimes too. |
-| 5 | Audio → finished video | `video pair/align/plan/verify/sync-audit/approve/render` (CLI gates) — see `CHAPTER_BUILD_WORKFLOW.md` |
+| 5 (recommended) | Audio → external editor project (CapCut / InShot) | `video align/plan/export` (no rendering needed) — see `docs/EXTERNAL_EDITOR_EXPORT_WORKFLOW.md` |
+| 5 (built-in MP4) | Audio → finished video via ffmpeg | `video pair/align/plan/verify/sync-audit/approve/render` (CLI gates) — see `CHAPTER_BUILD_WORKFLOW.md` |
 
 Stage 2 and Stage 3 (the voice pass) have no dedicated command — they are not
 optional just because there's no command to run. Treat each as a real gate:
