@@ -1177,6 +1177,12 @@ def cmd_video(args) -> int:
     if action == "compile":
         vb.compile_videos(sess, chapters(), titles=not args.no_titles, name=args.name, log=_log)
         return 0
+
+    if action == "export":
+        from .video.export import export_chapter
+        for c in chapters(default_all=False):
+            export_chapter(sess.path, c, fmt=args.format, out_dir=args.out, log=_log)
+        return 0
     return 1
 
 
@@ -1304,14 +1310,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("video", help="recap videos: panels, plan, sync, render, clips")
     p.add_argument("action", choices=["status", "panels", "trim", "detect", "precheck", "solve", "ocr-check", "ocr-draft", "vision-trim", "pipeline", "pair", "tts", "tts-verify", "align", "plan", "sync", "sync-audit", "qc", "storyboard", "render", "pipeline",
                                       "build", "clip", "compile", "movie", "verify", "review", "approve", "intro", "hook", "previously",
-                                      "shorts", "endscreen", "captions"])
+                                      "shorts", "endscreen", "captions", "export"])
     p.add_argument("--chapter", help="one chapter")
     p.add_argument("--chapters", help="several, e.g. 1-4,11 (default for build/status: all transcribed)")
     p.add_argument("--force", action="store_true", help="rebuild even if up to date (discards plan edits)")
     p.add_argument("--preview", action="store_true", help="fast 480p render for checking")
     p.add_argument("--strict", action="store_true",
                    help="render: stop if any sentence is flagged for review (default: warn only)")
-    p.add_argument("--format", choices=["16:9", "9:16"], help="video shape (default from config: 16:9)")
+    p.add_argument("--format", choices=["16:9", "9:16", "capcut", "folder", "all"], help="video shape or export format (default: 16:9 / all)")
     p.add_argument("--no-sync", dest="no_sync", action="store_true", help="don't transcribe the audio")
     p.add_argument("--duration", type=float, help="plan without audio, for this many seconds")
     p.add_argument("--pages", help="folder of page images to use for this chapter")
